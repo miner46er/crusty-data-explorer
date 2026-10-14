@@ -38,6 +38,7 @@ pub struct Connection {
     pub id: ConnectionId,
     pub name: String,
     pub config: ConnectionConfig,
+    pub password: String,
     state: ConnectionState,
 }
 
@@ -84,6 +85,7 @@ pub struct ConnectDraft {
     pub editing: Option<ConnectionId>,
     pub name: String,
     pub config: ConnectionConfig,
+    pub password: String,
     pub error: Option<String>,
 }
 
@@ -233,7 +235,7 @@ impl AppState {
     }
 
     pub fn connect(&mut self, id: ConnectionId) {
-        let config = match self.connections.iter().find(|c| c.id == id) {
+        let (config, password) = match self.connections.iter().find(|c| c.id == id) {
             Some(c) => {
                 if matches!(
                     c.state,
@@ -243,7 +245,12 @@ impl AppState {
                 ) {
                     return;
                 }
-                c.config.clone()
+                let password = if c.password.is_empty() {
+                    None
+                } else {
+                    Some(c.password.clone())
+                };
+                (c.config.clone(), password)
             }
             None => return,
         };
@@ -254,9 +261,16 @@ impl AppState {
             return;
         }
         let handle =
-            spawn_session(id, config, None, self.ui_ctx.clone(), self.events_tx.clone());
+            spawn_session(id, config, password, self.ui_ctx.clone(), self.events_tx.clone());
         if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
             c.state = ConnectionState::Connecting { handle };
+        }
+    }
+
+    /// Memory-only password update for a later prompt. Never persisted.
+    pub fn set_password(&mut self, id: ConnectionId, password: String) {
+        if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
+            c.password = password;
         }
     }
 
@@ -275,14 +289,14 @@ impl AppState {
     }
 
     pub fn open_draft(&mut self, editing: Option<ConnectionId>) {
-        let (name, config) = match editing {
+        let (name, config, password) = match editing {
             Some(id) => match self.connections.iter().find(|c| c.id == id) {
-                Some(c) => (c.name.clone(), c.config.clone()),
+                Some(c) => (c.name.clone(), c.config.clone(), c.password.clone()),
                 None => return,
             },
-            None => (String::new(), DbKind::Sqlite.default_config()),
+            None => (String::new(), DbKind::Sqlite.default_config(), String::new()),
         };
-        self.draft = Some(ConnectDraft { editing, name, config, error: None });
+        self.draft = Some(ConnectDraft { editing, name, config, password, error: None });
     }
 
     pub fn cancel_draft(&mut self) {
@@ -310,6 +324,7 @@ impl AppState {
                 if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
                     c.name = draft.name;
                     c.config = draft.config;
+                    c.password = draft.password;
                 }
             }
             None => {
@@ -318,6 +333,7 @@ impl AppState {
                     id,
                     name: draft.name,
                     config: draft.config,
+                    password: draft.password,
                     state: ConnectionState::Disconnected,
                 });
             }
@@ -473,6 +489,7 @@ fn load_connections() -> Vec<Connection> {
                 id: ConnectionId::from_raw(p.id),
                 name: p.name,
                 config: p.config,
+                password: String::new(),
                 state: ConnectionState::Disconnected,
             })
             .collect(),
@@ -500,4 +517,61 @@ fn save_connections(conns: &[Connection]) -> std::io::Result<()> {
     std::fs::write(&tmp, serde_json::to_vec_pretty(&profiles).unwrap_or_default())?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_profile_shape_has_no_password() {
+        let profile = PersistedProfile {
+            id: 1,
+            name: "pg".to_owned(),
+            config: ConnectionConfig::Postgres {
+                host: "localhost".to_owned(),
+                port: 5432,
+                database: "appdb".to_owned(),
+                user: "owner".to_owned(),
+            },
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(!json.contains("password"));
+        assert!(json.contains("\"kind\":\"postgres\""));
+    }
+
+    #[test]
+    fn save_and_load_never_persist_password() {
+        let dir = std::env::temp_dir().join(format!("cde-pw-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crusty-data-explorer")).unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        let conns = vec![Connection {
+            id: ConnectionId::from_raw(7),
+            name: "pg".to_owned(),
+            config: ConnectionConfig::Postgres {
+                host: "localhost".to_owned(),
+                port: 5432,
+                database: "appdb".to_owned(),
+                user: "owner".to_owned(),
+            },
+            password: "transient-only".to_owned(),
+            state: ConnectionState::Disconnected,
+        }];
+        let result = save_connections(&conns);
+        let raw = std::fs::read_to_string(dir.join("crusty-data-explorer").join("connections.json"))
+            .unwrap_or_default();
+        let loaded = load_connections();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap();
+        assert!(!raw.contains("transient-only"));
+        assert!(!raw.contains("password"));
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].password.is_empty());
+        assert_eq!(loaded[0].name, "pg");
+    }
 }

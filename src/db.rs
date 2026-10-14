@@ -487,7 +487,7 @@ impl PgSession {
         else {
             return Err(DbError::Config("not a postgres connection".to_owned()));
         };
-        let connection_string = pg_connection_string(host, *port, database, user, password);
+        let connection_string = postgres_url(host, *port, database, user, password);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -597,20 +597,36 @@ fn pg_cell_kind(type_name: &str) -> PgCellKind {
     }
 }
 
-#[cfg(feature = "postgres")]
-fn pg_connection_string(
+/// Pure URL builder for Postgres. User, password, and database are
+/// percent-encoded; an empty or missing password omits the secret part.
+pub fn postgres_url(
     host: &str,
     port: u16,
     database: &str,
     user: &str,
     password: Option<&str>,
 ) -> String {
+    let user_enc = percent_encode(user);
+    let db_enc = percent_encode(database);
     match password {
-        Some(secret) if !secret.is_empty() => {
-            format!("postgres://{user}:{secret}@{host}:{port}/{database}")
+        Some(s) if !s.is_empty() => {
+            let enc: String = percent_encode(s);
+            format!("postgres://{user_enc}:{enc}@{host}:{port}/{db_enc}")
         }
-        _ => format!("postgres://{user}@{host}:{port}/{database}"),
+        _ => format!("postgres://{user_enc}@{host}:{port}/{db_enc}"),
     }
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_' || *b == b'.' || *b == b'~' {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 #[cfg(feature = "postgres")]
@@ -833,20 +849,39 @@ mod tests {
         assert!(ids.connection().raw() > 100);
     }
 
-    #[cfg(feature = "postgres")]
     #[test]
-    fn pg_connection_string_keeps_parts_verbatim() {
+    fn postgres_url_without_password_omits_secret() {
         assert_eq!(
-            pg_connection_string("db.internal", 5433, "analytics", "reader", Some("s3cret!")),
-            "postgres://reader:s3cret!@db.internal:5433/analytics"
-        );
-        assert_eq!(
-            pg_connection_string("localhost", 5432, "appdb", "owner", None),
+            postgres_url("localhost", 5432, "appdb", "owner", None),
             "postgres://owner@localhost:5432/appdb"
         );
+    }
+
+    #[test]
+    fn postgres_url_empty_password_omits_secret() {
         assert_eq!(
-            pg_connection_string("localhost", 5432, "appdb", "owner", Some("")),
+            postgres_url("localhost", 5432, "appdb", "owner", Some("")),
             "postgres://owner@localhost:5432/appdb"
+        );
+    }
+
+    #[test]
+    fn postgres_url_with_password_includes_secret() {
+        assert_eq!(
+            postgres_url("db.internal", 5433, "analytics", "reader", Some("s3cret")),
+            "postgres://reader:s3cret@db.internal:5433/analytics"
+        );
+    }
+
+    #[test]
+    fn postgres_url_encodes_special_chars_in_user_and_password() {
+        assert_eq!(
+            postgres_url("localhost", 5432, "appdb", "ad min", Some("p@ss:w/ord?")),
+            "postgres://ad%20min:p%40ss%3Aw%2Ford%3F@localhost:5432/appdb"
+        );
+        assert_eq!(
+            postgres_url("h", 1, "d", "u", Some("a#b%c!")),
+            "postgres://u:a%23b%25c%21@h:1/d"
         );
     }
 

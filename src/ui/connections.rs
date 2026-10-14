@@ -143,6 +143,12 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
                 });
             }
         }
+        if matches!(draft.config, ConnectionConfig::Postgres { .. }) {
+            ui.horizontal(|ui| {
+                ui.label("Password:");
+                ui.add(egui::TextEdit::singleline(&mut draft.password).password(true));
+            });
+        }
         if let Some(error) = state.draft().and_then(|d| d.error.clone()) {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
