@@ -21,8 +21,10 @@
 
 ## Task-specific (added after framing, between Phase C and Phase D per figure-it-out)
 
-- [ ] Scaffold Rust workspace: Cargo.toml, eframe/egui shell, module map
-- [ ] Core domain types: ConnectionProfile, QueryResult, AppState machine
-- [ ] SQLite driver first via rusqlite (bundled), priority 1. Postgres via sqlx + tokio behind feature, priority 2. MySQL deferred.
-- [ ] UI: connection sidebar + tabbed query editor + results grid, Beekeeper-style theme
-- [ ] Verify: cargo test + cargo run smoke, SQLite in-memory query roundtrip
+- [x] Scaffold Rust workspace: Cargo.toml, eframe/egui shell, module map
+- [x] Core domain types: ConnectionProfile, QueryResult, AppState machine
+- [x] SQLite driver first via rusqlite (bundled), priority 1. Postgres via sqlx + tokio behind feature, priority 2. MySQL deferred.
+- [x] UI: connection sidebar + tabbed query editor + results grid, Beekeeper-style theme
+- [x] Verify: cargo test + cargo run smoke, SQLite in-memory query roundtrip
+- [x] Postgres queries: PgSession connect with pool, fetch rows to Value, affected counts, server_version, feature-gated tests
+- [x] Verify: cargo check --features postgres + cargo test --features postgres

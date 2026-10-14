@@ -402,23 +402,26 @@ pub enum Session {
 }
 
 impl Session {
-    pub fn open(config: &ConnectionConfig, _password: Option<&str>) -> Result<Session, DbError> {
+    pub fn open(config: &ConnectionConfig, password: Option<&str>) -> Result<Session, DbError> {
         match config {
             ConnectionConfig::Sqlite { path } => rusqlite::Connection::open(path)
                 .map(Session::Sqlite)
                 .map_err(|e| DbError::Open(e.to_string())),
-            ConnectionConfig::Postgres { .. } => Self::open_postgres(config),
+            ConnectionConfig::Postgres { .. } => Self::open_postgres(config, password),
         }
     }
 
-    fn open_postgres(_config: &ConnectionConfig) -> Result<Session, DbError> {
+    fn open_postgres(
+        config: &ConnectionConfig,
+        password: Option<&str>,
+    ) -> Result<Session, DbError> {
         #[cfg(feature = "postgres")]
         {
-            return Ok(Session::Postgres(PgSession::connect(_config)?));
+            return Ok(Session::Postgres(PgSession::connect(config, password)?));
         }
         #[cfg(not(feature = "postgres"))]
         {
-            let _ = _config;
+            let _ = (config, password);
             return Err(DbError::NotSupported(
                 "postgres needs the `postgres` feature".to_owned(),
             ));
@@ -429,7 +432,7 @@ impl Session {
         match self {
             Session::Sqlite(_) => format!("SQLite {}", rusqlite::version()),
             #[cfg(feature = "postgres")]
-            Session::Postgres(_) => "Postgres (stub)".to_owned(),
+            Session::Postgres(pg) => pg.server_version.clone(),
         }
     }
 
@@ -440,6 +443,9 @@ impl Session {
                 CancelHandle::new(move || handle.interrupt())
             }
             #[cfg(feature = "postgres")]
+            // Abandon-only: the tab drops the late result by run-id match. The
+            // upgrade path is a pg_cancel_backend() against the backend pid
+            // captured at connect.
             Session::Postgres(_) => CancelHandle::new(|| {}),
         }
     }
@@ -450,31 +456,216 @@ impl Session {
         match self {
             Session::Sqlite(conn) => execute_sqlite(conn, sql, ROW_CAP),
             #[cfg(feature = "postgres")]
-            Session::Postgres(_) => Err(DbError::NotSupported(
-                "postgres queries are not implemented yet".to_owned(),
-            )),
+            Session::Postgres(pg) => pg.query(sql),
         }
     }
 }
 
 /// Behind the `postgres` feature. Owns a current-thread tokio runtime so the
 /// async sqlx model stays caged inside this driver file; the public trait
-/// shape never changes. Query execution lands in the sqlx phase.
+/// shape never changes. The worker thread calls `block_on`, so the UI thread
+/// never blocks.
 #[cfg(feature = "postgres")]
 pub struct PgSession {
-    #[allow(dead_code)]
     rt: tokio::runtime::Runtime,
+    pool: sqlx::PgPool,
+    // Kept for diagnostics; the pool owns the live copy.
+    #[allow(dead_code)]
+    connection_string: String,
+    server_version: String,
 }
 
 #[cfg(feature = "postgres")]
 impl PgSession {
-    fn connect(_config: &ConnectionConfig) -> Result<Self, DbError> {
+    fn connect(config: &ConnectionConfig, password: Option<&str>) -> Result<Self, DbError> {
+        let ConnectionConfig::Postgres {
+            host,
+            port,
+            database,
+            user,
+        } = config
+        else {
+            return Err(DbError::Config("not a postgres connection".to_owned()));
+        };
+        let connection_string = pg_connection_string(host, *port, database, user, password);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| DbError::Open(e.to_string()))?;
-        Ok(Self { rt })
+        // `acquire_timeout` also bounds establishing the first connection;
+        // sqlx 0.8 has no separate `connect_timeout` on the pool options.
+        let pool = rt
+            .block_on(
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(1)
+                    .acquire_timeout(Duration::from_secs(10))
+                    .connect(&connection_string),
+            )
+            .map_err(|e| DbError::Open(e.to_string()))?;
+        let server_version = rt
+            .block_on(async {
+                let row = sqlx::query("SELECT version()")
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                use sqlx::Row as _;
+                row.try_get::<String, _>(0).map_err(|e| e.to_string())
+            })
+            .unwrap_or_else(|_| "Postgres".to_owned());
+        Ok(Self {
+            rt,
+            pool,
+            connection_string,
+            server_version,
+        })
     }
+
+    /// One statement per call. `describe` reports columns without executing,
+    /// so a data-changing statement runs exactly once on the `execute` path.
+    fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
+        let started = Instant::now();
+        let columns = self.describe_columns(sql)?;
+        if columns.is_empty() {
+            let done = self
+                .rt
+                .block_on(sqlx::query(sql).execute(&self.pool))
+                .map_err(|e| DbError::Query(e.to_string()))?;
+            return QueryResult::from_columns(
+                Vec::new(),
+                false,
+                Some(done.rows_affected()),
+                started.elapsed(),
+            )
+            .map_err(|e| DbError::Query(e.to_string()));
+        }
+        let rows = self
+            .rt
+            .block_on(sqlx::query(sql).fetch_all(&self.pool))
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        let mut builder = ResultBuilder::new(columns, ROW_CAP);
+        for row in &rows {
+            if !builder.push_row(map_pg_row(row)?) {
+                break;
+            }
+        }
+        Ok(builder.finish(started.elapsed()))
+    }
+
+    fn describe_columns(&self, sql: &str) -> Result<Vec<(String, String)>, DbError> {
+        use sqlx::{Column as _, Executor as _, TypeInfo as _};
+        let described = self
+            .rt
+            .block_on(async { (&self.pool).describe(sql).await })
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        Ok(described
+            .columns()
+            .iter()
+            .map(|c| (c.name().to_owned(), c.type_info().name().to_owned()))
+            .collect())
+    }
+}
+
+/// One Postgres column's decoding rule, keyed by `TypeInfo::name()`.
+#[cfg(feature = "postgres")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PgCellKind {
+    Bool,
+    Int16,
+    Int32,
+    Int64,
+    Oid,
+    Float32,
+    Float64,
+    Blob,
+    /// Text rendering: strings, numerics, UUIDs, JSON, dates, times, and
+    /// anything unlisted, including arrays and custom types.
+    Text,
+}
+
+#[cfg(feature = "postgres")]
+fn pg_cell_kind(type_name: &str) -> PgCellKind {
+    match type_name {
+        "BOOL" => PgCellKind::Bool,
+        "INT2" => PgCellKind::Int16,
+        "INT4" => PgCellKind::Int32,
+        "INT8" => PgCellKind::Int64,
+        "OID" => PgCellKind::Oid,
+        "FLOAT4" => PgCellKind::Float32,
+        "FLOAT8" => PgCellKind::Float64,
+        "BYTEA" => PgCellKind::Blob,
+        _ => PgCellKind::Text,
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn pg_connection_string(
+    host: &str,
+    port: u16,
+    database: &str,
+    user: &str,
+    password: Option<&str>,
+) -> String {
+    match password {
+        Some(secret) if !secret.is_empty() => {
+            format!("postgres://{user}:{secret}@{host}:{port}/{database}")
+        }
+        _ => format!("postgres://{user}@{host}:{port}/{database}"),
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn map_pg_row(row: &sqlx::postgres::PgRow) -> Result<Vec<Value>, DbError> {
+    use sqlx::{Column as _, Row as _, TypeInfo as _};
+    let mut cells = Vec::with_capacity(row.len());
+    for index in 0..row.len() {
+        let type_name = row.column(index).type_info().name().to_owned();
+        cells.push(decode_pg_cell(row, index, &type_name)?);
+    }
+    Ok(cells)
+}
+
+#[cfg(feature = "postgres")]
+fn decode_pg_cell(
+    row: &sqlx::postgres::PgRow,
+    index: usize,
+    type_name: &str,
+) -> Result<Value, DbError> {
+    match pg_cell_kind(type_name) {
+        PgCellKind::Bool => pg_option_cell(row, index, |b: bool| Value::Integer(i64::from(b))),
+        PgCellKind::Int16 => pg_option_cell(row, index, |n: i16| Value::Integer(i64::from(n))),
+        PgCellKind::Int32 => pg_option_cell(row, index, |n: i32| Value::Integer(i64::from(n))),
+        PgCellKind::Int64 => pg_option_cell(row, index, Value::Integer),
+        PgCellKind::Oid => pg_option_cell(row, index, |o: sqlx::postgres::types::Oid| {
+            Value::Integer(i64::from(o.0))
+        }),
+        PgCellKind::Float32 => pg_option_cell(row, index, |f: f32| Value::Real(f64::from(f))),
+        PgCellKind::Float64 => pg_option_cell(row, index, Value::Real),
+        PgCellKind::Blob => pg_option_cell(row, index, Value::Blob),
+        // A query without binds runs on the simple protocol, so every value
+        // arrives as text and the text-type compatibility gate is skipped for
+        // NUMERIC, UUID, date/time, and JSON names.
+        PgCellKind::Text => {
+            use sqlx::Row as _;
+            row.try_get_unchecked::<Option<String>, _>(index)
+                .map(|cell| cell.map(Value::Text).unwrap_or(Value::Null))
+                .map_err(|e| DbError::Query(e.to_string()))
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn pg_option_cell<T>(
+    row: &sqlx::postgres::PgRow,
+    index: usize,
+    into_value: impl FnOnce(T) -> Value,
+) -> Result<Value, DbError>
+where
+    T: for<'r> sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
+{
+    use sqlx::Row as _;
+    row.try_get::<Option<T>, _>(index)
+        .map(|cell| cell.map(into_value).unwrap_or(Value::Null))
+        .map_err(|e| DbError::Query(e.to_string()))
 }
 
 fn decode_value(v: rusqlite::types::Value) -> Value {
@@ -640,5 +831,99 @@ mod tests {
         let _ = (ids.tab(), ids.run());
         ids.resume_after(&[ConnectionId::from_raw(100)]);
         assert!(ids.connection().raw() > 100);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn pg_connection_string_keeps_parts_verbatim() {
+        assert_eq!(
+            pg_connection_string("db.internal", 5433, "analytics", "reader", Some("s3cret!")),
+            "postgres://reader:s3cret!@db.internal:5433/analytics"
+        );
+        assert_eq!(
+            pg_connection_string("localhost", 5432, "appdb", "owner", None),
+            "postgres://owner@localhost:5432/appdb"
+        );
+        assert_eq!(
+            pg_connection_string("localhost", 5432, "appdb", "owner", Some("")),
+            "postgres://owner@localhost:5432/appdb"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn pg_cell_kind_covers_listed_type_names() {
+        assert_eq!(pg_cell_kind("BOOL"), PgCellKind::Bool);
+        assert_eq!(pg_cell_kind("INT2"), PgCellKind::Int16);
+        assert_eq!(pg_cell_kind("INT4"), PgCellKind::Int32);
+        assert_eq!(pg_cell_kind("INT8"), PgCellKind::Int64);
+        assert_eq!(pg_cell_kind("OID"), PgCellKind::Oid);
+        assert_eq!(pg_cell_kind("FLOAT4"), PgCellKind::Float32);
+        assert_eq!(pg_cell_kind("FLOAT8"), PgCellKind::Float64);
+        assert_eq!(pg_cell_kind("BYTEA"), PgCellKind::Blob);
+        for name in [
+            "NUMERIC",
+            "TEXT",
+            "VARCHAR",
+            "CHAR",
+            "\"CHAR\"",
+            "NAME",
+            "UNKNOWN",
+            "UUID",
+            "JSON",
+            "JSONB",
+            "DATE",
+            "TIME",
+            "TIMETZ",
+            "TIMESTAMP",
+            "TIMESTAMPTZ",
+            "INTERVAL",
+            "VOID",
+            "INT4[]",
+            "TEXT[]",
+            "some_custom_type",
+        ] {
+            assert_eq!(pg_cell_kind(name), PgCellKind::Text, "{name}");
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_roundtrip_covers_result_and_affected_paths() {
+        let config = ConnectionConfig::Postgres {
+            host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
+            port: std::env::var("PGPORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
+            user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+        };
+        let password = std::env::var("PGPASSWORD").ok();
+        let mut session = Session::open(&config, password.as_deref()).expect("open");
+        assert!(!session.server_version().is_empty());
+        session
+            .query(
+                "CREATE TEMPORARY TABLE cde_probe (id INT4, name TEXT, active BOOL, ratio FLOAT8, payload BYTEA, note TEXT)",
+            )
+            .expect("create");
+        let inserted = session
+            .query("INSERT INTO cde_probe VALUES (1, 'ada', TRUE, 1.5, '\\x0102', NULL)")
+            .expect("insert");
+        assert_eq!(inserted.affected(), Some(1));
+        let result = session
+            .query("SELECT id, name, active, ratio, payload, note FROM cde_probe ORDER BY id")
+            .expect("select");
+        assert_eq!(result.row_count(), 1);
+        assert_eq!(result.affected(), None);
+        assert_eq!(result.columns()[0].type_name(), "INT4");
+        assert_eq!(result.columns()[2].type_name(), "BOOL");
+        assert_eq!(result.cell(0, 0), Some(&Value::Integer(1)));
+        assert_eq!(result.cell(0, 1), Some(&Value::Text("ada".to_owned())));
+        assert_eq!(result.cell(0, 2), Some(&Value::Integer(1)));
+        assert_eq!(result.cell(0, 3), Some(&Value::Real(1.5)));
+        assert_eq!(result.cell(0, 4), Some(&Value::Blob(vec![0x01, 0x02])));
+        assert_eq!(result.cell(0, 5), Some(&Value::Null));
     }
 }
