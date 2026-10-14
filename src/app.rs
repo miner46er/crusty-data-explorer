@@ -523,6 +523,8 @@ fn save_connections(conns: &[Connection]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn persisted_profile_shape_has_no_password() {
         let profile = PersistedProfile {
@@ -542,6 +544,7 @@ mod tests {
 
     #[test]
     fn save_and_load_never_persist_password() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("cde-pw-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("crusty-data-explorer")).unwrap();
         let prev = std::env::var_os("XDG_CONFIG_HOME");
@@ -573,5 +576,83 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert!(loaded[0].password.is_empty());
         assert_eq!(loaded[0].name, "pg");
+    }
+
+    #[test]
+    fn edit_draft_restores_and_updates_connection() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("cde-edit-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crusty-data-explorer")).unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        let ctx = eframe::egui::Context::default();
+        let mut state = AppState::new(&ctx);
+        for id in state.connections().iter().map(|c| c.id).collect::<Vec<_>>() {
+            state.delete_connection(id);
+        }
+        state.open_draft(None);
+        {
+            let draft = state.draft_mut().expect("new draft");
+            draft.name = "pg".to_owned();
+            draft.config = ConnectionConfig::Postgres {
+                host: "localhost".to_owned(),
+                port: 5432,
+                database: "appdb".to_owned(),
+                user: "owner".to_owned(),
+            };
+            draft.password = "first".to_owned();
+        }
+        state.save_draft();
+        assert!(state.draft().is_none());
+        assert_eq!(state.connections().len(), 1);
+        let id = state.connections()[0].id;
+        state.open_draft(Some(id));
+        {
+            let draft = state.draft().expect("edit draft");
+            assert_eq!(draft.editing, Some(id));
+            assert_eq!(draft.name, "pg");
+            assert_eq!(
+                draft.config,
+                ConnectionConfig::Postgres {
+                    host: "localhost".to_owned(),
+                    port: 5432,
+                    database: "appdb".to_owned(),
+                    user: "owner".to_owned(),
+                }
+            );
+            assert_eq!(draft.password, "first");
+        }
+        {
+            let draft = state.draft_mut().expect("edit draft mut");
+            draft.name = "pg-renamed".to_owned();
+            draft.config = ConnectionConfig::Postgres {
+                host: "db.internal".to_owned(),
+                port: 5433,
+                database: "analytics".to_owned(),
+                user: "reader".to_owned(),
+            };
+            draft.password = "second".to_owned();
+        }
+        state.save_draft();
+        assert!(state.draft().is_none());
+        assert_eq!(state.connections().len(), 1);
+        let conn = &state.connections()[0];
+        assert_eq!(conn.id, id);
+        assert_eq!(conn.name, "pg-renamed");
+        assert_eq!(
+            conn.config,
+            ConnectionConfig::Postgres {
+                host: "db.internal".to_owned(),
+                port: 5433,
+                database: "analytics".to_owned(),
+                user: "reader".to_owned(),
+            }
+        );
+        assert_eq!(conn.password, "second");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

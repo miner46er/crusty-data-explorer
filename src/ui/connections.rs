@@ -9,6 +9,7 @@ enum SidebarAction {
     Connect(ConnectionId),
     Disconnect(ConnectionId),
     NewQuery(ConnectionId),
+    Edit(ConnectionId),
     Delete(ConnectionId),
 }
 
@@ -57,6 +58,9 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                     }
                 }
             }
+            if ui.small_button("Edit").clicked() {
+                actions.push(SidebarAction::Edit(conn.id));
+            }
             if ui.small_button("Delete").clicked() {
                 actions.push(SidebarAction::Delete(conn.id));
             }
@@ -76,6 +80,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                 let tab = state.new_tab(id);
                 state.activate(tab);
             }
+            SidebarAction::Edit(id) => state.open_draft(Some(id)),
             SidebarAction::Delete(id) => state.delete_connection(id),
         }
     }
@@ -162,14 +167,10 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
         });
     });
     if save {
-        let editing = state.draft().and_then(|d| d.editing);
+        let is_new = state.draft().is_some_and(|d| d.editing.is_none());
         state.save_draft();
-        if state.draft().is_none() {
-            let target = match editing {
-                Some(id) => Some(id),
-                None => state.connections().last().map(|c| c.id),
-            };
-            if let Some(id) = target {
+        if state.draft().is_none() && is_new {
+            if let Some(id) = state.connections().last().map(|c| c.id) {
                 state.connect(id);
             }
         }
