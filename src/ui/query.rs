@@ -8,17 +8,31 @@ use eframe::egui;
 use crate::app::{AppState, RunOutcome};
 use crate::db::TabId;
 
+const RUN_GREEN: egui::Color32 = egui::Color32::from_rgb(115, 180, 115);
+
 pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     tab_bar(state, ui);
+    ui.add_space(4.0);
     toolbar(state, ui);
+    ui.add_space(4.0);
     if let Some(id) = state.active() {
+        let hint = state
+            .tab(id)
+            .and_then(|tab| state.connections().iter().find(|c| c.id == tab.conn))
+            .map(|c| format!("{} · {}", c.name, c.config.kind().label()))
+            .unwrap_or_else(|| "no connection".to_owned());
+        ui.label(egui::RichText::new(hint).small().weak());
         if let Some(sql) = state.tab_sql_mut(id) {
-            ui.add(
-                egui::TextEdit::multiline(sql)
-                    .code_editor()
-                    .desired_rows(8)
-                    .desired_width(f32::INFINITY),
-            );
+            egui::Frame::canvas(ui.style())
+                .inner_margin(egui::Margin::same(6))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(sql)
+                            .code_editor()
+                            .desired_rows(8)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
         }
     } else {
         ui.label("Open a connection and start a new query.");
@@ -32,15 +46,21 @@ fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
     let mut new_tab = false;
     ui.horizontal(|ui| {
         for tab in state.tabs() {
+            let is_active = Some(tab.id) == active;
             let title = tab_title(tab.sql.clone());
-            if ui.selectable_value(&mut active, Some(tab.id), title).clicked() {
+            let label = if is_active {
+                egui::RichText::new(title).strong()
+            } else {
+                egui::RichText::new(title).weak()
+            };
+            if ui.selectable_value(&mut active, Some(tab.id), label).clicked() {
                 activate = Some(tab.id);
             }
             if ui.small_button("×").clicked() {
                 close.push(tab.id);
             }
         }
-        if ui.button("+").clicked() {
+        if ui.small_button("+").clicked() {
             new_tab = true;
         }
     });
@@ -67,9 +87,21 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) {
     let Some(tab_id) = state.active() else { return };
     let (mut run_clicked, mut cancel_clicked) = (false, false);
     if state.tab(tab_id).is_some() {
+        let running = matches!(
+            state.tab(tab_id).map(|t| t.outcome()),
+            Some(RunOutcome::Running { .. })
+        );
         ui.horizontal(|ui| {
-            run_clicked = ui.button("Run").clicked();
-            cancel_clicked = ui.button("Cancel").clicked();
+            if running {
+                cancel_clicked = ui.button("Cancel").clicked();
+            } else {
+                run_clicked = ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("▶ Run").strong()).fill(RUN_GREEN),
+                    )
+                    .clicked();
+                ui.label(egui::RichText::new("Ctrl+Enter").small().weak());
+            }
             match state.tab(tab_id).map(|t| t.outcome()) {
                 Some(RunOutcome::Running { started, .. }) => {
                     ui.spinner();
@@ -79,10 +111,15 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) {
                     ui.colored_label(ui.visuals().error_fg_color, msg);
                 }
                 Some(RunOutcome::Ok(result)) => {
-                    ui.label(format!(
-                        "{:.0} ms",
-                        result.took().as_secs_f64() * 1000.0
-                    ));
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} rows · {:.0} ms",
+                            result.row_count(),
+                            result.took().as_secs_f64() * 1000.0
+                        ))
+                        .small()
+                        .weak(),
+                    );
                 }
                 Some(RunOutcome::Never) | None => {}
             }
