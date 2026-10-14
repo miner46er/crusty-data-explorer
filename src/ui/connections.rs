@@ -8,12 +8,20 @@ use crate::db::{ConnectionConfig, ConnectionId};
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(58, 110, 165);
 const LIVE_GREEN: egui::Color32 = egui::Color32::from_rgb(115, 180, 115);
 
+enum ConnectionStateKind {
+    Live,
+    Connecting,
+    Offline,
+}
+
 enum SidebarAction {
     Connect(ConnectionId),
     Disconnect(ConnectionId),
     NewQuery(ConnectionId),
     Edit(ConnectionId),
     Delete(ConnectionId),
+    RefreshSchema(ConnectionId),
+    PreviewTable(ConnectionId, String),
 }
 
 pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
@@ -45,22 +53,52 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                     .map(|tab| tab.conn);
 
                 let mut actions: Vec<SidebarAction> = Vec::new();
-                for conn in state.connections() {
-                    let selected = Some(conn.id) == active_conn;
-                    let (dot, dot_color, state_text) = match conn.state() {
-                        ConnectionState::Disconnected => ("○", egui::Color32::GRAY, "disconnected"),
-                        ConnectionState::Connecting { .. } => {
-                            ("◌", egui::Color32::YELLOW, "connecting")
-                        }
-                        ConnectionState::Connected { session } => {
-                            ("●", LIVE_GREEN, session.server_version.as_str())
-                        }
-                        ConnectionState::QueryRunning { session, .. } => {
-                            ("●", LIVE_GREEN, session.server_version.as_str())
-                        }
-                        ConnectionState::Error { message } => {
-                            ("●", egui::Color32::RED, message.as_str())
-                        }
+                let snapshot: Vec<(ConnectionId, String, String, bool)> = state
+                    .connections()
+                    .iter()
+                    .map(|c| {
+                        let (dot, text) = match c.state() {
+                            ConnectionState::Disconnected => ("○", "disconnected".to_owned()),
+                            ConnectionState::Connecting { .. } => {
+                                ("◌", "connecting".to_owned())
+                            }
+                            ConnectionState::Connected { session } => {
+                                ("●", session.server_version.clone())
+                            }
+                            ConnectionState::QueryRunning { session, .. } => {
+                                ("●", session.server_version.clone())
+                            }
+                            ConnectionState::Error { message } => ("●", message.clone()),
+                        };
+                        let live = matches!(
+                            c.state(),
+                            ConnectionState::Connected { .. }
+                                | ConnectionState::QueryRunning { .. }
+                        );
+                        (c.id, c.name.clone(), format!("{dot} {text}"), live)
+                    })
+                    .collect();
+                let dot_colors: std::collections::HashMap<ConnectionId, egui::Color32> = state
+                    .connections()
+                    .iter()
+                    .map(|c| {
+                        let color = match c.state() {
+                            ConnectionState::Disconnected => egui::Color32::GRAY,
+                            ConnectionState::Connecting { .. } => egui::Color32::YELLOW,
+                            ConnectionState::Connected { .. }
+                            | ConnectionState::QueryRunning { .. } => LIVE_GREEN,
+                            ConnectionState::Error { .. } => egui::Color32::RED,
+                        };
+                        (c.id, color)
+                    })
+                    .collect();
+                for (conn_id, conn_name, state_label, _is_live) in snapshot {
+                    let selected = Some(conn_id) == active_conn;
+                    let dot_color =
+                        dot_colors.get(&conn_id).copied().unwrap_or(egui::Color32::GRAY);
+                    let (dot, state_text) = match state_label.split_once(' ') {
+                        Some((d, t)) => (d.to_owned(), t.to_owned()),
+                        None => ("○".to_owned(), state_label.clone()),
                     };
                     let frame_fill = if selected {
                         ui.visuals().selection.bg_fill.gamma_multiply(0.35)
@@ -72,6 +110,23 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                     } else {
                         ui.visuals().widgets.noninteractive.bg_stroke
                     };
+                    let kind: ConnectionStateKind = {
+                        let conn = state
+                            .connections()
+                            .iter()
+                            .find(|c| c.id == conn_id)
+                            .map(|c| match c.state() {
+                                ConnectionState::Connected { .. } => ConnectionStateKind::Live,
+                                ConnectionState::QueryRunning { .. } => ConnectionStateKind::Live,
+                                ConnectionState::Connecting { .. } => {
+                                    ConnectionStateKind::Connecting
+                                }
+                                ConnectionState::Disconnected => ConnectionStateKind::Offline,
+                                ConnectionState::Error { .. } => ConnectionStateKind::Offline,
+                            })
+                            .unwrap_or(ConnectionStateKind::Offline);
+                        conn
+                    };
                     egui::Frame::group(ui.style())
                         .fill(frame_fill)
                         .stroke(frame_stroke)
@@ -80,19 +135,18 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width() - 16.0);
                             ui.horizontal(|ui| {
-                                ui.colored_label(dot_color, dot);
+                                ui.colored_label(dot_color, &dot);
                                 ui.vertical(|ui| {
-                                    ui.label(egui::RichText::new(&conn.name).strong());
+                                    ui.label(egui::RichText::new(&conn_name).strong());
                                     ui.label(
-                                        egui::RichText::new(state_text).small().weak(),
+                                        egui::RichText::new(&state_text).small().weak(),
                                     );
                                 });
                             });
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
-                                match conn.state() {
-                                    ConnectionState::Connected { .. }
-                                    | ConnectionState::QueryRunning { .. } => {
+                                match kind {
+                                    ConnectionStateKind::Live => {
                                         if ui
                                             .add(
                                                 egui::Button::new(
@@ -105,31 +159,48 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                                             )
                                             .clicked()
                                         {
-                                            actions.push(SidebarAction::NewQuery(conn.id));
+                                            actions.push(SidebarAction::NewQuery(conn_id));
                                         }
                                         if ui.small_button("Disconnect").clicked() {
-                                            actions.push(SidebarAction::Disconnect(conn.id));
+                                            actions.push(SidebarAction::Disconnect(conn_id));
                                         }
                                     }
-                                    ConnectionState::Connecting { .. } => {
+                                    ConnectionStateKind::Connecting => {
                                         if ui.small_button("Stop").clicked() {
-                                            actions.push(SidebarAction::Disconnect(conn.id));
+                                            actions.push(SidebarAction::Disconnect(conn_id));
                                         }
                                     }
-                                    ConnectionState::Disconnected
-                                    | ConnectionState::Error { .. } => {
+                                    ConnectionStateKind::Offline => {
                                         if ui.small_button("Connect").clicked() {
-                                            actions.push(SidebarAction::Connect(conn.id));
+                                            actions.push(SidebarAction::Connect(conn_id));
                                         }
                                     }
                                 }
                                 if ui.small_button("Edit").clicked() {
-                                    actions.push(SidebarAction::Edit(conn.id));
+                                    actions.push(SidebarAction::Edit(conn_id));
                                 }
                                 if ui.small_button("Delete").clicked() {
-                                    actions.push(SidebarAction::Delete(conn.id));
+                                    actions.push(SidebarAction::Delete(conn_id));
                                 }
                             });
+                            if matches!(kind, ConnectionStateKind::Live) {
+                                ui.add_space(4.0);
+                                ui.separator();
+                                ui.add_space(4.0);
+                                let schema_actions = super::schema::connection_schema(
+                                    state, ui, conn_id,
+                                );
+                                for sa in schema_actions {
+                                    match sa {
+                                        super::schema::SchemaAction::Refresh(id) => {
+                                            actions.push(SidebarAction::RefreshSchema(id));
+                                        }
+                                        super::schema::SchemaAction::Preview(id, table) => {
+                                            actions.push(SidebarAction::PreviewTable(id, table));
+                                        }
+                                    }
+                                }
+                            }
                         });
                     ui.add_space(4.0);
                 }
@@ -144,6 +215,8 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                         }
                         SidebarAction::Edit(id) => state.open_draft(Some(id)),
                         SidebarAction::Delete(id) => state.delete_connection(id),
+                        SidebarAction::RefreshSchema(id) => state.refresh_schema(id),
+                        SidebarAction::PreviewTable(id, table) => state.preview_table(id, &table),
                     }
                 }
             });

@@ -8,6 +8,7 @@ use crate::app::{AppState, ConnectionState};
 pub mod connections;
 pub mod grid;
 pub mod query;
+pub mod schema;
 
 pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     egui::Panel::left("connections")

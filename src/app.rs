@@ -5,12 +5,13 @@
 //! Worker events fold into the per-connection [`ConnectionState`] machine in
 //! exactly one place: [`AppState::apply`], drained from [`AppState::logic`].
 
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::Instant;
 
 use crate::db::{
     CancelHandle, ConnectionConfig, ConnectionId, DbCommand, DbEvent, DbHandle, DbKind,
-    DriverRegistry, Ids, QueryResult, RunId, TabId, spawn_session,
+    DriverRegistry, Ids, QueryResult, RunId, SchemaInfo, TabId, spawn_session,
 };
 
 /// Everything that changes about one connection's lifecycle, in five states.
@@ -99,6 +100,9 @@ pub struct AppState {
     events_tx: mpsc::Sender<DbEvent>,
     events_rx: mpsc::Receiver<DbEvent>,
     ui_ctx: eframe::egui::Context,
+    schemas: HashMap<ConnectionId, SchemaInfo>,
+    schema_loading: HashSet<ConnectionId>,
+    schema_errors: HashMap<ConnectionId, String>,
 }
 
 impl AppState {
@@ -117,7 +121,20 @@ impl AppState {
             events_tx,
             events_rx,
             ui_ctx: egui_ctx.clone(),
+            schemas: HashMap::new(),
+            schema_loading: HashSet::new(),
+            schema_errors: HashMap::new(),
         }
+    }
+
+    pub fn schema(&self, conn: ConnectionId) -> Option<&SchemaInfo> {
+        self.schemas.get(&conn)
+    }
+    pub fn schema_is_loading(&self, conn: ConnectionId) -> bool {
+        self.schema_loading.contains(&conn)
+    }
+    pub fn schema_error(&self, conn: ConnectionId) -> Option<&str> {
+        self.schema_errors.get(&conn).map(String::as_str)
     }
 
     pub fn connections(&self) -> &[Connection] {
@@ -278,14 +295,59 @@ impl AppState {
         if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
             c.state = ConnectionState::Disconnected;
         }
+        self.schemas.remove(&id);
+        self.schema_loading.remove(&id);
+        self.schema_errors.remove(&id);
     }
 
     pub fn delete_connection(&mut self, id: ConnectionId) {
         self.disconnect(id);
         self.tabs.retain(|t| t.conn != id);
         self.connections.retain(|c| c.id != id);
+        self.schemas.remove(&id);
+        self.schema_loading.remove(&id);
+        self.schema_errors.remove(&id);
         self.repair_active();
         self.persist();
+    }
+
+    pub fn refresh_schema(&mut self, conn: ConnectionId) {
+        let handle = match self.connections.iter().find(|c| c.id == conn) {
+            Some(c) => match &c.state {
+                ConnectionState::Connected { session }
+                | ConnectionState::QueryRunning { session, .. } => session.handle.clone(),
+                _ => return,
+            },
+            None => return,
+        };
+        self.schema_loading.insert(conn);
+        self.schema_errors.remove(&conn);
+        if handle.send(DbCommand::LoadSchema).is_err() {
+            self.schema_loading.remove(&conn);
+            self.schema_errors.insert(conn, "connection is gone".to_owned());
+        }
+    }
+
+    pub fn preview_table(&mut self, conn: ConnectionId, table: &str) {
+        if self.connections.iter().find(|c| c.id == conn).is_none() {
+            return;
+        }
+        let sql = format!("SELECT * FROM \"{}\" LIMIT 100", table.replace('"', "\"\""));
+        let existing = self.tabs.iter().find(|t| t.conn == conn && t.sql == sql).map(|t| t.id);
+        match existing {
+            Some(id) => {
+                self.activate(id);
+                self.start_run(id, &sql.clone());
+            }
+            None => {
+                let id = self.new_tab(conn);
+                if let Some(slot) = self.tab_sql_mut(id) {
+                    *slot = sql.clone();
+                }
+                self.activate(id);
+                self.start_run(id, &sql);
+            }
+        }
     }
 
     pub fn open_draft(&mut self, editing: Option<ConnectionId>) {
@@ -359,14 +421,29 @@ impl AppState {
     fn apply(&mut self, event: DbEvent) {
         match event {
             DbEvent::Connected { conn, cancel, server_version } => {
-                if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn) {
+                let handle = if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn)
+                {
                     if let ConnectionState::Connecting { handle } = &c.state {
                         let session = LiveSession {
                             handle: handle.clone(),
                             cancel,
                             server_version,
                         };
+                        let handle = session.handle.clone();
                         c.state = ConnectionState::Connected { session };
+                        Some(handle)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(handle) = handle {
+                    self.schema_loading.insert(conn);
+                    self.schema_errors.remove(&conn);
+                    if handle.send(DbCommand::LoadSchema).is_err() {
+                        self.schema_loading.remove(&conn);
+                        self.schema_errors.insert(conn, "connection is gone".to_owned());
                     }
                 }
             }
@@ -376,9 +453,19 @@ impl AppState {
                         c.state = ConnectionState::Error { message: error.to_string() };
                     }
                 }
+                self.schema_loading.remove(&conn);
             }
             DbEvent::QueryOk { run, result } => {
                 self.finish_run(run, RunOutcome::Ok(result));
+            }
+            DbEvent::SchemaOk { conn, schema } => {
+                self.schema_loading.remove(&conn);
+                self.schema_errors.remove(&conn);
+                self.schemas.insert(conn, schema);
+            }
+            DbEvent::SchemaErr { conn, error } => {
+                self.schema_loading.remove(&conn);
+                self.schema_errors.insert(conn, error.to_string());
             }
             DbEvent::QueryErr { run, error } => {
                 let fatal = error.is_fatal();

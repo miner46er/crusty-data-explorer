@@ -278,6 +278,127 @@ pub enum ShapeError {
     Ragged { expected: usize },
 }
 
+/// Cap on tables materialized per schema load. The schema reports truncation.
+pub const SCHEMA_TABLE_CAP: usize = 500;
+/// Cap on columns materialized per table. The schema reports truncation.
+pub const SCHEMA_COLUMN_CAP: usize = 200;
+
+/// Table or view. The variant is the kind; no stringly matching above this file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableKind {
+    Table,
+    View,
+}
+
+/// One column in a schema tree. Fields are private; construction checks happen
+/// in [`ColumnInfo::new`], so empty names cannot exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnInfo {
+    name: String,
+    type_name: String,
+    nullable: bool,
+    pk_position: Option<u32>,
+}
+
+impl ColumnInfo {
+    /// Checked constructor. Rejects empty names.
+    pub fn new(
+        name: String,
+        type_name: String,
+        nullable: bool,
+        pk_position: Option<u32>,
+    ) -> Result<Self, SchemaError> {
+        if name.trim().is_empty() {
+            return Err(SchemaError::EmptyName("column"));
+        }
+        Ok(Self { name, type_name, nullable, pk_position })
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn type_name(&self) -> &str {
+        &self.type_name
+    }
+    pub fn nullable(&self) -> bool {
+        self.nullable
+    }
+    pub fn pk_position(&self) -> Option<u32> {
+        self.pk_position
+    }
+    pub fn is_pk(&self) -> bool {
+        self.pk_position.is_some()
+    }
+}
+
+/// One table or view in a schema tree. Fields are private; construction checks
+/// happen in [`TableInfo::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableInfo {
+    name: String,
+    kind: TableKind,
+    columns: Vec<ColumnInfo>,
+}
+
+impl TableInfo {
+    /// Checked constructor. Rejects empty names.
+    pub fn new(
+        name: String,
+        kind: TableKind,
+        columns: Vec<ColumnInfo>,
+    ) -> Result<Self, SchemaError> {
+        if name.trim().is_empty() {
+            return Err(SchemaError::EmptyName("table"));
+        }
+        Ok(Self { name, kind, columns })
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn kind(&self) -> TableKind {
+        self.kind
+    }
+    pub fn columns(&self) -> &[ColumnInfo] {
+        &self.columns
+    }
+}
+
+/// A browsable schema: ordered tables and views with truncation flags.
+/// Fields are private; drivers build it, the UI reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaInfo {
+    tables: Vec<TableInfo>,
+    tables_truncated: bool,
+    columns_truncated: bool,
+}
+
+impl SchemaInfo {
+    pub fn new(
+        tables: Vec<TableInfo>,
+        tables_truncated: bool,
+        columns_truncated: bool,
+    ) -> Self {
+        Self { tables, tables_truncated, columns_truncated }
+    }
+    pub fn tables(&self) -> &[TableInfo] {
+        &self.tables
+    }
+    pub fn tables_truncated(&self) -> bool {
+        self.tables_truncated
+    }
+    pub fn columns_truncated(&self) -> bool {
+        self.columns_truncated
+    }
+    pub fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SchemaError {
+    #[error("{0} name is empty")]
+    EmptyName(&'static str),
+}
+
 /// Row-wise constructor used by drivers. Buffers rows, transposes at finish.
 pub struct ResultBuilder {
     columns: Vec<(String, String)>,
@@ -383,6 +504,7 @@ impl DbHandle {
 #[derive(Debug)]
 pub enum DbCommand {
     Query { run: RunId, sql: String },
+    LoadSchema,
 }
 
 #[derive(Debug)]
@@ -391,6 +513,8 @@ pub enum DbEvent {
     ConnectFailed { conn: ConnectionId, error: DbError },
     QueryOk { run: RunId, result: QueryResult },
     QueryErr { run: RunId, error: DbError },
+    SchemaOk { conn: ConnectionId, schema: SchemaInfo },
+    SchemaErr { conn: ConnectionId, error: DbError },
 }
 
 /// Owned by one worker thread for its whole life. Not Sync, and that is the
@@ -457,6 +581,16 @@ impl Session {
             Session::Sqlite(conn) => execute_sqlite(conn, sql, ROW_CAP),
             #[cfg(feature = "postgres")]
             Session::Postgres(pg) => pg.query(sql),
+        }
+    }
+
+    /// Ordered schema load, capped with truncation flags. No client type
+    /// crosses the boundary.
+    pub fn schema(&self) -> Result<SchemaInfo, DbError> {
+        match self {
+            Session::Sqlite(conn) => sqlite_schema(conn),
+            #[cfg(feature = "postgres")]
+            Session::Postgres(pg) => pg.schema(),
         }
     }
 }
@@ -562,6 +696,131 @@ impl PgSession {
             .iter()
             .map(|c| (c.name().to_owned(), c.type_info().name().to_owned()))
             .collect())
+    }
+
+    fn schema(&self) -> Result<SchemaInfo, DbError> {
+        use sqlx::Row as _;
+        let tables: Vec<(String, String)> = self
+            .rt
+            .block_on(
+                sqlx::query(
+                    "SELECT table_name, table_type FROM information_schema.tables \
+                     WHERE table_schema = 'public' \
+                     AND table_type IN ('BASE TABLE', 'VIEW') \
+                     ORDER BY table_name",
+                )
+                .fetch_all(&self.pool),
+            )
+            .map_err(|e| DbError::Query(e.to_string()))?
+            .iter()
+            .map(|row| {
+                let name: String = row.try_get(0).map_err(|e| DbError::Query(e.to_string()))?;
+                let kind: String = row.try_get(1).map_err(|e| DbError::Query(e.to_string()))?;
+                Ok((name, kind))
+            })
+            .collect::<Result<Vec<_>, DbError>>()?;
+        let tables_truncated = tables.len() > SCHEMA_TABLE_CAP;
+        let names: Vec<(String, TableKind)> = tables
+            .into_iter()
+            .take(SCHEMA_TABLE_CAP)
+            .map(|(name, kind)| {
+                let kind =
+                    if kind == "VIEW" { TableKind::View } else { TableKind::Table };
+                (name, kind)
+            })
+            .collect();
+        let columns: Vec<(String, String, String, String)> = self
+            .rt
+            .block_on(
+                sqlx::query(
+                    "SELECT table_name, column_name, data_type, is_nullable \
+                     FROM information_schema.columns \
+                     WHERE table_schema = 'public' \
+                     ORDER BY table_name, ordinal_position",
+                )
+                .fetch_all(&self.pool),
+            )
+            .map_err(|e| DbError::Query(e.to_string()))?
+            .iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String, _>(0)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                    row.try_get::<String, _>(1)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                    row.try_get::<String, _>(2)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                    row.try_get::<String, _>(3)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                ))
+            })
+            .collect::<Result<Vec<_>, DbError>>()?;
+        let pk_rows: Vec<(String, String)> = self
+            .rt
+            .block_on(
+                sqlx::query(
+                    "SELECT tc.table_name, kcu.column_name \
+                     FROM information_schema.table_constraints tc \
+                     JOIN information_schema.key_column_usage kcu \
+                     ON tc.constraint_name = kcu.constraint_name \
+                     AND tc.table_schema = kcu.table_schema \
+                     WHERE tc.table_schema = 'public' \
+                     AND tc.constraint_type = 'PRIMARY KEY' \
+                     ORDER BY tc.table_name, kcu.ordinal_position",
+                )
+                .fetch_all(&self.pool),
+            )
+            .map_err(|e| DbError::Query(e.to_string()))?
+            .iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String, _>(0)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                    row.try_get::<String, _>(1)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                ))
+            })
+            .collect::<Result<Vec<_>, DbError>>()?;
+        let mut pk_order: std::collections::HashMap<(String, String), u32> =
+            std::collections::HashMap::new();
+        let mut pk_count: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        for (table, column) in pk_rows {
+            let next = pk_count.get(&table).copied().unwrap_or(0) + 1;
+            pk_count.insert(table.clone(), next);
+            pk_order.insert((table, column), next);
+        }
+        let mut by_table: std::collections::HashMap<String, Vec<(String, String, bool)>> =
+            std::collections::HashMap::new();
+        for (table, column, data_type, is_nullable) in columns {
+            by_table.entry(table).or_default().push((
+                column,
+                data_type,
+                is_nullable == "YES",
+            ));
+        }
+        let mut out = Vec::new();
+        let mut columns_truncated = false;
+        for (name, kind) in names {
+            let raw = by_table.remove(&name).unwrap_or_default();
+            if raw.len() > SCHEMA_COLUMN_CAP {
+                columns_truncated = true;
+            }
+            let mut cols = Vec::new();
+            for (col_name, type_name, nullable) in raw.into_iter().take(SCHEMA_COLUMN_CAP) {
+                let pk_position = pk_order.get(&(name.clone(), col_name.clone())).copied();
+                let nullable = if pk_position.is_some() { false } else { nullable };
+                cols.push(
+                    ColumnInfo::new(col_name, type_name, nullable, pk_position)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                );
+            }
+            out.push(
+                TableInfo::new(name, kind, cols)
+                    .map_err(|e| DbError::Query(e.to_string()))?,
+            );
+        }
+        Ok(SchemaInfo::new(out, tables_truncated, columns_truncated))
     }
 }
 
@@ -734,6 +993,59 @@ fn execute_sqlite(
     Ok(builder.finish(started.elapsed()))
 }
 
+fn sqlite_schema(conn: &rusqlite::Connection) -> Result<SchemaInfo, DbError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT name, type FROM sqlite_master \
+             WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' \
+             ORDER BY name",
+        )
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    let entries: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|e| DbError::Query(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    let tables_truncated = entries.len() > SCHEMA_TABLE_CAP;
+    let mut tables = Vec::new();
+    let mut columns_truncated = false;
+    for (name, kind) in entries.into_iter().take(SCHEMA_TABLE_CAP) {
+        let kind = if kind == "view" { TableKind::View } else { TableKind::Table };
+        let pragma = format!("PRAGMA table_info(\"{}\")", name.replace('"', "\"\""));
+        let mut col_stmt =
+            conn.prepare(&pragma).map_err(|e| DbError::Query(e.to_string()))?;
+        let raw_cols: Vec<(String, String, bool, u32)> = col_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, i64>(5).unwrap_or(0).max(0) as u32,
+                ))
+            })
+            .map_err(|e| DbError::Query(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        if raw_cols.len() > SCHEMA_COLUMN_CAP {
+            columns_truncated = true;
+        }
+        let mut columns = Vec::new();
+        for (col_name, type_name, notnull, pk) in
+            raw_cols.into_iter().take(SCHEMA_COLUMN_CAP)
+        {
+            let pk_position = if pk > 0 { Some(pk) } else { None };
+            let nullable = !notnull && pk_position.is_none();
+            let col = ColumnInfo::new(col_name, type_name, nullable, pk_position)
+                .map_err(|e| DbError::Query(e.to_string()))?;
+            columns.push(col);
+        }
+        let table = TableInfo::new(name, kind, columns)
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        tables.push(table);
+    }
+    Ok(SchemaInfo::new(tables, tables_truncated, columns_truncated))
+}
+
 /// Spawns the connection's worker thread and returns its handle.
 /// `password` is memory-only and never persisted; SQLite ignores it.
 pub fn spawn_session(
@@ -807,6 +1119,20 @@ fn worker_loop(
                     break;
                 }
                 ui.request_repaint();
+            }
+            DbCommand::LoadSchema => {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    session.schema()
+                }));
+                let event = match outcome {
+                    Ok(Ok(schema)) => DbEvent::SchemaOk { conn, schema },
+                    Ok(Err(error)) => DbEvent::SchemaErr { conn, error },
+                    Err(_) => DbEvent::SchemaErr {
+                        conn,
+                        error: DbError::Query("driver panicked while loading schema".to_owned()),
+                    },
+                };
+                emit(&events, &ui, event);
             }
         }
     }
@@ -960,5 +1286,66 @@ mod tests {
         assert_eq!(result.cell(0, 3), Some(&Value::Real(1.5)));
         assert_eq!(result.cell(0, 4), Some(&Value::Blob(vec![0x01, 0x02])));
         assert_eq!(result.cell(0, 5), Some(&Value::Null));
+    }
+
+    #[test]
+    fn schema_constructors_reject_empty_names() {
+        assert!(ColumnInfo::new(String::new(), "TEXT".into(), true, None).is_err());
+        assert!(ColumnInfo::new("  ".into(), "TEXT".into(), true, None).is_err());
+        assert!(TableInfo::new(String::new(), TableKind::Table, Vec::new()).is_err());
+        assert!(TableInfo::new(" ".into(), TableKind::View, Vec::new()).is_err());
+        assert!(ColumnInfo::new("id".into(), "INTEGER".into(), false, Some(1)).is_ok());
+        assert!(
+            TableInfo::new(
+                "users".into(),
+                TableKind::Table,
+                vec![
+                    ColumnInfo::new("id".into(), "INTEGER".into(), false, Some(1)).unwrap()
+                ],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn sqlite_schema_lists_tables_view_and_pk() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER)", [])
+            .unwrap();
+        conn.execute("CREATE VIEW user_names AS SELECT name FROM users", []).unwrap();
+        let session = Session::Sqlite(conn);
+        let schema = session.schema().unwrap();
+        assert!(!schema.tables_truncated());
+        assert!(!schema.columns_truncated());
+        let names: Vec<(&str, TableKind)> =
+            schema.tables().iter().map(|t| (t.name(), t.kind())).collect();
+        assert_eq!(
+            names,
+            vec![
+                ("posts", TableKind::Table),
+                ("user_names", TableKind::View),
+                ("users", TableKind::Table),
+            ]
+        );
+        let users = schema.tables().iter().find(|t| t.name() == "users").unwrap();
+        assert_eq!(users.columns().len(), 3);
+        let id = users.columns().iter().find(|c| c.name() == "id").unwrap();
+        assert_eq!(id.pk_position(), Some(1));
+        assert!(id.is_pk());
+        assert!(!id.nullable());
+        let name = users.columns().iter().find(|c| c.name() == "name").unwrap();
+        assert_eq!(name.pk_position(), None);
+        assert!(!name.nullable());
+        assert_eq!(name.type_name(), "TEXT");
+        let note = users.columns().iter().find(|c| c.name() == "note").unwrap();
+        assert!(note.nullable());
+        let view = schema.tables().iter().find(|t| t.name() == "user_names").unwrap();
+        assert_eq!(view.kind(), TableKind::View);
+        assert!(!view.columns().is_empty());
     }
 }
