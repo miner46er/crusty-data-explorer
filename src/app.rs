@@ -12,12 +12,14 @@ use std::time::Instant;
 
 use crate::db::{
     CancelHandle, ConnectionConfig, ConnectionId, DbCommand, DbEvent, DbHandle, DbKind,
-    DriverRegistry, Ids, QueryResult, RunId, SchemaInfo, TabId, Value, explain_sql, spawn_session,
+    DriverRegistry, Ids, QueryResult, RunId, SchemaInfo, TabId, TableInfo, Value, explain_sql,
+    spawn_session,
 };
 use crate::edit::{
     delete_statement, editable_table, insert_statement, is_text_type, qualified_parts,
     to_literal, update_statement,
 };
+use crate::import::{ColumnMap, ROW_CAP, dropped_rows, insert_batches, map_headers, parse_csv};
 use crate::sql::{current_statement, split_statements, statement_ranges};
 
 /// Everything that changes about one connection's lifecycle, in five states.
@@ -144,6 +146,10 @@ pub struct Tab {
     added_rows: Vec<Vec<String>>,
     /// The apply batch in flight, so its landing can refresh the grid.
     pending_apply: Option<RunId>,
+    /// The import batch in flight with the notice its Ok landing records.
+    /// The notice is set after the post-import refresh is sent, so the
+    /// refresh's own send cannot clear it.
+    pending_import: Option<(RunId, String)>,
     /// The silent post-apply refresh in flight. It adds no history entry.
     silent_run: Option<RunId>,
 }
@@ -272,11 +278,14 @@ pub enum RunOutcome {
 }
 
 /// Why a batch was sent, so its landing knows what it ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum BatchPurpose {
     Run,
     /// The staged edits; a successful landing re-reads the tab.
     ApplyEdits,
+    /// The CSV import, with the notice its successful landing records; it
+    /// adds no history entry.
+    Import(String),
     /// The silent re-read after an apply; it adds no history entry.
     Refresh,
 }
@@ -367,11 +376,11 @@ fn effective_statements(
     }
 }
 
-/// Primary key columns in key order with their declared types, from the
-/// loaded schema tree. A qualified name matches under its schema; an
-/// unqualified one takes the first table matching case-insensitively across
-/// databases and schemas. A table without a key is not editable.
-fn primary_key(schema: &SchemaInfo, table: &str) -> Option<Vec<(String, String)>> {
+/// The loaded table a possibly qualified name resolves to: under its schema
+/// when qualified, else the first case-insensitive match across databases and
+/// schemas. An unqualified name takes the first match; a deeper qualifier
+/// resolves nothing.
+fn find_table<'a>(schema: &'a SchemaInfo, table: &str) -> Option<&'a TableInfo> {
     let parts = qualified_parts(table);
     let (wanted_schema, wanted_table) = match parts.as_slice() {
         [table] => (None, table.as_str()),
@@ -384,28 +393,40 @@ fn primary_key(schema: &SchemaInfo, table: &str) -> Option<Vec<(String, String)>
                 continue;
             }
             for info in node.tables() {
-                if !info.name().eq_ignore_ascii_case(wanted_table) {
-                    continue;
+                if info.name().eq_ignore_ascii_case(wanted_table) {
+                    return Some(info);
                 }
-                let mut columns: Vec<(u32, String, String)> = info
-                    .columns()
-                    .iter()
-                    .filter_map(|c| {
-                        c.pk_position().map(|position| {
-                            (position, c.name().to_owned(), c.type_name().to_owned())
-                        })
-                    })
-                    .collect();
-                columns.sort_by_key(|(position, _, _)| *position);
-                let key: Vec<(String, String)> = columns
-                    .into_iter()
-                    .map(|(_, name, type_name)| (name, type_name))
-                    .collect();
-                return (!key.is_empty()).then_some(key);
             }
         }
     }
     None
+}
+
+/// Primary key columns in key order with their declared types, from the
+/// loaded schema tree. A table without a key is not editable.
+fn primary_key(schema: &SchemaInfo, table: &str) -> Option<Vec<(String, String)>> {
+    let info = find_table(schema, table)?;
+    let mut columns: Vec<(u32, String, String)> = info
+        .columns()
+        .iter()
+        .filter_map(|c| {
+            c.pk_position().map(|position| {
+                (position, c.name().to_owned(), c.type_name().to_owned())
+            })
+        })
+        .collect();
+    columns.sort_by_key(|(position, _, _)| *position);
+    let key: Vec<(String, String)> = columns
+        .into_iter()
+        .map(|(_, name, type_name)| (name, type_name))
+        .collect();
+    (!key.is_empty()).then_some(key)
+}
+
+/// Column names of a loaded table in schema order, the way [`primary_key`]
+/// resolves the table, so CSV headers map onto all of its columns.
+fn table_columns(schema: &SchemaInfo, table: &str) -> Option<Vec<String>> {
+    Some(find_table(schema, table)?.columns().iter().map(|c| c.name().to_owned()).collect())
 }
 
 /// Key pairs for one row: each key column with the literal of the original
@@ -483,6 +504,17 @@ pub struct SavePrompt {
     pub error: Option<String>,
 }
 
+/// A parsed CSV awaiting its confirmation: the tab it imports into, the
+/// file's headers and rows, the resolved header map, and the target table.
+#[derive(Debug)]
+pub struct ImportDraft {
+    pub tab: TabId,
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub map: ColumnMap,
+    pub table: String,
+}
+
 pub struct AppState {
     connections: Vec<Connection>,
     tabs: Vec<Tab>,
@@ -502,6 +534,7 @@ pub struct AppState {
     history: Vec<HistoryEntry>,
     saved: Vec<SavedQuery>,
     save_prompt: Option<SavePrompt>,
+    imports: Option<ImportDraft>,
 }
 
 impl AppState {
@@ -531,6 +564,7 @@ impl AppState {
             history: load_history(),
             saved,
             save_prompt: None,
+            imports: None,
         }
     }
 
@@ -608,6 +642,7 @@ impl AppState {
             deleted_rows: Vec::new(),
             added_rows: Vec::new(),
             pending_apply: None,
+            pending_import: None,
             silent_run: None,
         });
         if self.active.is_none() {
@@ -708,6 +743,9 @@ impl AppState {
                             match purpose {
                                 BatchPurpose::Run => {}
                                 BatchPurpose::ApplyEdits => t.pending_apply = Some(run),
+                                BatchPurpose::Import(notice) => {
+                                    t.pending_import = Some((run, notice));
+                                }
                                 BatchPurpose::Refresh => t.silent_run = Some(run),
                             }
                         }
@@ -744,6 +782,14 @@ impl AppState {
         if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
             if t.pending_apply == Some(run) {
                 t.pending_apply = None;
+            }
+            let imported = t
+                .pending_import
+                .as_ref()
+                .is_some_and(|(pending, _)| *pending == run);
+            if imported {
+                t.pending_import = None;
+                t.clear_export_notice();
             }
             if t.silent_run == Some(run) {
                 t.silent_run = None;
@@ -872,6 +918,123 @@ impl AppState {
             None => return,
         };
         self.send_batch(tab, conn_id, handle, statements, BatchPurpose::ApplyEdits);
+    }
+
+    /// Read and parse a CSV file for one tab and stage it for confirmation.
+    /// Failure lands in the tab's notice: an unreadable file, a file that is
+    /// not a CSV of one column count, or a tab the edit path cannot resolve.
+    pub fn begin_import(&mut self, tab: TabId, path: &std::path::Path) {
+        let Some(target) = self.edit_target(tab) else {
+            self.set_tab_notice(tab, "Import failed: the table is not editable".to_owned(), true);
+            return;
+        };
+        let conn = match self.tabs.iter().find(|t| t.id == tab) {
+            Some(t) => t.conn,
+            None => return,
+        };
+        let Some(columns) = self
+            .schemas
+            .get(&conn)
+            .and_then(|schema| table_columns(schema, &target.table))
+        else {
+            self.set_tab_notice(
+                tab,
+                "Import failed: the table columns are not loaded".to_owned(),
+                true,
+            );
+            return;
+        };
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => {
+                self.set_tab_notice(
+                    tab,
+                    format!("Import failed: {}: {error}", path.display()),
+                    true,
+                );
+                return;
+            }
+        };
+        let Some(parsed) = parse_csv(&text) else {
+            self.set_tab_notice(
+                tab,
+                "Import failed: the file needs a header and rows of one column count".to_owned(),
+                true,
+            );
+            return;
+        };
+        let map = map_headers(&parsed.headers, &columns);
+        self.imports = Some(ImportDraft {
+            tab,
+            headers: parsed.headers,
+            rows: parsed.rows,
+            map,
+            table: target.table,
+        });
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+            t.clear_export_notice();
+        }
+    }
+
+    /// Send the pending import as one batch through the edit write path: it
+    /// adds no history entry and the tab re-reads itself when it lands.
+    /// Nothing sends without a draft.
+    pub fn commit_import(&mut self) {
+        let Some(draft) = self.imports.take() else { return };
+        if self.edit_target(draft.tab).is_none() {
+            self.set_tab_notice(
+                draft.tab,
+                "Import failed: the table is not editable".to_owned(),
+                true,
+            );
+            return;
+        }
+        let statements = insert_batches(&draft.table, &draft.map, &draft.rows);
+        if statements.is_empty() {
+            self.set_tab_notice(
+                draft.tab,
+                format!("Import failed: no CSV header matches {}", draft.table),
+                true,
+            );
+            return;
+        }
+        let (conn_id, handle) = match self.tabs.iter().find(|t| t.id == draft.tab) {
+            Some(t) => match self.connections.iter().find(|c| c.id == t.conn) {
+                Some(c) => (t.conn, c.handle()),
+                None => return,
+            },
+            None => return,
+        };
+        let inserted = draft.rows.len().min(ROW_CAP);
+        let skipped = draft.map.skipped.len();
+        let dropped = dropped_rows(draft.rows.len());
+        let notice = format!(
+            "Imported {inserted} rows into {} ({skipped} skipped, {dropped} dropped)",
+            draft.table
+        );
+        self.send_batch(
+            draft.tab,
+            conn_id,
+            handle,
+            statements,
+            BatchPurpose::Import(notice),
+        );
+    }
+
+    /// Drop the pending import without sending anything.
+    pub fn cancel_import(&mut self) {
+        self.imports = None;
+    }
+
+    /// The pending import awaiting its confirmation, if any.
+    pub fn import_draft(&self) -> Option<&ImportDraft> {
+        self.imports.as_ref()
+    }
+
+    fn set_tab_notice(&mut self, tab: TabId, notice: String, is_error: bool) {
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+            t.set_export_notice(notice, is_error);
+        }
     }
 
     /// Rows and columns of the tab's active result. None when there is none.
@@ -1445,13 +1608,19 @@ impl AppState {
         {
             Some(t) => {
                 let ok = matches!(&outcome, RunOutcome::Ok { .. });
-                let applied = t.pending_apply == Some(run);
+                // An import landing behaves like an apply that adds no
+                // history entry and records its send-time notice.
+                let pending_import = t.pending_import.take_if(|(pending, _)| *pending == run);
+                let imported = pending_import.is_some();
+                let import_notice =
+                    pending_import.filter(|_| ok).map(|(_, notice)| notice);
+                let applied = t.pending_apply == Some(run) || imported;
                 let refresh = applied && ok;
-                if applied {
+                if t.pending_apply == Some(run) {
                     t.pending_apply = None;
                 }
-                let silent = t.silent_run == Some(run);
-                if silent {
+                let silent = t.silent_run == Some(run) || imported;
+                if t.silent_run == Some(run) {
                     t.silent_run = None;
                 }
                 if ok {
@@ -1501,12 +1670,17 @@ impl AppState {
                 };
                 let tab_id = t.id;
                 t.outcome = outcome;
-                t.clear_export_notice();
-                Some((tab_id, conn, entries, refresh))
+                // A silent run leaves the notice alone, so an import notice
+                // set when its batch landed outlives the refresh; a failure
+                // clears it.
+                if !silent || !ok {
+                    t.clear_export_notice();
+                }
+                Some((tab_id, conn, entries, refresh, import_notice))
             }
             None => None,
         };
-        let Some((tab_id, conn, entries, refresh)) = matched else { return };
+        let Some((tab_id, conn, entries, refresh, import_notice)) = matched else { return };
         if !entries.is_empty() {
             self.history.splice(0..0, entries);
             self.history.truncate(HISTORY_CAP);
@@ -1526,6 +1700,11 @@ impl AppState {
         }
         if refresh {
             self.start_refresh(tab_id);
+        }
+        // After the refresh send: its set_outcome clears the notice, so the
+        // import notice must land last to survive.
+        if let Some(notice) = import_notice {
+            self.set_tab_notice(tab_id, notice, false);
         }
     }
 
@@ -3469,6 +3648,85 @@ mod tests {
         });
     }
 
+    /// A CSV import end to end through the real SQLite worker: the batch
+    /// inserts, the silent refresh re-reads the tab, and the notice lands.
+    #[test]
+    fn import_inserts_and_refreshes_through_the_sqlite_worker() {
+        with_isolated_state("import-live", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            state.connect(conn);
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                state.drain_events();
+                if matches!(state.connections()[0].state(), ConnectionState::Connected { .. }) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "connection did not come up");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+
+            let tab = state.new_tab(conn);
+            let sql = "SELECT tenant, id, name FROM items ORDER BY id";
+            let setup = "CREATE TABLE items (tenant TEXT, id INTEGER, name TEXT, \
+                         PRIMARY KEY (tenant, id)); \
+                         INSERT INTO items (tenant, id, name) VALUES \
+                         ('acme', 1, 'ada'), ('globex', 2, 'grace')";
+            state.start_run(tab, setup, 0, None);
+            state.start_run(tab, sql, 0, None);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = sql.to_owned();
+            }
+            state.refresh_schema(conn);
+            let has_items = |state: &AppState| {
+                state.schema(conn).is_some_and(|schema| {
+                    schema.databases().iter().any(|database| {
+                        database.schemas().iter().any(|node| {
+                            node.tables().iter().any(|table| table.name() == "items")
+                        })
+                    })
+                })
+            };
+            loop {
+                state.drain_events();
+                let settled = !matches!(
+                    state.tab(tab).expect("tab").outcome(),
+                    RunOutcome::Running { .. }
+                ) && has_items(state);
+                if settled {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "setup did not settle");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+
+            let path = write_csv("live", "tenant,id,name\ninitech,3,Lin\ncobalt,4,Ada\n");
+            state.begin_import(tab, &path);
+            assert!(state.import_draft().is_some(), "draft staged");
+            state.commit_import();
+            let notice = "Imported 2 rows into items (0 skipped, 0 dropped)";
+            loop {
+                state.drain_events();
+                let view = state.tab(tab).expect("tab");
+                let running = matches!(view.outcome(), RunOutcome::Running { .. });
+                if !running && view.export_notice() == Some(notice) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "import and refresh did not finish");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let view = state.tab(tab).expect("tab");
+            let result = view.active_query_result().expect("refreshed result");
+            assert_eq!(result.row_count(), 4);
+            assert_eq!(result.cell(2, 0), Some(&Value::Text("initech".to_owned())));
+            assert_eq!(result.cell(2, 1), Some(&Value::Integer(3)));
+            assert_eq!(result.cell(2, 2), Some(&Value::Text("Lin".to_owned())));
+            assert_eq!(result.cell(3, 0), Some(&Value::Text("cobalt".to_owned())));
+            assert_eq!(result.cell(3, 1), Some(&Value::Integer(4)));
+            assert_eq!(result.cell(3, 2), Some(&Value::Text("Ada".to_owned())));
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
     #[test]
     fn inline_edit_applies_and_refreshes_through_the_sqlite_worker() {
         with_isolated_state("edit-live", |state| {
@@ -3594,6 +3852,211 @@ mod tests {
             let text = rendered_text(&output);
             assert!(text.iter().any(|t| t == "read only"), "{text:?}");
             assert!(!text.iter().any(|t| t.starts_with("Apply")), "{text:?}");
+        });
+    }
+
+    /// Write a CSV for a test and return its path. The caller removes it.
+    fn write_csv(tag: &str, text: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("cde-csv-{tag}-{}.csv", std::process::id()));
+        std::fs::write(&path, text).expect("write csv");
+        path
+    }
+
+    #[test]
+    fn begin_import_stages_the_file_and_commit_sends_the_exact_inserts() {
+        with_isolated_state("import-commit", |state| {
+            let (tab, _conn, commands) = editable_tab(state);
+            let path = write_csv("commit", "TENANT,Id,note\nacme,1,first\nglobex,2,second\n");
+            state.begin_import(tab, &path);
+            let draft = state.import_draft().expect("draft");
+            assert_eq!(draft.tab, tab);
+            assert_eq!(draft.table, "items");
+            assert_eq!(draft.headers, vec!["TENANT", "Id", "note"]);
+            assert_eq!(draft.rows.len(), 2);
+            assert_eq!(draft.map.pairs, vec![(0, 0), (1, 1)]);
+            assert_eq!(draft.map.skipped, vec!["note"]);
+
+            state.commit_import();
+            assert!(state.import_draft().is_none());
+            let run = match commands.try_recv().expect("insert batch") {
+                DbCommand::QueryBatch { run, statements } => {
+                    assert_eq!(
+                        statements,
+                        vec![
+                            "INSERT INTO \"items\" (\"tenant\", \"id\") \
+                             VALUES ('acme', 1), ('globex', 2)"
+                        ]
+                    );
+                    run
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            // The notice lands with the batch, not when it is sent.
+            assert_eq!(state.tab(tab).expect("tab").export_notice(), None);
+            let notice = "Imported 2 rows into items (1 skipped, 0 dropped)";
+            let before = state.history().len();
+            state.apply(DbEvent::BatchOk { run, results: vec![affected_result(2)] });
+            assert_eq!(state.history().len(), before);
+            let view = state.tab(tab).expect("tab");
+            assert_eq!(view.export_notice(), Some(notice));
+            assert!(!view.export_failed());
+
+            // The import batch adds no history entry and quietly re-reads
+            // the tab; the notice outlives the refresh landing.
+            let refresh_run = match commands.try_recv().expect("silent refresh") {
+                DbCommand::QueryBatch { run, statements } => {
+                    assert_eq!(statements, vec!["SELECT tenant, id, name FROM items"]);
+                    run
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            state.apply(DbEvent::BatchOk { run: refresh_run, results: vec![items_result()] });
+            assert_eq!(state.history().len(), before);
+            let view = state.tab(tab).expect("tab");
+            assert_eq!(view.export_notice(), Some(notice));
+            assert_eq!(view.active_query_result().map(|r| r.row_count()), Some(2));
+            assert!(commands.try_recv().is_err());
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn import_over_the_cap_sends_twenty_batches_and_reports_the_dropped_rows() {
+        with_isolated_state("import-cap", |state| {
+            let (tab, _conn, commands) = editable_tab(state);
+            let mut text = String::from("tenant,id,name\n");
+            for i in 0..1002 {
+                text.push_str(&format!("t{i},{i},n{i}\n"));
+            }
+            let path = write_csv("cap", &text);
+            state.begin_import(tab, &path);
+            state.commit_import();
+            let run = match commands.try_recv().expect("insert batches") {
+                DbCommand::QueryBatch { run, statements } => {
+                    assert_eq!(statements.len(), 20);
+                    assert!(statements[0].contains("('t0', 0, 'n0')"), "{}", statements[0]);
+                    assert!(statements[19].contains("('t999', 999, 'n999')"));
+                    assert!(!statements[19].contains("t1000"));
+                    run
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            state.apply(DbEvent::BatchOk { run, results: vec![affected_result(1000)] });
+            assert_eq!(
+                state.tab(tab).expect("tab").export_notice(),
+                Some("Imported 1000 rows into items (0 skipped, 2 dropped)")
+            );
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn cancel_import_clears_and_commit_without_a_draft_sends_nothing() {
+        with_isolated_state("import-cancel", |state| {
+            let (tab, _conn, commands) = editable_tab(state);
+            state.commit_import();
+            state.cancel_import();
+            assert!(state.import_draft().is_none());
+            assert!(commands.try_recv().is_err());
+
+            let path = write_csv("cancel", "tenant,id,name\nacme,1,ada\n");
+            state.begin_import(tab, &path);
+            assert!(state.import_draft().is_some());
+            state.cancel_import();
+            assert!(state.import_draft().is_none());
+            state.commit_import();
+            assert!(commands.try_recv().is_err());
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn a_file_that_does_not_import_errors_into_the_tab_notice() {
+        with_isolated_state("import-bad", |state| {
+            let (tab, _conn, commands) = editable_tab(state);
+            let ragged = write_csv("ragged", "tenant,id,name\nacme,1\n");
+            state.begin_import(tab, &ragged);
+            assert!(state.import_draft().is_none());
+            let view = state.tab(tab).expect("tab");
+            assert!(view.export_failed());
+            assert_eq!(
+                view.export_notice(),
+                Some("Import failed: the file needs a header and rows of one column count")
+            );
+            state.begin_import(tab, std::path::Path::new("/nonexistent/cde-import.csv"));
+            let notice = state.tab(tab).expect("tab").export_notice().unwrap_or_default();
+            assert!(notice.starts_with("Import failed: "), "{notice}");
+            assert!(notice.contains("cde-import.csv"), "{notice}");
+
+            // Headers that match no column stage a draft that cannot send.
+            let unmatched = write_csv("unmatched", "zzz\n1\n");
+            state.begin_import(tab, &unmatched);
+            assert_eq!(state.import_draft().expect("draft").map.skipped, vec!["zzz"]);
+            state.commit_import();
+            assert_eq!(
+                state.tab(tab).expect("tab").export_notice(),
+                Some("Import failed: no CSV header matches items")
+            );
+            assert!(state.tab(tab).expect("tab").export_failed());
+            assert!(commands.try_recv().is_err());
+            let _ = std::fs::remove_file(&ragged);
+            let _ = std::fs::remove_file(&unmatched);
+        });
+    }
+
+    #[test]
+    fn grid_import_button_and_modal_render_the_mapping_and_skipped_headers() {
+        with_isolated_state("import-render", |state| {
+            let (tab, _conn, _commands) = editable_tab(state);
+            state.activate(tab);
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input.clone(), |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            output.textures_delta.clear();
+            let text = rendered_text(&output);
+            assert!(text.iter().any(|t| t == "Import CSV"), "{text:?}");
+
+            let path = write_csv("render", "tenant,id,extra\nacme,1,x\n");
+            state.begin_import(tab, &path);
+            assert!(state.import_draft().is_some(), "draft staged");
+            // A fresh egui window paints from its second frame on.
+            let render = |state: &mut AppState| {
+                let mut output = ctx.run_ui(input.clone(), |ui| {
+                    crate::ui::grid::results(state, ui);
+                });
+                output.textures_delta.clear();
+                output
+            };
+            render(state);
+            let output = render(state);
+            let text = rendered_text(&output);
+            assert!(text.iter().any(|t| t == "Import into items"), "{text:?}");
+            assert!(text.iter().any(|t| t == "CSV column"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Skipped headers: extra"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Import"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Cancel"), "{text:?}");
+
+            // A tab the edit path cannot resolve offers no import.
+            state.cancel_import();
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT i.id FROM items i JOIN items o ON o.id = i.id".to_owned();
+            }
+            let mut output = ctx.run_ui(input, |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            output.textures_delta.clear();
+            let text = rendered_text(&output);
+            assert!(!text.iter().any(|t| t == "Import CSV"), "{text:?}");
+            let _ = std::fs::remove_file(&path);
         });
     }
 }

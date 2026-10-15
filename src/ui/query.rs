@@ -15,7 +15,8 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     prune_find(state, ui.ctx());
     let modal_open = state.draft().is_some()
         || state.save_prompt().is_some()
-        || state.password_prompt().is_some();
+        || state.password_prompt().is_some()
+        || state.import_draft().is_some();
     let (new_tab_shortcut_pressed, close_tab_shortcut_pressed, find_shortcut_pressed) = ui
         .input_mut(|i| {
             (

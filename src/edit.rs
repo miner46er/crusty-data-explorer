@@ -236,14 +236,14 @@ pub fn insert_statement(table: &str, columns: &[String], values: &[String]) -> S
     format!("INSERT INTO {} ({}) VALUES ({})", quote_qualified(table), columns, values)
 }
 
-fn ident(name: &str) -> String {
+pub fn ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// A table name for SQL: split on unquoted dots only, so a literal table
 /// named `a.b` stays one part, then double-quote each part with inner quotes
 /// doubled.
-fn quote_qualified(table: &str) -> String {
+pub fn quote_qualified(table: &str) -> String {
     qualified_parts(table).iter().map(|part| ident(part)).collect::<Vec<_>>().join(".")
 }
 

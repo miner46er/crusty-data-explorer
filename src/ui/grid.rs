@@ -87,6 +87,7 @@ fn cmp_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
 }
 
 pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
+    import_window(state, ui);
     let Some(tab_id) = state.active() else {
         ui.label("No query tab.");
         return;
@@ -140,6 +141,7 @@ enum EditAction {
     AddRow,
     Apply,
     Discard,
+    ImportCsv,
 }
 
 fn apply_edit_actions(state: &mut AppState, tab: TabId, actions: Vec<EditAction>) {
@@ -150,7 +152,70 @@ fn apply_edit_actions(state: &mut AppState, tab: TabId, actions: Vec<EditAction>
             EditAction::AddRow => state.add_row(tab),
             EditAction::Apply => state.apply_edits(tab),
             EditAction::Discard => state.discard_edits(tab),
+            EditAction::ImportCsv => pick_import_file(state, tab),
         }
+    }
+}
+
+/// Ask for a CSV file and stage it on the tab. A dismissed dialog changes
+/// nothing.
+fn pick_import_file(state: &mut AppState, tab: TabId) {
+    let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).pick_file() else {
+        return;
+    };
+    state.begin_import(tab, &path);
+}
+
+/// The confirmation modal for a pending import: every mapped header beside
+/// the table column it writes, the skipped headers, the truncation count,
+/// and the Import and Cancel buttons.
+pub fn import_window(state: &mut AppState, ui: &mut egui::Ui) {
+    let Some(draft) = state.import_draft() else { return };
+    let title = format!("Import into {}", draft.table);
+    let mut confirm = false;
+    let mut cancel = false;
+    egui::Window::new(title).show(ui.ctx(), |ui| {
+        let Some(draft) = state.import_draft() else { return };
+        ui.label(format!("{} rows", draft.rows.len()));
+        egui::Grid::new("import_columns").striped(true).show(ui, |ui| {
+            ui.label(egui::RichText::new("CSV column").small().weak());
+            ui.label(egui::RichText::new("Table column").small().weak());
+            ui.end_row();
+            for (header, column) in &draft.map.pairs {
+                ui.monospace(draft.headers.get(*header).cloned().unwrap_or_default());
+                ui.monospace(draft.map.columns.get(*column).cloned().unwrap_or_default());
+                ui.end_row();
+            }
+        });
+        if !draft.map.skipped.is_empty() {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("Skipped headers: {}", draft.map.skipped.join(", ")),
+            );
+        }
+        let dropped = crate::import::dropped_rows(draft.rows.len());
+        if dropped > 0 {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!(
+                    "{dropped} rows over the {} row cap will be dropped",
+                    crate::import::ROW_CAP
+                ),
+            );
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Import").clicked() {
+                confirm = true;
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+        });
+    });
+    if confirm {
+        state.commit_import();
+    } else if cancel {
+        state.cancel_import();
     }
 }
 
@@ -312,6 +377,13 @@ fn results_grid(
                     .clicked()
                 {
                     actions.push(EditAction::Apply);
+                }
+                if ui
+                    .button("Import CSV")
+                    .on_hover_text("Load a CSV file into this table")
+                    .clicked()
+                {
+                    actions.push(EditAction::ImportCsv);
                 }
                 if ui
                     .add_enabled(staged > 0, egui::Button::new("Discard"))
