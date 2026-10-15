@@ -44,8 +44,8 @@ Wave 1 — parallel, additive only, separate owned files.
 
 Wave 2 — serial core chain on `src/app.rs` Tab machine + `src/db.rs` worker.
 - [x] T4 Run scope + multi-statement + resultset picker (after Wave 1). Extends `RunOutcome`, splitter, picker UI. Blocks T6, T2. Landed f859206, live batch tests green.
-- [ ] T6 EXPLAIN plan view (after T4). EXPLAIN runner, rows rendered in grid. Read-only. Tests + live EXPLAIN on both engines. In flight on deepseek max.
-- [ ] T2 Inline editing (after T4, T6). Grid dirty tracking + PK-aware UPDATE/INSERT/DELETE + worker write command. Tests + live write + cancel regression.
+- [x] T6 EXPLAIN plan view (after T4). EXPLAIN runner, rows rendered in grid. Read-only. Landed with live tests on both engines.
+- [ ] T2 Inline editing (after T4, T6). Grid dirty tracking + PK-aware UPDATE/INSERT/DELETE + worker write command. Tests + live write + cancel regression. In flight on deepseek max.
 - [ ] T7b CSV import (after T2). Column mapper + batched INSERT on T2 write path. Tests + live import.
 
 Wave 3 — serial drivers on config shape, after Wave 2 (shared `src/db.rs`).
