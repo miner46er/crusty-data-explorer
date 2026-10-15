@@ -2640,6 +2640,61 @@ mod tests {
         assert!(result.row_count() > 0);
     }
 
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_edit_statements_update_a_temp_table() {
+        let config = ConnectionConfig::Postgres {
+            host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
+            port: std::env::var("PGPORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
+            user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+            ssl_mode: PostgresSslMode::Disable,
+        };
+        let password = std::env::var("PGPASSWORD").ok();
+        let mut session = Session::open(&config, password.as_deref()).expect("open");
+        session
+            .query("CREATE TEMPORARY TABLE cde_edit (id INT4 PRIMARY KEY, name TEXT)")
+            .expect("create");
+        session
+            .query("INSERT INTO cde_edit (id, name) VALUES (1, 'ada'), (2, 'grace')")
+            .expect("seed");
+        let updated = session
+            .query(&crate::edit::update_statement(
+                "cde_edit",
+                &[("id".to_owned(), "1".to_owned())],
+                &[("name".to_owned(), "Ada".to_owned())],
+            ))
+            .expect("update");
+        assert_eq!(updated.affected(), Some(1));
+        let deleted = session
+            .query(&crate::edit::delete_statement(
+                "cde_edit",
+                &[("id".to_owned(), "2".to_owned())],
+            ))
+            .expect("delete");
+        assert_eq!(deleted.affected(), Some(1));
+        let inserted = session
+            .query(&crate::edit::insert_statement(
+                "cde_edit",
+                &["id".to_owned(), "name".to_owned()],
+                &["3".to_owned(), "Lin".to_owned()],
+            ))
+            .expect("insert");
+        assert_eq!(inserted.affected(), Some(1));
+        let result = session
+            .query("SELECT id, name FROM cde_edit ORDER BY id")
+            .expect("reselect");
+        assert_eq!(result.row_count(), 2);
+        assert_eq!(result.cell(0, 0), Some(&Value::Integer(1)));
+        assert_eq!(result.cell(0, 1), Some(&Value::Text("Ada".to_owned())));
+        assert_eq!(result.cell(1, 0), Some(&Value::Integer(3)));
+        assert_eq!(result.cell(1, 1), Some(&Value::Text("Lin".to_owned())));
+    }
+
     #[test]
     fn schema_constructors_reject_empty_names() {
         assert!(ColumnInfo::new(String::new(), "TEXT".into(), true, None).is_err());
@@ -2930,6 +2985,49 @@ mod tests {
         let plan = explain_sql(DbKind::Sqlite, "SELECT 1");
         let result = session.query(&plan).expect("explain runs");
         assert!(result.row_count() > 0);
+    }
+
+    #[test]
+    #[ignore = "live engine test; run with --ignored"]
+    fn sqlite_live_edit_statements_write_and_reselect() {
+        let mut session = Session::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        session
+            .query("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("create");
+        session
+            .query("INSERT INTO users (id, name) VALUES (1, 'ada'), (2, 'grace')")
+            .expect("seed");
+        let updated = session
+            .query(&crate::edit::update_statement(
+                "users",
+                &[("id".to_owned(), "1".to_owned())],
+                &[("name".to_owned(), "Ada".to_owned())],
+            ))
+            .expect("update");
+        assert_eq!(updated.affected(), Some(1));
+        let deleted = session
+            .query(&crate::edit::delete_statement(
+                "users",
+                &[("id".to_owned(), "2".to_owned())],
+            ))
+            .expect("delete");
+        assert_eq!(deleted.affected(), Some(1));
+        let inserted = session
+            .query(&crate::edit::insert_statement(
+                "users",
+                &["id".to_owned(), "name".to_owned()],
+                &["3".to_owned(), "Lin".to_owned()],
+            ))
+            .expect("insert");
+        assert_eq!(inserted.affected(), Some(1));
+        let result = session
+            .query("SELECT id, name FROM users ORDER BY id")
+            .expect("reselect");
+        assert_eq!(result.row_count(), 2);
+        assert_eq!(result.cell(0, 0), Some(&Value::Integer(1)));
+        assert_eq!(result.cell(0, 1), Some(&Value::Text("Ada".to_owned())));
+        assert_eq!(result.cell(1, 0), Some(&Value::Integer(3)));
+        assert_eq!(result.cell(1, 1), Some(&Value::Text("Lin".to_owned())));
     }
 
     #[test]

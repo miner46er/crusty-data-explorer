@@ -7,11 +7,13 @@ use std::cmp::Ordering;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::app::{AppState, RunOutcome, SortDir, Tab};
-use crate::db::{CELL_CAP, QueryResult, Value};
+use crate::app::{AppState, EditTarget, RunOutcome, SortDir, Tab};
+use crate::db::{CELL_CAP, QueryResult, TabId, Value};
 use crate::export::{to_csv, to_inserts, to_json, to_markdown};
 
 const AFFECT_GREEN: egui::Color32 = egui::Color32::from_rgb(115, 180, 115);
+/// Translucent amber over a cell with a staged edit.
+const EDIT_TINT: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(227, 179, 65, 64);
 
 /// Row indices surviving `filter`, ordered by the sort column. The result
 /// is never mutated. An out-of-range sort column keeps natural order.
@@ -89,7 +91,7 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
         ui.label("No query tab.");
         return;
     };
-    let Some(tab) = state.tab_mut(tab_id) else {
+    let Some(tab) = state.tab(tab_id) else {
         ui.label("No query tab.");
         return;
     };
@@ -100,14 +102,16 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
             return;
         }
         RunOutcome::Running { .. } => {
+            // A new run replaces the rows under any open field.
+            store_edit_field(ui.ctx(), tab_id, None);
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label("Running… Cancel in the toolbar to abandon.");
             });
             return;
         }
-        RunOutcome::Err(msg) => {
-            ui.colored_label(ui.visuals().error_fg_color, msg);
+        RunOutcome::Err(message) => {
+            ui.colored_label(ui.visuals().error_fg_color, message.clone());
             if tab.results().is_empty() {
                 ui.label(
                     egui::RichText::new(
@@ -123,7 +127,63 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
             );
         }
     }
-    results_grid(tab, ui);
+    let target = state.edit_target(tab_id);
+    let Some(tab) = state.tab_mut(tab_id) else { return };
+    let actions = results_grid(tab, target.as_ref(), ui);
+    apply_edit_actions(state, tab_id, actions);
+}
+
+/// One deferred grid edit transition, applied once the tab borrow ends.
+enum EditAction {
+    Stage { row: usize, col: usize, text: String },
+    ToggleDelete(usize),
+    AddRow,
+    Apply,
+    Discard,
+}
+
+fn apply_edit_actions(state: &mut AppState, tab: TabId, actions: Vec<EditAction>) {
+    for action in actions {
+        match action {
+            EditAction::Stage { row, col, text } => state.stage_edit(tab, row, col, text),
+            EditAction::ToggleDelete(row) => state.mark_row_deleted(tab, row),
+            EditAction::AddRow => state.add_row(tab),
+            EditAction::Apply => state.apply_edits(tab),
+            EditAction::Discard => state.discard_edits(tab),
+        }
+    }
+}
+
+/// The in-place cell editor, kept in the egui context data keyed by tab, the
+/// pattern the find bar uses.
+#[derive(Clone)]
+struct EditField {
+    row: usize,
+    col: usize,
+    /// The active result the field opened on, so switching results closes it.
+    result: usize,
+    text: String,
+    /// Focus is requested on the first frame the field draws.
+    fresh: bool,
+}
+
+fn edit_field_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_edit_field", tab))
+}
+
+fn edit_field_of(ctx: &egui::Context, tab: TabId) -> Option<EditField> {
+    ctx.data(|d| d.get_temp(edit_field_id(tab)))
+}
+
+fn store_edit_field(ctx: &egui::Context, tab: TabId, field: Option<EditField>) {
+    ctx.data_mut(|d| match field {
+        Some(field) => {
+            d.insert_temp(edit_field_id(tab), field);
+        }
+        None => {
+            d.remove::<EditField>(edit_field_id(tab));
+        }
+    });
 }
 
 /// Result picker for a run that produced more than one result set.
@@ -147,10 +207,15 @@ fn result_tabs(tab: &mut Tab, ui: &mut egui::Ui) {
     }
 }
 
-fn results_grid(tab: &mut Tab, ui: &mut egui::Ui) {
+fn results_grid(
+    tab: &mut Tab,
+    target: Option<&EditTarget>,
+    ui: &mut egui::Ui,
+) -> Vec<EditAction> {
+    let mut actions = Vec::new();
     result_tabs(tab, ui);
     let (cols, total) = {
-        let Some(result) = tab.active_query_result() else { return };
+        let Some(result) = tab.active_query_result() else { return actions };
         if result.columns().is_empty() {
             match result.affected() {
                 Some(n) => {
@@ -163,7 +228,7 @@ fn results_grid(tab: &mut Tab, ui: &mut egui::Ui) {
                     ui.label("Done.");
                 }
             }
-            return;
+            return actions;
         }
         let total = result.row_count();
         let cols: Vec<(String, String)> = result
@@ -190,12 +255,17 @@ fn results_grid(tab: &mut Tab, ui: &mut egui::Ui) {
                 );
             }
         });
-        if total == 0 {
+        if total == 0 && tab.added_rows().is_empty() {
             ui.label(egui::RichText::new("No rows returned.").weak());
-            return;
+            return actions;
         }
         (cols, total)
     };
+    let editable = target.is_some();
+    if !editable {
+        // A run or a target change withdraws editing; drop any open field.
+        store_edit_field(ui.ctx(), tab.id, None);
+    }
     ui.horizontal(|ui| {
         ui.label("Filter");
         let mut text = tab.filter().to_owned();
@@ -232,6 +302,42 @@ fn results_grid(tab: &mut Tab, ui: &mut egui::Ui) {
         {
             copy_markdown_view(tab, ui.ctx());
         }
+        ui.separator();
+        match target {
+            Some(target) => {
+                let staged = tab.staged_count();
+                if ui
+                    .add_enabled(staged > 0, egui::Button::new(format!("Apply ({staged})")))
+                    .on_hover_text("Send the staged changes")
+                    .clicked()
+                {
+                    actions.push(EditAction::Apply);
+                }
+                if ui
+                    .add_enabled(staged > 0, egui::Button::new("Discard"))
+                    .on_hover_text("Drop every staged change")
+                    .clicked()
+                {
+                    actions.push(EditAction::Discard);
+                }
+                if ui
+                    .button("Add row")
+                    .on_hover_text("Stage one empty row for INSERT")
+                    .clicked()
+                {
+                    actions.push(EditAction::AddRow);
+                }
+                ui.label(
+                    egui::RichText::new(format!("editing {}", target.table)).small().weak(),
+                );
+            }
+            None => {
+                ui.label(egui::RichText::new("read only").small().weak()).on_hover_text(
+                    "Inline editing needs an idle connection and a single-table SELECT \
+                     whose table has a primary key in the result.",
+                );
+            }
+        }
     });
     if let Some(notice) = tab.export_notice().map(str::to_owned) {
         if tab.export_failed() {
@@ -243,12 +349,19 @@ fn results_grid(tab: &mut Tab, ui: &mut egui::Ui) {
     let (sort_col, sort_dir, filter) = (tab.sort_col(), tab.sort_dir(), tab.filter().to_owned());
     let visible = match tab.active_query_result() {
         Some(result) => visible_rows(result, sort_col, sort_dir, &filter),
-        None => return,
+        None => return actions,
     };
     ui.label(
         egui::RichText::new(format!("{} of {} rows", visible.len(), total)).small().weak(),
     );
     let ncols = cols.len();
+    let active_result = tab.active_result();
+    let added = tab.added_rows().len();
+    let open_field = edit_field_of(ui.ctx(), tab.id);
+    let field_cell = open_field
+        .as_ref()
+        .filter(|field| field.result == active_result)
+        .map(|field| (field.row, field.col));
     let mut pending_sort: Option<usize> = None;
     egui::ScrollArea::both().show(ui, |ui| {
         TableBuilder::new(ui)
@@ -287,16 +400,128 @@ fn results_grid(tab: &mut Tab, ui: &mut egui::Ui) {
                 }
             })
             .body(|body| {
-                body.rows(20.0, visible.len(), |mut row| {
-                    let r = visible[row.index()];
+                body.rows(20.0, visible.len() + added, |mut row| {
+                    let index = row.index();
+                    if let Some(added_index) = index.checked_sub(visible.len()) {
+                        for c in 0..ncols {
+                            row.col(|ui| {
+                                let mut text = tab
+                                    .added_rows()
+                                    .get(added_index)
+                                    .and_then(|cells| cells.get(c))
+                                    .cloned()
+                                    .unwrap_or_default();
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut text)
+                                            .desired_width(f32::INFINITY)
+                                            .font(egui::TextStyle::Monospace),
+                                    )
+                                    .changed()
+                                {
+                                    actions.push(EditAction::Stage {
+                                        row: total + added_index,
+                                        col: c,
+                                        text,
+                                    });
+                                }
+                            });
+                        }
+                        return;
+                    }
+                    let r = visible[index];
                     for c in 0..ncols {
                         row.col(|ui| {
-                            let text = tab
-                                .active_query_result()
-                                .and_then(|result| result.cell(r, c))
-                                .map(|v| v.display(CELL_CAP).into_owned())
-                                .unwrap_or_default();
-                            ui.monospace(text);
+                            if field_cell == Some((r, c)) {
+                                let mut open = open_field.clone().expect("the open field");
+                                let response = ui.add(
+                                    egui::TextEdit::singleline(&mut open.text)
+                                        .desired_width(f32::INFINITY)
+                                        .font(egui::TextStyle::Monospace),
+                                );
+                                if open.fresh {
+                                    response.request_focus();
+                                    open.fresh = false;
+                                }
+                                let commit = response.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                let cancel = ui.input_mut(|i| {
+                                    i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                                });
+                                if commit {
+                                    actions.push(EditAction::Stage {
+                                        row: r,
+                                        col: c,
+                                        text: open.text,
+                                    });
+                                    store_edit_field(ui.ctx(), tab.id, None);
+                                } else if cancel {
+                                    store_edit_field(ui.ctx(), tab.id, None);
+                                } else {
+                                    store_edit_field(ui.ctx(), tab.id, Some(open));
+                                }
+                                return;
+                            }
+                            let deleted = tab.is_row_deleted(r);
+                            let staged = tab.edit_text(r, c);
+                            let text = match staged {
+                                Some(text) => text.to_owned(),
+                                None => tab
+                                    .active_query_result()
+                                    .and_then(|result| result.cell(r, c))
+                                    .map(|v| v.display(CELL_CAP).into_owned())
+                                    .unwrap_or_default(),
+                            };
+                            let cell_rect = ui.max_rect();
+                            if staged.is_some() && !deleted {
+                                ui.painter().rect_filled(
+                                    cell_rect,
+                                    egui::CornerRadius::ZERO,
+                                    EDIT_TINT,
+                                );
+                            }
+                            let label = if deleted {
+                                ui.monospace(
+                                    egui::RichText::new(text).strikethrough().weak(),
+                                )
+                            } else {
+                                ui.monospace(text)
+                            };
+                            let response = label.union(ui.interact(
+                                cell_rect,
+                                ui.id().with("edit_cell"),
+                                egui::Sense::click(),
+                            ));
+                            if !deleted && editable && response.double_clicked() {
+                                let cell = tab
+                                    .active_query_result()
+                                    .and_then(|result| result.cell(r, c));
+                                let preload = cell
+                                    .map(|v| v.display(usize::MAX).into_owned())
+                                    .unwrap_or_default();
+                                if !matches!(cell, Some(Value::Blob(_))) {
+                                    store_edit_field(
+                                        ui.ctx(),
+                                        tab.id,
+                                        Some(EditField {
+                                            row: r,
+                                            col: c,
+                                            result: active_result,
+                                            text: preload,
+                                            fresh: true,
+                                        }),
+                                    );
+                                }
+                            }
+                            if editable {
+                                let label = if deleted { "Restore row" } else { "Delete row" };
+                                response.context_menu(|ui| {
+                                    if ui.button(label).clicked() {
+                                        actions.push(EditAction::ToggleDelete(r));
+                                        ui.close();
+                                    }
+                                });
+                            }
                         });
                     }
                 });
@@ -305,6 +530,7 @@ fn results_grid(tab: &mut Tab, ui: &mut egui::Ui) {
     if let Some(col) = pending_sort {
         tab.set_sort(col);
     }
+    actions
 }
 
 fn export_current_view(tab: &mut Tab) {

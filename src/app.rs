@@ -12,8 +12,9 @@ use std::time::Instant;
 
 use crate::db::{
     CancelHandle, ConnectionConfig, ConnectionId, DbCommand, DbEvent, DbHandle, DbKind,
-    DriverRegistry, Ids, QueryResult, RunId, SchemaInfo, TabId, explain_sql, spawn_session,
+    DriverRegistry, Ids, QueryResult, RunId, SchemaInfo, TabId, Value, explain_sql, spawn_session,
 };
+use crate::edit::{delete_statement, editable_table, insert_statement, to_literal, update_statement};
 use crate::sql::{current_statement, split_statements, statement_ranges};
 
 /// Everything that changes about one connection's lifecycle, in five states.
@@ -100,6 +101,23 @@ impl RunScope {
     }
 }
 
+/// One staged cell edit: a result row and column with the text to write on
+/// the next apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowEdit {
+    pub row: usize,
+    pub col: usize,
+    pub text: String,
+}
+
+/// The table one tab's grid edits: its name and every primary key column
+/// with the result column index its value shows in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditTarget {
+    pub table: String,
+    pub pk_cols: Vec<(String, usize)>,
+}
+
 #[derive(Debug)]
 pub struct Tab {
     pub id: TabId,
@@ -116,6 +134,13 @@ pub struct Tab {
     filter: String,
     export_notice: Option<String>,
     export_failed: bool,
+    edits: Vec<RowEdit>,
+    deleted_rows: Vec<usize>,
+    added_rows: Vec<Vec<String>>,
+    /// The apply batch in flight, so its landing can refresh the grid.
+    pending_apply: Option<RunId>,
+    /// The silent post-apply refresh in flight. It adds no history entry.
+    silent_run: Option<RunId>,
 }
 
 impl Tab {
@@ -200,6 +225,35 @@ impl Tab {
         self.export_notice = None;
         self.export_failed = false;
     }
+    pub fn edits(&self) -> &[RowEdit] {
+        &self.edits
+    }
+    /// Staged text for one result cell, if any.
+    pub fn edit_text(&self, row: usize, col: usize) -> Option<&str> {
+        self.edits
+            .iter()
+            .find(|e| e.row == row && e.col == col)
+            .map(|e| e.text.as_str())
+    }
+    pub fn is_row_deleted(&self, row: usize) -> bool {
+        self.deleted_rows.contains(&row)
+    }
+    pub fn added_rows(&self) -> &[Vec<String>] {
+        &self.added_rows
+    }
+    /// How many statements the next apply would send: one per dirty row,
+    /// one per deleted row, and one per added row.
+    pub fn staged_count(&self) -> usize {
+        let mut dirty_rows: Vec<usize> = self
+            .edits
+            .iter()
+            .map(|e| e.row)
+            .filter(|row| !self.deleted_rows.contains(row))
+            .collect();
+        dirty_rows.sort_unstable();
+        dirty_rows.dedup();
+        dirty_rows.len() + self.deleted_rows.len() + self.added_rows.len()
+    }
 }
 
 /// One state per tab. `Running` carries the run id events must match and the
@@ -210,6 +264,16 @@ pub enum RunOutcome {
     Running { run: RunId, started: Instant, statements: Vec<String> },
     Ok { results: Vec<QueryResult>, active: usize },
     Err(String),
+}
+
+/// Why a batch was sent, so its landing knows what it ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchPurpose {
+    Run,
+    /// The staged edits; a successful landing re-reads the tab.
+    ApplyEdits,
+    /// The silent re-read after an apply; it adds no history entry.
+    Refresh,
 }
 
 /// One finished run. Newest first in [`AppState::history`]. Holds the SQL
@@ -296,6 +360,46 @@ fn effective_statements(
             None => effective_statements(sql, RunScope::Current, cursor, None),
         },
     }
+}
+
+/// Primary key column names in key order, from the loaded schema tree. The
+/// first table matching `table` case-insensitively wins across databases and
+/// schemas; a table without a key is not editable.
+fn primary_key(schema: &SchemaInfo, table: &str) -> Option<Vec<String>> {
+    for database in schema.databases() {
+        for node in database.schemas() {
+            for info in node.tables() {
+                if !info.name().eq_ignore_ascii_case(table) {
+                    continue;
+                }
+                let mut columns: Vec<(u32, String)> = info
+                    .columns()
+                    .iter()
+                    .filter_map(|c| c.pk_position().map(|pos| (pos, c.name().to_owned())))
+                    .collect();
+                columns.sort_by_key(|(position, _)| *position);
+                let names: Vec<String> = columns.into_iter().map(|(_, name)| name).collect();
+                return (!names.is_empty()).then_some(names);
+            }
+        }
+    }
+    None
+}
+
+/// Key pairs for one row: each key column with the literal of the original
+/// cell display, so the WHERE clause names the row exactly as displayed.
+fn key_pairs(
+    result: &QueryResult,
+    target: &EditTarget,
+    row: usize,
+) -> Option<Vec<(String, String)>> {
+    let mut pairs = Vec::with_capacity(target.pk_cols.len());
+    for (name, col) in &target.pk_cols {
+        let cell = result.cell(row, *col)?;
+        let was_null = matches!(cell, Value::Null);
+        pairs.push((name.clone(), to_literal(&cell.display(usize::MAX), was_null)));
+    }
+    Some(pairs)
 }
 
 /// Target tier for a connection. Prod connects route through a confirmation
@@ -465,6 +569,11 @@ impl AppState {
             filter: String::new(),
             export_notice: None,
             export_failed: false,
+            edits: Vec::new(),
+            deleted_rows: Vec::new(),
+            added_rows: Vec::new(),
+            pending_apply: None,
+            silent_run: None,
         });
         if self.active.is_none() {
             self.active = Some(id);
@@ -522,7 +631,6 @@ impl AppState {
         selection: Option<Range<usize>>,
         prepare: impl Fn(DbKind, String) -> String,
     ) {
-        let run = self.ids.run();
         let (conn_id, kind, handle, scope) = match self.tabs.iter().find(|t| t.id == tab) {
             Some(t) => match self.connections.iter().find(|c| c.id == t.conn) {
                 Some(c) => (t.conn, c.config.kind(), c.handle(), t.run_scope),
@@ -540,11 +648,34 @@ impl AppState {
         }
         let statements: Vec<String> =
             statements.into_iter().map(|statement| prepare(kind, statement)).collect();
+        self.send_batch(tab, conn_id, handle, statements, BatchPurpose::Run);
+    }
+
+    /// One prepared batch: mint the run, send it, and fold the tab's outcome
+    /// and the connection's running state. `purpose` marks the batch so the
+    /// landing knows what it ended.
+    fn send_batch(
+        &mut self,
+        tab: TabId,
+        conn_id: ConnectionId,
+        handle: Option<DbHandle>,
+        statements: Vec<String>,
+        purpose: BatchPurpose,
+    ) {
+        debug_assert!(!statements.is_empty());
+        let run = self.ids.run();
         match handle {
             Some(handle) => {
                 match handle.send(DbCommand::QueryBatch { run, statements: statements.clone() })
                 {
                     Ok(()) => {
+                        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                            match purpose {
+                                BatchPurpose::Run => {}
+                                BatchPurpose::ApplyEdits => t.pending_apply = Some(run),
+                                BatchPurpose::Refresh => t.silent_run = Some(run),
+                            }
+                        }
                         self.set_outcome(
                             tab,
                             RunOutcome::Running { run, started: Instant::now(), statements },
@@ -575,6 +706,14 @@ impl AppState {
             None => return,
         };
         self.set_outcome(tab, RunOutcome::Err("cancelled".to_owned()));
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+            if t.pending_apply == Some(run) {
+                t.pending_apply = None;
+            }
+            if t.silent_run == Some(run) {
+                t.silent_run = None;
+            }
+        }
         if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn_id) {
             if let ConnectionState::QueryRunning { session, run: current, .. } = &c.state {
                 if *current == run {
@@ -584,6 +723,181 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// What the tab's grid can edit, if anything. Some only while the
+    /// connection is idle, the tab's SQL is a single-table SELECT, the loaded
+    /// schema carries that table with a primary key, and every key column
+    /// appears in the active result.
+    pub fn edit_target(&self, tab: TabId) -> Option<EditTarget> {
+        let tab = self.tabs.iter().find(|t| t.id == tab)?;
+        let idle = matches!(
+            self.connections.iter().find(|c| c.id == tab.conn)?.state(),
+            ConnectionState::Connected { .. }
+        );
+        if !idle {
+            return None;
+        }
+        let table = editable_table(&tab.sql)?;
+        let pk = primary_key(self.schemas.get(&tab.conn)?, &table)?;
+        let result = tab.active_query_result()?;
+        let mut pk_cols = Vec::with_capacity(pk.len());
+        for column in pk {
+            let index = result
+                .columns()
+                .iter()
+                .position(|c| c.name().eq_ignore_ascii_case(&column))?;
+            pk_cols.push((column, index));
+        }
+        Some(EditTarget { table, pk_cols })
+    }
+
+    /// Stage one cell edit. `row` counts result rows first, then staged added
+    /// rows. No-op unless the target resolves and the cell is in the active
+    /// result or a staged added row. A later stage on the same cell replaces
+    /// its text.
+    pub fn stage_edit(&mut self, tab: TabId, row: usize, col: usize, text: String) {
+        if self.edit_target(tab).is_none() {
+            return;
+        }
+        let Some((rows, cols)) = self.result_shape(tab) else { return };
+        let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) else { return };
+        match row.checked_sub(rows).filter(|index| *index < t.added_rows.len()) {
+            Some(index) => {
+                if col < cols {
+                    t.added_rows[index][col] = text;
+                }
+            }
+            None => {
+                if row < rows && col < cols {
+                    match t.edits.iter_mut().find(|e| e.row == row && e.col == col) {
+                        Some(edit) => edit.text = text,
+                        None => t.edits.push(RowEdit { row, col, text }),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop every staged change on the tab.
+    pub fn discard_edits(&mut self, tab: TabId) {
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+            t.edits.clear();
+            t.deleted_rows.clear();
+            t.added_rows.clear();
+        }
+    }
+
+    /// Stage a DELETE for one result row. Marking the row again restores it.
+    /// No-op unless the target resolves and the row is in the active result.
+    pub fn mark_row_deleted(&mut self, tab: TabId, row: usize) {
+        if self.edit_target(tab).is_none() {
+            return;
+        }
+        let Some((rows, _)) = self.result_shape(tab) else { return };
+        if row >= rows {
+            return;
+        }
+        let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) else { return };
+        match t.deleted_rows.iter().position(|r| *r == row) {
+            Some(index) => {
+                t.deleted_rows.remove(index);
+            }
+            None => t.deleted_rows.push(row),
+        }
+    }
+
+    /// Stage one empty row for INSERT, with one cell per result column.
+    /// No-op unless the target resolves.
+    pub fn add_row(&mut self, tab: TabId) {
+        if self.edit_target(tab).is_none() {
+            return;
+        }
+        let Some((_, cols)) = self.result_shape(tab) else { return };
+        let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) else { return };
+        t.added_rows.push(vec![String::new(); cols]);
+    }
+
+    /// Send every staged change as one batch: an UPDATE per dirty row, a
+    /// DELETE per deleted row, then an INSERT per added row. Nothing sends
+    /// when nothing is staged or the target does not resolve.
+    pub fn apply_edits(&mut self, tab: TabId) {
+        let Some(target) = self.edit_target(tab) else { return };
+        let Some(statements) = self.edit_statements(tab, &target) else { return };
+        if statements.is_empty() {
+            return;
+        }
+        let (conn_id, handle) = match self.tabs.iter().find(|t| t.id == tab) {
+            Some(t) => match self.connections.iter().find(|c| c.id == t.conn) {
+                Some(c) => (t.conn, c.handle()),
+                None => return,
+            },
+            None => return,
+        };
+        self.send_batch(tab, conn_id, handle, statements, BatchPurpose::ApplyEdits);
+    }
+
+    /// Rows and columns of the tab's active result. None when there is none.
+    fn result_shape(&self, tab: TabId) -> Option<(usize, usize)> {
+        let result = self.tabs.iter().find(|t| t.id == tab)?.active_query_result()?;
+        Some((result.row_count(), result.columns().len()))
+    }
+
+    /// The statements for the staged changes, in apply order. None when the
+    /// displayed result cannot be read.
+    fn edit_statements(&self, tab: TabId, target: &EditTarget) -> Option<Vec<String>> {
+        let t = self.tabs.iter().find(|t| t.id == tab)?;
+        let result = t.active_query_result()?;
+        let columns: Vec<String> =
+            result.columns().iter().map(|c| c.name().to_owned()).collect();
+        let mut statements = Vec::new();
+        let mut dirty_rows: Vec<usize> = t.edits.iter().map(|e| e.row).collect();
+        dirty_rows.sort_unstable();
+        dirty_rows.dedup();
+        for row in dirty_rows {
+            if t.is_row_deleted(row) {
+                continue;
+            }
+            let mut sets: Vec<(String, String)> = Vec::new();
+            for col in 0..columns.len() {
+                if let Some(text) = t.edit_text(row, col) {
+                    sets.push((columns[col].clone(), text.to_owned()));
+                }
+            }
+            if sets.is_empty() {
+                continue;
+            }
+            let pk = key_pairs(result, target, row)?;
+            statements.push(update_statement(&target.table, &pk, &sets));
+        }
+        for row in &t.deleted_rows {
+            statements.push(delete_statement(&target.table, &key_pairs(result, target, *row)?));
+        }
+        for added in &t.added_rows {
+            statements.push(insert_statement(&target.table, &columns, added));
+        }
+        Some(statements)
+    }
+
+    /// Re-run the tab's SQL once after an apply so the grid reads the rows
+    /// back. The run is silent: it adds no history entry.
+    fn start_refresh(&mut self, tab: TabId) {
+        let sql = match self.tabs.iter().find(|t| t.id == tab) {
+            Some(t) => t.sql.clone(),
+            None => return,
+        };
+        let statements = effective_statements(&sql, RunScope::All, 0, None);
+        if statements.is_empty() {
+            return;
+        }
+        let (conn_id, handle) = match self.tabs.iter().find(|t| t.id == tab) {
+            Some(t) => match self.connections.iter().find(|c| c.id == t.conn) {
+                Some(c) => (t.conn, c.handle()),
+                None => return,
+            },
+            None => return,
+        };
+        self.send_batch(tab, conn_id, handle, statements, BatchPurpose::Refresh);
     }
 
     /// Connect from a user gesture. A prod connection arms the confirmation
@@ -1083,7 +1397,9 @@ impl AppState {
 
     /// The one staleness check. A run applies only if its tab is still
     /// Running that exact run id. Cancelled, replaced, and closed-tab runs
-    /// land here and are silently dropped.
+    /// land here and are silently dropped. A run that lands Ok replaces the
+    /// displayed rows, so it clears the staged changes; a failure leaves them
+    /// staged for a retry.
     fn finish_run(&mut self, run: RunId, outcome: RunOutcome) {
         let matched = match self
             .tabs
@@ -1091,6 +1407,21 @@ impl AppState {
             .find(|t| matches!(&t.outcome, RunOutcome::Running { run: r, .. } if *r == run))
         {
             Some(t) => {
+                let ok = matches!(&outcome, RunOutcome::Ok { .. });
+                let applied = t.pending_apply == Some(run);
+                let refresh = applied && ok;
+                if applied {
+                    t.pending_apply = None;
+                }
+                let silent = t.silent_run == Some(run);
+                if silent {
+                    t.silent_run = None;
+                }
+                if ok {
+                    t.edits.clear();
+                    t.deleted_rows.clear();
+                    t.added_rows.clear();
+                }
                 let (started, statements) = match &t.outcome {
                     RunOutcome::Running { started, statements, .. } => {
                         (*started, statements.clone())
@@ -1099,38 +1430,46 @@ impl AppState {
                 };
                 let conn = t.conn;
                 let sql = t.sql.clone();
-                let entries: Vec<HistoryEntry> = match &outcome {
-                    RunOutcome::Ok { results, .. } => results
-                        .iter()
-                        .enumerate()
-                        .map(|(index, result)| HistoryEntry {
+                let entries: Vec<HistoryEntry> = if silent {
+                    Vec::new()
+                } else {
+                    match &outcome {
+                        RunOutcome::Ok { results, .. } => results
+                            .iter()
+                            .enumerate()
+                            .map(|(index, result)| HistoryEntry {
+                                conn,
+                                sql: statements
+                                    .get(index)
+                                    .cloned()
+                                    .unwrap_or_else(|| sql.clone()),
+                                succeeded: true,
+                                rows: Some(
+                                    result.affected().unwrap_or(result.row_count() as u64),
+                                ),
+                                took: result.took(),
+                                at: now_unix_secs(),
+                            })
+                            .collect(),
+                        RunOutcome::Err(_) => vec![HistoryEntry {
                             conn,
-                            sql: statements.get(index).cloned().unwrap_or_else(|| sql.clone()),
-                            succeeded: true,
-                            rows: Some(
-                                result.affected().unwrap_or(result.row_count() as u64),
-                            ),
-                            took: result.took(),
+                            sql,
+                            succeeded: false,
+                            rows: None,
+                            took: started.elapsed(),
                             at: now_unix_secs(),
-                        })
-                        .collect(),
-                    RunOutcome::Err(_) => vec![HistoryEntry {
-                        conn,
-                        sql,
-                        succeeded: false,
-                        rows: None,
-                        took: started.elapsed(),
-                        at: now_unix_secs(),
-                    }],
-                    _ => Vec::new(),
+                        }],
+                        _ => Vec::new(),
+                    }
                 };
+                let tab_id = t.id;
                 t.outcome = outcome;
                 t.clear_export_notice();
-                Some((conn, entries))
+                Some((tab_id, conn, entries, refresh))
             }
             None => None,
         };
-        let Some((conn, entries)) = matched else { return };
+        let Some((tab_id, conn, entries, refresh)) = matched else { return };
         if !entries.is_empty() {
             self.history.splice(0..0, entries);
             self.history.truncate(HISTORY_CAP);
@@ -1147,6 +1486,9 @@ impl AppState {
                     c.state = ConnectionState::Connected { session };
                 }
             }
+        }
+        if refresh {
+            self.start_refresh(tab_id);
         }
     }
 
@@ -1319,6 +1661,7 @@ fn save_saved_queries(saved: &[SavedQuery]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::db::PostgresSslMode;
+    use crate::db::{ColumnInfo, DatabaseNode, SchemaNode, TableInfo, TableKind};
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1481,6 +1824,100 @@ mod tests {
         let conn = state.connections.iter_mut().find(|c| c.id == id).expect("connection");
         conn.state = ConnectionState::Connecting { handle };
         commands
+    }
+
+    /// A connected, idle connection whose worker channel is a scripted
+    /// receiver.
+    fn attach_test_session(state: &mut AppState, id: ConnectionId) -> mpsc::Receiver<DbCommand> {
+        let (handle, commands) = crate::db::test_handle();
+        let conn = state.connections.iter_mut().find(|c| c.id == id).expect("connection");
+        conn.state = ConnectionState::Connected {
+            session: LiveSession {
+                handle,
+                cancel: CancelHandle::new(|| {}),
+                server_version: "test".to_owned(),
+            },
+        };
+        commands
+    }
+
+    /// One table with a composite key and one editable column.
+    fn items_schema() -> SchemaInfo {
+        let columns = vec![
+            ColumnInfo::new("tenant".to_owned(), "TEXT".to_owned(), false, Some(1)).unwrap(),
+            ColumnInfo::new("id".to_owned(), "INTEGER".to_owned(), false, Some(2)).unwrap(),
+            ColumnInfo::new("name".to_owned(), "TEXT".to_owned(), true, None).unwrap(),
+        ];
+        let table = TableInfo::new(
+            "items".to_owned(),
+            TableKind::Table,
+            columns,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let node =
+            SchemaNode::new("main".to_owned(), vec![table], Vec::new(), Vec::new(), Vec::new())
+                .unwrap();
+        let database = DatabaseNode::new(":memory:".to_owned(), vec![node]).unwrap();
+        SchemaInfo::new(vec![database], false, false)
+    }
+
+    fn items_result() -> QueryResult {
+        QueryResult::from_columns(
+            vec![
+                crate::db::Column::new(
+                    "tenant".to_owned(),
+                    "TEXT".to_owned(),
+                    vec![
+                        crate::db::Value::Text("acme".to_owned()),
+                        crate::db::Value::Text("globex".to_owned()),
+                    ],
+                ),
+                crate::db::Column::new(
+                    "id".to_owned(),
+                    "INTEGER".to_owned(),
+                    vec![crate::db::Value::Integer(1), crate::db::Value::Integer(2)],
+                ),
+                crate::db::Column::new(
+                    "name".to_owned(),
+                    "TEXT".to_owned(),
+                    vec![crate::db::Value::Text("ada".to_owned()), crate::db::Value::Null],
+                ),
+            ],
+            false,
+            None,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap()
+    }
+
+    /// An idle scripted connection with the items schema loaded and one tab
+    /// showing two items rows.
+    fn editable_tab(state: &mut AppState) -> (TabId, ConnectionId, mpsc::Receiver<DbCommand>) {
+        let conn = add_sqlite_connection(state, "mem-edit");
+        let commands = attach_test_session(state, conn);
+        state.apply(DbEvent::SchemaOk { conn, schema: items_schema() });
+        let tab = state.new_tab(conn);
+        let sql = "SELECT tenant, id, name FROM items";
+        if let Some(slot) = state.tab_sql_mut(tab) {
+            *slot = sql.to_owned();
+        }
+        let run = state.ids.run();
+        state.set_outcome(
+            tab,
+            RunOutcome::Running {
+                run,
+                started: Instant::now(),
+                statements: vec![sql.to_owned()],
+            },
+        );
+        state.apply(DbEvent::BatchOk { run, results: vec![items_result()] });
+        (tab, conn, commands)
     }
 
     /// Every text galley painted in one frame, for render assertions.
@@ -2563,6 +3000,478 @@ mod tests {
                 assert_eq!(conn.env, env);
                 assert!(matches!(conn.state(), ConnectionState::Connecting { .. }));
             }
+        });
+    }
+
+    #[test]
+    fn edit_target_resolves_for_a_simple_select_and_not_for_a_join() {
+        with_isolated_state("edit-target", |state| {
+            let (tab, _conn, commands) = editable_tab(state);
+            let target = state.edit_target(tab).expect("target");
+            assert_eq!(target.table, "items");
+            assert_eq!(
+                target.pk_cols,
+                vec![("tenant".to_owned(), 0), ("id".to_owned(), 1)]
+            );
+
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT i.id FROM items i JOIN items o ON o.id = i.id".to_owned();
+            }
+            assert_eq!(state.edit_target(tab), None);
+            state.stage_edit(tab, 0, 2, "Ada".to_owned());
+            assert!(state.tab(tab).expect("tab").edits().is_empty());
+            state.apply_edits(tab);
+            assert!(commands.try_recv().is_err());
+
+            // A run in flight withdraws editing until it lands.
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT tenant, id, name FROM items".to_owned();
+            }
+            let sql = state.tab(tab).expect("tab").sql.clone();
+            state.start_run(tab, &sql, 0, None);
+            assert!(matches!(
+                state.tab(tab).expect("tab").outcome(),
+                RunOutcome::Running { .. }
+            ));
+            assert_eq!(state.edit_target(tab), None);
+            let run = match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { run, .. } => run,
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            state.apply(DbEvent::BatchOk { run, results: vec![items_result()] });
+            assert!(state.edit_target(tab).is_some());
+        });
+    }
+
+    #[test]
+    fn stage_and_discard_roundtrip() {
+        with_isolated_state("edit-stage", |state| {
+            let (tab, _conn, _commands) = editable_tab(state);
+            state.stage_edit(tab, 0, 2, "Ada".to_owned());
+            state.stage_edit(tab, 1, 2, "grace".to_owned());
+            state.stage_edit(tab, 1, 2, "Grace".to_owned());
+            let view = state.tab(tab).expect("tab");
+            assert_eq!(view.staged_count(), 2);
+            assert_eq!(view.edit_text(0, 2), Some("Ada"));
+            assert_eq!(view.edit_text(1, 2), Some("Grace"));
+            assert_eq!(view.edits().len(), 2);
+            assert_eq!(view.edits()[0], RowEdit { row: 0, col: 2, text: "Ada".to_owned() });
+
+            state.mark_row_deleted(tab, 0);
+            assert!(state.tab(tab).expect("tab").is_row_deleted(0));
+            state.mark_row_deleted(tab, 0);
+            assert!(!state.tab(tab).expect("tab").is_row_deleted(0));
+
+            state.add_row(tab);
+            let view = state.tab(tab).expect("tab");
+            assert_eq!(
+                view.added_rows(),
+                &[vec![String::new(), String::new(), String::new()]]
+            );
+            assert_eq!(view.staged_count(), 3);
+            state.stage_edit(tab, 2, 1, "7".to_owned());
+            assert_eq!(
+                state.tab(tab).expect("tab").added_rows(),
+                &[vec![String::new(), "7".to_owned(), String::new()]]
+            );
+            // Out-of-range rows and columns stage nothing.
+            state.stage_edit(tab, 9, 0, "x".to_owned());
+            state.stage_edit(tab, 0, 9, "x".to_owned());
+            assert_eq!(state.tab(tab).expect("tab").staged_count(), 3);
+
+            state.discard_edits(tab);
+            let view = state.tab(tab).expect("tab");
+            assert_eq!(view.staged_count(), 0);
+            assert!(view.edits().is_empty());
+            assert!(!view.is_row_deleted(0));
+            assert!(view.added_rows().is_empty());
+        });
+    }
+
+    #[test]
+    fn apply_sends_update_delete_and_insert_as_one_batch() {
+        with_isolated_state("edit-apply", |state| {
+            let (tab, _conn, commands) = editable_tab(state);
+            state.stage_edit(tab, 0, 2, "ada lovelace".to_owned());
+            state.mark_row_deleted(tab, 1);
+            state.add_row(tab);
+            state.stage_edit(tab, 2, 0, "initech".to_owned());
+            state.stage_edit(tab, 2, 1, "3".to_owned());
+            state.stage_edit(tab, 2, 2, "Lin".to_owned());
+            state.apply_edits(tab);
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(
+                        statements,
+                        vec![
+                            "UPDATE \"items\" SET \"name\" = 'ada lovelace' WHERE \"tenant\" = 'acme' AND \"id\" = 1",
+                            "DELETE FROM \"items\" WHERE \"tenant\" = 'globex' AND \"id\" = 2",
+                            "INSERT INTO \"items\" (\"tenant\", \"id\", \"name\") VALUES ('initech', 3, 'Lin')",
+                        ]
+                    );
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+            assert!(matches!(
+                state.tab(tab).expect("tab").outcome(),
+                RunOutcome::Running { .. }
+            ));
+            assert!(commands.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn apply_with_no_staged_changes_sends_nothing() {
+        with_isolated_state("edit-empty", |state| {
+            let (tab, _conn, commands) = editable_tab(state);
+            state.apply_edits(tab);
+            assert!(commands.try_recv().is_err());
+            assert!(matches!(state.tab(tab).expect("tab").outcome(), RunOutcome::Ok { .. }));
+
+            // A target that does not resolve no-ops every transition.
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 1".to_owned();
+            }
+            state.stage_edit(tab, 0, 2, "Ada".to_owned());
+            state.mark_row_deleted(tab, 0);
+            state.add_row(tab);
+            state.apply_edits(tab);
+            assert!(commands.try_recv().is_err());
+            let view = state.tab(tab).expect("tab");
+            assert_eq!(view.staged_count(), 0);
+            assert!(matches!(view.outcome(), RunOutcome::Ok { .. }));
+        });
+    }
+
+    #[test]
+    fn a_landed_apply_refreshes_the_tab_once_without_a_history_entry() {
+        with_isolated_state("edit-refresh", |state| {
+            let (tab, _conn, commands) = editable_tab(state);
+            let sql = state.tab(tab).expect("tab").sql.clone();
+            state.stage_edit(tab, 0, 2, "Ada".to_owned());
+            state.apply_edits(tab);
+            let apply_run = match commands.try_recv().expect("apply batch") {
+                DbCommand::QueryBatch { run, statements } => {
+                    assert_eq!(statements.len(), 1);
+                    run
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            let before = state.history().len();
+            state.apply(DbEvent::BatchOk { run: apply_run, results: vec![affected_result(1)] });
+            assert_eq!(state.history().len(), before + 1);
+            assert_eq!(state.tab(tab).expect("tab").staged_count(), 0);
+
+            let refresh_run = match commands.try_recv().expect("refresh batch") {
+                DbCommand::QueryBatch { run, statements } => {
+                    assert_eq!(statements, vec![sql]);
+                    run
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            assert!(matches!(
+                state.tab(tab).expect("tab").outcome(),
+                RunOutcome::Running { .. }
+            ));
+            state.apply(DbEvent::BatchOk { run: refresh_run, results: vec![items_result()] });
+            assert_eq!(state.history().len(), before + 1);
+            let view = state.tab(tab).expect("tab");
+            assert_eq!(view.active_query_result().map(|r| r.row_count()), Some(2));
+            assert_eq!(view.staged_count(), 0);
+            assert!(matches!(view.outcome(), RunOutcome::Ok { .. }));
+            assert!(commands.try_recv().is_err());
+
+            // A failed apply keeps the staged changes for a retry.
+            state.stage_edit(tab, 0, 2, "Ada".to_owned());
+            state.apply_edits(tab);
+            let failed_run = match commands.try_recv().expect("apply batch") {
+                DbCommand::QueryBatch { run, .. } => run,
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            state.apply(DbEvent::QueryErr {
+                run: failed_run,
+                error: crate::db::DbError::Query("statement 0: nope".to_owned()),
+            });
+            assert_eq!(state.tab(tab).expect("tab").staged_count(), 1);
+            assert!(commands.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn a_landed_run_drops_stale_staging() {
+        with_isolated_state("edit-stale", |state| {
+            let (tab, _conn, commands) = editable_tab(state);
+            state.stage_edit(tab, 0, 2, "Ada".to_owned());
+            state.mark_row_deleted(tab, 1);
+            state.add_row(tab);
+            assert_eq!(state.tab(tab).expect("tab").staged_count(), 3);
+            let sql = state.tab(tab).expect("tab").sql.clone();
+            state.start_run(tab, &sql, 0, None);
+            let run = match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { run, .. } => run,
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            state.apply(DbEvent::BatchOk { run, results: vec![items_result()] });
+            let view = state.tab(tab).expect("tab");
+            assert_eq!(view.staged_count(), 0);
+            assert!(view.edits().is_empty());
+            assert!(view.added_rows().is_empty());
+            assert!(!view.is_row_deleted(0));
+            assert!(!view.is_row_deleted(1));
+        });
+    }
+
+    /// Center of the first painted text whose galley reads `needle`.
+    fn text_center(
+        output: &eframe::egui::FullOutput,
+        needle: &str,
+    ) -> Option<eframe::egui::Pos2> {
+        output.shapes.iter().find_map(|clipped| match &clipped.shape {
+            eframe::egui::Shape::Text(text) if text.galley.text() == needle => Some(
+                eframe::egui::Rect::from_min_size(text.pos, text.galley.size()).center(),
+            ),
+            _ => None,
+        })
+    }
+
+    /// A double-click on the painted text `needle`: two press and release
+    /// pairs at the same spot, so egui counts the second as a double click.
+    fn double_click_events(
+        pos: eframe::egui::Pos2,
+    ) -> Vec<eframe::egui::Event> {
+        use eframe::egui::{Event, Modifiers, PointerButton};
+        let click = |pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        vec![
+            Event::PointerMoved(pos),
+            click(true),
+            click(false),
+            click(true),
+            click(false),
+        ]
+    }
+
+    #[test]
+    fn double_click_opens_the_cell_editor_and_enter_stages() {
+        with_isolated_state("edit-input", |state| {
+            let (tab, _conn, _commands) = editable_tab(state);
+            state.activate(tab);
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let mut first = ctx.run_ui(input.clone(), |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            let pos = text_center(&first, "ada").expect("the name cell renders");
+            first.textures_delta.clear();
+
+            let mut double_click = input.clone();
+            double_click.events = double_click_events(pos);
+            let mut second = ctx.run_ui(double_click, |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            second.textures_delta.clear();
+
+            // The editor draws once before it holds focus, the way a user
+            // types after the field appears.
+            let mut opened = ctx.run_ui(input.clone(), |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            opened.textures_delta.clear();
+
+            let mut typed = input.clone();
+            typed.events = vec![
+                eframe::egui::Event::Key {
+                    key: eframe::egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: eframe::egui::Modifiers {
+                        ctrl: true,
+                        command: true,
+                        ..Default::default()
+                    },
+                },
+                eframe::egui::Event::Text("Grace".to_owned()),
+                eframe::egui::Event::Key {
+                    key: eframe::egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: eframe::egui::Modifiers::NONE,
+                },
+            ];
+            let mut third = ctx.run_ui(typed, |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            third.textures_delta.clear();
+            assert_eq!(state.tab(tab).expect("tab").edit_text(0, 2), Some("Grace"));
+
+            // Esc closes the field without staging the typed text.
+            let mut double_click = input.clone();
+            double_click.events = double_click_events(pos);
+            let mut fourth = ctx.run_ui(double_click, |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            fourth.textures_delta.clear();
+            let mut opened = ctx.run_ui(input.clone(), |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            opened.textures_delta.clear();
+            let mut escaped = input;
+            escaped.events = vec![
+                eframe::egui::Event::Text("nope".to_owned()),
+                eframe::egui::Event::Key {
+                    key: eframe::egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: eframe::egui::Modifiers::NONE,
+                },
+            ];
+            let mut fifth = ctx.run_ui(escaped, |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            fifth.textures_delta.clear();
+            assert_eq!(state.tab(tab).expect("tab").edit_text(0, 2), Some("Grace"));
+            assert_eq!(state.tab(tab).expect("tab").staged_count(), 1);
+        });
+    }
+
+    #[test]
+    fn inline_edit_applies_and_refreshes_through_the_sqlite_worker() {
+        with_isolated_state("edit-live", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            state.connect(conn);
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                state.drain_events();
+                if matches!(state.connections()[0].state(), ConnectionState::Connected { .. }) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "connection did not come up");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+
+            let tab = state.new_tab(conn);
+            let sql = "SELECT tenant, id, name FROM items ORDER BY id";
+            let setup = "CREATE TABLE items (tenant TEXT, id INTEGER, name TEXT, \
+                         PRIMARY KEY (tenant, id)); \
+                         INSERT INTO items (tenant, id, name) VALUES \
+                         ('acme', 1, 'ada'), ('globex', 2, 'grace')";
+            state.start_run(tab, setup, 0, None);
+            state.start_run(tab, sql, 0, None);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = sql.to_owned();
+            }
+            // The schema loaded when the connection came up, before the table
+            // existed, so the test refreshes it the way the tree's button does.
+            state.refresh_schema(conn);
+            let has_items = |state: &AppState| {
+                state.schema(conn).is_some_and(|schema| {
+                    schema.databases().iter().any(|database| {
+                        database.schemas().iter().any(|node| {
+                            node.tables().iter().any(|table| table.name() == "items")
+                        })
+                    })
+                })
+            };
+            loop {
+                state.drain_events();
+                let settled = !matches!(
+                    state.tab(tab).expect("tab").outcome(),
+                    RunOutcome::Running { .. }
+                ) && has_items(state);
+                if settled {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "setup did not settle");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(state.edit_target(tab).is_some(), "editable after the setup batch");
+
+            state.stage_edit(tab, 1, 2, "Grace".to_owned());
+            state.add_row(tab);
+            state.stage_edit(tab, 2, 0, "initech".to_owned());
+            state.stage_edit(tab, 2, 1, "3".to_owned());
+            state.stage_edit(tab, 2, 2, "Lin".to_owned());
+            state.apply_edits(tab);
+            loop {
+                state.drain_events();
+                let running = matches!(
+                    state.tab(tab).expect("tab").outcome(),
+                    RunOutcome::Running { .. }
+                );
+                if !running {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "apply and refresh did not finish");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let tab_view = state.tab(tab).expect("tab");
+            assert_eq!(tab_view.staged_count(), 0);
+            let result = tab_view.active_query_result().expect("refreshed result");
+            assert_eq!(result.row_count(), 3);
+            assert_eq!(result.cell(0, 2), Some(&Value::Text("ada".to_owned())));
+            assert_eq!(result.cell(1, 2), Some(&Value::Text("Grace".to_owned())));
+            assert_eq!(result.cell(2, 0), Some(&Value::Text("initech".to_owned())));
+            assert_eq!(result.cell(2, 1), Some(&Value::Integer(3)));
+            assert_eq!(result.cell(2, 2), Some(&Value::Text("Lin".to_owned())));
+            assert!(matches!(tab_view.outcome(), RunOutcome::Ok { .. }));
+        });
+    }
+
+    #[test]
+    fn grid_edit_controls_render_the_staged_count_or_a_read_only_hint() {
+        with_isolated_state("edit-render", |state| {
+            let (tab, _conn, _commands) = editable_tab(state);
+            state.activate(tab);
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input.clone(), |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            output.textures_delta.clear();
+            let text = rendered_text(&output);
+            assert!(text.iter().any(|t| t == "Apply (0)"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Discard"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Add row"), "{text:?}");
+            assert!(text.iter().any(|t| t == "editing items"), "{text:?}");
+
+            state.stage_edit(tab, 0, 2, "Ada".to_owned());
+            state.add_row(tab);
+            let mut output = ctx.run_ui(input.clone(), |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            output.textures_delta.clear();
+            let text = rendered_text(&output);
+            assert!(text.iter().any(|t| t == "Apply (2)"), "{text:?}");
+
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT i.id FROM items i JOIN items o ON o.id = i.id".to_owned();
+            }
+            let mut output = ctx.run_ui(input, |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            output.textures_delta.clear();
+            let text = rendered_text(&output);
+            assert!(text.iter().any(|t| t == "read only"), "{text:?}");
+            assert!(!text.iter().any(|t| t.starts_with("Apply")), "{text:?}");
         });
     }
 }
