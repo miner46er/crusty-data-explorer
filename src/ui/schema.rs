@@ -3,7 +3,7 @@
 use eframe::egui;
 
 use crate::app::AppState;
-use crate::db::{ConnectionId, TableKind};
+use crate::db::{ConnectionId, TableInfo, TableKind};
 
 pub enum SchemaAction {
     Refresh(ConnectionId),
@@ -62,7 +62,7 @@ pub fn connection_schema(
                     if i > 0 {
                         ui.separator();
                     }
-                    show_table(ui, conn, table.name(), table.columns(), &mut actions);
+                    show_table(ui, conn, table, &mut actions);
                 }
                 ui.add_space(4.0);
             }
@@ -73,7 +73,7 @@ pub fn connection_schema(
                     if i > 0 {
                         ui.separator();
                     }
-                    show_table(ui, conn, view.name(), view.columns(), &mut actions);
+                    show_table(ui, conn, view, &mut actions);
                 }
                 ui.add_space(4.0);
             }
@@ -84,10 +84,11 @@ pub fn connection_schema(
 fn show_table(
     ui: &mut egui::Ui,
     conn: ConnectionId,
-    name: &str,
-    columns: &[crate::db::ColumnInfo],
+    table: &TableInfo,
     actions: &mut Vec<SchemaAction>,
 ) {
+    let name = table.name();
+    let columns = table.columns();
     let header =
         egui::RichText::new(format!("{name} ({})", columns.len())).monospace().small();
     let resp = egui::CollapsingHeader::new(header).default_open(false).show(ui, |ui| {
@@ -104,6 +105,60 @@ fn show_table(
         }
         if columns.is_empty() {
             ui.label(egui::RichText::new("No columns.").small().weak());
+        }
+        if !table.foreign_keys().is_empty() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Relations").small().weak());
+            for fk in table.foreign_keys() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(fk.columns().join(", ")).monospace().small(),
+                    );
+                    ui.label(egui::RichText::new("→").small().weak());
+                    if ui.link(egui::RichText::new(fk.ref_table()).monospace().small()).clicked()
+                    {
+                        actions.push(SchemaAction::Preview(
+                            conn,
+                            fk.ref_table().to_owned(),
+                        ));
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("({})", fk.ref_columns().join(", ")))
+                            .small()
+                            .weak(),
+                    );
+                    if let Some(constraint) = fk.constraint_name() {
+                        ui.label(
+                            egui::RichText::new(constraint).small().weak(),
+                        );
+                    }
+                });
+            }
+            if table.foreign_keys_truncated() {
+                ui.label(egui::RichText::new("Showing first 50 relations.").small().weak());
+            }
+        }
+        if !table.indexes().is_empty() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Indexes").small().weak());
+            for index in table.indexes() {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(index.name()).small().strong());
+                    if index.is_unique() {
+                        ui.label(egui::RichText::new("UNIQUE").small().strong());
+                    }
+                    if !index.columns().is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("({})", index.columns().join(", ")))
+                                .small()
+                                .weak(),
+                        );
+                    }
+                });
+            }
+            if table.indexes_truncated() {
+                ui.label(egui::RichText::new("Showing first 50 indexes.").small().weak());
+            }
         }
     });
     if resp.header_response.clicked() {

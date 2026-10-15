@@ -282,6 +282,10 @@ pub enum ShapeError {
 pub const SCHEMA_TABLE_CAP: usize = 500;
 /// Cap on columns materialized per table. The schema reports truncation.
 pub const SCHEMA_COLUMN_CAP: usize = 200;
+/// Cap on foreign keys materialized per table. Each table reports truncation.
+pub const SCHEMA_FK_CAP: usize = 50;
+/// Cap on indexes materialized per table. Each table reports truncation.
+pub const SCHEMA_INDEX_CAP: usize = 50;
 
 /// Table or view. The variant is the kind; no stringly matching above this file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,6 +334,91 @@ impl ColumnInfo {
     }
 }
 
+/// One foreign key from a table to a referenced table. Fields are private;
+/// construction checks happen in [`ForeignKeyInfo::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyInfo {
+    columns: Vec<String>,
+    ref_table: String,
+    ref_columns: Vec<String>,
+    constraint_name: Option<String>,
+}
+
+impl ForeignKeyInfo {
+    /// Checked constructor. Rejects blank table and column names, and a
+    /// blank constraint name when one is present.
+    pub fn new(
+        columns: Vec<String>,
+        ref_table: String,
+        ref_columns: Vec<String>,
+        constraint_name: Option<String>,
+    ) -> Result<Self, SchemaError> {
+        if ref_table.trim().is_empty() {
+            return Err(SchemaError::EmptyName("referenced table"));
+        }
+        if columns.iter().any(|c| c.trim().is_empty()) {
+            return Err(SchemaError::EmptyName("foreign key column"));
+        }
+        if ref_columns.iter().any(|c| c.trim().is_empty()) {
+            return Err(SchemaError::EmptyName("referenced column"));
+        }
+        if constraint_name.as_ref().is_some_and(|n| n.trim().is_empty()) {
+            return Err(SchemaError::EmptyName("foreign key constraint"));
+        }
+        Ok(Self { columns, ref_table, ref_columns, constraint_name })
+    }
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+    pub fn ref_table(&self) -> &str {
+        &self.ref_table
+    }
+    pub fn ref_columns(&self) -> &[String] {
+        &self.ref_columns
+    }
+    pub fn constraint_name(&self) -> Option<&str> {
+        self.constraint_name.as_deref()
+    }
+}
+
+/// One index on a table. Fields are private; construction checks happen in
+/// [`IndexInfo::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexInfo {
+    name: String,
+    columns: Vec<String>,
+    unique: bool,
+}
+
+impl IndexInfo {
+    /// Checked constructor. Rejects blank index and column names.
+    pub fn new(
+        name: String,
+        columns: Vec<String>,
+        unique: bool,
+    ) -> Result<Self, SchemaError> {
+        if name.trim().is_empty() {
+            return Err(SchemaError::EmptyName("index"));
+        }
+        if columns.iter().any(|c| c.trim().is_empty()) {
+            return Err(SchemaError::EmptyName("index column"));
+        }
+        Ok(Self { name, columns, unique })
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+    pub fn unique(&self) -> bool {
+        self.unique
+    }
+    pub fn is_unique(&self) -> bool {
+        self.unique
+    }
+}
+
 /// One table or view in a schema tree. Fields are private; construction checks
 /// happen in [`TableInfo::new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,6 +426,10 @@ pub struct TableInfo {
     name: String,
     kind: TableKind,
     columns: Vec<ColumnInfo>,
+    foreign_keys: Vec<ForeignKeyInfo>,
+    indexes: Vec<IndexInfo>,
+    foreign_keys_truncated: bool,
+    indexes_truncated: bool,
 }
 
 impl TableInfo {
@@ -345,11 +438,23 @@ impl TableInfo {
         name: String,
         kind: TableKind,
         columns: Vec<ColumnInfo>,
+        foreign_keys: Vec<ForeignKeyInfo>,
+        indexes: Vec<IndexInfo>,
+        foreign_keys_truncated: bool,
+        indexes_truncated: bool,
     ) -> Result<Self, SchemaError> {
         if name.trim().is_empty() {
             return Err(SchemaError::EmptyName("table"));
         }
-        Ok(Self { name, kind, columns })
+        Ok(Self {
+            name,
+            kind,
+            columns,
+            foreign_keys,
+            indexes,
+            foreign_keys_truncated,
+            indexes_truncated,
+        })
     }
     pub fn name(&self) -> &str {
         &self.name
@@ -359,6 +464,18 @@ impl TableInfo {
     }
     pub fn columns(&self) -> &[ColumnInfo] {
         &self.columns
+    }
+    pub fn foreign_keys(&self) -> &[ForeignKeyInfo] {
+        &self.foreign_keys
+    }
+    pub fn indexes(&self) -> &[IndexInfo] {
+        &self.indexes
+    }
+    pub fn foreign_keys_truncated(&self) -> bool {
+        self.foreign_keys_truncated
+    }
+    pub fn indexes_truncated(&self) -> bool {
+        self.indexes_truncated
     }
 }
 
@@ -799,6 +916,146 @@ impl PgSession {
                 is_nullable == "YES",
             ));
         }
+        let fk_rows: Vec<(String, String, String, String, String)> = self
+            .rt
+            .block_on(
+                sqlx::query(
+                    "SELECT tc.table_name, tc.constraint_name, kcu.column_name, \
+                      ccu.table_name, ccu.column_name \
+                      FROM information_schema.table_constraints tc \
+                      JOIN information_schema.key_column_usage kcu \
+                      ON tc.constraint_name = kcu.constraint_name \
+                      AND tc.table_schema = kcu.table_schema \
+                      JOIN information_schema.referential_constraints rc \
+                      ON tc.constraint_name = rc.constraint_name \
+                      AND tc.table_schema = rc.constraint_schema \
+                      JOIN information_schema.key_column_usage ccu \
+                      ON rc.unique_constraint_name = ccu.constraint_name \
+                      AND rc.unique_constraint_schema = ccu.constraint_schema \
+                      AND kcu.position_in_unique_constraint = ccu.ordinal_position \
+                      WHERE tc.table_schema = 'public' \
+                      AND tc.constraint_type = 'FOREIGN KEY' \
+                      ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position",
+                )
+                .fetch_all(&self.pool),
+            )
+            .map_err(|e| DbError::Query(e.to_string()))?
+            .iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String, _>(0)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                    row.try_get::<String, _>(1)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                    row.try_get::<String, _>(2)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                    row.try_get::<String, _>(3)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                    row.try_get::<String, _>(4)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                ))
+            })
+            .collect::<Result<Vec<_>, DbError>>()?;
+        let mut fk_by_table: std::collections::HashMap<
+            String,
+            Vec<(String, Vec<String>, String, Vec<String>)>,
+        > = std::collections::HashMap::new();
+        {
+            let mut current: Option<(String, String, Vec<String>, String, Vec<String>)> = None;
+            let flush = |current: &mut Option<(String, String, Vec<String>, String, Vec<String>)>,
+                             map: &mut std::collections::HashMap<
+                                String,
+                                Vec<(String, Vec<String>, String, Vec<String>)>,
+                            >| {
+                if let Some((table, name, cols, ref_table, ref_cols)) = current.take() {
+                    map.entry(table).or_default().push((name, cols, ref_table, ref_cols));
+                }
+            };
+            for (table, constraint, column, ref_table, ref_column) in fk_rows {
+                match current.as_mut() {
+                    Some(cur)
+                        if cur.0 == table && cur.1 == constraint && cur.3 == ref_table =>
+                    {
+                        cur.2.push(column);
+                        cur.4.push(ref_column);
+                    }
+                    _ => {
+                        flush(&mut current, &mut fk_by_table);
+                        current = Some((table, constraint, vec![column], ref_table, vec![ref_column]));
+                    }
+                }
+            }
+            flush(&mut current, &mut fk_by_table);
+        }
+        let index_rows: Vec<(String, String, bool, Option<String>)> = self
+            .rt
+            .block_on(
+                sqlx::query(
+                    "SELECT t.relname, c.relname, ix.indisunique, a.attname \
+                      FROM pg_class t \
+                      JOIN pg_index ix ON t.oid = ix.indrelid \
+                      JOIN pg_class c ON c.oid = ix.indexrelid \
+                      LEFT JOIN pg_attribute a \
+                      ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey) \
+                      WHERE t.relkind IN ('r', 'm') \
+                      AND t.relnamespace = 'public'::regnamespace \
+                      AND ix.indisvalid \
+                      ORDER BY t.relname, c.relname, \
+                        array_position(ix.indkey, a.attnum)",
+                )
+                .fetch_all(&self.pool),
+            )
+            .map_err(|e| DbError::Query(e.to_string()))?
+            .iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String, _>(0)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                    row.try_get::<String, _>(1)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                    row.try_get::<bool, _>(2)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                    row.try_get::<Option<String>, _>(3)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                ))
+            })
+            .collect::<Result<Vec<_>, DbError>>()?;
+        let mut idx_by_table: std::collections::HashMap<
+            String,
+            Vec<(String, bool, Vec<String>)>,
+        > = std::collections::HashMap::new();
+        {
+            let mut current: Option<(String, String, bool, Vec<String>)> = None;
+            let flush = |current: &mut Option<(String, String, bool, Vec<String>)>,
+                             map: &mut std::collections::HashMap<
+                                String,
+                                Vec<(String, bool, Vec<String>)>,
+                            >| {
+                if let Some((table, name, unique, cols)) = current.take() {
+                    map.entry(table).or_default().push((name, unique, cols));
+                }
+            };
+            for (table, index, unique, column) in index_rows {
+                match current.as_mut() {
+                    Some(cur) if cur.0 == table && cur.1 == index => {
+                        if let Some(col) = column {
+                            if !col.trim().is_empty() {
+                                cur.3.push(col);
+                            }
+                        }
+                    }
+                    _ => {
+                        flush(&mut current, &mut idx_by_table);
+                        let cols = match column {
+                            Some(col) if !col.trim().is_empty() => vec![col],
+                            _ => Vec::new(),
+                        };
+                        current = Some((table, index, unique, cols));
+                    }
+                }
+            }
+            flush(&mut current, &mut idx_by_table);
+        }
         let mut out = Vec::new();
         let mut columns_truncated = false;
         for (name, kind) in names {
@@ -815,9 +1072,39 @@ impl PgSession {
                         .map_err(|e| DbError::Query(e.to_string()))?,
                 );
             }
+            let raw_fks = fk_by_table.remove(&name).unwrap_or_default();
+            let fk_truncated = raw_fks.len() > SCHEMA_FK_CAP;
+            let mut foreign_keys = Vec::new();
+            for (constraint, fk_cols, ref_table, ref_cols) in
+                raw_fks.into_iter().take(SCHEMA_FK_CAP)
+            {
+                foreign_keys.push(
+                    ForeignKeyInfo::new(fk_cols, ref_table, ref_cols, Some(constraint))
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                );
+            }
+            let raw_idxs = idx_by_table.remove(&name).unwrap_or_default();
+            let idx_truncated = raw_idxs.len() > SCHEMA_INDEX_CAP;
+            let mut indexes = Vec::new();
+            for (index_name, unique, idx_cols) in
+                raw_idxs.into_iter().take(SCHEMA_INDEX_CAP)
+            {
+                indexes.push(
+                    IndexInfo::new(index_name, idx_cols, unique)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                );
+            }
             out.push(
-                TableInfo::new(name, kind, cols)
-                    .map_err(|e| DbError::Query(e.to_string()))?,
+                TableInfo::new(
+                    name,
+                    kind,
+                    cols,
+                    foreign_keys,
+                    indexes,
+                    fk_truncated,
+                    idx_truncated,
+                )
+                .map_err(|e| DbError::Query(e.to_string()))?,
             );
         }
         Ok(SchemaInfo::new(out, tables_truncated, columns_truncated))
@@ -993,6 +1280,92 @@ fn execute_sqlite(
     Ok(builder.finish(started.elapsed()))
 }
 
+fn sqlite_foreign_keys(
+    conn: &rusqlite::Connection,
+    table: &str,
+) -> Result<(Vec<ForeignKeyInfo>, bool), DbError> {
+    let pragma = format!("PRAGMA foreign_key_list(\"{}\")", table.replace('"', "\"\""));
+    let mut stmt = conn.prepare(&pragma).map_err(|e| DbError::Query(e.to_string()))?;
+    let rows: Vec<(i64, i64, String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|e| DbError::Query(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    let mut grouped: std::collections::BTreeMap<i64, Vec<(i64, String, String, String)>> =
+        std::collections::BTreeMap::new();
+    for (id, seq, ref_table, from, to) in rows {
+        grouped.entry(id).or_default().push((seq, ref_table, from, to));
+    }
+    let total = grouped.len();
+    let truncated = total > SCHEMA_FK_CAP;
+    let mut out = Vec::new();
+    for (_, mut group) in grouped.into_iter().take(SCHEMA_FK_CAP) {
+        group.sort_by_key(|(seq, _, _, _)| *seq);
+        let ref_table = group.first().map(|(_, t, _, _)| t.clone()).unwrap_or_default();
+        let columns: Vec<String> =
+            group.iter().map(|(_, _, from, _)| from.clone()).collect();
+        let ref_columns: Vec<String> =
+            group.iter().map(|(_, _, _, to)| to.clone()).collect();
+        out.push(
+            ForeignKeyInfo::new(columns, ref_table, ref_columns, None)
+                .map_err(|e| DbError::Query(e.to_string()))?,
+        );
+    }
+    Ok((out, truncated))
+}
+
+fn sqlite_indexes(
+    conn: &rusqlite::Connection,
+    table: &str,
+) -> Result<(Vec<IndexInfo>, bool), DbError> {
+    let pragma = format!("PRAGMA index_list(\"{}\")", table.replace('"', "\"\""));
+    let mut stmt = conn.prepare(&pragma).map_err(|e| DbError::Query(e.to_string()))?;
+    let rows: Vec<(String, bool)> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0))
+        })
+        .map_err(|e| DbError::Query(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    let mut names: Vec<(String, bool)> = rows
+        .into_iter()
+        .filter(|(name, _)| !name.starts_with("sqlite_"))
+        .collect();
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+    let truncated = names.len() > SCHEMA_INDEX_CAP;
+    let mut out = Vec::new();
+    for (index_name, unique) in names.into_iter().take(SCHEMA_INDEX_CAP) {
+        let info_pragma =
+            format!("PRAGMA index_info(\"{}\")", index_name.replace('"', "\"\""));
+        let mut info_stmt =
+            conn.prepare(&info_pragma).map_err(|e| DbError::Query(e.to_string()))?;
+        let mut cols: Vec<(i64, String)> = info_stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(2)?)))
+            .map_err(|e| DbError::Query(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        cols.sort_by_key(|(seqno, _)| *seqno);
+        let columns: Vec<String> = cols
+            .into_iter()
+            .map(|(_, name)| name)
+            .filter(|n| !n.trim().is_empty())
+            .collect();
+        out.push(
+            IndexInfo::new(index_name, columns, unique)
+                .map_err(|e| DbError::Query(e.to_string()))?,
+        );
+    }
+    Ok((out, truncated))
+}
+
 fn sqlite_schema(conn: &rusqlite::Connection) -> Result<SchemaInfo, DbError> {
     let mut stmt = conn
         .prepare(
@@ -1039,8 +1412,19 @@ fn sqlite_schema(conn: &rusqlite::Connection) -> Result<SchemaInfo, DbError> {
                 .map_err(|e| DbError::Query(e.to_string()))?;
             columns.push(col);
         }
-        let table = TableInfo::new(name, kind, columns)
-            .map_err(|e| DbError::Query(e.to_string()))?;
+        let (foreign_keys, fk_truncated) = if kind == TableKind::Table {
+            sqlite_foreign_keys(conn, &name)?
+        } else {
+            (Vec::new(), false)
+        };
+        let (indexes, idx_truncated) = if kind == TableKind::Table {
+            sqlite_indexes(conn, &name)?
+        } else {
+            (Vec::new(), false)
+        };
+        let table =
+            TableInfo::new(name, kind, columns, foreign_keys, indexes, fk_truncated, idx_truncated)
+                .map_err(|e| DbError::Query(e.to_string()))?;
         tables.push(table);
     }
     Ok(SchemaInfo::new(tables, tables_truncated, columns_truncated))
@@ -1292,9 +1676,66 @@ mod tests {
     fn schema_constructors_reject_empty_names() {
         assert!(ColumnInfo::new(String::new(), "TEXT".into(), true, None).is_err());
         assert!(ColumnInfo::new("  ".into(), "TEXT".into(), true, None).is_err());
-        assert!(TableInfo::new(String::new(), TableKind::Table, Vec::new()).is_err());
-        assert!(TableInfo::new(" ".into(), TableKind::View, Vec::new()).is_err());
+        assert!(
+            TableInfo::new(
+                String::new(),
+                TableKind::Table,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                false,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            TableInfo::new(
+                " ".into(),
+                TableKind::View,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                false,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            ForeignKeyInfo::new(
+                vec!["child_id".into()],
+                String::new(),
+                vec!["id".into()],
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            ForeignKeyInfo::new(vec![" ".into()], "parent".into(), vec!["id".into()], None)
+                .is_err()
+        );
+        assert!(
+            ForeignKeyInfo::new(
+                vec!["child_id".into()],
+                "parent".into(),
+                vec!["id".into()],
+                Some("  ".into())
+            )
+            .is_err()
+        );
+        assert!(IndexInfo::new(String::new(), vec!["id".into()], false).is_err());
+        assert!(IndexInfo::new("  ".into(), vec!["id".into()], true).is_err());
+        assert!(IndexInfo::new("idx_a".into(), vec![" ".into()], false).is_err());
         assert!(ColumnInfo::new("id".into(), "INTEGER".into(), false, Some(1)).is_ok());
+        assert!(
+            ForeignKeyInfo::new(
+                vec!["child_id".into()],
+                "parent".into(),
+                vec!["id".into()],
+                None
+            )
+            .is_ok()
+        );
+        assert!(IndexInfo::new("idx_a".into(), vec!["id".into()], true).is_ok());
         assert!(
             TableInfo::new(
                 "users".into(),
@@ -1302,6 +1743,10 @@ mod tests {
                 vec![
                     ColumnInfo::new("id".into(), "INTEGER".into(), false, Some(1)).unwrap()
                 ],
+                Vec::new(),
+                Vec::new(),
+                false,
+                false,
             )
             .is_ok()
         );
@@ -1318,6 +1763,17 @@ mod tests {
         conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER)", [])
             .unwrap();
         conn.execute("CREATE VIEW user_names AS SELECT name FROM users", []).unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL \
+              REFERENCES parent(id))",
+            [],
+        )
+        .unwrap();
+        conn.execute("CREATE UNIQUE INDEX idx_child_parent_unique ON child(parent_id)", [])
+            .unwrap();
+        conn.execute("CREATE INDEX idx_child_id_plain ON child(id)", []).unwrap();
         let session = Session::Sqlite(conn);
         let schema = session.schema().unwrap();
         assert!(!schema.tables_truncated());
@@ -1327,6 +1783,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                ("child", TableKind::Table),
+                ("parent", TableKind::Table),
                 ("posts", TableKind::Table),
                 ("user_names", TableKind::View),
                 ("users", TableKind::Table),
@@ -1347,5 +1805,29 @@ mod tests {
         let view = schema.tables().iter().find(|t| t.name() == "user_names").unwrap();
         assert_eq!(view.kind(), TableKind::View);
         assert!(!view.columns().is_empty());
+        let child = schema.tables().iter().find(|t| t.name() == "child").unwrap();
+        assert_eq!(child.foreign_keys().len(), 1);
+        let fk = &child.foreign_keys()[0];
+        assert_eq!(fk.columns(), &["parent_id".to_owned()]);
+        assert_eq!(fk.ref_table(), "parent");
+        assert_eq!(fk.ref_columns(), &["id".to_owned()]);
+        assert!(!child.foreign_keys_truncated());
+        assert!(!child.indexes_truncated());
+        let index_names: Vec<(&str, bool)> =
+            child.indexes().iter().map(|i| (i.name(), i.is_unique())).collect();
+        assert_eq!(
+            index_names,
+            vec![("idx_child_id_plain", false), ("idx_child_parent_unique", true)]
+        );
+        let unique_idx =
+            child.indexes().iter().find(|i| i.name() == "idx_child_parent_unique").unwrap();
+        assert!(unique_idx.unique());
+        assert_eq!(unique_idx.columns(), &["parent_id".to_owned()]);
+        let plain_idx =
+            child.indexes().iter().find(|i| i.name() == "idx_child_id_plain").unwrap();
+        assert!(!plain_idx.unique());
+        assert_eq!(plain_idx.columns(), &["id".to_owned()]);
+        let parent = schema.tables().iter().find(|t| t.name() == "parent").unwrap();
+        assert!(parent.foreign_keys().is_empty());
     }
 }
