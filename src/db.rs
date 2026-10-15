@@ -113,6 +113,15 @@ impl DbKind {
     }
 }
 
+/// The statement form that returns a query plan for `kind`. Pure text: the
+/// statement is trimmed and the engine's plan prefix is prepended.
+pub fn explain_sql(kind: DbKind, statement: &str) -> String {
+    match kind {
+        DbKind::Sqlite => format!("EXPLAIN QUERY PLAN {}", statement.trim()),
+        DbKind::Postgres => format!("EXPLAIN {}", statement.trim()),
+    }
+}
+
 /// The single list of bundled engines. The connection form iterates
 /// `all()`, so a new backend appears in the UI with no UI change.
 #[derive(Debug, Clone, Copy)]
@@ -2610,6 +2619,27 @@ mod tests {
         assert!(matches!(error, DbError::Query(_)));
     }
 
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_explain_returns_rows() {
+        let config = ConnectionConfig::Postgres {
+            host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
+            port: std::env::var("PGPORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
+            user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+            ssl_mode: PostgresSslMode::Disable,
+        };
+        let password = std::env::var("PGPASSWORD").ok();
+        let mut session = Session::open(&config, password.as_deref()).expect("open");
+        let plan = explain_sql(DbKind::Postgres, "SELECT 1");
+        let result = session.query(&plan).expect("explain runs");
+        assert!(result.row_count() > 0);
+    }
+
     #[test]
     fn schema_constructors_reject_empty_names() {
         assert!(ColumnInfo::new(String::new(), "TEXT".into(), true, None).is_err());
@@ -2881,6 +2911,25 @@ mod tests {
         let named = statement_error(index, error).to_string();
         assert!(named.contains("statement 1"), "{named}");
         assert!(named.contains("missing_table"), "{named}");
+    }
+
+    #[test]
+    fn explain_sql_prefixes_each_engine() {
+        assert_eq!(explain_sql(DbKind::Sqlite, "SELECT 1"), "EXPLAIN QUERY PLAN SELECT 1");
+        assert_eq!(explain_sql(DbKind::Postgres, "SELECT 1"), "EXPLAIN SELECT 1");
+        assert_eq!(
+            explain_sql(DbKind::Sqlite, "  SELECT 1  "),
+            "EXPLAIN QUERY PLAN SELECT 1"
+        );
+    }
+
+    #[test]
+    #[ignore = "live engine test; run with --ignored"]
+    fn sqlite_live_explain_query_plan_returns_rows() {
+        let mut session = Session::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        let plan = explain_sql(DbKind::Sqlite, "SELECT 1");
+        let result = session.query(&plan).expect("explain runs");
+        assert!(result.row_count() > 0);
     }
 
     #[test]

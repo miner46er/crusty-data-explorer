@@ -131,7 +131,8 @@ fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
 fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
     let Some(tab_id) = state.active() else { return false };
     let find_open = find_bar_of(ui.ctx(), tab_id).open;
-    let (mut run_clicked, mut cancel_clicked, mut save_clicked) = (false, false, false);
+    let (mut run_clicked, mut explain_clicked, mut cancel_clicked, mut save_clicked) =
+        (false, false, false, false);
     let (mut format_clicked, mut find_clicked) = (false, false);
     let mut scope = state.tab(tab_id).map(|t| t.run_scope()).unwrap_or_default();
     if state.tab(tab_id).is_some() {
@@ -154,6 +155,10 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                     .add(
                         egui::Button::new(egui::RichText::new("▶ Run").strong()).fill(RUN_GREEN),
                     )
+                    .clicked();
+                explain_clicked = ui
+                    .button("Explain")
+                    .on_hover_text("Query execution plan")
                     .clicked();
                 ui.label(
                     egui::RichText::new(format!("{} · Ctrl+Enter", scope.hint()))
@@ -214,6 +219,11 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
         let sql = state.tab(tab_id).map(|t| t.sql.clone()).unwrap_or_default();
         let (cursor, selection) = super::complete::editor_offsets(ui.ctx(), tab_id, &sql);
         state.start_run(tab_id, &sql, cursor, selection);
+    }
+    if explain_clicked {
+        let sql = state.tab(tab_id).map(|t| t.sql.clone()).unwrap_or_default();
+        let (cursor, selection) = super::complete::editor_offsets(ui.ctx(), tab_id, &sql);
+        state.start_explain(tab_id, &sql, cursor, selection);
     }
     find_opened
 }
@@ -419,5 +429,6 @@ mod tests {
 // Ctrl+F toggles the find bar for the active tab, and all three stay off with
 // a draft, save, or password modal open, using the same new_tab/activate/
 // close_tab/default_connection transitions as the plus and cross buttons
-// covered by AppState tests. Format and the find bar's Next/Prev selection are
-// manual too.
+// covered by AppState tests. Explain runs start_explain with the same offsets
+// Run passes, and Format and the find bar's Next/Prev selection are manual
+// too.

@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use crate::db::{
     CancelHandle, ConnectionConfig, ConnectionId, DbCommand, DbEvent, DbHandle, DbKind,
-    DriverRegistry, Ids, QueryResult, RunId, SchemaInfo, TabId, spawn_session,
+    DriverRegistry, Ids, QueryResult, RunId, SchemaInfo, TabId, explain_sql, spawn_session,
 };
 use crate::sql::{current_statement, split_statements, statement_ranges};
 
@@ -492,10 +492,40 @@ impl AppState {
         cursor: usize,
         selection: Option<Range<usize>>,
     ) {
+        self.start_batch(tab, sql, cursor, selection, |_, statement| statement);
+    }
+
+    /// Send the same statements [`AppState::start_run`] would, each in its
+    /// engine's explain form, so the plan renders through the grid like any
+    /// other batch.
+    pub fn start_explain(
+        &mut self,
+        tab: TabId,
+        sql: &str,
+        cursor: usize,
+        selection: Option<Range<usize>>,
+    ) {
+        self.start_batch(tab, sql, cursor, selection, |kind, statement| {
+            explain_sql(kind, &statement)
+        });
+    }
+
+    /// The shared body of run and explain. Resolves the tab's connection, its
+    /// handle, and the effective statements, maps each through `prepare`, and
+    /// sends one batch. Both entry points share these error paths: a missing
+    /// connection or an empty effective set never sends.
+    fn start_batch(
+        &mut self,
+        tab: TabId,
+        sql: &str,
+        cursor: usize,
+        selection: Option<Range<usize>>,
+        prepare: impl Fn(DbKind, String) -> String,
+    ) {
         let run = self.ids.run();
-        let (conn_id, handle, scope) = match self.tabs.iter().find(|t| t.id == tab) {
+        let (conn_id, kind, handle, scope) = match self.tabs.iter().find(|t| t.id == tab) {
             Some(t) => match self.connections.iter().find(|c| c.id == t.conn) {
-                Some(c) => (t.conn, c.handle(), t.run_scope),
+                Some(c) => (t.conn, c.config.kind(), c.handle(), t.run_scope),
                 None => {
                     self.set_outcome(tab, RunOutcome::Err("connection not found".to_owned()));
                     return;
@@ -508,6 +538,8 @@ impl AppState {
             self.set_outcome(tab, RunOutcome::Err("nothing to run".to_owned()));
             return;
         }
+        let statements: Vec<String> =
+            statements.into_iter().map(|statement| prepare(kind, statement)).collect();
         match handle {
             Some(handle) => {
                 match handle.send(DbCommand::QueryBatch { run, statements: statements.clone() })
@@ -1431,10 +1463,24 @@ mod tests {
         name: &str,
     ) -> (ConnectionId, mpsc::Receiver<DbCommand>) {
         let id = add_sqlite_connection(state, name);
+        let commands = attach_test_handle(state, id);
+        (id, commands)
+    }
+
+    fn scripted_postgres_connection(
+        state: &mut AppState,
+        name: &str,
+    ) -> (ConnectionId, mpsc::Receiver<DbCommand>) {
+        let id = add_postgres_connection(state, name, "");
+        let commands = attach_test_handle(state, id);
+        (id, commands)
+    }
+
+    fn attach_test_handle(state: &mut AppState, id: ConnectionId) -> mpsc::Receiver<DbCommand> {
         let (handle, commands) = crate::db::test_handle();
         let conn = state.connections.iter_mut().find(|c| c.id == id).expect("connection");
         conn.state = ConnectionState::Connecting { handle };
-        (id, commands)
+        commands
     }
 
     /// Every text galley painted in one frame, for render assertions.
@@ -1794,6 +1840,89 @@ mod tests {
     }
 
     #[test]
+    fn explain_sends_each_scope_prefixed_for_sqlite() {
+        with_isolated_state("explain-scope", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            let sql = "SELECT 1;\nSELECT 2;\nSELECT 3";
+
+            state.start_explain(tab, sql, 0, None);
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(
+                        statements,
+                        vec![
+                            "EXPLAIN QUERY PLAN SELECT 1",
+                            "EXPLAIN QUERY PLAN SELECT 2",
+                            "EXPLAIN QUERY PLAN SELECT 3",
+                        ]
+                    );
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+            assert!(matches!(
+                state.tab(tab).expect("tab").outcome(),
+                RunOutcome::Running { .. }
+            ));
+
+            let current = state.new_tab(conn);
+            state.tab_mut(current).expect("tab").set_run_scope(RunScope::Current);
+            let cursor = sql.find("SELECT 2").expect("second statement") + 3;
+            state.start_explain(current, sql, cursor, None);
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["EXPLAIN QUERY PLAN SELECT 2"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+
+            let selection = state.new_tab(conn);
+            state.tab_mut(selection).expect("tab").set_run_scope(RunScope::Selection);
+            let start = sql.find("2;").expect("second statement");
+            let end = sql.find("SELECT 3").expect("third statement") + 3;
+            state.start_explain(selection, sql, start, Some(start..end));
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(
+                        statements,
+                        vec!["EXPLAIN QUERY PLAN SELECT 2", "EXPLAIN QUERY PLAN SELECT 3"]
+                    );
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn explain_uses_the_postgres_prefix_for_a_postgres_connection() {
+        with_isolated_state("explain-pg", |state| {
+            let (conn, commands) = scripted_postgres_connection(state, "pg");
+            let tab = state.new_tab(conn);
+            state.start_explain(tab, "SELECT 1", 0, None);
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["EXPLAIN SELECT 1"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn explain_empty_effective_set_errors_without_sending() {
+        with_isolated_state("explain-empty", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.start_explain(tab, "   ", 0, None);
+            assert!(matches!(
+                state.tab(tab).expect("tab").outcome(),
+                RunOutcome::Err(message) if message.as_str() == "nothing to run"
+            ));
+            assert!(commands.try_recv().is_err());
+        });
+    }
+
+    #[test]
     fn all_scope_runs_a_script_through_the_sqlite_worker() {
         with_isolated_state("batch-live", |state| {
             let conn = add_sqlite_connection(state, "mem");
@@ -1879,6 +2008,7 @@ mod tests {
             toolbar.textures_delta.clear();
             let toolbar_text = rendered_text(&toolbar);
             assert!(toolbar_text.iter().any(|t| t == "▶ Run"), "{toolbar_text:?}");
+            assert!(toolbar_text.iter().any(|t| t == "Explain"), "{toolbar_text:?}");
             assert!(
                 toolbar_text.iter().any(|t| t.contains("all statements")),
                 "{toolbar_text:?}"
