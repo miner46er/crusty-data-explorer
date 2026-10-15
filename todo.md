@@ -28,3 +28,28 @@
 - [x] Verify: cargo test + cargo run smoke, SQLite in-memory query roundtrip
 - [x] Postgres queries: PgSession connect with pool, fetch rows to Value, affected counts, server_version, feature-gated tests
 - [x] Verify: cargo check --features postgres + cargo test --features postgres
+
+## Parity plan (DBeaver / Beekeeper gaps, ranked 2026-10-16)
+
+Wave 0 — scaffold, blocks all.
+- [ ] T0 Baseline capture: record `cargo check`, `cargo check --features postgres`, `cargo test`, `cargo test --features postgres` outputs at head. No code.
+
+Wave 1 — parallel, additive only, separate owned files.
+- [ ] T1 Autocomplete: new `src/ui/complete.rs` over `SchemaInfo` + keywords, hook into `src/ui/query.rs` (Ctrl+Space popup). No `Tab` shape change. Tests: suggestion unit tests.
+- [ ] T3 DDL view + Generate SQL: new `src/ui/ddl.rs` pure builder over loaded schema, read-only pane. No state change. Tests: DDL string tests.
+- [ ] T5 Editor quality: new `src/ui/editor.rs` (highlight + format + find), hook into `src/ui/query.rs` AFTER T1 lands (shared hook point). Tests: formatter idempotence.
+- [ ] T7a Extended export: extend `src/export.rs` with JSON + SQL-inserts + clipboard copy. No `QueryResult` change. Tests: quoting + roundtrip.
+- [ ] T8a Postgres SSL modes: additive `ssl` field on Postgres config in `src/db.rs` + sqlx connect options + persist. Tests: URL builder per mode.
+- [ ] T9a Env types (dev/test/prod colors + prod confirm): AFTER T8a (shared config shape), copies its additive-field pattern. Tests: default dev + guard.
+
+Wave 2 — serial core chain on `src/app.rs` Tab machine + `src/db.rs` worker.
+- [ ] T4 Run scope + multi-statement + resultset picker (after Wave 1). Extends `RunOutcome`, splitter, picker UI. Blocks T6, T2. Tests + live run + cancel regression.
+- [ ] T6 EXPLAIN plan view (after T4). EXPLAIN runner, rows rendered in grid. Read-only. Tests + live EXPLAIN on both engines.
+- [ ] T2 Inline editing (after T4, T6). Grid dirty tracking + PK-aware UPDATE/INSERT/DELETE + worker write command. Tests + live write + cancel regression.
+- [ ] T7b CSV import (after T2). Column mapper + batched INSERT on T2 write path. Tests + live import.
+
+Wave 3 — serial drivers on config shape, after Wave 2 (shared `src/db.rs`).
+- [ ] T9b MySQL session cage mirroring `PgSession` behind feature. Tests: gated roundtrip.
+- [ ] T8b SSH tunnel (last, heaviest). Spike prototype first, then real build. Tests: forward + connect.
+
+Per-unit verify: `cargo check`, `cargo check --features postgres`, `cargo test`, `cargo test --features postgres` (live ignored), plus live probe where noted.
