@@ -24,6 +24,8 @@ enum SidebarAction {
     PreviewTable(ConnectionId, String, String),
     OpenHistory(ConnectionId, String),
     ClearHistory,
+    OpenSaved(u64),
+    DeleteSaved(u64),
 }
 
 fn history_title(sql: &str) -> String {
@@ -243,6 +245,38 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                 }
                 ui.add_space(8.0);
 
+                ui.label(egui::RichText::new("SAVED").small().weak());
+                ui.add_space(4.0);
+                if state.saved_queries().is_empty() {
+                    ui.label(egui::RichText::new("No saved queries.").small().weak());
+                } else {
+                    let rows: Vec<(u64, String, String)> = state
+                        .saved_queries()
+                        .iter()
+                        .map(|q| {
+                            let conn_name = state
+                                .connections()
+                                .iter()
+                                .find(|c| c.id == q.conn)
+                                .map(|c| c.name.clone())
+                                .unwrap_or_else(|| "deleted".to_owned());
+                            (q.id, q.name.clone(), conn_name)
+                        })
+                        .collect();
+                    for (id, name, conn_name) in rows {
+                        ui.horizontal(|ui| {
+                            if ui.small_button(&name).clicked() {
+                                actions.push(SidebarAction::OpenSaved(id));
+                            }
+                            ui.label(egui::RichText::new(conn_name).small().weak());
+                            if ui.small_button("Delete").clicked() {
+                                actions.push(SidebarAction::DeleteSaved(id));
+                            }
+                        });
+                    }
+                }
+                ui.add_space(8.0);
+
                 for action in actions {
                     match action {
                         SidebarAction::Connect(id) => state.connect(id),
@@ -259,6 +293,10 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                         }
                         SidebarAction::OpenHistory(conn, sql) => state.open_history(conn, &sql),
                         SidebarAction::ClearHistory => state.clear_history(),
+                        SidebarAction::OpenSaved(id) => state.open_saved(id),
+                        SidebarAction::DeleteSaved(id) => {
+                            state.delete_saved(id);
+                        }
                     }
                 }
             });

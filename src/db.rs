@@ -64,6 +64,15 @@ impl Ids {
     pub fn run(&mut self) -> RunId {
         RunId(self.take())
     }
+    pub fn saved(&mut self) -> u64 {
+        self.take()
+    }
+    /// Keep the single counter past loaded saved-query ids.
+    pub fn resume_after_saved(&mut self, existing: &[u64]) {
+        if let Some(max) = existing.iter().copied().max() {
+            self.next = self.next.max(max + 1);
+        }
+    }
 }
 
 /// The kind the user picks in the New Connection form. A chooser, not

@@ -93,10 +93,43 @@ pub struct HistoryEntry {
     pub at: u64,
 }
 
+/// One named query. Newest first in [`AppState::saved`]. Holds the SQL and
+/// its connection only, never credentials.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SavedQuery {
+    pub id: u64,
+    pub name: String,
+    pub sql: String,
+    pub conn: ConnectionId,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum SavedQueryError {
+    #[error("name is empty")]
+    EmptyName,
+}
+
+impl SavedQuery {
+    /// Checked constructor. Rejects empty names.
+    pub fn new(
+        id: u64,
+        name: String,
+        sql: String,
+        conn: ConnectionId,
+    ) -> Result<Self, SavedQueryError> {
+        if name.trim().is_empty() {
+            return Err(SavedQueryError::EmptyName);
+        }
+        Ok(Self { id, name, sql, conn })
+    }
+}
+
 /// Cap on retained history entries, newest first.
 const HISTORY_CAP: usize = 200;
 /// Cap on history rows rendered in the sidebar.
 pub const HISTORY_SHOWN: usize = 30;
+/// Cap on retained saved queries, newest first.
+const SAVED_CAP: usize = 200;
 
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
@@ -114,6 +147,12 @@ pub struct ConnectDraft {
     pub error: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct SavePrompt {
+    pub name: String,
+    pub error: Option<String>,
+}
+
 pub struct AppState {
     connections: Vec<Connection>,
     tabs: Vec<Tab>,
@@ -128,6 +167,8 @@ pub struct AppState {
     schema_loading: HashSet<ConnectionId>,
     schema_errors: HashMap<ConnectionId, String>,
     history: Vec<HistoryEntry>,
+    saved: Vec<SavedQuery>,
+    save_prompt: Option<SavePrompt>,
 }
 
 impl AppState {
@@ -135,6 +176,8 @@ impl AppState {
         let profiles = load_connections();
         let mut ids = Ids::new();
         ids.resume_after(&profiles.iter().map(|c| c.id).collect::<Vec<_>>());
+        let saved = load_saved_queries();
+        ids.resume_after_saved(&saved.iter().map(|q| q.id).collect::<Vec<_>>());
         let (events_tx, events_rx) = mpsc::channel();
         Self {
             connections: profiles,
@@ -150,6 +193,8 @@ impl AppState {
             schema_loading: HashSet::new(),
             schema_errors: HashMap::new(),
             history: load_history(),
+            saved,
+            save_prompt: None,
         }
     }
 
@@ -393,6 +438,119 @@ impl AppState {
         self.persist_history();
     }
 
+    pub fn saved_queries(&self) -> &[SavedQuery] {
+        &self.saved
+    }
+
+    /// Save the active tab's SQL under `name` for its connection. A duplicate
+    /// name replaces the existing entry in place and keeps its id.
+    pub fn save_active_tab(&mut self, name: &str) -> Option<u64> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let (conn, sql) = match self.active.and_then(|id| self.tab(id)) {
+            Some(tab) => (tab.conn, tab.sql.clone()),
+            None => return None,
+        };
+        if let Some(existing) = self.saved.iter_mut().find(|q| q.name == trimmed) {
+            existing.sql = sql;
+            existing.conn = conn;
+            let id = existing.id;
+            self.persist_saved();
+            return Some(id);
+        }
+        let id = self.ids.saved();
+        match SavedQuery::new(id, trimmed.to_owned(), sql, conn) {
+            Ok(query) => {
+                self.saved.insert(0, query);
+                self.saved.truncate(SAVED_CAP);
+                self.persist_saved();
+                Some(id)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Open a saved query in a fresh tab on its connection. Never auto-runs.
+    pub fn open_saved(&mut self, id: u64) {
+        let Some(query) = self.saved.iter().find(|q| q.id == id).cloned() else {
+            return;
+        };
+        let tab = self.new_tab(query.conn);
+        if let Some(slot) = self.tab_sql_mut(tab) {
+            *slot = query.sql;
+        }
+        self.activate(tab);
+        self.set_outcome(tab, RunOutcome::Never);
+    }
+
+    pub fn rename_saved(&mut self, id: u64, name: &str) -> bool {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let Some(query) = self.saved.iter_mut().find(|q| q.id == id) else {
+            return false;
+        };
+        query.name = trimmed.to_owned();
+        self.persist_saved();
+        true
+    }
+
+    pub fn delete_saved(&mut self, id: u64) -> bool {
+        let before = self.saved.len();
+        self.saved.retain(|q| q.id != id);
+        if self.saved.len() == before {
+            return false;
+        }
+        self.persist_saved();
+        true
+    }
+
+    pub fn save_prompt(&self) -> Option<&SavePrompt> {
+        self.save_prompt.as_ref()
+    }
+
+    pub fn save_prompt_mut(&mut self) -> Option<&mut SavePrompt> {
+        self.save_prompt.as_mut()
+    }
+
+    pub fn open_save_prompt(&mut self) {
+        self.save_prompt =
+            Some(SavePrompt { name: String::new(), error: None });
+    }
+
+    pub fn close_save_prompt(&mut self) {
+        self.save_prompt = None;
+    }
+
+    pub fn confirm_save_prompt(&mut self) -> Option<u64> {
+        let name = self
+            .save_prompt
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        if name.trim().is_empty() {
+            if let Some(prompt) = self.save_prompt.as_mut() {
+                prompt.error = Some("name is empty".to_owned());
+            }
+            return None;
+        }
+        match self.save_active_tab(&name) {
+            Some(id) => {
+                self.save_prompt = None;
+                Some(id)
+            }
+            None => {
+                if let Some(prompt) = self.save_prompt.as_mut() {
+                    prompt.error = Some("nothing to save".to_owned());
+                }
+                None
+            }
+        }
+    }
+
     /// Reopen a past query in a fresh tab. Runs immediately when the
     /// connection is live, else loads the SQL with a `Never` outcome.
     pub fn open_history(&mut self, conn: ConnectionId, sql: &str) {
@@ -627,6 +785,12 @@ impl AppState {
             log::warn!("persist history: {e}");
         }
     }
+
+    fn persist_saved(&self) {
+        if let Err(e) = save_saved_queries(&self.saved) {
+            log::warn!("persist saved queries: {e}");
+        }
+    }
 }
 
 impl eframe::App for AppState {
@@ -727,6 +891,40 @@ fn save_history(history: &[HistoryEntry]) -> std::io::Result<()> {
     }
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(history).unwrap_or_default())?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn saved_queries_path() -> std::path::PathBuf {
+    profiles_path().with_file_name("saved_queries.json")
+}
+
+fn load_saved_queries() -> Vec<SavedQuery> {
+    let path = saved_queries_path();
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    match serde_json::from_slice::<Vec<SavedQuery>>(&bytes) {
+        Ok(mut queries) => {
+            queries.retain(|q| !q.name.trim().is_empty());
+            queries.truncate(SAVED_CAP);
+            queries
+        }
+        Err(e) => {
+            log::warn!("parse {}: {e}", path.display());
+            Vec::new()
+        }
+    }
+}
+
+fn save_saved_queries(saved: &[SavedQuery]) -> std::io::Result<()> {
+    let path = saved_queries_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(saved).unwrap_or_default())?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
@@ -950,6 +1148,123 @@ mod tests {
         let loaded = AppState::new(&ctx);
         assert_eq!(loaded.history().len(), 200);
         assert_eq!(loaded.history()[0].sql, "SELECT 0");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_query_constructor_rejects_empty_names() {
+        let conn = ConnectionId::from_raw(1);
+        assert!(SavedQuery::new(1, String::new(), "SELECT 1".to_owned(), conn).is_err());
+        assert!(SavedQuery::new(1, "   ".to_owned(), "SELECT 1".to_owned(), conn).is_err());
+        let query =
+            SavedQuery::new(1, "daily".to_owned(), "SELECT 1".to_owned(), conn).unwrap();
+        assert_eq!(query.id, 1);
+        assert_eq!(query.name, "daily");
+        let json = serde_json::to_string(&query).unwrap();
+        assert!(!json.contains("password"));
+        assert!(json.contains("SELECT 1"));
+    }
+
+    #[test]
+    fn save_duplicate_open_rename_delete_roundtrip() {
+        with_isolated_state("saved-round", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 1".to_owned();
+            }
+            state.activate(tab);
+            assert!(state.save_active_tab("   ").is_none());
+            assert!(state.saved_queries().is_empty());
+            let id = state.save_active_tab("first").expect("saved");
+            assert_eq!(state.saved_queries().len(), 1);
+            assert_eq!(state.saved_queries()[0].sql, "SELECT 1");
+            assert_eq!(state.saved_queries()[0].conn, conn);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 2".to_owned();
+            }
+            let again = state.save_active_tab("first").expect("replaced");
+            assert_eq!(id, again);
+            assert_eq!(state.saved_queries().len(), 1);
+            assert_eq!(state.saved_queries()[0].sql, "SELECT 2");
+            state.open_saved(id);
+            let opened = state.active().and_then(|t| state.tab(t)).expect("active tab");
+            assert_eq!(opened.sql, "SELECT 2");
+            assert!(matches!(opened.outcome(), RunOutcome::Never));
+            state.open_saved(999_999);
+            let still = state.active().and_then(|t| state.tab(t)).expect("active tab");
+            assert_eq!(still.sql, "SELECT 2");
+            assert!(!state.rename_saved(id, "   "));
+            assert_eq!(state.saved_queries()[0].name, "first");
+            assert!(state.rename_saved(id, "renamed"));
+            assert_eq!(state.saved_queries()[0].name, "renamed");
+            assert!(!state.rename_saved(999_999, "nope"));
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.saved_queries().len(), 1);
+            assert_eq!(reloaded.saved_queries()[0].name, "renamed");
+            assert_eq!(reloaded.saved_queries()[0].sql, "SELECT 2");
+            assert!(state.delete_saved(id));
+            assert!(state.saved_queries().is_empty());
+            assert!(!state.delete_saved(id));
+            let emptied = AppState::new(&eframe::egui::Context::default());
+            assert!(emptied.saved_queries().is_empty());
+        });
+    }
+
+    #[test]
+    fn saved_queries_cap_at_200_newest_first() {
+        with_isolated_state("saved-cap", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            for i in 0..250 {
+                if let Some(slot) = state.tab_sql_mut(tab) {
+                    *slot = format!("SELECT {i}");
+                }
+                state.save_active_tab(&format!("q{i}")).expect("saved");
+            }
+            assert_eq!(state.saved_queries().len(), 200);
+            assert_eq!(state.saved_queries()[0].name, "q249");
+            assert_eq!(state.saved_queries()[199].name, "q50");
+        });
+    }
+
+    #[test]
+    fn corrupt_saved_file_falls_back_to_empty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("cde-saved-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crusty-data-explorer")).unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        std::fs::write(
+            dir.join("crusty-data-explorer").join("saved_queries.json"),
+            b"{oops",
+        )
+        .unwrap();
+        let ctx = eframe::egui::Context::default();
+        let state = AppState::new(&ctx);
+        assert!(state.saved_queries().is_empty());
+        let entries: Vec<SavedQuery> = (0..250)
+            .map(|i| SavedQuery {
+                id: i,
+                name: format!("q{i}"),
+                sql: format!("SELECT {i}"),
+                conn: ConnectionId::from_raw(1),
+            })
+            .collect();
+        std::fs::write(
+            dir.join("crusty-data-explorer").join("saved_queries.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        let loaded = AppState::new(&ctx);
+        assert_eq!(loaded.saved_queries().len(), 200);
+        assert_eq!(loaded.saved_queries()[0].name, "q0");
         match prev {
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },

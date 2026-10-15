@@ -15,6 +15,7 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     toolbar(state, ui);
     ui.add_space(4.0);
+    save_window(state, ui);
     if let Some(id) = state.active() {
         let hint = state
             .tab(id)
@@ -85,7 +86,7 @@ fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
 
 fn toolbar(state: &mut AppState, ui: &mut egui::Ui) {
     let Some(tab_id) = state.active() else { return };
-    let (mut run_clicked, mut cancel_clicked) = (false, false);
+    let (mut run_clicked, mut cancel_clicked, mut save_clicked) = (false, false, false);
     if state.tab(tab_id).is_some() {
         let running = matches!(
             state.tab(tab_id).map(|t| t.outcome()),
@@ -101,6 +102,7 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) {
                     )
                     .clicked();
                 ui.label(egui::RichText::new("Ctrl+Enter").small().weak());
+                save_clicked = ui.button("Save").clicked();
             }
             match state.tab(tab_id).map(|t| t.outcome()) {
                 Some(RunOutcome::Running { started, .. }) => {
@@ -129,6 +131,9 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) {
     if cancel_clicked {
         state.cancel_run(tab_id);
     }
+    if save_clicked {
+        state.open_save_prompt();
+    }
     if run_clicked {
         let sql = state.tab(tab_id).map(|t| t.sql.clone()).unwrap_or_default();
         state.start_run(tab_id, &sql);
@@ -146,4 +151,35 @@ fn tab_title(sql: String) -> String {
 
 pub fn run_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Enter)
+}
+
+fn save_window(state: &mut AppState, ui: &mut egui::Ui) {
+    if state.save_prompt().is_none() {
+        return;
+    }
+    let mut confirm = false;
+    let mut close = false;
+    egui::Window::new("Save query").show(ui.ctx(), |ui| {
+        let Some(prompt) = state.save_prompt_mut() else { return };
+        ui.horizontal(|ui| {
+            ui.label("Name:");
+            ui.text_edit_singleline(&mut prompt.name);
+        });
+        if let Some(error) = prompt.error.clone() {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Save").clicked() {
+                confirm = true;
+            }
+            if ui.button("Cancel").clicked() {
+                close = true;
+            }
+        });
+    });
+    if confirm {
+        state.confirm_save_prompt();
+    } else if close {
+        state.close_save_prompt();
+    }
 }
