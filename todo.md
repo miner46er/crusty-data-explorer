@@ -49,7 +49,7 @@ Wave 2 — serial core chain on `src/app.rs` Tab machine + `src/db.rs` worker.
 - [x] T7b CSV import (after T2). Column mapper + batched INSERT on T2 write path. Landed feec93d, modal shortcut gate fixed in query.rs.
 
 Wave 3 — serial drivers on config shape, after Wave 2 (shared `src/db.rs`).
-- [ ] T9b MySQL session cage mirroring `PgSession` behind feature. Tests: gated roundtrip. In flight on deepseek max.
-- [ ] T8b SSH tunnel (last, heaviest). Spike prototype first, then real build. Tests: forward + connect.
+- [x] T9b MySQL session cage mirroring `PgSession` behind feature. Landed with live roundtrip, schema, and cancel tests against cde-mysql on port 3307.
+- [ ] T8b SSH tunnel (last, heaviest). Spike prototype first, then real build. Tests: forward + connect. In flight on deepseek max.
 
 Per-unit verify: `cargo check`, `cargo check --features postgres`, `cargo test`, `cargo test --features postgres` (live ignored), plus live probe where noted.
