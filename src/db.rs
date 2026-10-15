@@ -1,7 +1,7 @@
 //! Database engines, value types, and the worker-thread protocol.
 //!
-//! Everything that touches rusqlite (or sqlx, behind the `postgres`
-//! feature) lives in this module. Layers above only see [`Value`],
+//! Everything that touches rusqlite (or sqlx, behind the `postgres` and
+//! `mysql` features) lives in this module. Layers above only see [`Value`],
 //! [`QueryResult`], [`DbError`], and the [`DbCommand`]/[`DbEvent`]
 //! protocol. No client-library type crosses the boundary.
 
@@ -81,20 +81,23 @@ impl Ids {
 pub enum DbKind {
     Sqlite,
     Postgres,
+    Mysql,
 }
 
 impl DbKind {
-    pub const ALL: [DbKind; 2] = [DbKind::Sqlite, DbKind::Postgres];
+    pub const ALL: [DbKind; 3] = [DbKind::Sqlite, DbKind::Postgres, DbKind::Mysql];
     pub fn label(self) -> &'static str {
         match self {
             DbKind::Sqlite => "SQLite",
             DbKind::Postgres => "Postgres",
+            DbKind::Mysql => "MySQL",
         }
     }
     pub fn default_port(self) -> Option<u16> {
         match self {
             DbKind::Sqlite => None,
             DbKind::Postgres => Some(5432),
+            DbKind::Mysql => Some(3306),
         }
     }
     pub fn default_config(self) -> ConnectionConfig {
@@ -109,6 +112,12 @@ impl DbKind {
                 user: String::new(),
                 ssl_mode: PostgresSslMode::Disable,
             },
+            DbKind::Mysql => ConnectionConfig::Mysql {
+                host: "localhost".to_owned(),
+                port: 3306,
+                database: String::new(),
+                user: String::new(),
+            },
         }
     }
 }
@@ -118,7 +127,7 @@ impl DbKind {
 pub fn explain_sql(kind: DbKind, statement: &str) -> String {
     match kind {
         DbKind::Sqlite => format!("EXPLAIN QUERY PLAN {}", statement.trim()),
-        DbKind::Postgres => format!("EXPLAIN {}", statement.trim()),
+        DbKind::Postgres | DbKind::Mysql => format!("EXPLAIN {}", statement.trim()),
     }
 }
 
@@ -199,6 +208,12 @@ pub enum ConnectionConfig {
         #[serde(default)]
         ssl_mode: PostgresSslMode,
     },
+    Mysql {
+        host: String,
+        port: u16,
+        database: String,
+        user: String,
+    },
 }
 
 impl ConnectionConfig {
@@ -206,7 +221,12 @@ impl ConnectionConfig {
         match self {
             ConnectionConfig::Sqlite { .. } => DbKind::Sqlite,
             ConnectionConfig::Postgres { .. } => DbKind::Postgres,
+            ConnectionConfig::Mysql { .. } => DbKind::Mysql,
         }
+    }
+    /// The engines the UI prompts for a password when the profile stores none.
+    pub fn prompts_for_password(&self) -> bool {
+        matches!(self, ConnectionConfig::Postgres { .. } | ConnectionConfig::Mysql { .. })
     }
     /// Boundary check before a session opens. Shared by the form and the worker.
     pub fn validate(&self) -> Result<(), DbError> {
@@ -217,7 +237,8 @@ impl ConnectionConfig {
                 }
                 Ok(())
             }
-            ConnectionConfig::Postgres { host, port, database, user, .. } => {
+            ConnectionConfig::Postgres { host, port, database, user, .. }
+            | ConnectionConfig::Mysql { host, port, database, user } => {
                 if host.trim().is_empty() {
                     return Err(DbError::Config("host is empty".to_owned()));
                 }
@@ -940,6 +961,8 @@ pub enum Session {
     Sqlite(rusqlite::Connection),
     #[cfg(feature = "postgres")]
     Postgres(PgSession),
+    #[cfg(feature = "mysql")]
+    Mysql(MySession),
 }
 
 impl Session {
@@ -949,6 +972,7 @@ impl Session {
                 .map(Session::Sqlite)
                 .map_err(|e| DbError::Open(e.to_string())),
             ConnectionConfig::Postgres { .. } => Self::open_postgres(config, password),
+            ConnectionConfig::Mysql { .. } => Self::open_mysql(config, password),
         }
     }
 
@@ -969,11 +993,25 @@ impl Session {
         }
     }
 
+    fn open_mysql(config: &ConnectionConfig, password: Option<&str>) -> Result<Session, DbError> {
+        #[cfg(feature = "mysql")]
+        {
+            return Ok(Session::Mysql(MySession::connect(config, password)?));
+        }
+        #[cfg(not(feature = "mysql"))]
+        {
+            let _ = (config, password);
+            return Err(DbError::Config("mysql feature not enabled".to_owned()));
+        }
+    }
+
     pub fn server_version(&self) -> String {
         match self {
             Session::Sqlite(_) => format!("SQLite {}", rusqlite::version()),
             #[cfg(feature = "postgres")]
             Session::Postgres(pg) => pg.server_version.clone(),
+            #[cfg(feature = "mysql")]
+            Session::Mysql(my) => my.server_version.clone(),
         }
     }
 
@@ -987,6 +1025,10 @@ impl Session {
             Session::Postgres(pg) => {
                 pg_cancel_handle(pg.connection_string.clone(), pg.backend_pid)
             }
+            #[cfg(feature = "mysql")]
+            Session::Mysql(my) => {
+                mysql_cancel_handle(my.connection_string.clone(), my.connection_id)
+            }
         }
     }
 
@@ -997,6 +1039,8 @@ impl Session {
             Session::Sqlite(conn) => execute_sqlite(conn, sql, ROW_CAP),
             #[cfg(feature = "postgres")]
             Session::Postgres(pg) => pg.query(sql),
+            #[cfg(feature = "mysql")]
+            Session::Mysql(my) => my.query(sql),
         }
     }
 
@@ -1007,6 +1051,8 @@ impl Session {
             Session::Sqlite(conn) => sqlite_schema(conn),
             #[cfg(feature = "postgres")]
             Session::Postgres(pg) => pg.schema(),
+            #[cfg(feature = "mysql")]
+            Session::Mysql(my) => my.schema(),
         }
     }
 }
@@ -1604,6 +1650,647 @@ impl PgSession {
             .map_err(|e| DbError::Query(e.to_string()))?;
         Ok(SchemaInfo::new(vec![db_node], tables_truncated, columns_truncated))
     }
+}
+
+/// Behind the `mysql` feature. Owns a current-thread tokio runtime so the
+/// async sqlx model stays caged inside this driver file. sqlx sends every
+/// query through the prepared/binary protocol, even one with no binds, so
+/// values arrive in their binary encodings; the cell decoder turns the
+/// temporal ones back into the text the server itself would print.
+#[cfg(feature = "mysql")]
+pub struct MySession {
+    rt: tokio::runtime::Runtime,
+    pool: sqlx::MySqlPool,
+    connection_string: String,
+    database: String,
+    server_version: String,
+    connection_id: u64,
+}
+
+#[cfg(feature = "mysql")]
+impl MySession {
+    fn connect(config: &ConnectionConfig, password: Option<&str>) -> Result<Self, DbError> {
+        let ConnectionConfig::Mysql { host, port, database, user } = config else {
+            return Err(DbError::Config("not a mysql connection".to_owned()));
+        };
+        let connection_string = mysql_url(host, *port, database, user, password);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| DbError::Open(e.to_string()))?;
+        // `acquire_timeout` also bounds establishing the first connection.
+        let pool = rt
+            .block_on(
+                sqlx::mysql::MySqlPoolOptions::new()
+                    .max_connections(1)
+                    .acquire_timeout(Duration::from_secs(10))
+                    .connect(&connection_string),
+            )
+            .map_err(|e| DbError::Open(e.to_string()))?;
+        let server_version = rt
+            .block_on(async {
+                let row = sqlx::query("SELECT VERSION()")
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                use sqlx::Row as _;
+                row.try_get::<String, _>(0).map_err(|e| e.to_string())
+            })
+            .unwrap_or_else(|_| "MySQL".to_owned());
+        let connection_id = rt
+            .block_on(async {
+                let row = sqlx::query("SELECT CONNECTION_ID()")
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                use sqlx::Row as _;
+                row.try_get::<u64, _>(0).map_err(|e| e.to_string())
+            })
+            .unwrap_or(0);
+        Ok(Self {
+            rt,
+            pool,
+            connection_string,
+            database: database.clone(),
+            server_version,
+            connection_id,
+        })
+    }
+
+    /// One statement per call. `describe` reports columns without executing,
+    /// so a data-changing statement runs exactly once on the `execute` path.
+    fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
+        let started = Instant::now();
+        let columns = self.describe_columns(sql)?;
+        if columns.is_empty() {
+            let done = self
+                .rt
+                .block_on(sqlx::query(sql).execute(&self.pool))
+                .map_err(|e| DbError::Query(e.to_string()))?;
+            return QueryResult::from_columns(
+                Vec::new(),
+                false,
+                Some(done.rows_affected()),
+                started.elapsed(),
+            )
+            .map_err(|e| DbError::Query(e.to_string()));
+        }
+        let rows = self
+            .rt
+            .block_on(sqlx::query(sql).fetch_all(&self.pool))
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        let mut builder = ResultBuilder::new(columns, ROW_CAP);
+        for row in &rows {
+            if !builder.push_row(map_my_row(row)?) {
+                break;
+            }
+        }
+        Ok(builder.finish(started.elapsed()))
+    }
+
+    fn describe_columns(&self, sql: &str) -> Result<Vec<(String, String)>, DbError> {
+        use sqlx::{Column as _, Executor as _, TypeInfo as _};
+        let described = self
+            .rt
+            .block_on(async { (&self.pool).describe(sql).await })
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        Ok(described
+            .columns()
+            .iter()
+            .map(|c| (c.name().to_owned(), c.type_info().name().to_owned()))
+            .collect())
+    }
+
+    /// One `DatabaseNode` per visible database, each with a single schema
+    /// node named after the database. A user without the privilege to list
+    /// databases still sees the connected one.
+    fn schema(&self) -> Result<SchemaInfo, DbError> {
+        let database_names: Vec<String> = match self.rt.block_on(
+            sqlx::query(
+                "SELECT schema_name FROM information_schema.schemata \
+                 WHERE schema_name NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys') \
+                 ORDER BY schema_name",
+            )
+            .fetch_all(&self.pool),
+        ) {
+            Ok(rows) => rows
+                .iter()
+                .map(|row| my_string(row, 0))
+                .collect::<Result<Vec<_>, DbError>>()?,
+            Err(_) => vec![self.database.clone()],
+        };
+        let database_names: Vec<String> =
+            database_names.into_iter().take(SCHEMA_SCHEMA_CAP).collect();
+        let mut tables_truncated = false;
+        let mut columns_truncated = false;
+        let mut databases = Vec::new();
+        for database in &database_names {
+            let table_rows: Vec<(String, String)> = self
+                .rt
+                .block_on(
+                    sqlx::query(
+                        "SELECT table_name, table_type FROM information_schema.tables \
+                         WHERE table_schema = ? \
+                         AND table_type IN ('BASE TABLE', 'VIEW') \
+                         ORDER BY table_name",
+                    )
+                    .bind(database)
+                    .fetch_all(&self.pool),
+                )
+                .map_err(|e| DbError::Query(e.to_string()))?
+                .iter()
+                .map(|row| Ok((my_string(row, 0)?, my_string(row, 1)?)))
+                .collect::<Result<Vec<_>, DbError>>()?;
+            if table_rows.len() > SCHEMA_TABLE_CAP {
+                tables_truncated = true;
+            }
+            let order: Vec<(String, TableKind)> = table_rows
+                .into_iter()
+                .take(SCHEMA_TABLE_CAP)
+                .map(|(name, kind)| {
+                    (name, if kind == "VIEW" { TableKind::View } else { TableKind::Table })
+                })
+                .collect();
+            let column_rows: Vec<(String, String, String, String)> = self
+                .rt
+                .block_on(
+                    sqlx::query(
+                        "SELECT table_name, column_name, column_type, is_nullable \
+                         FROM information_schema.columns \
+                         WHERE table_schema = ? \
+                         ORDER BY table_name, ordinal_position",
+                    )
+                    .bind(database)
+                    .fetch_all(&self.pool),
+                )
+                .map_err(|e| DbError::Query(e.to_string()))?
+                .iter()
+                .map(|row| {
+                    Ok((
+                        my_string(row, 0)?,
+                        my_string(row, 1)?,
+                        my_string(row, 2)?,
+                        my_string(row, 3)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, DbError>>()?;
+            let mut columns_by_table: std::collections::HashMap<
+                String,
+                Vec<(String, String, bool)>,
+            > = std::collections::HashMap::new();
+            for (table, column, column_type, is_nullable) in column_rows {
+                columns_by_table.entry(table).or_default().push((
+                    column,
+                    column_type,
+                    is_nullable == "YES",
+                ));
+            }
+            let pk_rows: Vec<(String, String)> = self
+                .rt
+                .block_on(
+                    sqlx::query(
+                        "SELECT table_name, column_name \
+                         FROM information_schema.key_column_usage \
+                         WHERE table_schema = ? AND constraint_name = 'PRIMARY' \
+                         ORDER BY table_name, ordinal_position",
+                    )
+                    .bind(database)
+                    .fetch_all(&self.pool),
+                )
+                .map_err(|e| DbError::Query(e.to_string()))?
+                .iter()
+                .map(|row| Ok((my_string(row, 0)?, my_string(row, 1)?)))
+                .collect::<Result<Vec<_>, DbError>>()?;
+            let mut pk_by_table: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for (table, column) in pk_rows {
+                pk_by_table.entry(table).or_default().push(column);
+            }
+            let index_rows: Vec<(String, String, i64, Option<String>)> = self
+                .rt
+                .block_on(
+                    sqlx::query(
+                        "SELECT table_name, index_name, non_unique, column_name \
+                         FROM information_schema.statistics \
+                         WHERE table_schema = ? \
+                         ORDER BY table_name, index_name, seq_in_index",
+                    )
+                    .bind(database)
+                    .fetch_all(&self.pool),
+                )
+                .map_err(|e| DbError::Query(e.to_string()))?
+                .iter()
+                .map(|row| {
+                    use sqlx::Row as _;
+                    let non_unique = row
+                        .try_get_unchecked::<i64, _>(2)
+                        .map_err(|e| DbError::Query(e.to_string()))?;
+                    // A functional index has no column name.
+                    let column = row
+                        .try_get_unchecked::<Option<String>, _>(3)
+                        .map_err(|e| DbError::Query(e.to_string()))?;
+                    Ok((my_string(row, 0)?, my_string(row, 1)?, non_unique, column))
+                })
+                .collect::<Result<Vec<_>, DbError>>()?;
+            let mut idx_grouped: std::collections::HashMap<
+                String,
+                Vec<(String, bool, Vec<String>)>,
+            > = std::collections::HashMap::new();
+            {
+                let mut current: Option<(String, String, bool, Vec<String>)> = None;
+                let flush = |current: &mut Option<(String, String, bool, Vec<String>)>,
+                             map: &mut std::collections::HashMap<
+                    String,
+                    Vec<(String, bool, Vec<String>)>,
+                >| {
+                    if let Some((table, name, unique, cols)) = current.take() {
+                        map.entry(table).or_default().push((name, unique, cols));
+                    }
+                };
+                for (table, index, non_unique, column) in index_rows {
+                    match current.as_mut() {
+                        Some(cur) if cur.0 == table && cur.1 == index => {
+                            if let Some(col) = column {
+                                if !col.trim().is_empty() {
+                                    cur.3.push(col);
+                                }
+                            }
+                        }
+                        _ => {
+                            flush(&mut current, &mut idx_grouped);
+                            let cols = match column {
+                                Some(col) if !col.trim().is_empty() => vec![col],
+                                _ => Vec::new(),
+                            };
+                            current = Some((table, index, non_unique == 0, cols));
+                        }
+                    }
+                }
+                flush(&mut current, &mut idx_grouped);
+            }
+            let mut idx_by_table: std::collections::HashMap<String, Vec<IndexInfo>> =
+                std::collections::HashMap::new();
+            let mut idx_truncated_by_table: std::collections::HashMap<String, bool> =
+                std::collections::HashMap::new();
+            let mut schema_indexes: Vec<IndexRef> = Vec::new();
+            for (table, groups) in idx_grouped {
+                if groups.len() > SCHEMA_INDEX_CAP {
+                    idx_truncated_by_table.insert(table.clone(), true);
+                }
+                let mut idxs = Vec::new();
+                for (index_name, unique, idx_cols) in
+                    groups.into_iter().take(SCHEMA_INDEX_CAP)
+                {
+                    schema_indexes.push(
+                        IndexRef::new(table.clone(), index_name.clone())
+                            .map_err(|e| DbError::Query(e.to_string()))?,
+                    );
+                    idxs.push(
+                        IndexInfo::new(index_name, idx_cols, unique)
+                            .map_err(|e| DbError::Query(e.to_string()))?,
+                    );
+                }
+                idx_by_table.insert(table, idxs);
+            }
+            schema_indexes.sort_by(|a, b| (a.table(), a.index()).cmp(&(b.table(), b.index())));
+            schema_indexes.truncate(SCHEMA_SCHEMA_INDEX_CAP);
+            let mut tables = Vec::new();
+            let mut views = Vec::new();
+            for (name, kind) in &order {
+                let col_rows = columns_by_table.get(name).cloned().unwrap_or_default();
+                if col_rows.len() > SCHEMA_COLUMN_CAP {
+                    columns_truncated = true;
+                }
+                let pk_cols = pk_by_table.get(name).cloned().unwrap_or_default();
+                let mut pk_pos: std::collections::HashMap<String, u32> =
+                    std::collections::HashMap::new();
+                for (i, col) in pk_cols.iter().enumerate() {
+                    pk_pos.insert(col.clone(), (i + 1) as u32);
+                }
+                let mut cols = Vec::new();
+                for (col_name, type_name, nullable) in
+                    col_rows.into_iter().take(SCHEMA_COLUMN_CAP)
+                {
+                    let pk_position = pk_pos.get(&col_name).copied();
+                    let nullable = if pk_position.is_some() { false } else { nullable };
+                    cols.push(
+                        ColumnInfo::new(col_name, type_name, nullable, pk_position)
+                            .map_err(|e| DbError::Query(e.to_string()))?,
+                    );
+                }
+                let indexes = idx_by_table.get(name).cloned().unwrap_or_default();
+                let constraints = mysql_table_constraints(&pk_cols, &indexes)?;
+                let idx_truncated =
+                    idx_truncated_by_table.get(name).copied().unwrap_or(false);
+                let table = TableInfo::new(
+                    name.clone(),
+                    *kind,
+                    cols,
+                    constraints,
+                    Vec::new(),
+                    Vec::new(),
+                    indexes,
+                    false,
+                    idx_truncated,
+                )
+                .map_err(|e| DbError::Query(e.to_string()))?;
+                match kind {
+                    TableKind::Table => tables.push(table),
+                    TableKind::View => views.push(table),
+                }
+            }
+            let schema_node = SchemaNode::new(
+                database.clone(),
+                tables,
+                views,
+                Vec::new(),
+                schema_indexes,
+            )
+            .map_err(|e| DbError::Query(e.to_string()))?;
+            databases.push(
+                DatabaseNode::new(database.clone(), vec![schema_node])
+                    .map_err(|e| DbError::Query(e.to_string()))?,
+            );
+        }
+        Ok(SchemaInfo::new(databases, tables_truncated, columns_truncated))
+    }
+}
+
+/// Mirrors `sqlite_table_constraints`: MySQL keeps the primary key in
+/// `key_column_usage` and unique keys as unique indexes, so synthesize both.
+/// The primary constraint is named `PRIMARY`, the server's own name, so the
+/// DDL builder folds the primary index into it instead of emitting a
+/// duplicate CREATE INDEX.
+#[cfg(feature = "mysql")]
+fn mysql_table_constraints(
+    pk_cols: &[String],
+    indexes: &[IndexInfo],
+) -> Result<Vec<ConstraintInfo>, DbError> {
+    let mut out = Vec::new();
+    if !pk_cols.is_empty() {
+        out.push(
+            ConstraintInfo::new(
+                "PRIMARY".to_owned(),
+                ConstraintKind::Pk,
+                pk_cols.to_vec(),
+                None,
+                Vec::new(),
+                None,
+            )
+            .map_err(|e| DbError::Query(e.to_string()))?,
+        );
+    }
+    for index in indexes.iter().filter(|i| i.is_unique() && i.name() != "PRIMARY") {
+        out.push(
+            ConstraintInfo::new(
+                index.name().to_owned(),
+                ConstraintKind::Unique,
+                index.columns().to_vec(),
+                None,
+                Vec::new(),
+                None,
+            )
+            .map_err(|e| DbError::Query(e.to_string()))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Builds the MySQL cancel closure. Owns the connection string plus the
+/// connection id captured at connect. Unknown id no-ops. Else a fresh
+/// current-thread runtime opens one connection and runs KILL QUERY. Every
+/// error collapses into unit. Never panics, safe to fire twice.
+#[cfg(feature = "mysql")]
+fn mysql_cancel_handle(connection_string: String, connection_id: u64) -> CancelHandle {
+    CancelHandle::new(move || {
+        if connection_id == 0 {
+            return;
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
+            rt.block_on(async {
+                let pool = match sqlx::mysql::MySqlPoolOptions::new()
+                    .max_connections(1)
+                    .acquire_timeout(Duration::from_secs(5))
+                    .connect(&connection_string)
+                    .await
+                {
+                    Ok(pool) => pool,
+                    Err(_) => return,
+                };
+                let _ = sqlx::query(&format!("KILL QUERY {connection_id}"))
+                    .execute(&pool)
+                    .await;
+                pool.close().await;
+            });
+        }));
+    })
+}
+
+/// One MySQL column's decoding rule, keyed by `TypeInfo::name()`.
+#[cfg(feature = "mysql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MyCellKind {
+    /// TINYINT through BIGINT, plus BOOLEAN (MySQL's TINYINT(1) alias).
+    Signed,
+    /// The `* UNSIGNED` names. Values above i64::MAX print as text.
+    Unsigned,
+    Float,
+    Year,
+    Date,
+    Time,
+    /// DATETIME and TIMESTAMP.
+    DateTime,
+    /// Binary payloads: BINARY, VARBINARY, the BLOB family, BIT, GEOMETRY.
+    Blob,
+    /// Text rendering: strings, decimals, JSON, enum, set, and anything
+    /// unlisted.
+    Text,
+}
+
+#[cfg(feature = "mysql")]
+fn my_cell_kind(type_name: &str) -> MyCellKind {
+    match type_name {
+        "BOOLEAN" | "TINYINT" | "SMALLINT" | "INT" | "MEDIUMINT" | "BIGINT" => MyCellKind::Signed,
+        "TINYINT UNSIGNED"
+        | "SMALLINT UNSIGNED"
+        | "INT UNSIGNED"
+        | "MEDIUMINT UNSIGNED"
+        | "BIGINT UNSIGNED" => MyCellKind::Unsigned,
+        "FLOAT" | "DOUBLE" => MyCellKind::Float,
+        "YEAR" => MyCellKind::Year,
+        "DATE" => MyCellKind::Date,
+        "TIME" => MyCellKind::Time,
+        "DATETIME" | "TIMESTAMP" => MyCellKind::DateTime,
+        "BINARY" | "VARBINARY" | "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BIT"
+        | "GEOMETRY" => MyCellKind::Blob,
+        _ => MyCellKind::Text,
+    }
+}
+
+/// Renders a MySQL binary temporal payload the way the server's text
+/// protocol would. Byte one is the payload length, then little-endian date
+/// and time fields; a payload that fails the length check passes through as
+/// bytes, which keeps a string-shaped value readable.
+#[cfg(feature = "mysql")]
+fn my_temporal_text(type_name: &str, bytes: &[u8]) -> String {
+    let Some((&len, body)) = bytes.split_first() else {
+        return String::new();
+    };
+    if usize::from(len) != body.len() {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let year = || u16::from_le_bytes([body[0], body[1]]);
+    let u32_at =
+        |at: usize| u32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+    match type_name {
+        "DATE" => match body.len() {
+            0 => "0000-00-00".to_owned(),
+            4 => format!("{:04}-{:02}-{:02}", year(), body[2], body[3]),
+            _ => String::from_utf8_lossy(bytes).into_owned(),
+        },
+        "TIME" => match body.len() {
+            0 => "00:00:00".to_owned(),
+            8 | 12 => {
+                let sign = if body[0] == 0 { "" } else { "-" };
+                let hours = u32_at(1) * 24 + u32::from(body[5]);
+                let mut out = format!("{sign}{hours:02}:{:02}:{:02}", body[6], body[7]);
+                if body.len() == 12 {
+                    out.push_str(&format!(".{:06}", u32_at(8)));
+                }
+                out
+            }
+            _ => String::from_utf8_lossy(bytes).into_owned(),
+        },
+        _ => match body.len() {
+            0 => "0000-00-00 00:00:00".to_owned(),
+            4 => format!("{:04}-{:02}-{:02} 00:00:00", year(), body[2], body[3]),
+            7 | 11 => {
+                let mut out = format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    year(),
+                    body[2],
+                    body[3],
+                    body[4],
+                    body[5],
+                    body[6]
+                );
+                if body.len() == 11 {
+                    out.push_str(&format!(".{:06}", u32_at(7)));
+                }
+                out
+            }
+            _ => String::from_utf8_lossy(bytes).into_owned(),
+        },
+    }
+}
+
+/// Pure URL builder for MySQL. User, password, and database are
+/// percent-encoded; an empty or missing password omits the secret part.
+/// TLS parameters land with their own unit, so no query string yet.
+pub fn mysql_url(
+    host: &str,
+    port: u16,
+    database: &str,
+    user: &str,
+    password: Option<&str>,
+) -> String {
+    let user_enc = percent_encode(user);
+    let db_enc = percent_encode(database);
+    match password {
+        Some(s) if !s.is_empty() => {
+            let enc: String = percent_encode(s);
+            format!("mysql://{user_enc}:{enc}@{host}:{port}/{db_enc}")
+        }
+        _ => format!("mysql://{user_enc}@{host}:{port}/{db_enc}"),
+    }
+}
+
+/// One `information_schema` string cell. Unchecked because MySQL 8 reports
+/// some of those columns with the binary flag, which the checked path
+/// rejects; the value is still decoded from UTF-8 and never coerced.
+#[cfg(feature = "mysql")]
+fn my_string(row: &sqlx::mysql::MySqlRow, index: usize) -> Result<String, DbError> {
+    use sqlx::Row as _;
+    row.try_get_unchecked::<String, _>(index)
+        .map_err(|e| DbError::Query(e.to_string()))
+}
+
+#[cfg(feature = "mysql")]
+fn map_my_row(row: &sqlx::mysql::MySqlRow) -> Result<Vec<Value>, DbError> {
+    use sqlx::{Column as _, Row as _, TypeInfo as _};
+    let mut cells = Vec::with_capacity(row.len());
+    for index in 0..row.len() {
+        let type_name = row.column(index).type_info().name().to_owned();
+        cells.push(decode_my_cell(row, index, &type_name)?);
+    }
+    Ok(cells)
+}
+
+#[cfg(feature = "mysql")]
+fn decode_my_cell(
+    row: &sqlx::mysql::MySqlRow,
+    index: usize,
+    type_name: &str,
+) -> Result<Value, DbError> {
+    match my_cell_kind(type_name) {
+        MyCellKind::Signed => my_option_cell(row, index, Value::Integer),
+        MyCellKind::Unsigned => {
+            use sqlx::Row as _;
+            row.try_get_unchecked::<Option<u64>, _>(index)
+                .map(|cell| match cell {
+                    Some(n) => match i64::try_from(n) {
+                        Ok(n) => Value::Integer(n),
+                        Err(_) => Value::Text(n.to_string()),
+                    },
+                    None => Value::Null,
+                })
+                .map_err(|e| DbError::Query(e.to_string()))
+        }
+        MyCellKind::Float => my_option_cell(row, index, Value::Real),
+        MyCellKind::Year => my_option_cell(row, index, |n: u16| Value::Integer(i64::from(n))),
+        MyCellKind::Date | MyCellKind::Time | MyCellKind::DateTime => {
+            use sqlx::Row as _;
+            row.try_get_unchecked::<Option<Vec<u8>>, _>(index)
+                .map(|cell| match cell {
+                    Some(bytes) => Value::Text(my_temporal_text(type_name, &bytes)),
+                    None => Value::Null,
+                })
+                .map_err(|e| DbError::Query(e.to_string()))
+        }
+        MyCellKind::Blob => my_option_cell(row, index, Value::Blob),
+        // The binary protocol already sends decimals, strings, and JSON as
+        // their display bytes, so the text decode is the whole job.
+        MyCellKind::Text => {
+            use sqlx::Row as _;
+            row.try_get_unchecked::<Option<String>, _>(index)
+                .map(|cell| cell.map(Value::Text).unwrap_or(Value::Null))
+                .map_err(|e| DbError::Query(e.to_string()))
+        }
+    }
+}
+
+/// Unchecked decode, because MySQL's leading `UNSIGNED` flag does not change
+/// the type name for TINYINT(1) and would fail the checked compatibility gate.
+#[cfg(feature = "mysql")]
+fn my_option_cell<T>(
+    row: &sqlx::mysql::MySqlRow,
+    index: usize,
+    into_value: impl FnOnce(T) -> Value,
+) -> Result<Value, DbError>
+where
+    T: for<'r> sqlx::Decode<'r, sqlx::MySql> + sqlx::Type<sqlx::MySql>,
+{
+    use sqlx::Row as _;
+    row.try_get_unchecked::<Option<T>, _>(index)
+        .map(|cell| cell.map(into_value).unwrap_or(Value::Null))
+        .map_err(|e| DbError::Query(e.to_string()))
 }
 
 /// Builds the Postgres cancel closure. Owns the connection string plus the
@@ -2416,6 +3103,117 @@ mod tests {
         assert_eq!(PostgresSslMode::default(), PostgresSslMode::Disable);
     }
 
+    #[test]
+    fn mysql_kind_defaults_and_registry() {
+        assert_eq!(DbKind::Mysql.label(), "MySQL");
+        assert_eq!(DbKind::Mysql.default_port(), Some(3306));
+        assert_eq!(
+            DbKind::Mysql.default_config(),
+            ConnectionConfig::Mysql {
+                host: "localhost".to_owned(),
+                port: 3306,
+                database: String::new(),
+                user: String::new(),
+            }
+        );
+        assert_eq!(DbKind::Mysql.default_config().kind(), DbKind::Mysql);
+        let kinds: Vec<DbKind> = DriverRegistry::bundled().all().collect();
+        assert_eq!(kinds, vec![DbKind::Sqlite, DbKind::Postgres, DbKind::Mysql]);
+    }
+
+    #[test]
+    fn mysql_config_roundtrips_through_json() {
+        let config = ConnectionConfig::Mysql {
+            host: "db.internal".to_owned(),
+            port: 3307,
+            database: "cde_test".to_owned(),
+            user: "root".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_string(&config).unwrap(),
+            r#"{"kind":"mysql","host":"db.internal","port":3307,"database":"cde_test","user":"root"}"#
+        );
+        let back: ConnectionConfig = serde_json::from_str(&serde_json::to_string(&config).unwrap())
+            .unwrap();
+        assert_eq!(back, config);
+        assert!(back.prompts_for_password());
+        assert!(!ConnectionConfig::Sqlite { path: ":memory:".into() }.prompts_for_password());
+    }
+
+    #[test]
+    fn mysql_config_validate_matches_postgres_rules() {
+        let bad = |host: &str, port: u16, database: &str, user: &str| ConnectionConfig::Mysql {
+            host: host.to_owned(),
+            port,
+            database: database.to_owned(),
+            user: user.to_owned(),
+        };
+        assert!(
+            bad("localhost", 3306, "cde_test", "root").validate().is_ok()
+        );
+        assert_eq!(
+            bad(" ", 3306, "cde_test", "root").validate(),
+            Err(DbError::Config("host is empty".to_owned()))
+        );
+        assert_eq!(
+            bad("localhost", 0, "cde_test", "root").validate(),
+            Err(DbError::Config("port is not set".to_owned()))
+        );
+        assert_eq!(
+            bad("localhost", 3306, " ", "root").validate(),
+            Err(DbError::Config("database is empty".to_owned()))
+        );
+        assert_eq!(
+            bad("localhost", 3306, "cde_test", " ").validate(),
+            Err(DbError::Config("user is empty".to_owned()))
+        );
+    }
+
+    #[test]
+    fn mysql_url_without_password_omits_secret() {
+        assert_eq!(
+            mysql_url("localhost", 3306, "cde_test", "root", None),
+            "mysql://root@localhost:3306/cde_test"
+        );
+        assert_eq!(
+            mysql_url("localhost", 3306, "cde_test", "root", Some("")),
+            "mysql://root@localhost:3306/cde_test"
+        );
+    }
+
+    #[test]
+    fn mysql_url_with_password_includes_secret() {
+        assert_eq!(
+            mysql_url("db.internal", 3307, "cde_test", "root", Some("cdepass")),
+            "mysql://root:cdepass@db.internal:3307/cde_test"
+        );
+    }
+
+    #[test]
+    fn mysql_url_encodes_special_chars_in_user_and_password() {
+        assert_eq!(
+            mysql_url("localhost", 3306, "cde test", "ad min", Some("p@ss:w/ord?")),
+            "mysql://ad%20min:p%40ss%3Aw%2Ford%3F@localhost:3306/cde%20test"
+        );
+    }
+
+    #[cfg(not(feature = "mysql"))]
+    #[test]
+    fn mysql_feature_off_reports_config_error() {
+        let config = ConnectionConfig::Mysql {
+            host: "localhost".to_owned(),
+            port: 3306,
+            database: "cde_test".to_owned(),
+            user: "root".to_owned(),
+        };
+        match Session::open(&config, Some("cdepass")) {
+            Err(error) => {
+                assert_eq!(error, DbError::Config("mysql feature not enabled".to_owned()));
+            }
+            Ok(_) => panic!("expected the feature-off stub to refuse"),
+        }
+    }
+
     #[cfg(feature = "postgres")]
     #[test]
     fn pg_cell_kind_covers_listed_type_names() {
@@ -2484,6 +3282,8 @@ mod tests {
         match &session {
             Session::Postgres(pg) => assert!(pg.backend_pid > 0),
             Session::Sqlite(_) => panic!("expected a Postgres session"),
+            #[cfg(feature = "mysql")]
+            Session::Mysql(_) => panic!("expected a Postgres session"),
         }
         let cancel = session.cancel_handle();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2693,6 +3493,288 @@ mod tests {
         assert_eq!(result.cell(0, 1), Some(&Value::Text("Ada".to_owned())));
         assert_eq!(result.cell(1, 0), Some(&Value::Integer(3)));
         assert_eq!(result.cell(1, 1), Some(&Value::Text("Lin".to_owned())));
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn my_cell_kind_covers_listed_type_names() {
+        for name in ["BOOLEAN", "TINYINT", "SMALLINT", "INT", "MEDIUMINT", "BIGINT"] {
+            assert_eq!(my_cell_kind(name), MyCellKind::Signed, "{name}");
+        }
+        for name in [
+            "TINYINT UNSIGNED",
+            "SMALLINT UNSIGNED",
+            "INT UNSIGNED",
+            "MEDIUMINT UNSIGNED",
+            "BIGINT UNSIGNED",
+        ] {
+            assert_eq!(my_cell_kind(name), MyCellKind::Unsigned, "{name}");
+        }
+        for name in ["FLOAT", "DOUBLE"] {
+            assert_eq!(my_cell_kind(name), MyCellKind::Float, "{name}");
+        }
+        assert_eq!(my_cell_kind("YEAR"), MyCellKind::Year);
+        assert_eq!(my_cell_kind("DATE"), MyCellKind::Date);
+        assert_eq!(my_cell_kind("TIME"), MyCellKind::Time);
+        for name in ["DATETIME", "TIMESTAMP"] {
+            assert_eq!(my_cell_kind(name), MyCellKind::DateTime, "{name}");
+        }
+        for name in [
+            "BINARY",
+            "VARBINARY",
+            "BLOB",
+            "TINYBLOB",
+            "MEDIUMBLOB",
+            "LONGBLOB",
+            "BIT",
+            "GEOMETRY",
+        ] {
+            assert_eq!(my_cell_kind(name), MyCellKind::Blob, "{name}");
+        }
+        for name in [
+            "DECIMAL",
+            "JSON",
+            "VARCHAR",
+            "CHAR",
+            "TEXT",
+            "ENUM",
+            "SET",
+            "NULL",
+            "some_custom_type",
+        ] {
+            assert_eq!(my_cell_kind(name), MyCellKind::Text, "{name}");
+        }
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn my_temporal_text_restores_server_text() {
+        // Byte layouts captured from a live MySQL 8.4 server.
+        assert_eq!(my_temporal_text("DATE", &[4, 234, 7, 10, 13]), "2026-10-13");
+        assert_eq!(my_temporal_text("DATE", &[0]), "0000-00-00");
+        assert_eq!(
+            my_temporal_text("TIME", &[8, 0, 0, 0, 0, 0, 12, 34, 56]),
+            "12:34:56"
+        );
+        assert_eq!(my_temporal_text("TIME", &[0]), "00:00:00");
+        assert_eq!(
+            my_temporal_text("TIME", &[12, 1, 0, 0, 0, 0, 12, 34, 56, 64, 226, 1, 0]),
+            "-12:34:56.123456"
+        );
+        assert_eq!(
+            my_temporal_text("TIME", &[8, 0, 34, 0, 0, 0, 22, 59, 59]),
+            "838:59:59"
+        );
+        assert_eq!(
+            my_temporal_text("TIME", &[8, 1, 34, 0, 0, 0, 22, 59, 59]),
+            "-838:59:59"
+        );
+        assert_eq!(
+            my_temporal_text("DATETIME", &[7, 234, 7, 10, 13, 12, 34, 56]),
+            "2026-10-13 12:34:56"
+        );
+        assert_eq!(
+            my_temporal_text(
+                "DATETIME",
+                &[11, 234, 7, 10, 13, 12, 34, 56, 64, 226, 1, 0]
+            ),
+            "2026-10-13 12:34:56.123456"
+        );
+        assert_eq!(
+            my_temporal_text("TIMESTAMP", &[4, 234, 7, 10, 13]),
+            "2026-10-13 00:00:00"
+        );
+        assert_eq!(my_temporal_text("DATETIME", &[0]), "0000-00-00 00:00:00");
+        assert_eq!(my_temporal_text("DATE", b"2026-10-13"), "2026-10-13");
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn my_cancel_handle_double_fire_is_safe_without_server() {
+        let unknown = mysql_cancel_handle("mysql://root@localhost:3307/cde_test".to_owned(), 0);
+        unknown.cancel();
+        unknown.cancel();
+        let bad_url = mysql_cancel_handle("not-a-url".to_owned(), 424_242);
+        bad_url.cancel();
+        bad_url.cancel();
+    }
+
+    #[cfg(feature = "mysql")]
+    fn mysql_live_config() -> ConnectionConfig {
+        ConnectionConfig::Mysql {
+            host: std::env::var("MYSQLHOST").unwrap_or_else(|_| "localhost".to_owned()),
+            port: std::env::var("MYSQLPORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(3306),
+            database: std::env::var("MYSQLDATABASE").unwrap_or_else(|_| "cde_test".to_owned()),
+            user: std::env::var("MYSQLUSER").unwrap_or_else(|_| "root".to_owned()),
+        }
+    }
+
+    #[cfg(feature = "mysql")]
+    fn mysql_live_open() -> Session {
+        let config = mysql_live_config();
+        let password = std::env::var("MYSQLPASSWORD").ok();
+        Session::open(&config, password.as_deref()).expect("open MySQL")
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    #[ignore = "needs a live MySQL; set MYSQLHOST/MYSQLPORT/MYSQLDATABASE/MYSQLUSER/MYSQLPASSWORD"]
+    fn mysql_live_roundtrip_covers_result_and_affected_paths() {
+        let mut session = mysql_live_open();
+        assert!(!session.server_version().is_empty());
+        session
+            .query(
+                "CREATE TEMPORARY TABLE cde_probe (\
+                 id INT, name VARCHAR(64), active TINYINT(1), ratio DOUBLE, \
+                 amount DECIMAL(10,2), born DATE, at DATETIME, clock TIME, \
+                 delta TIME, payload BLOB, big BIGINT UNSIGNED, note VARCHAR(64))",
+            )
+            .expect("create");
+        let inserted = session
+            .query(
+                "INSERT INTO cde_probe VALUES (1, 'ada', TRUE, 1.5, 1.5, \
+                 '2026-10-13', '2026-10-13 12:34:56', '12:34:56', '-12:34:56', \
+                 X'0102', 18446744073709551615, NULL)",
+            )
+            .expect("insert");
+        assert_eq!(inserted.affected(), Some(1));
+        let result = session
+            .query(
+                "SELECT id, name, active, ratio, amount, born, at, clock, delta, \
+                 payload, big, note FROM cde_probe ORDER BY id",
+            )
+            .expect("select");
+        assert_eq!(result.row_count(), 1);
+        assert_eq!(result.affected(), None);
+        assert_eq!(result.columns()[0].type_name(), "INT");
+        assert_eq!(result.columns()[2].type_name(), "BOOLEAN");
+        assert_eq!(result.columns()[5].type_name(), "DATE");
+        assert_eq!(result.columns()[7].type_name(), "TIME");
+        assert_eq!(result.columns()[10].type_name(), "BIGINT UNSIGNED");
+        assert_eq!(result.cell(0, 0), Some(&Value::Integer(1)));
+        assert_eq!(result.cell(0, 1), Some(&Value::Text("ada".to_owned())));
+        assert_eq!(result.cell(0, 2), Some(&Value::Integer(1)));
+        assert_eq!(result.cell(0, 3), Some(&Value::Real(1.5)));
+        assert_eq!(result.cell(0, 4), Some(&Value::Text("1.50".to_owned())));
+        assert_eq!(result.cell(0, 5), Some(&Value::Text("2026-10-13".to_owned())));
+        assert_eq!(
+            result.cell(0, 6),
+            Some(&Value::Text("2026-10-13 12:34:56".to_owned()))
+        );
+        assert_eq!(result.cell(0, 7), Some(&Value::Text("12:34:56".to_owned())));
+        assert_eq!(result.cell(0, 8), Some(&Value::Text("-12:34:56".to_owned())));
+        assert_eq!(result.cell(0, 9), Some(&Value::Blob(vec![0x01, 0x02])));
+        assert_eq!(
+            result.cell(0, 10),
+            Some(&Value::Text("18446744073709551615".to_owned()))
+        );
+        assert_eq!(result.cell(0, 11), Some(&Value::Null));
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    #[ignore = "needs a live MySQL; set MYSQLHOST/MYSQLPORT/MYSQLDATABASE/MYSQLUSER/MYSQLPASSWORD"]
+    fn mysql_live_schema_introspection_returns_non_empty() {
+        let config = mysql_live_config();
+        let ConnectionConfig::Mysql { database, .. } = &config else {
+            panic!("expected a mysql config");
+        };
+        let mut session = mysql_live_open();
+        session.query("DROP VIEW IF EXISTS cde_schema_view").expect("drop view");
+        session.query("DROP TABLE IF EXISTS cde_schema_probe").expect("drop table");
+        session
+            .query(
+                "CREATE TABLE cde_schema_probe (\
+                 id INT NOT NULL, name VARCHAR(64), amount DECIMAL(10,2), \
+                 PRIMARY KEY (id), UNIQUE KEY u_cde_name (name), \
+                 KEY i_cde_amount (amount))",
+            )
+            .expect("create table");
+        session
+            .query("CREATE VIEW cde_schema_view AS SELECT id FROM cde_schema_probe")
+            .expect("create view");
+        let schema = session.schema();
+        session.query("DROP VIEW IF EXISTS cde_schema_view").expect("cleanup view");
+        session.query("DROP TABLE IF EXISTS cde_schema_probe").expect("cleanup table");
+        let schema = schema.expect("schema loads");
+        assert!(!schema.is_empty());
+        let node = schema
+            .databases()
+            .iter()
+            .find(|d| d.name() == database.as_str())
+            .expect("connected database node");
+        assert_eq!(node.schemas().len(), 1);
+        let main = &node.schemas()[0];
+        assert_eq!(main.name(), database.as_str());
+        let table = main
+            .tables()
+            .iter()
+            .find(|t| t.name() == "cde_schema_probe")
+            .expect("probe table");
+        let col_names: Vec<&str> = table.columns().iter().map(|c| c.name()).collect();
+        assert_eq!(col_names, vec!["id", "name", "amount"]);
+        let id = &table.columns()[0];
+        assert_eq!(id.pk_position(), Some(1));
+        assert!(!id.nullable());
+        assert_eq!(id.type_name(), "int");
+        let name_idx = table
+            .indexes()
+            .iter()
+            .find(|i| i.name() == "u_cde_name")
+            .expect("unique index");
+        assert!(name_idx.unique());
+        assert_eq!(name_idx.columns(), &["name".to_owned()]);
+        let plain_idx = table
+            .indexes()
+            .iter()
+            .find(|i| i.name() == "i_cde_amount")
+            .expect("plain index");
+        assert!(!plain_idx.unique());
+        let pk: Vec<&ConstraintInfo> = table
+            .constraints()
+            .iter()
+            .filter(|c| c.kind() == ConstraintKind::Pk)
+            .collect();
+        assert_eq!(pk.len(), 1);
+        assert_eq!(pk[0].name(), "PRIMARY");
+        assert_eq!(pk[0].columns(), &["id".to_owned()]);
+        let view_names: Vec<&str> = main.views().iter().map(|t| t.name()).collect();
+        assert!(view_names.contains(&"cde_schema_view"), "{view_names:?}");
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    #[ignore = "needs a live MySQL; set MYSQLHOST/MYSQLPORT/MYSQLDATABASE/MYSQLUSER/MYSQLPASSWORD"]
+    fn mysql_live_cancel_stops_a_running_batch() {
+        let session = mysql_live_open();
+        let cancel = session.cancel_handle();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut session = session;
+            // SLEEP() returns 1 when killed instead of erroring, so the
+            // interruptible statement is a cross join that never finishes.
+            let statements: Vec<String> = vec![
+                "SELECT 1".to_owned(),
+                "SELECT COUNT(*) FROM information_schema.columns a \
+                 CROSS JOIN information_schema.columns b \
+                 CROSS JOIN information_schema.columns c"
+                    .to_owned(),
+                "SELECT 3".to_owned(),
+            ];
+            let _ = tx.send(run_statements(&mut session, &statements));
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        cancel.cancel();
+        cancel.cancel();
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("batch returns within 10s after cancel");
+        let (index, error) = outcome.expect_err("cancelled batch fails");
+        assert_eq!(index, 1);
+        assert!(matches!(error, DbError::Query(_)));
     }
 
     #[test]

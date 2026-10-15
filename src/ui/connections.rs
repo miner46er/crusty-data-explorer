@@ -303,10 +303,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                                 .iter()
                                 .find(|c| c.id == id)
                                 .is_some_and(|c| {
-                                    matches!(
-                                        c.config,
-                                        ConnectionConfig::Postgres { .. }
-                                    ) && c.password.is_empty()
+                                    c.config.prompts_for_password() && c.password.is_empty()
                                 });
                             if needs_prompt {
                                 state.open_password_prompt(id);
@@ -472,8 +469,32 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
                         });
                 });
             }
+            ConnectionConfig::Mysql { host, port, database, user } => {
+                ui.horizontal(|ui| {
+                    ui.label("Host:");
+                    ui.text_edit_singleline(host);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Port:");
+                    let mut text = port.to_string();
+                    if ui.text_edit_singleline(&mut text).changed() {
+                        if let Ok(p) = text.parse() {
+                            *port = p;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Database:");
+                    ui.text_edit_singleline(database);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("User:");
+                    ui.text_edit_singleline(user);
+                });
+                // MySQL TLS options land with their own unit, so no SSL row yet.
+            }
         }
-        if matches!(draft.config, ConnectionConfig::Postgres { .. }) {
+        if draft.config.prompts_for_password() {
             ui.horizontal(|ui| {
                 ui.label("Password:");
                 ui.add(egui::TextEdit::singleline(&mut draft.password).password(true));

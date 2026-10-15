@@ -227,7 +227,8 @@ pub fn show_table_ddl(ui: &mut egui::Ui, table: &TableInfo, dialect: DbKind) {
         DbKind::Sqlite => {
             table_ddl_sqlite(table.name(), table.columns(), &merged, table.indexes())
         }
-        DbKind::Postgres => {
+        // MySQL reuses the shared builder until its own quoting unit lands.
+        DbKind::Postgres | DbKind::Mysql => {
             table_ddl_postgres(table.name(), table.columns(), &merged, table.indexes())
         }
     };

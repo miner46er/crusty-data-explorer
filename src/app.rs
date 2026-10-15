@@ -1158,7 +1158,7 @@ impl AppState {
     }
 
     /// Proceed with the connection whose prod confirmation is pending,
-    /// including the Postgres password prompt when no password is stored.
+    /// including the password prompt when no password is stored.
     pub fn confirm_prod(&mut self) {
         let Some(id) = self.pending_prod.take() else { return };
         self.prompt_or_connect(id);
@@ -1196,12 +1196,10 @@ impl AppState {
         self.prompt_or_connect(id);
     }
 
-    /// Prompt when a Postgres connection has no password, else spawn.
+    /// Prompt when a password engine has no password stored, else spawn.
     fn prompt_or_connect(&mut self, id: ConnectionId) {
         let should_prompt = match self.connections.iter().find(|c| c.id == id) {
-            Some(c) => {
-                matches!(c.config, ConnectionConfig::Postgres { .. }) && c.password.is_empty()
-            }
+            Some(c) => c.config.prompts_for_password() && c.password.is_empty(),
             None => return,
         };
         if should_prompt {
@@ -1947,6 +1945,24 @@ mod tests {
                 database: "appdb".to_owned(),
                 user: "owner".to_owned(),
                 ssl_mode: PostgresSslMode::Disable,
+            };
+            draft.password = password.to_owned();
+        }
+        state.save_draft();
+        state.connections().last().map(|c| c.id).expect("saved connection")
+    }
+
+    fn add_mysql_connection(state: &mut AppState, name: &str, password: &str) -> ConnectionId {
+        state.open_draft(None);
+        {
+            let draft = state.draft_mut().expect("new draft");
+            draft.name = name.to_owned();
+            draft.env = Environment::Dev;
+            draft.config = ConnectionConfig::Mysql {
+                host: "localhost".to_owned(),
+                port: 3307,
+                database: "cde_test".to_owned(),
+                user: "root".to_owned(),
             };
             draft.password = password.to_owned();
         }
@@ -3062,6 +3078,53 @@ mod tests {
             assert_eq!(state.prompt_password(), "");
             let conn = state.connections().iter().find(|c| c.id == empty).expect("pg");
             assert!(matches!(conn.state(), ConnectionState::Disconnected));
+        });
+    }
+
+    #[test]
+    fn prompt_opens_for_mysql_with_empty_password() {
+        with_isolated_state("pw-mysql", |state| {
+            let stored = add_mysql_connection(state, "my-stored", "cdepass");
+            state.open_password_prompt(stored);
+            assert_eq!(state.password_prompt(), None);
+            assert!(state.prompt_password().is_empty());
+            let conn =
+                state.connections().iter().find(|c| c.id == stored).expect("mysql");
+            assert!(matches!(conn.state(), ConnectionState::Connecting { .. }));
+
+            let empty = add_mysql_connection(state, "my-empty", "");
+            state.open_password_prompt(empty);
+            assert_eq!(state.password_prompt(), Some(empty));
+            assert_eq!(state.prompt_password(), "");
+            let conn = state.connections().iter().find(|c| c.id == empty).expect("mysql");
+            assert!(matches!(conn.state(), ConnectionState::Disconnected));
+        });
+    }
+
+    #[test]
+    fn mysql_profile_roundtrips_through_save_and_load() {
+        with_isolated_state("mysql-persist", |state| {
+            let id = add_mysql_connection(state, "mysql", "cdepass");
+            let raw = std::fs::read_to_string(profiles_path()).expect("profiles file");
+            let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(json[0]["config"]["kind"], serde_json::json!("mysql"));
+            assert_eq!(json[0]["config"]["port"], serde_json::json!(3307));
+            assert!(!raw.contains("cdepass"));
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.connections().len(), 1);
+            let conn = &reloaded.connections()[0];
+            assert_eq!(conn.id, id);
+            assert_eq!(conn.name, "mysql");
+            assert_eq!(
+                conn.config,
+                ConnectionConfig::Mysql {
+                    host: "localhost".to_owned(),
+                    port: 3307,
+                    database: "cde_test".to_owned(),
+                    user: "root".to_owned(),
+                }
+            );
+            assert!(conn.password.is_empty());
         });
     }
 
