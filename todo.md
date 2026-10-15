@@ -46,10 +46,10 @@ Wave 2 — serial core chain on `src/app.rs` Tab machine + `src/db.rs` worker.
 - [x] T4 Run scope + multi-statement + resultset picker (after Wave 1). Extends `RunOutcome`, splitter, picker UI. Blocks T6, T2. Landed f859206, live batch tests green.
 - [x] T6 EXPLAIN plan view (after T4). EXPLAIN runner, rows rendered in grid. Read-only. Landed with live tests on both engines.
 - [x] T2 Inline editing (after T4, T6). Grid dirty tracking + PK-aware UPDATE/INSERT/DELETE + worker write command. Landed 153be64, live write tests green. Edge fix for qualified names + typed keys landed with the same wave.
-- [ ] T7b CSV import (after T2). Column mapper + batched INSERT on T2 write path. Tests: quoting + roundtrip. In flight on deepseek max.
+- [x] T7b CSV import (after T2). Column mapper + batched INSERT on T2 write path. Landed feec93d, modal shortcut gate fixed in query.rs.
 
 Wave 3 — serial drivers on config shape, after Wave 2 (shared `src/db.rs`).
-- [ ] T9b MySQL session cage mirroring `PgSession` behind feature. Tests: gated roundtrip.
+- [ ] T9b MySQL session cage mirroring `PgSession` behind feature. Tests: gated roundtrip. In flight on deepseek max.
 - [ ] T8b SSH tunnel (last, heaviest). Spike prototype first, then real build. Tests: forward + connect.
 
 Per-unit verify: `cargo check`, `cargo check --features postgres`, `cargo test`, `cargo test --features postgres` (live ignored), plus live probe where noted.
