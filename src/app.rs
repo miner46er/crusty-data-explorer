@@ -215,6 +215,8 @@ pub struct AppState {
     tabs: Vec<Tab>,
     active: Option<TabId>,
     draft: Option<ConnectDraft>,
+    password_prompt: Option<ConnectionId>,
+    prompt_password: String,
     ids: Ids,
     registry: DriverRegistry,
     events_tx: mpsc::Sender<DbEvent>,
@@ -241,6 +243,8 @@ impl AppState {
             tabs: Vec::new(),
             active: None,
             draft: None,
+            password_prompt: None,
+            prompt_password: String::new(),
             ids,
             registry: DriverRegistry::bundled(),
             events_tx,
@@ -430,6 +434,45 @@ impl AppState {
         if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
             c.password = password;
         }
+    }
+
+    pub fn password_prompt(&self) -> Option<ConnectionId> {
+        self.password_prompt
+    }
+
+    pub fn prompt_password(&self) -> &str {
+        &self.prompt_password
+    }
+
+    pub fn prompt_password_mut(&mut self) -> &mut String {
+        &mut self.prompt_password
+    }
+
+    pub fn open_password_prompt(&mut self, id: ConnectionId) {
+        let should_prompt = match self.connections.iter().find(|c| c.id == id) {
+            Some(c) => {
+                matches!(c.config, ConnectionConfig::Postgres { .. }) && c.password.is_empty()
+            }
+            None => return,
+        };
+        if should_prompt {
+            self.password_prompt = Some(id);
+            self.prompt_password.clear();
+        } else {
+            self.connect(id);
+        }
+    }
+
+    pub fn submit_password(&mut self) {
+        let Some(id) = self.password_prompt.take() else { return };
+        let password = std::mem::take(&mut self.prompt_password);
+        self.set_password(id, password);
+        self.connect(id);
+    }
+
+    pub fn cancel_password_prompt(&mut self) {
+        self.password_prompt = None;
+        self.prompt_password.clear();
     }
 
     pub fn disconnect(&mut self, id: ConnectionId) {
@@ -1039,6 +1082,27 @@ mod tests {
         state.connections().last().map(|c| c.id).expect("saved connection")
     }
 
+    fn add_postgres_connection(
+        state: &mut AppState,
+        name: &str,
+        password: &str,
+    ) -> ConnectionId {
+        state.open_draft(None);
+        {
+            let draft = state.draft_mut().expect("new draft");
+            draft.name = name.to_owned();
+            draft.config = ConnectionConfig::Postgres {
+                host: "localhost".to_owned(),
+                port: 5432,
+                database: "appdb".to_owned(),
+                user: "owner".to_owned(),
+            };
+            draft.password = password.to_owned();
+        }
+        state.save_draft();
+        state.connections().last().map(|c| c.id).expect("saved connection")
+    }
+
     fn finish_ok(state: &mut AppState, conn: ConnectionId, sql: &str) {
         let tab = state.new_tab(conn);
         if let Some(slot) = state.tab_sql_mut(tab) {
@@ -1498,5 +1562,70 @@ mod tests {
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_opens_only_for_postgres_with_empty_password() {
+        with_isolated_state("pw-open", |state| {
+            let sqlite = add_sqlite_connection(state, "mem");
+            state.open_password_prompt(sqlite);
+            assert_eq!(state.password_prompt(), None);
+            assert!(state.prompt_password().is_empty());
+
+            let stored = add_postgres_connection(state, "pg-stored", "secret");
+            state.open_password_prompt(stored);
+            assert_eq!(state.password_prompt(), None);
+            assert!(state.prompt_password().is_empty());
+
+            let empty = add_postgres_connection(state, "pg-empty", "");
+            state.open_password_prompt(empty);
+            assert_eq!(state.password_prompt(), Some(empty));
+            assert_eq!(state.prompt_password(), "");
+            let conn = state.connections().iter().find(|c| c.id == empty).expect("pg");
+            assert!(matches!(conn.state(), ConnectionState::Disconnected));
+        });
+    }
+
+    #[test]
+    fn submit_stores_and_clears() {
+        with_isolated_state("pw-submit", |state| {
+            let pg = add_postgres_connection(state, "pg", "");
+            state.open_password_prompt(pg);
+            assert_eq!(state.password_prompt(), Some(pg));
+            state.prompt_password_mut().push_str("s3cret");
+            state.submit_password();
+            assert_eq!(state.password_prompt(), None);
+            assert!(state.prompt_password().is_empty());
+            let conn = state.connections().iter().find(|c| c.id == pg).expect("pg");
+            assert_eq!(conn.password, "s3cret");
+            assert!(matches!(conn.state(), ConnectionState::Connecting { .. }));
+        });
+    }
+
+    #[test]
+    fn cancel_clears_without_storing() {
+        with_isolated_state("pw-cancel", |state| {
+            let pg = add_postgres_connection(state, "pg", "");
+            state.open_password_prompt(pg);
+            state.prompt_password_mut().push_str("typed");
+            state.cancel_password_prompt();
+            assert_eq!(state.password_prompt(), None);
+            assert!(state.prompt_password().is_empty());
+            let conn = state.connections().iter().find(|c| c.id == pg).expect("pg");
+            assert!(conn.password.is_empty());
+            assert!(matches!(conn.state(), ConnectionState::Disconnected));
+        });
+    }
+
+    #[test]
+    fn sqlite_connects_directly_without_prompt() {
+        with_isolated_state("pw-sqlite", |state| {
+            let sqlite = add_sqlite_connection(state, "mem");
+            state.open_password_prompt(sqlite);
+            assert_eq!(state.password_prompt(), None);
+            let conn =
+                state.connections().iter().find(|c| c.id == sqlite).expect("sqlite");
+            assert!(matches!(conn.state(), ConnectionState::Connecting { .. }));
+        });
     }
 }

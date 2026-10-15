@@ -279,7 +279,23 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
 
                 for action in actions {
                     match action {
-                        SidebarAction::Connect(id) => state.connect(id),
+                        SidebarAction::Connect(id) => {
+                            let needs_prompt = state
+                                .connections()
+                                .iter()
+                                .find(|c| c.id == id)
+                                .is_some_and(|c| {
+                                    matches!(
+                                        c.config,
+                                        ConnectionConfig::Postgres { .. }
+                                    ) && c.password.is_empty()
+                                });
+                            if needs_prompt {
+                                state.open_password_prompt(id);
+                            } else {
+                                state.connect(id);
+                            }
+                        }
                         SidebarAction::Disconnect(id) => state.disconnect(id),
                         SidebarAction::NewQuery(id) => {
                             let tab = state.new_tab(id);
@@ -302,6 +318,35 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
             });
         });
     });
+}
+
+pub fn password_window(state: &mut AppState, ui: &mut egui::Ui) {
+    let Some(id) = state.password_prompt() else { return };
+    let Some(name) =
+        state.connections().iter().find(|c| c.id == id).map(|c| c.name.clone())
+    else {
+        state.cancel_password_prompt();
+        return;
+    };
+    let mut submit = false;
+    let mut cancel = false;
+    egui::Window::new(format!("Password for {name}")).show(ui.ctx(), |ui| {
+        ui.label(format!("Enter password for {name}"));
+        ui.add(egui::TextEdit::singleline(state.prompt_password_mut()).password(true));
+        ui.horizontal(|ui| {
+            if ui.button("Connect").clicked() {
+                submit = true;
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+        });
+    });
+    if submit {
+        state.submit_password();
+    } else if cancel {
+        state.cancel_password_prompt();
+    }
 }
 
 pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {

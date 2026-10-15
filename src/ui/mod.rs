@@ -21,6 +21,7 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
         .show(ui, |ui| query::editor(state, ui));
     egui::CentralPanel::default().show(ui, |ui| grid::results(state, ui));
     connections::draft_window(state, ui);
+    connections::password_window(state, ui);
 }
 
 fn status_bar(state: &AppState, ui: &mut egui::Ui) {
