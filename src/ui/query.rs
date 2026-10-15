@@ -43,16 +43,16 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
             .map(|c| format!("{} · {}", c.name, c.config.kind().label()))
             .unwrap_or_else(|| "no connection".to_owned());
         ui.label(egui::RichText::new(hint).small().weak());
+        let schema = state
+            .tab(id)
+            .map(|tab| tab.conn)
+            .and_then(|conn| state.schema(conn))
+            .cloned();
         if let Some(sql) = state.tab_sql_mut(id) {
             egui::Frame::canvas(ui.style())
                 .inner_margin(egui::Margin::same(6))
                 .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(sql)
-                            .code_editor()
-                            .desired_rows(8)
-                            .desired_width(f32::INFINITY),
-                    );
+                    super::complete::editor_with_completion(schema.as_ref(), sql, ui);
                 });
         }
     } else {
