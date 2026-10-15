@@ -38,6 +38,7 @@ pub struct LiveSession {
 pub struct Connection {
     pub id: ConnectionId,
     pub name: String,
+    pub env: Environment,
     pub config: ConnectionConfig,
     pub password: String,
     state: ConnectionState,
@@ -195,10 +196,41 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Target tier for a connection. Prod connects route through a confirmation
+/// first; the badge tells the tiers apart at a glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Environment {
+    #[default]
+    Dev,
+    Test,
+    Prod,
+}
+
+impl Environment {
+    pub const ALL: [Environment; 3] = [Environment::Dev, Environment::Test, Environment::Prod];
+    pub fn label(self) -> &'static str {
+        match self {
+            Environment::Dev => "Dev",
+            Environment::Test => "Test",
+            Environment::Prod => "Prod",
+        }
+    }
+    /// Badge tint. Neutral for dev, amber for test, red for prod.
+    pub fn badge_color(self) -> eframe::egui::Color32 {
+        match self {
+            Environment::Dev => eframe::egui::Color32::from_rgb(148, 155, 166),
+            Environment::Test => eframe::egui::Color32::from_rgb(227, 179, 65),
+            Environment::Prod => eframe::egui::Color32::from_rgb(224, 91, 91),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ConnectDraft {
     pub editing: Option<ConnectionId>,
     pub name: String,
+    pub env: Environment,
     pub config: ConnectionConfig,
     pub password: String,
     pub error: Option<String>,
@@ -216,6 +248,7 @@ pub struct AppState {
     active: Option<TabId>,
     draft: Option<ConnectDraft>,
     password_prompt: Option<ConnectionId>,
+    pending_prod: Option<ConnectionId>,
     prompt_password: String,
     ids: Ids,
     registry: DriverRegistry,
@@ -244,6 +277,7 @@ impl AppState {
             active: None,
             draft: None,
             password_prompt: None,
+            pending_prod: None,
             prompt_password: String::new(),
             ids,
             registry: DriverRegistry::bundled(),
@@ -396,7 +430,19 @@ impl AppState {
         }
     }
 
+    /// Connect from a user gesture. A prod connection arms the confirmation
+    /// instead of spawning; only the confirmed path reaches the spawn.
     pub fn connect(&mut self, id: ConnectionId) {
+        if self.prod_needs_confirm(id) {
+            self.pending_prod = Some(id);
+            return;
+        }
+        self.connect_now(id);
+    }
+
+    /// The spawn path. Confirmation and password continuations enter here so
+    /// a confirmed prod connection is never re-armed.
+    fn connect_now(&mut self, id: ConnectionId) {
         let (config, password) = match self.connections.iter().find(|c| c.id == id) {
             Some(c) => {
                 if matches!(
@@ -429,6 +475,30 @@ impl AppState {
         }
     }
 
+    fn prod_needs_confirm(&self, id: ConnectionId) -> bool {
+        self.connections
+            .iter()
+            .find(|c| c.id == id)
+            .is_some_and(|c| c.env == Environment::Prod)
+    }
+
+    /// The connection awaiting a prod confirmation, if any.
+    pub fn pending_prod(&self) -> Option<ConnectionId> {
+        self.pending_prod
+    }
+
+    /// Proceed with the connection whose prod confirmation is pending,
+    /// including the Postgres password prompt when no password is stored.
+    pub fn confirm_prod(&mut self) {
+        let Some(id) = self.pending_prod.take() else { return };
+        self.prompt_or_connect(id);
+    }
+
+    /// Drop the pending prod confirmation without connecting.
+    pub fn cancel_prod(&mut self) {
+        self.pending_prod = None;
+    }
+
     /// Memory-only password update for a later prompt. Never persisted.
     pub fn set_password(&mut self, id: ConnectionId, password: String) {
         if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
@@ -449,6 +519,15 @@ impl AppState {
     }
 
     pub fn open_password_prompt(&mut self, id: ConnectionId) {
+        if self.prod_needs_confirm(id) {
+            self.pending_prod = Some(id);
+            return;
+        }
+        self.prompt_or_connect(id);
+    }
+
+    /// Prompt when a Postgres connection has no password, else spawn.
+    fn prompt_or_connect(&mut self, id: ConnectionId) {
         let should_prompt = match self.connections.iter().find(|c| c.id == id) {
             Some(c) => {
                 matches!(c.config, ConnectionConfig::Postgres { .. }) && c.password.is_empty()
@@ -459,7 +538,7 @@ impl AppState {
             self.password_prompt = Some(id);
             self.prompt_password.clear();
         } else {
-            self.connect(id);
+            self.connect_now(id);
         }
     }
 
@@ -467,7 +546,7 @@ impl AppState {
         let Some(id) = self.password_prompt.take() else { return };
         let password = std::mem::take(&mut self.prompt_password);
         self.set_password(id, password);
-        self.connect(id);
+        self.connect_now(id);
     }
 
     pub fn cancel_password_prompt(&mut self) {
@@ -686,14 +765,19 @@ impl AppState {
     }
 
     pub fn open_draft(&mut self, editing: Option<ConnectionId>) {
-        let (name, config, password) = match editing {
+        let (name, env, config, password) = match editing {
             Some(id) => match self.connections.iter().find(|c| c.id == id) {
-                Some(c) => (c.name.clone(), c.config.clone(), c.password.clone()),
+                Some(c) => (c.name.clone(), c.env, c.config.clone(), c.password.clone()),
                 None => return,
             },
-            None => (String::new(), DbKind::Sqlite.default_config(), String::new()),
+            None => (
+                String::new(),
+                Environment::default(),
+                DbKind::Sqlite.default_config(),
+                String::new(),
+            ),
         };
-        self.draft = Some(ConnectDraft { editing, name, config, password, error: None });
+        self.draft = Some(ConnectDraft { editing, name, env, config, password, error: None });
     }
 
     pub fn cancel_draft(&mut self) {
@@ -720,6 +804,7 @@ impl AppState {
             Some(id) => {
                 if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
                     c.name = draft.name;
+                    c.env = draft.env;
                     c.config = draft.config;
                     c.password = draft.password;
                 }
@@ -729,6 +814,7 @@ impl AppState {
                 self.connections.push(Connection {
                     id,
                     name: draft.name,
+                    env: draft.env,
                     config: draft.config,
                     password: draft.password,
                     state: ConnectionState::Disconnected,
@@ -921,6 +1007,8 @@ impl eframe::App for AppState {
 struct PersistedProfile {
     id: u64,
     name: String,
+    #[serde(default)]
+    env: Environment,
     config: ConnectionConfig,
 }
 
@@ -946,6 +1034,7 @@ fn load_connections() -> Vec<Connection> {
             .map(|p| Connection {
                 id: ConnectionId::from_raw(p.id),
                 name: p.name,
+                env: p.env,
                 config: p.config,
                 password: String::new(),
                 state: ConnectionState::Disconnected,
@@ -968,6 +1057,7 @@ fn save_connections(conns: &[Connection]) -> std::io::Result<()> {
         .map(|c| PersistedProfile {
             id: c.id.raw(),
             name: c.name.clone(),
+            env: c.env,
             config: c.config.clone(),
         })
         .collect();
@@ -1073,10 +1163,19 @@ mod tests {
     }
 
     fn add_sqlite_connection(state: &mut AppState, name: &str) -> ConnectionId {
+        add_sqlite_connection_env(state, name, Environment::Dev)
+    }
+
+    fn add_sqlite_connection_env(
+        state: &mut AppState,
+        name: &str,
+        env: Environment,
+    ) -> ConnectionId {
         state.open_draft(None);
         {
             let draft = state.draft_mut().expect("new draft");
             draft.name = name.to_owned();
+            draft.env = env;
             draft.config = ConnectionConfig::Sqlite { path: ":memory:".into() };
         }
         state.save_draft();
@@ -1088,10 +1187,20 @@ mod tests {
         name: &str,
         password: &str,
     ) -> ConnectionId {
+        add_postgres_connection_env(state, name, password, Environment::Dev)
+    }
+
+    fn add_postgres_connection_env(
+        state: &mut AppState,
+        name: &str,
+        password: &str,
+        env: Environment,
+    ) -> ConnectionId {
         state.open_draft(None);
         {
             let draft = state.draft_mut().expect("new draft");
             draft.name = name.to_owned();
+            draft.env = env;
             draft.config = ConnectionConfig::Postgres {
                 host: "localhost".to_owned(),
                 port: 5432,
@@ -1440,6 +1549,7 @@ mod tests {
         let profile = PersistedProfile {
             id: 1,
             name: "pg".to_owned(),
+            env: Environment::Prod,
             config: ConnectionConfig::Postgres {
                 host: "localhost".to_owned(),
                 port: 5432,
@@ -1463,6 +1573,7 @@ mod tests {
         let conns = vec![Connection {
             id: ConnectionId::from_raw(7),
             name: "pg".to_owned(),
+            env: Environment::Test,
             config: ConnectionConfig::Postgres {
                 host: "localhost".to_owned(),
                 port: 5432,
@@ -1488,6 +1599,7 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert!(loaded[0].password.is_empty());
         assert_eq!(loaded[0].name, "pg");
+        assert_eq!(loaded[0].env, Environment::Test);
     }
 
     #[test]
@@ -1634,6 +1746,144 @@ mod tests {
             let conn =
                 state.connections().iter().find(|c| c.id == sqlite).expect("sqlite");
             assert!(matches!(conn.state(), ConnectionState::Connecting { .. }));
+        });
+    }
+
+    #[test]
+    fn environment_serde_labels_and_defaults() {
+        assert_eq!(Environment::default(), Environment::Dev);
+        assert_eq!(Environment::Dev.label(), "Dev");
+        assert_eq!(Environment::Test.label(), "Test");
+        assert_eq!(Environment::Prod.label(), "Prod");
+        assert_eq!(serde_json::to_string(&Environment::Dev).unwrap(), "\"dev\"");
+        assert_eq!(serde_json::to_string(&Environment::Test).unwrap(), "\"test\"");
+        assert_eq!(serde_json::to_string(&Environment::Prod).unwrap(), "\"prod\"");
+        assert_ne!(Environment::Dev.badge_color(), Environment::Test.badge_color());
+        assert_ne!(Environment::Test.badge_color(), Environment::Prod.badge_color());
+        assert_ne!(Environment::Dev.badge_color(), Environment::Prod.badge_color());
+    }
+
+    #[test]
+    fn old_json_without_env_loads_as_dev() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("cde-env-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crusty-data-explorer")).unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        std::fs::write(
+            dir.join("crusty-data-explorer").join("connections.json"),
+            br#"[{"id":3,"name":"legacy","config":{"kind":"sqlite","path":":memory:"}}]"#,
+        )
+        .unwrap();
+        let state = AppState::new(&eframe::egui::Context::default());
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(state.connections().len(), 1);
+        assert_eq!(state.connections()[0].name, "legacy");
+        assert_eq!(state.connections()[0].env, Environment::Dev);
+    }
+
+    #[test]
+    fn env_roundtrips_through_save_and_load() {
+        with_isolated_state("env-round", |state| {
+            let id = add_sqlite_connection(state, "db");
+            state.open_draft(Some(id));
+            {
+                let draft = state.draft_mut().expect("edit draft");
+                assert_eq!(draft.env, Environment::Dev);
+                draft.env = Environment::Test;
+            }
+            state.save_draft();
+            assert_eq!(state.connections()[0].env, Environment::Test);
+            let raw = std::fs::read_to_string(profiles_path()).expect("profiles file");
+            let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(json[0]["env"], serde_json::json!("test"));
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.connections().len(), 1);
+            assert_eq!(reloaded.connections()[0].env, Environment::Test);
+        });
+    }
+
+    #[test]
+    fn prod_connect_arms_confirmation_without_spawning() {
+        with_isolated_state("prod-arm", |state| {
+            let prod = add_sqlite_connection_env(state, "prod-db", Environment::Prod);
+            state.connect(prod);
+            assert_eq!(state.pending_prod(), Some(prod));
+            assert_eq!(state.password_prompt(), None);
+            let conn = state.connections().iter().find(|c| c.id == prod).expect("conn");
+            assert!(matches!(conn.state(), ConnectionState::Disconnected));
+        });
+    }
+
+    #[test]
+    fn prod_confirm_connects_and_clears() {
+        with_isolated_state("prod-confirm", |state| {
+            let prod = add_sqlite_connection_env(state, "prod-db", Environment::Prod);
+            state.connect(prod);
+            assert_eq!(state.pending_prod(), Some(prod));
+            state.confirm_prod();
+            assert_eq!(state.pending_prod(), None);
+            let conn = state.connections().iter().find(|c| c.id == prod).expect("conn");
+            assert!(matches!(conn.state(), ConnectionState::Connecting { .. }));
+        });
+    }
+
+    #[test]
+    fn prod_confirm_postgres_prompts_then_connects() {
+        with_isolated_state("prod-pg", |state| {
+            let prod = add_postgres_connection_env(state, "prod-pg", "", Environment::Prod);
+            state.open_password_prompt(prod);
+            assert_eq!(state.password_prompt(), None);
+            assert_eq!(state.pending_prod(), Some(prod));
+            {
+                let conn =
+                    state.connections().iter().find(|c| c.id == prod).expect("conn");
+                assert!(matches!(conn.state(), ConnectionState::Disconnected));
+            }
+            state.confirm_prod();
+            assert_eq!(state.pending_prod(), None);
+            assert_eq!(state.password_prompt(), Some(prod));
+            {
+                let conn =
+                    state.connections().iter().find(|c| c.id == prod).expect("conn");
+                assert!(matches!(conn.state(), ConnectionState::Disconnected));
+            }
+            state.prompt_password_mut().push_str("s3cret");
+            state.submit_password();
+            assert_eq!(state.password_prompt(), None);
+            let conn = state.connections().iter().find(|c| c.id == prod).expect("conn");
+            assert_eq!(conn.password, "s3cret");
+            assert!(matches!(conn.state(), ConnectionState::Connecting { .. }));
+        });
+    }
+
+    #[test]
+    fn prod_cancel_clears_without_connecting() {
+        with_isolated_state("prod-cancel", |state| {
+            let prod = add_sqlite_connection_env(state, "prod-db", Environment::Prod);
+            state.connect(prod);
+            state.cancel_prod();
+            assert_eq!(state.pending_prod(), None);
+            let conn = state.connections().iter().find(|c| c.id == prod).expect("conn");
+            assert!(matches!(conn.state(), ConnectionState::Disconnected));
+        });
+    }
+
+    #[test]
+    fn dev_and_test_envs_skip_the_confirmation() {
+        with_isolated_state("env-direct", |state| {
+            for env in [Environment::Dev, Environment::Test] {
+                let id = add_sqlite_connection_env(state, env.label(), env);
+                state.open_password_prompt(id);
+                assert_eq!(state.pending_prod(), None);
+                let conn = state.connections().iter().find(|c| c.id == id).expect("conn");
+                assert_eq!(conn.env, env);
+                assert!(matches!(conn.state(), ConnectionState::Connecting { .. }));
+            }
         });
     }
 }

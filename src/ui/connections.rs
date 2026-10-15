@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use crate::app::{AppState, ConnectionState};
+use crate::app::{AppState, ConnectionState, Environment};
 use crate::db::{ConnectionConfig, ConnectionId, PostgresSslMode};
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(58, 110, 165);
@@ -37,7 +37,22 @@ fn history_title(sql: &str) -> String {
     title
 }
 
+fn env_badge(ui: &mut egui::Ui, env: Environment) {
+    let color = env.badge_color();
+    egui::Frame::NONE
+        .fill(color.gamma_multiply(0.2))
+        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.6)))
+        .corner_radius(egui::CornerRadius::same(3))
+        .inner_margin(egui::Margin::symmetric(4, 1))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(env.label()).small().strong().color(color));
+        });
+}
+
 pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
+    // root() pumps this module through the sidebar, so the prod confirm
+    // renders with the connect gestures that raise it.
+    prod_confirm_window(state, ui);
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
         if ui
             .add_sized(
@@ -66,7 +81,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                     .map(|tab| tab.conn);
 
                 let mut actions: Vec<SidebarAction> = Vec::new();
-                let snapshot: Vec<(ConnectionId, String, String, bool)> = state
+                let snapshot: Vec<(ConnectionId, String, Environment, String, bool)> = state
                     .connections()
                     .iter()
                     .map(|c| {
@@ -88,7 +103,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                             ConnectionState::Connected { .. }
                                 | ConnectionState::QueryRunning { .. }
                         );
-                        (c.id, c.name.clone(), format!("{dot} {text}"), live)
+                        (c.id, c.name.clone(), c.env, format!("{dot} {text}"), live)
                     })
                     .collect();
                 let dot_colors: std::collections::HashMap<ConnectionId, egui::Color32> = state
@@ -105,7 +120,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                         (c.id, color)
                     })
                     .collect();
-                for (conn_id, conn_name, state_label, _is_live) in snapshot {
+                for (conn_id, conn_name, env, state_label, _is_live) in snapshot {
                     let selected = Some(conn_id) == active_conn;
                     let dot_color =
                         dot_colors.get(&conn_id).copied().unwrap_or(egui::Color32::GRAY);
@@ -150,7 +165,10 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                             ui.horizontal(|ui| {
                                 ui.colored_label(dot_color, &dot);
                                 ui.vertical(|ui| {
-                                    ui.label(egui::RichText::new(&conn_name).strong());
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(&conn_name).strong());
+                                        env_badge(ui, env);
+                                    });
                                     ui.label(
                                         egui::RichText::new(&state_text).small().weak(),
                                     );
@@ -349,6 +367,34 @@ pub fn password_window(state: &mut AppState, ui: &mut egui::Ui) {
     }
 }
 
+pub fn prod_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
+    let Some(id) = state.pending_prod() else { return };
+    let Some(name) =
+        state.connections().iter().find(|c| c.id == id).map(|c| c.name.clone())
+    else {
+        state.cancel_prod();
+        return;
+    };
+    let mut confirm = false;
+    let mut cancel = false;
+    egui::Window::new("Connect to prod?").show(ui.ctx(), |ui| {
+        ui.label(format!("Connect to {name}?"));
+        ui.horizontal(|ui| {
+            if ui.button("Connect").clicked() {
+                confirm = true;
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+        });
+    });
+    if confirm {
+        state.confirm_prod();
+    } else if cancel {
+        state.cancel_prod();
+    }
+}
+
 pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
     if state.draft().is_none() {
         return;
@@ -374,6 +420,12 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
                 if ui.selectable_value(&mut selected, kind, kind.label()).clicked() {
                     draft.config = kind.default_config();
                 }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Environment:");
+            for env in Environment::ALL {
+                ui.selectable_value(&mut draft.env, env, env.label());
             }
         });
         match &mut draft.config {
