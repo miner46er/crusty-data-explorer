@@ -1047,6 +1047,7 @@ fn save_saved_queries(saved: &[SavedQuery]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::PostgresSslMode;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1096,6 +1097,7 @@ mod tests {
                 port: 5432,
                 database: "appdb".to_owned(),
                 user: "owner".to_owned(),
+                ssl_mode: PostgresSslMode::Disable,
             };
             draft.password = password.to_owned();
         }
@@ -1443,6 +1445,7 @@ mod tests {
                 port: 5432,
                 database: "appdb".to_owned(),
                 user: "owner".to_owned(),
+                ssl_mode: PostgresSslMode::Disable,
             },
         };
         let json = serde_json::to_string(&profile).unwrap();
@@ -1465,6 +1468,7 @@ mod tests {
                 port: 5432,
                 database: "appdb".to_owned(),
                 user: "owner".to_owned(),
+                ssl_mode: PostgresSslMode::Disable,
             },
             password: "transient-only".to_owned(),
             state: ConnectionState::Disconnected,
@@ -1507,6 +1511,7 @@ mod tests {
                 port: 5432,
                 database: "appdb".to_owned(),
                 user: "owner".to_owned(),
+                ssl_mode: PostgresSslMode::Disable,
             };
             draft.password = "first".to_owned();
         }
@@ -1526,6 +1531,7 @@ mod tests {
                     port: 5432,
                     database: "appdb".to_owned(),
                     user: "owner".to_owned(),
+                    ssl_mode: PostgresSslMode::Disable,
                 }
             );
             assert_eq!(draft.password, "first");
@@ -1538,6 +1544,7 @@ mod tests {
                 port: 5433,
                 database: "analytics".to_owned(),
                 user: "reader".to_owned(),
+                ssl_mode: PostgresSslMode::Disable,
             };
             draft.password = "second".to_owned();
         }
@@ -1554,6 +1561,7 @@ mod tests {
                 port: 5433,
                 database: "analytics".to_owned(),
                 user: "reader".to_owned(),
+                ssl_mode: PostgresSslMode::Disable,
             }
         );
         assert_eq!(conn.password, "second");

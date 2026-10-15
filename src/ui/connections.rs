@@ -3,7 +3,7 @@
 use eframe::egui;
 
 use crate::app::{AppState, ConnectionState};
-use crate::db::{ConnectionConfig, ConnectionId};
+use crate::db::{ConnectionConfig, ConnectionId, PostgresSslMode};
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(58, 110, 165);
 const LIVE_GREEN: egui::Color32 = egui::Color32::from_rgb(115, 180, 115);
@@ -387,7 +387,7 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
                 });
                 ui.small("Use :memory: for a throwaway database.");
             }
-            ConnectionConfig::Postgres { host, port, database, user } => {
+            ConnectionConfig::Postgres { host, port, database, user, ssl_mode } => {
                 ui.horizontal(|ui| {
                     ui.label("Host:");
                     ui.text_edit_singleline(host);
@@ -408,6 +408,16 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
                 ui.horizontal(|ui| {
                     ui.label("User:");
                     ui.text_edit_singleline(user);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("SSL:");
+                    egui::ComboBox::from_label("")
+                        .selected_text(ssl_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in PostgresSslMode::ALL {
+                                ui.selectable_value(ssl_mode, mode, mode.label());
+                            }
+                        });
                 });
             }
         }

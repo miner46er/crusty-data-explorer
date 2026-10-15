@@ -107,6 +107,7 @@ impl DbKind {
                 port: 5432,
                 database: String::new(),
                 user: String::new(),
+                ssl_mode: PostgresSslMode::Disable,
             },
         }
     }
@@ -128,13 +129,67 @@ impl DriverRegistry {
     }
 }
 
+/// Postgres TLS policy. Appended as `sslmode` on the connection string.
+/// `Disable` is the default and leaves the URL untouched, so existing
+/// profiles keep their old strings. Later additive options copy this shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PostgresSslMode {
+    Disable,
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+}
+
+impl Default for PostgresSslMode {
+    fn default() -> Self {
+        Self::Disable
+    }
+}
+
+impl PostgresSslMode {
+    pub const ALL: [PostgresSslMode; 5] = [
+        PostgresSslMode::Disable,
+        PostgresSslMode::Prefer,
+        PostgresSslMode::Require,
+        PostgresSslMode::VerifyCa,
+        PostgresSslMode::VerifyFull,
+    ];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PostgresSslMode::Disable => "disable",
+            PostgresSslMode::Prefer => "prefer",
+            PostgresSslMode::Require => "require",
+            PostgresSslMode::VerifyCa => "verify-ca",
+            PostgresSslMode::VerifyFull => "verify-full",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            PostgresSslMode::Disable => "Disable",
+            PostgresSslMode::Prefer => "Prefer",
+            PostgresSslMode::Require => "Require",
+            PostgresSslMode::VerifyCa => "Verify CA",
+            PostgresSslMode::VerifyFull => "Verify Full",
+        }
+    }
+}
+
 /// Persisted settings, one variant per engine. The variant IS the kind.
 /// Serialized shape (the `kind` tag) is the on-disk contract.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConnectionConfig {
     Sqlite { path: PathBuf },
-    Postgres { host: String, port: u16, database: String, user: String },
+    Postgres {
+        host: String,
+        port: u16,
+        database: String,
+        user: String,
+        #[serde(default)]
+        ssl_mode: PostgresSslMode,
+    },
 }
 
 impl ConnectionConfig {
@@ -153,7 +208,7 @@ impl ConnectionConfig {
                 }
                 Ok(())
             }
-            ConnectionConfig::Postgres { host, port, database, user } => {
+            ConnectionConfig::Postgres { host, port, database, user, .. } => {
                 if host.trim().is_empty() {
                     return Err(DbError::Config("host is empty".to_owned()));
                 }
@@ -959,11 +1014,12 @@ impl PgSession {
             port,
             database,
             user,
+            ssl_mode,
         } = config
         else {
             return Err(DbError::Config("not a postgres connection".to_owned()));
         };
-        let connection_string = postgres_url(host, *port, database, user, password);
+        let connection_string = postgres_url(host, *port, database, user, password, *ssl_mode);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1603,21 +1659,28 @@ fn pg_cell_kind(type_name: &str) -> PgCellKind {
 
 /// Pure URL builder for Postgres. User, password, and database are
 /// percent-encoded; an empty or missing password omits the secret part.
+/// `Disable` leaves the URL untouched; any other mode appends `sslmode`.
 pub fn postgres_url(
     host: &str,
     port: u16,
     database: &str,
     user: &str,
     password: Option<&str>,
+    ssl_mode: PostgresSslMode,
 ) -> String {
     let user_enc = percent_encode(user);
     let db_enc = percent_encode(database);
-    match password {
+    let base = match password {
         Some(s) if !s.is_empty() => {
             let enc: String = percent_encode(s);
             format!("postgres://{user_enc}:{enc}@{host}:{port}/{db_enc}")
         }
         _ => format!("postgres://{user_enc}@{host}:{port}/{db_enc}"),
+    };
+    if ssl_mode == PostgresSslMode::Disable {
+        base
+    } else {
+        format!("{base}?sslmode={}", ssl_mode.as_str())
     }
 }
 
@@ -2143,7 +2206,7 @@ mod tests {
     #[test]
     fn postgres_url_without_password_omits_secret() {
         assert_eq!(
-            postgres_url("localhost", 5432, "appdb", "owner", None),
+            postgres_url("localhost", 5432, "appdb", "owner", None, PostgresSslMode::Disable),
             "postgres://owner@localhost:5432/appdb"
         );
     }
@@ -2151,7 +2214,14 @@ mod tests {
     #[test]
     fn postgres_url_empty_password_omits_secret() {
         assert_eq!(
-            postgres_url("localhost", 5432, "appdb", "owner", Some("")),
+            postgres_url(
+                "localhost",
+                5432,
+                "appdb",
+                "owner",
+                Some(""),
+                PostgresSslMode::Disable
+            ),
             "postgres://owner@localhost:5432/appdb"
         );
     }
@@ -2159,7 +2229,14 @@ mod tests {
     #[test]
     fn postgres_url_with_password_includes_secret() {
         assert_eq!(
-            postgres_url("db.internal", 5433, "analytics", "reader", Some("s3cret")),
+            postgres_url(
+                "db.internal",
+                5433,
+                "analytics",
+                "reader",
+                Some("s3cret"),
+                PostgresSslMode::Disable
+            ),
             "postgres://reader:s3cret@db.internal:5433/analytics"
         );
     }
@@ -2167,13 +2244,114 @@ mod tests {
     #[test]
     fn postgres_url_encodes_special_chars_in_user_and_password() {
         assert_eq!(
-            postgres_url("localhost", 5432, "appdb", "ad min", Some("p@ss:w/ord?")),
+            postgres_url(
+                "localhost",
+                5432,
+                "appdb",
+                "ad min",
+                Some("p@ss:w/ord?"),
+                PostgresSslMode::Disable
+            ),
             "postgres://ad%20min:p%40ss%3Aw%2Ford%3F@localhost:5432/appdb"
         );
         assert_eq!(
-            postgres_url("h", 1, "d", "u", Some("a#b%c!")),
+            postgres_url("h", 1, "d", "u", Some("a#b%c!"), PostgresSslMode::Disable),
             "postgres://u:a%23b%25c%21@h:1/d"
         );
+    }
+
+    #[test]
+    fn postgres_url_disable_keeps_old_string() {
+        assert_eq!(
+            postgres_url(
+                "localhost",
+                5432,
+                "appdb",
+                "owner",
+                None,
+                PostgresSslMode::Disable
+            ),
+            "postgres://owner@localhost:5432/appdb"
+        );
+        assert_eq!(
+            postgres_url(
+                "db.internal",
+                5433,
+                "analytics",
+                "reader",
+                Some("s3cret"),
+                PostgresSslMode::Disable
+            ),
+            "postgres://reader:s3cret@db.internal:5433/analytics"
+        );
+    }
+
+    #[test]
+    fn postgres_url_appends_sslmode_per_variant() {
+        for (mode, wire) in [
+            (PostgresSslMode::Prefer, "prefer"),
+            (PostgresSslMode::Require, "require"),
+            (PostgresSslMode::VerifyCa, "verify-ca"),
+            (PostgresSslMode::VerifyFull, "verify-full"),
+        ] {
+            assert_eq!(
+                postgres_url("localhost", 5432, "appdb", "owner", None, mode),
+                format!("postgres://owner@localhost:5432/appdb?sslmode={wire}"),
+            );
+            assert_eq!(
+                postgres_url(
+                    "db.internal",
+                    5433,
+                    "analytics",
+                    "reader",
+                    Some("s3cret"),
+                    mode
+                ),
+                format!(
+                    "postgres://reader:s3cret@db.internal:5433/analytics?sslmode={wire}"
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_ssl_mode_roundtrips_through_json() {
+        for mode in PostgresSslMode::ALL {
+            let config = ConnectionConfig::Postgres {
+                host: "localhost".to_owned(),
+                port: 5432,
+                database: "appdb".to_owned(),
+                user: "owner".to_owned(),
+                ssl_mode: mode,
+            };
+            let json = serde_json::to_string(&config).unwrap();
+            assert!(json.contains(mode.as_str()));
+            let back: ConnectionConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, config);
+        }
+    }
+
+    #[test]
+    fn postgres_ssl_mode_missing_from_old_profiles_defaults_to_disable() {
+        let old = serde_json::json!({
+            "kind": "postgres",
+            "host": "localhost",
+            "port": 5432,
+            "database": "appdb",
+            "user": "owner",
+        });
+        let back: ConnectionConfig = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            back,
+            ConnectionConfig::Postgres {
+                host: "localhost".to_owned(),
+                port: 5432,
+                database: "appdb".to_owned(),
+                user: "owner".to_owned(),
+                ssl_mode: PostgresSslMode::Disable,
+            }
+        );
+        assert_eq!(PostgresSslMode::default(), PostgresSslMode::Disable);
     }
 
     #[cfg(feature = "postgres")]
@@ -2237,6 +2415,7 @@ mod tests {
                 .unwrap_or(5432),
             database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
             user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+            ssl_mode: PostgresSslMode::Disable,
         };
         let password = std::env::var("PGPASSWORD").ok();
         let session = Session::open(&config, password.as_deref()).expect("open");
@@ -2272,6 +2451,7 @@ mod tests {
                 .unwrap_or(5432),
             database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
             user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+            ssl_mode: PostgresSslMode::Disable,
         };
         let password = std::env::var("PGPASSWORD").ok();
         let mut session = Session::open(&config, password.as_deref()).expect("open");
