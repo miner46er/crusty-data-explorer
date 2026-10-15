@@ -11,6 +11,26 @@ use crate::db::TabId;
 const RUN_GREEN: egui::Color32 = egui::Color32::from_rgb(115, 180, 115);
 
 pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
+    let modal_open = state.draft().is_some() || state.save_prompt().is_some();
+    let (new_tab_shortcut_pressed, close_tab_shortcut_pressed) = ui.input_mut(|i| {
+        (
+            i.consume_shortcut(&new_tab_shortcut()),
+            i.consume_shortcut(&close_tab_shortcut()),
+        )
+    });
+    if !modal_open {
+        if new_tab_shortcut_pressed {
+            if let Some(conn) = state.default_connection() {
+                let id = state.new_tab(conn);
+                state.activate(id);
+            }
+        }
+        if close_tab_shortcut_pressed {
+            if let Some(active) = state.active() {
+                state.close_tab(active);
+            }
+        }
+    }
     tab_bar(state, ui);
     ui.add_space(4.0);
     toolbar(state, ui);
@@ -61,7 +81,11 @@ fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
                 close.push(tab.id);
             }
         }
-        if ui.small_button("+").clicked() {
+        if ui
+            .small_button("+")
+            .on_hover_text("New tab (Ctrl+T)")
+            .clicked()
+        {
             new_tab = true;
         }
     });
@@ -153,6 +177,14 @@ pub fn run_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Enter)
 }
 
+pub fn new_tab_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::T)
+}
+
+pub fn close_tab_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::W)
+}
+
 fn save_window(state: &mut AppState, ui: &mut egui::Ui) {
     if state.save_prompt().is_none() {
         return;
@@ -183,3 +215,26 @@ fn save_window(state: &mut AppState, ui: &mut egui::Ui) {
         state.close_save_prompt();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shortcuts_carry_expected_modifiers_and_keys() {
+        let run = run_shortcut();
+        assert_eq!(run.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(run.logical_key, egui::Key::Enter);
+        let new_tab = new_tab_shortcut();
+        assert_eq!(new_tab.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(new_tab.logical_key, egui::Key::T);
+        let close_tab = close_tab_shortcut();
+        assert_eq!(close_tab.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(close_tab.logical_key, egui::Key::W);
+    }
+}
+// Manual check: Ctrl+T creates a tab on default_connection and activates it
+// (no-op with no connection), Ctrl+W closes the active tab (no-op with none),
+// both suppressed while a draft or save modal is open, using the same
+// new_tab/activate/close_tab/default_connection transitions as the plus and
+// cross buttons covered by AppState tests.
