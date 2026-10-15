@@ -910,10 +910,9 @@ impl Session {
                 CancelHandle::new(move || handle.interrupt())
             }
             #[cfg(feature = "postgres")]
-            // Abandon-only: the tab drops the late result by run-id match. The
-            // upgrade path is a pg_cancel_backend() against the backend pid
-            // captured at connect.
-            Session::Postgres(_) => CancelHandle::new(|| {}),
+            Session::Postgres(pg) => {
+                pg_cancel_handle(pg.connection_string.clone(), pg.backend_pid)
+            }
         }
     }
 
@@ -946,11 +945,10 @@ impl Session {
 pub struct PgSession {
     rt: tokio::runtime::Runtime,
     pool: sqlx::PgPool,
-    // Kept for diagnostics; the pool owns the live copy.
-    #[allow(dead_code)]
     connection_string: String,
     database: String,
     server_version: String,
+    backend_pid: i32,
 }
 
 #[cfg(feature = "postgres")]
@@ -990,12 +988,23 @@ impl PgSession {
                 row.try_get::<String, _>(0).map_err(|e| e.to_string())
             })
             .unwrap_or_else(|_| "Postgres".to_owned());
+        let backend_pid = rt
+            .block_on(async {
+                let row = sqlx::query("SELECT pg_backend_pid()")
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                use sqlx::Row as _;
+                row.try_get::<i32, _>(0).map_err(|e| e.to_string())
+            })
+            .unwrap_or(-1);
         Ok(Self {
             rt,
             pool,
             connection_string,
             database: database.clone(),
             server_version,
+            backend_pid,
         })
     }
 
@@ -1520,6 +1529,44 @@ impl PgSession {
             .map_err(|e| DbError::Query(e.to_string()))?;
         Ok(SchemaInfo::new(vec![db_node], tables_truncated, columns_truncated))
     }
+}
+
+/// Builds the Postgres cancel closure. Owns the connection string plus the
+/// backend pid captured at connect. Unknown pid no-ops. Else a fresh
+/// current-thread runtime opens one connection and runs pg_cancel_backend.
+/// Every error collapses into unit. Never panics, safe to fire twice.
+#[cfg(feature = "postgres")]
+fn pg_cancel_handle(connection_string: String, backend_pid: i32) -> CancelHandle {
+    CancelHandle::new(move || {
+        if backend_pid < 0 {
+            return;
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
+            rt.block_on(async {
+                let pool = match sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(1)
+                    .acquire_timeout(Duration::from_secs(5))
+                    .connect(&connection_string)
+                    .await
+                {
+                    Ok(pool) => pool,
+                    Err(_) => return,
+                };
+                let _ = sqlx::query("SELECT pg_cancel_backend($1)")
+                    .bind(backend_pid)
+                    .execute(&pool)
+                    .await;
+                pool.close().await;
+            });
+        }));
+    })
 }
 
 /// One Postgres column's decoding rule, keyed by `TypeInfo::name()`.
@@ -2164,6 +2211,53 @@ mod tests {
         ] {
             assert_eq!(pg_cell_kind(name), PgCellKind::Text, "{name}");
         }
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn pg_cancel_handle_double_fire_is_safe_without_server() {
+        let unknown =
+            pg_cancel_handle("postgres://owner@localhost:5432/appdb".to_owned(), -1);
+        unknown.cancel();
+        unknown.cancel();
+        let bad_url = pg_cancel_handle("not-a-url".to_owned(), 424_242);
+        bad_url.cancel();
+        bad_url.cancel();
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_cancel_frees_sleeping_worker() {
+        let config = ConnectionConfig::Postgres {
+            host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
+            port: std::env::var("PGPORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
+            user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+        };
+        let password = std::env::var("PGPASSWORD").ok();
+        let session = Session::open(&config, password.as_deref()).expect("open");
+        match &session {
+            Session::Postgres(pg) => assert!(pg.backend_pid > 0),
+            Session::Sqlite(_) => panic!("expected a Postgres session"),
+        }
+        let cancel = session.cancel_handle();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut session = session;
+            let outcome = session.query("SELECT pg_sleep(30)");
+            let _ = tx.send(outcome);
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        cancel.cancel();
+        cancel.cancel();
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("worker returns within 10s after cancel");
+        assert!(outcome.is_err());
     }
 
     #[cfg(feature = "postgres")]
