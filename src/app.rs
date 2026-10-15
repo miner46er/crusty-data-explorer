@@ -14,7 +14,10 @@ use crate::db::{
     CancelHandle, ConnectionConfig, ConnectionId, DbCommand, DbEvent, DbHandle, DbKind,
     DriverRegistry, Ids, QueryResult, RunId, SchemaInfo, TabId, Value, explain_sql, spawn_session,
 };
-use crate::edit::{delete_statement, editable_table, insert_statement, to_literal, update_statement};
+use crate::edit::{
+    delete_statement, editable_table, insert_statement, is_text_type, qualified_parts,
+    to_literal, update_statement,
+};
 use crate::sql::{current_statement, split_statements, statement_ranges};
 
 /// Everything that changes about one connection's lifecycle, in five states.
@@ -111,11 +114,13 @@ pub struct RowEdit {
 }
 
 /// The table one tab's grid edits: its name and every primary key column
-/// with the result column index its value shows in.
+/// with the result column index its value shows in and whether its type is
+/// text, so a text key can render as a quoted literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditTarget {
     pub table: String,
     pub pk_cols: Vec<(String, usize)>,
+    pub pk_types: Vec<bool>,
 }
 
 #[derive(Debug)]
@@ -362,24 +367,41 @@ fn effective_statements(
     }
 }
 
-/// Primary key column names in key order, from the loaded schema tree. The
-/// first table matching `table` case-insensitively wins across databases and
-/// schemas; a table without a key is not editable.
-fn primary_key(schema: &SchemaInfo, table: &str) -> Option<Vec<String>> {
+/// Primary key columns in key order with their declared types, from the
+/// loaded schema tree. A qualified name matches under its schema; an
+/// unqualified one takes the first table matching case-insensitively across
+/// databases and schemas. A table without a key is not editable.
+fn primary_key(schema: &SchemaInfo, table: &str) -> Option<Vec<(String, String)>> {
+    let parts = qualified_parts(table);
+    let (wanted_schema, wanted_table) = match parts.as_slice() {
+        [table] => (None, table.as_str()),
+        [schema, table] => (Some(schema.as_str()), table.as_str()),
+        _ => return None,
+    };
     for database in schema.databases() {
         for node in database.schemas() {
+            if wanted_schema.is_some_and(|wanted| !node.name().eq_ignore_ascii_case(wanted)) {
+                continue;
+            }
             for info in node.tables() {
-                if !info.name().eq_ignore_ascii_case(table) {
+                if !info.name().eq_ignore_ascii_case(wanted_table) {
                     continue;
                 }
-                let mut columns: Vec<(u32, String)> = info
+                let mut columns: Vec<(u32, String, String)> = info
                     .columns()
                     .iter()
-                    .filter_map(|c| c.pk_position().map(|pos| (pos, c.name().to_owned())))
+                    .filter_map(|c| {
+                        c.pk_position().map(|position| {
+                            (position, c.name().to_owned(), c.type_name().to_owned())
+                        })
+                    })
                     .collect();
-                columns.sort_by_key(|(position, _)| *position);
-                let names: Vec<String> = columns.into_iter().map(|(_, name)| name).collect();
-                return (!names.is_empty()).then_some(names);
+                columns.sort_by_key(|(position, _, _)| *position);
+                let key: Vec<(String, String)> = columns
+                    .into_iter()
+                    .map(|(_, name, type_name)| (name, type_name))
+                    .collect();
+                return (!key.is_empty()).then_some(key);
             }
         }
     }
@@ -387,19 +409,32 @@ fn primary_key(schema: &SchemaInfo, table: &str) -> Option<Vec<String>> {
 }
 
 /// Key pairs for one row: each key column with the literal of the original
-/// cell display, so the WHERE clause names the row exactly as displayed.
+/// cell display, so the WHERE clause names the row exactly as displayed. A
+/// text key always renders quoted; the rest keep [`to_literal`]'s mapping.
 fn key_pairs(
     result: &QueryResult,
     target: &EditTarget,
     row: usize,
 ) -> Option<Vec<(String, String)>> {
     let mut pairs = Vec::with_capacity(target.pk_cols.len());
-    for (name, col) in &target.pk_cols {
+    for (index, (name, col)) in target.pk_cols.iter().enumerate() {
         let cell = result.cell(row, *col)?;
         let was_null = matches!(cell, Value::Null);
-        pairs.push((name.clone(), to_literal(&cell.display(usize::MAX), was_null)));
+        let text_key = target.pk_types.get(index).copied().unwrap_or(false);
+        let literal = key_literal(&cell.display(usize::MAX), was_null, text_key);
+        pairs.push((name.clone(), literal));
     }
     Some(pairs)
+}
+
+/// One key cell as a WHERE literal. A text key renders through the escaped
+/// quoted form even when it parses as a number, so `010` keeps its text
+/// identity; other keys keep [`to_literal`]'s mapping.
+fn key_literal(text: &str, was_null: bool, text_key: bool) -> String {
+    if text_key && !was_null {
+        return format!("'{}'", text.replace('\'', "''"));
+    }
+    to_literal(text, was_null)
 }
 
 /// Target tier for a connection. Prod connects route through a confirmation
@@ -742,14 +777,16 @@ impl AppState {
         let pk = primary_key(self.schemas.get(&tab.conn)?, &table)?;
         let result = tab.active_query_result()?;
         let mut pk_cols = Vec::with_capacity(pk.len());
-        for column in pk {
+        let mut pk_types = Vec::with_capacity(pk.len());
+        for (column, type_name) in pk {
             let index = result
                 .columns()
                 .iter()
                 .position(|c| c.name().eq_ignore_ascii_case(&column))?;
             pk_cols.push((column, index));
+            pk_types.push(is_text_type(&type_name));
         }
-        Some(EditTarget { table, pk_cols })
+        Some(EditTarget { table, pk_cols, pk_types })
     }
 
     /// Stage one cell edit. `row` counts result rows first, then staged added
@@ -1896,6 +1933,33 @@ mod tests {
         .unwrap()
     }
 
+    /// The items shape with a text key whose value prints as a number.
+    fn numeric_text_key_result() -> QueryResult {
+        QueryResult::from_columns(
+            vec![
+                crate::db::Column::new(
+                    "tenant".to_owned(),
+                    "TEXT".to_owned(),
+                    vec![crate::db::Value::Text("010".to_owned())],
+                ),
+                crate::db::Column::new(
+                    "id".to_owned(),
+                    "INTEGER".to_owned(),
+                    vec![crate::db::Value::Integer(1)],
+                ),
+                crate::db::Column::new(
+                    "name".to_owned(),
+                    "TEXT".to_owned(),
+                    vec![crate::db::Value::Text("ada".to_owned())],
+                ),
+            ],
+            false,
+            None,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap()
+    }
+
     /// An idle scripted connection with the items schema loaded and one tab
     /// showing two items rows.
     fn editable_tab(state: &mut AppState) -> (TabId, ConnectionId, mpsc::Receiver<DbCommand>) {
@@ -3013,6 +3077,24 @@ mod tests {
                 target.pk_cols,
                 vec![("tenant".to_owned(), 0), ("id".to_owned(), 1)]
             );
+            assert_eq!(target.pk_types, vec![true, false]);
+
+            // The tree's preview form resolves through the schema name.
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT * FROM \"main\".\"items\" LIMIT 100".to_owned();
+            }
+            let qualified = state.edit_target(tab).expect("qualified target");
+            assert_eq!(qualified.table, "main.items");
+            assert_eq!(
+                qualified.pk_cols,
+                vec![("tenant".to_owned(), 0), ("id".to_owned(), 1)]
+            );
+            assert_eq!(qualified.pk_types, vec![true, false]);
+            // A qualifier naming no loaded schema does not resolve.
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT * FROM \"other\".\"items\"".to_owned();
+            }
+            assert_eq!(state.edit_target(tab), None);
 
             if let Some(slot) = state.tab_sql_mut(tab) {
                 *slot = "SELECT i.id FROM items i JOIN items o ON o.id = i.id".to_owned();
@@ -3117,6 +3199,46 @@ mod tests {
                 RunOutcome::Running { .. }
             ));
             assert!(commands.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn a_text_key_that_prints_as_a_number_stays_quoted_in_where() {
+        with_isolated_state("edit-text-pk", |state| {
+            let conn = add_sqlite_connection(state, "mem-text-pk");
+            let commands = attach_test_session(state, conn);
+            state.apply(DbEvent::SchemaOk { conn, schema: items_schema() });
+            let tab = state.new_tab(conn);
+            let sql = "SELECT tenant, id, name FROM items";
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = sql.to_owned();
+            }
+            let run = state.ids.run();
+            state.set_outcome(
+                tab,
+                RunOutcome::Running {
+                    run,
+                    started: Instant::now(),
+                    statements: vec![sql.to_owned()],
+                },
+            );
+            state.apply(DbEvent::BatchOk {
+                run,
+                results: vec![numeric_text_key_result()],
+            });
+            let target = state.edit_target(tab).expect("target");
+            assert_eq!(target.pk_types, vec![true, false]);
+            state.stage_edit(tab, 0, 2, "Ada".to_owned());
+            state.apply_edits(tab);
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => assert_eq!(
+                    statements,
+                    vec![
+                        "UPDATE \"items\" SET \"name\" = 'Ada' WHERE \"tenant\" = '010' AND \"id\" = 1"
+                    ]
+                ),
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
         });
     }
 
