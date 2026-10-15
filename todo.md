@@ -55,3 +55,37 @@ Wave 3 — serial drivers on config shape, after Wave 2 (shared `src/db.rs`).
 Plan status: all waves landed and verified 2026-10-16. Final sweep passes: `--all-features` check clean, full test matrix green, live suite 13 of 13 across SQLite, Postgres, MySQL, and the SSH tunnel. The tunnel tests read PGHOST/PGPORT as the address the jump host dials, which matches how DBeaver and Beekeeper configure a tunnel.
 
 Per-unit verify: `cargo check`, `cargo check --features postgres`, `cargo test`, `cargo test --features postgres` (live ignored), plus live probe where noted.
+
+## Next horizon plan (researched 2026-10-16, waves 4 to 7)
+
+Ranked from three delegate reports, current-app seams, Beekeeper Studio v6.1.6 gap, and DBeaver Community 26.2 gap. Friction rankings are the researchers' judgment, sizes are estimates. Execution starts on the operator's go. One unit at a time, the parent verifies and commits between units.
+
+Wave 4: high friction small wins, standalone, any order.
+- [ ] T10 Grid copy bundle. TSV spreadsheet copy with a headers option, copy as CSV, JSON, Markdown, and SQL INSERT from any selection, Create IN statement from selected values, paste-as-new-rows reusing the CSV importer mapping. Owns `src/ui/grid.rs` and `src/export.rs`. Tests: TSV shape, IN literal typing, paste roundtrip. DBeaver copy set ranks second, Beekeeper seventh.
+- [ ] T11 Connection URL paste. `parse_connection_url` pure beside the existing URL builders in `src/db.rs`, one paste row at the top of the draft form that fills the config. Owns `src/db.rs` and `src/ui/connections.rs`. Tests: parse matrix per scheme, roundtrip against `postgres_url` and `mysql_url`. Beekeeper ranks third.
+- [ ] T12 Tab and session restore. `PersistedTab { conn, sql }` in `tabs.json` through the existing tmp plus rename writer, loaded in `AppState::new` as fresh tabs, pruned when the connection is gone, saved from the exit hook. Owns `src/app.rs`. Tests: roundtrip, prune, empty-state start. DBeaver ranks fourth, Beekeeper sixth.
+- [ ] T13 Light theme and toggle. Split `ui::install` into dark and light palette functions, a theme field on `AppState`, a status-bar toggle, and per-module color constants read from `Visuals` instead of hard-coded. Owns `src/ui/mod.rs`, `src/app.rs`, and the color constants in the ui modules. Tests: palette apply both ways. Both reports rate themes medium.
+
+Wave 5: run path and write path, serial on `start_batch` and the worker.
+- [ ] T14 Read-only connection plus write guard. A `read_only` flag on config with validate and persist, refuse writes at send time, and a confirm modal when an UPDATE or DELETE reaches the runner without a WHERE. Owns `src/db.rs`, `src/app.rs`, and the modal in `src/ui/grid.rs`. Tests: gate matrix per statement kind, WHERE matcher cases. Beekeeper ranks second and ships the WHERE warning only as an open PR, so this compounds our prod confirm.
+- [ ] T15 Named query parameters. A pure substitution pass in `src/sql.rs` for `:name` and `?` placeholders applied in `start_batch`, a value prompt reusing `to_literal` before the run, raw SQL threaded through so history records the original text. Owns `src/sql.rs`, `src/app.rs`, and the prompt in `src/ui/query.rs`. Tests: substitution, quoting per type, history keeps raw. DBeaver ranks first, Beekeeper eighth.
+- [ ] T16 Manual transactions, three sub-units in order.
+  - [ ] T16a Subtract the dead `DbCommand::Query` arm first. The inventory found it is test-only today. Owns `src/db.rs`. Gates only.
+  - [ ] T16b Begin, Commit, and Rollback buttons sending plain statements through the existing batch path, plus an open-transaction indicator on the tab and the connection card. Owns `src/ui/query.rs` and `src/app.rs`. Tests: live Postgres and MySQL commit and rollback roundtrips.
+  - [ ] T16c Autocommit toggle per connection with worker-owned transaction state pinned to one connection, cancel semantics decided up front (cancel stops the statement and leaves the transaction open), and idle auto-rollback after ten minutes with a warning. Owns `src/db.rs` and `src/app.rs`. Tests: toggle matrix, cancel keeps the transaction, idle rollback fires. Beekeeper ranks first and skips SQLite entirely, so the toggle covers Postgres and MySQL while the buttons work everywhere.
+
+Wave 6: discovery surface, after wave 5.
+- [ ] T17 Saved query folders and pinning. A folder field on `SavedQuery` with a serde default so old files load, a folder field in the save prompt, and the sidebar grouped by folder with pinned entries first. Owns `src/app.rs`, `src/ui/query.rs`, and `src/ui/connections.rs`. Tests: old-file load, grouping order, pin precedence. Beekeeper ranks fifth.
+- [ ] T18 Search palette. A Ctrl+K switcher over connections, saved queries with their folders, and loaded tables and columns, keyboard navigable, Enter opens. Owns new `src/ui/search.rs` and `src/app.rs`. Edge: after T17. Tests: fuzzy match ranking, keyboard flow. Beekeeper ranks fourth, DBeaver sixth.
+- [ ] T19 Schema object coverage. Triggers and routines for Postgres first, copied to MySQL, SQLite triggers from `sqlite_master`, rendered as new navigator sections. Owns the schema arms in `src/db.rs` and `src/ui/schema.rs`. Tests: per-engine live introspection extends. Supports T18 depth. DBeaver navigator coverage is the reference.
+
+Wave 7: breadth, individually optional after wave 6.
+- [ ] T20 MySQL SSL modes mirroring the Postgres `ssl_mode` field. Owns `src/db.rs` and `src/ui/connections.rs`. Tests: URL builder per mode. Beekeeper ninth.
+- [ ] T21 Row counts on demand in the navigator, estimates for Postgres and MySQL and COUNT for SQLite behind an explicit request. Owns `src/db.rs` and `src/ui/schema.rs`. Tests: live per engine.
+- [ ] T22 Import and export breadth. XLSX read and write, JSONL, multi-table export, streamed full-results export past the row cap. Owns `src/import.rs` and `src/export.rs`. Tests: format roundtrips. Beekeeper tenth.
+
+Considered and deferred: vim mode (large with low daily friction for our users), plan graph view (large, our table EXPLAIN already leads Beekeeper), virtual keys, filter memory, row coloring, foreign key navigation panel, grouping and calc panels, formatter presets, and search depth over DDL and comments. Out of scope stays ERD, plugins, admin tooling, enterprise auth, AI shell, cloud sync, and backup wizards.
+
+Risks: sqlx sessions pool connections, so T16c must pin one connection for the life of a transaction instead of acquiring per statement, and that decision touches the cancel path. Named parameters risk recording substituted SQL in history unless the raw text is threaded through T15. The units in waves 5 and 6 all touch `src/app.rs`, so they run one at a time with a green gate between.
+
+Per-unit verify: `cargo check`, `cargo check --all-features`, `cargo test`, `cargo test --features postgres`, plus `--features mysql` and `--features ssh` where a unit touches them, and live ignored probes against cde-postgres, cde-mysql, and cde-ssh where an engine or the tunnel is involved.
