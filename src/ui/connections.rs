@@ -22,6 +22,17 @@ enum SidebarAction {
     Delete(ConnectionId),
     RefreshSchema(ConnectionId),
     PreviewTable(ConnectionId, String, String),
+    OpenHistory(ConnectionId, String),
+    ClearHistory,
+}
+
+fn history_title(sql: &str) -> String {
+    let first = sql.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("SQL");
+    let mut title: String = first.chars().take(28).collect();
+    if first.chars().count() > 28 {
+        title += "…";
+    }
+    title
 }
 
 pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
@@ -207,6 +218,31 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                     ui.add_space(4.0);
                 }
 
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("HISTORY").small().weak());
+                    if ui.small_button("Clear").clicked() {
+                        actions.push(SidebarAction::ClearHistory);
+                    }
+                });
+                ui.add_space(4.0);
+                if state.history().is_empty() {
+                    ui.label(egui::RichText::new("No runs yet.").small().weak());
+                } else {
+                    for entry in state.history().iter().take(crate::app::HISTORY_SHOWN) {
+                        let dot = if entry.succeeded { LIVE_GREEN } else { egui::Color32::RED };
+                        ui.horizontal(|ui| {
+                            ui.colored_label(dot, "●");
+                            if ui.small_button(history_title(&entry.sql)).clicked() {
+                                actions.push(SidebarAction::OpenHistory(
+                                    entry.conn,
+                                    entry.sql.clone(),
+                                ));
+                            }
+                        });
+                    }
+                }
+                ui.add_space(8.0);
+
                 for action in actions {
                     match action {
                         SidebarAction::Connect(id) => state.connect(id),
@@ -221,6 +257,8 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                         SidebarAction::PreviewTable(id, schema, table) => {
                             state.preview_table(id, &schema, &table)
                         }
+                        SidebarAction::OpenHistory(conn, sql) => state.open_history(conn, &sql),
+                        SidebarAction::ClearHistory => state.clear_history(),
                     }
                 }
             });

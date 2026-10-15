@@ -81,6 +81,30 @@ pub enum RunOutcome {
     Err(String),
 }
 
+/// One finished run. Newest first in [`AppState::history`]. Holds the SQL
+/// only, never credentials.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HistoryEntry {
+    pub conn: ConnectionId,
+    pub sql: String,
+    pub succeeded: bool,
+    pub rows: Option<u64>,
+    pub took: std::time::Duration,
+    pub at: u64,
+}
+
+/// Cap on retained history entries, newest first.
+const HISTORY_CAP: usize = 200;
+/// Cap on history rows rendered in the sidebar.
+pub const HISTORY_SHOWN: usize = 30;
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[derive(Debug)]
 pub struct ConnectDraft {
     pub editing: Option<ConnectionId>,
@@ -103,6 +127,7 @@ pub struct AppState {
     schemas: HashMap<ConnectionId, SchemaInfo>,
     schema_loading: HashSet<ConnectionId>,
     schema_errors: HashMap<ConnectionId, String>,
+    history: Vec<HistoryEntry>,
 }
 
 impl AppState {
@@ -124,6 +149,7 @@ impl AppState {
             schemas: HashMap::new(),
             schema_loading: HashSet::new(),
             schema_errors: HashMap::new(),
+            history: load_history(),
         }
     }
 
@@ -354,6 +380,40 @@ impl AppState {
         }
     }
 
+    pub fn history(&self) -> &[HistoryEntry] {
+        &self.history
+    }
+
+    pub fn history_for(&self, conn: ConnectionId) -> Vec<&HistoryEntry> {
+        self.history.iter().filter(|e| e.conn == conn).collect()
+    }
+
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+        self.persist_history();
+    }
+
+    /// Reopen a past query in a fresh tab. Runs immediately when the
+    /// connection is live, else loads the SQL with a `Never` outcome.
+    pub fn open_history(&mut self, conn: ConnectionId, sql: &str) {
+        let id = self.new_tab(conn);
+        if let Some(slot) = self.tab_sql_mut(id) {
+            *slot = sql.to_owned();
+        }
+        self.activate(id);
+        let live = self.connections.iter().find(|c| c.id == conn).is_some_and(|c| {
+            matches!(
+                c.state(),
+                ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
+            )
+        });
+        if live {
+            self.start_run(id, sql);
+        } else {
+            self.set_outcome(id, RunOutcome::Never);
+        }
+    }
+
     pub fn open_draft(&mut self, editing: Option<ConnectionId>) {
         let (name, config, password) = match editing {
             Some(id) => match self.connections.iter().find(|c| c.id == id) {
@@ -501,28 +561,50 @@ impl AppState {
     /// Running that exact run id. Cancelled, replaced, and closed-tab runs
     /// land here and are silently dropped.
     fn finish_run(&mut self, run: RunId, outcome: RunOutcome) {
-        let conn_id = match self
+        let matched = match self
             .tabs
             .iter_mut()
             .find(|t| matches!(&t.outcome, RunOutcome::Running { run: r, .. } if *r == run))
         {
             Some(t) => {
+                let started = match &t.outcome {
+                    RunOutcome::Running { started, .. } => *started,
+                    _ => Instant::now(),
+                };
+                let sql = t.sql.clone();
+                let record = match &outcome {
+                    RunOutcome::Ok(result) => Some((
+                        true,
+                        Some(result.affected().unwrap_or(result.row_count() as u64)),
+                        result.took(),
+                    )),
+                    RunOutcome::Err(_) => Some((false, None, started.elapsed())),
+                    _ => None,
+                };
+                let conn = t.conn;
                 t.outcome = outcome;
-                Some(t.conn)
+                Some((conn, record.map(|(succeeded, rows, took)| (sql, succeeded, rows, took))))
             }
             None => None,
         };
-        if let Some(id) = conn_id {
-            let still_running = self
-                .tabs
-                .iter()
-                .any(|t| t.conn == id && matches!(t.outcome, RunOutcome::Running { .. }));
-            if !still_running {
-                if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
-                    if let ConnectionState::QueryRunning { session, .. } = &c.state {
-                        let session = session.clone();
-                        c.state = ConnectionState::Connected { session };
-                    }
+        let Some((conn, record)) = matched else { return };
+        if let Some((sql, succeeded, rows, took)) = record {
+            self.history.insert(
+                0,
+                HistoryEntry { conn, sql, succeeded, rows, took, at: now_unix_secs() },
+            );
+            self.history.truncate(HISTORY_CAP);
+            self.persist_history();
+        }
+        let still_running = self
+            .tabs
+            .iter()
+            .any(|t| t.conn == conn && matches!(t.outcome, RunOutcome::Running { .. }));
+        if !still_running {
+            if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn) {
+                if let ConnectionState::QueryRunning { session, .. } = &c.state {
+                    let session = session.clone();
+                    c.state = ConnectionState::Connected { session };
                 }
             }
         }
@@ -537,6 +619,12 @@ impl AppState {
     fn persist(&self) {
         if let Err(e) = save_connections(&self.connections) {
             log::warn!("persist connections: {e}");
+        }
+    }
+
+    fn persist_history(&self) {
+        if let Err(e) = save_history(&self.history) {
+            log::warn!("persist history: {e}");
         }
     }
 }
@@ -610,11 +698,264 @@ fn save_connections(conns: &[Connection]) -> std::io::Result<()> {
     Ok(())
 }
 
+fn history_path() -> std::path::PathBuf {
+    profiles_path().with_file_name("history.json")
+}
+
+fn load_history() -> Vec<HistoryEntry> {
+    let path = history_path();
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    match serde_json::from_slice::<Vec<HistoryEntry>>(&bytes) {
+        Ok(mut entries) => {
+            entries.truncate(HISTORY_CAP);
+            entries
+        }
+        Err(e) => {
+            log::warn!("parse {}: {e}", path.display());
+            Vec::new()
+        }
+    }
+}
+
+fn save_history(history: &[HistoryEntry]) -> std::io::Result<()> {
+    let path = history_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(history).unwrap_or_default())?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_isolated_state(tag: &str, body: impl FnOnce(&mut AppState)) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("cde-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crusty-data-explorer")).unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        {
+            let ctx = eframe::egui::Context::default();
+            let mut state = AppState::new(&ctx);
+            for id in state.connections().iter().map(|c| c.id).collect::<Vec<_>>() {
+                state.delete_connection(id);
+            }
+            body(&mut state);
+        }
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn add_sqlite_connection(state: &mut AppState, name: &str) -> ConnectionId {
+        state.open_draft(None);
+        {
+            let draft = state.draft_mut().expect("new draft");
+            draft.name = name.to_owned();
+            draft.config = ConnectionConfig::Sqlite { path: ":memory:".into() };
+        }
+        state.save_draft();
+        state.connections().last().map(|c| c.id).expect("saved connection")
+    }
+
+    fn finish_ok(state: &mut AppState, conn: ConnectionId, sql: &str) {
+        let tab = state.new_tab(conn);
+        if let Some(slot) = state.tab_sql_mut(tab) {
+            *slot = sql.to_owned();
+        }
+        let run = state.ids.run();
+        state.set_outcome(tab, RunOutcome::Running { run, started: Instant::now() });
+        let result = QueryResult::from_columns(
+            Vec::new(),
+            false,
+            None,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap();
+        state.finish_run(run, RunOutcome::Ok(result));
+    }
+
+    #[test]
+    fn history_entry_shape_holds_sql_only() {
+        let entry = HistoryEntry {
+            conn: ConnectionId::from_raw(1),
+            sql: "SELECT 1".to_owned(),
+            succeeded: true,
+            rows: Some(1),
+            took: std::time::Duration::from_millis(7),
+            at: 1_700_000_000,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("password"));
+        assert!(json.contains("SELECT 1"));
+    }
+
+    #[test]
+    fn finish_run_records_ok_and_err() {
+        with_isolated_state("hist-rec", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 1".to_owned();
+            }
+            let run = state.ids.run();
+            state.set_outcome(tab, RunOutcome::Running { run, started: Instant::now() });
+            let result = QueryResult::from_columns(
+                vec![crate::db::Column::new(
+                    "n".to_owned(),
+                    "INTEGER".to_owned(),
+                    vec![
+                        crate::db::Value::Integer(1),
+                        crate::db::Value::Integer(2),
+                    ],
+                )],
+                false,
+                None,
+                std::time::Duration::from_millis(42),
+            )
+            .unwrap();
+            state.finish_run(run, RunOutcome::Ok(result));
+            assert_eq!(state.history().len(), 1);
+            let entry = &state.history()[0];
+            assert_eq!(entry.conn, conn);
+            assert_eq!(entry.sql, "SELECT 1");
+            assert!(entry.succeeded);
+            assert_eq!(entry.rows, Some(2));
+            assert_eq!(entry.took, std::time::Duration::from_millis(42));
+
+            let affected_tab = state.new_tab(conn);
+            if let Some(slot) = state.tab_sql_mut(affected_tab) {
+                *slot = "DELETE FROM t".to_owned();
+            }
+            let affected_run = state.ids.run();
+            state.set_outcome(
+                affected_tab,
+                RunOutcome::Running { run: affected_run, started: Instant::now() },
+            );
+            let affected = QueryResult::from_columns(
+                Vec::new(),
+                false,
+                Some(3),
+                std::time::Duration::from_millis(5),
+            )
+            .unwrap();
+            state.finish_run(affected_run, RunOutcome::Ok(affected));
+            assert_eq!(state.history()[0].rows, Some(3));
+
+            let err_tab = state.new_tab(conn);
+            if let Some(slot) = state.tab_sql_mut(err_tab) {
+                *slot = "SELECT bad".to_owned();
+            }
+            let err_run = state.ids.run();
+            state.set_outcome(
+                err_tab,
+                RunOutcome::Running { run: err_run, started: Instant::now() },
+            );
+            state.finish_run(err_run, RunOutcome::Err("query failed".to_owned()));
+            assert_eq!(state.history().len(), 3);
+            let latest = &state.history()[0];
+            assert_eq!(latest.sql, "SELECT bad");
+            assert!(!latest.succeeded);
+            assert_eq!(latest.rows, None);
+
+            let before = state.history().len();
+            state.finish_run(err_run, RunOutcome::Err("late duplicate".to_owned()));
+            assert_eq!(state.history().len(), before);
+
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.history().len(), state.history().len());
+            assert_eq!(reloaded.history()[0].sql, "SELECT bad");
+        });
+    }
+
+    #[test]
+    fn history_caps_at_200_newest_first() {
+        with_isolated_state("hist-cap", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            for i in 0..250 {
+                finish_ok(state, conn, &format!("SELECT {i}"));
+            }
+            assert_eq!(state.history().len(), 200);
+            assert_eq!(state.history()[0].sql, "SELECT 249");
+            assert_eq!(state.history()[199].sql, "SELECT 50");
+        });
+    }
+
+    #[test]
+    fn history_for_filters_by_connection() {
+        with_isolated_state("hist-filter", |state| {
+            let a = add_sqlite_connection(state, "a");
+            let b = add_sqlite_connection(state, "b");
+            finish_ok(state, a, "SELECT a");
+            finish_ok(state, b, "SELECT b");
+            let only_a = state.history_for(a);
+            assert_eq!(only_a.len(), 1);
+            assert_eq!(only_a[0].sql, "SELECT a");
+            let only_b = state.history_for(b);
+            assert_eq!(only_b.len(), 1);
+            assert_eq!(only_b[0].sql, "SELECT b");
+            state.open_history(a, "SELECT a");
+            let tab = state.active().and_then(|id| state.tab(id)).expect("active tab");
+            assert_eq!(tab.sql, "SELECT a");
+            assert!(matches!(tab.outcome(), RunOutcome::Never));
+            state.clear_history();
+            assert!(state.history().is_empty());
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert!(reloaded.history().is_empty());
+        });
+    }
+
+    #[test]
+    fn corrupt_history_file_falls_back_to_empty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("cde-hist-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crusty-data-explorer")).unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        std::fs::write(
+            dir.join("crusty-data-explorer").join("history.json"),
+            b"{oops",
+        )
+        .unwrap();
+        let ctx = eframe::egui::Context::default();
+        let state = AppState::new(&ctx);
+        assert!(state.history().is_empty());
+        let entries: Vec<HistoryEntry> = (0..250)
+            .map(|i| HistoryEntry {
+                conn: ConnectionId::from_raw(1),
+                sql: format!("SELECT {i}"),
+                succeeded: true,
+                rows: Some(i),
+                took: std::time::Duration::from_millis(1),
+                at: i,
+            })
+            .collect();
+        std::fs::write(
+            dir.join("crusty-data-explorer").join("history.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        let loaded = AppState::new(&ctx);
+        assert_eq!(loaded.history().len(), 200);
+        assert_eq!(loaded.history()[0].sql, "SELECT 0");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn persisted_profile_shape_has_no_password() {

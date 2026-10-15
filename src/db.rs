@@ -16,7 +16,7 @@ pub const ROW_CAP: usize = 10_000;
 pub const CELL_CAP: usize = 256;
 
 /// Branded id so a tab id cannot stand in for a connection id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ConnectionId(u64);
 /// Stable tab identity, never a vector index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
