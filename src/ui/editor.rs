@@ -160,6 +160,15 @@ impl FindState {
     }
 }
 
+/// Convert a byte range in `text` into a character range, the unit the text
+/// cursor uses. Both ends must sit on char boundaries, which
+/// [`FindState::find_all`] produces.
+pub fn char_range(text: &str, bytes: &Range<usize>) -> Range<usize> {
+    let start = text[..bytes.start].chars().count();
+    let end = text[..bytes.end].chars().count();
+    start..end
+}
+
 /// Highlight kind for one tagged span. Gaps between spans are plain text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -514,6 +523,14 @@ mod tests {
             vec![0..3, 7..10, 11..14]
         );
         assert!(FindState::find_all("select 1", "").is_empty());
+    }
+
+    #[test]
+    fn find_ranges_convert_to_char_ranges() {
+        let text = "héllo wörld";
+        let hits = FindState::find_all(text, "wörld");
+        assert_eq!(hits, vec![7..13]);
+        assert_eq!(char_range(text, &hits[0]), 6..11);
     }
 
     #[test]

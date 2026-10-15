@@ -1,23 +1,29 @@
-//! Tab bar, SQL editor, and the Run/Cancel toolbar.
+//! Tab bar, SQL editor, toolbar, and the find bar.
 //!
 //! Clicks are collected while a tab borrow is live and applied after it
 //! ends, so the editor borrow never overlaps a transition.
 
 use eframe::egui;
 
+use super::editor::{char_range, format_sql, FindState};
 use crate::app::{AppState, RunOutcome};
 use crate::db::TabId;
 
 const RUN_GREEN: egui::Color32 = egui::Color32::from_rgb(115, 180, 115);
 
 pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
-    let modal_open = state.draft().is_some() || state.save_prompt().is_some();
-    let (new_tab_shortcut_pressed, close_tab_shortcut_pressed) = ui.input_mut(|i| {
-        (
-            i.consume_shortcut(&new_tab_shortcut()),
-            i.consume_shortcut(&close_tab_shortcut()),
-        )
-    });
+    prune_find(state, ui.ctx());
+    let modal_open = state.draft().is_some()
+        || state.save_prompt().is_some()
+        || state.password_prompt().is_some();
+    let (new_tab_shortcut_pressed, close_tab_shortcut_pressed, find_shortcut_pressed) = ui
+        .input_mut(|i| {
+            (
+                i.consume_shortcut(&new_tab_shortcut()),
+                i.consume_shortcut(&close_tab_shortcut()),
+                i.consume_shortcut(&find_shortcut()),
+            )
+        });
     if !modal_open {
         if new_tab_shortcut_pressed {
             if let Some(conn) = state.default_connection() {
@@ -33,7 +39,13 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     }
     tab_bar(state, ui);
     ui.add_space(4.0);
-    toolbar(state, ui);
+    let mut find_opened = false;
+    if !modal_open && find_shortcut_pressed {
+        if let Some(id) = state.active() {
+            find_opened = toggle_find(ui.ctx(), id);
+        }
+    }
+    find_opened |= toolbar(state, ui);
     ui.add_space(4.0);
     save_window(state, ui);
     if let Some(id) = state.active() {
@@ -48,12 +60,20 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
             .map(|tab| tab.conn)
             .and_then(|conn| state.schema(conn))
             .cloned();
+        find_bar(state, ui, find_opened);
         if let Some(sql) = state.tab_sql_mut(id) {
             egui::Frame::canvas(ui.style())
                 .inner_margin(egui::Margin::same(6))
                 .show(ui, |ui| {
-                    super::complete::editor_with_completion(schema.as_ref(), sql, ui);
+                    super::complete::editor_with_completion(id, schema.as_ref(), sql, ui);
                 });
+        }
+        // The completion popup gets first claim on Esc; close find only if free.
+        if !modal_open
+            && find_bar_of(ui.ctx(), id).open
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            close_find(ui.ctx(), id);
         }
     } else {
         ui.label("Open a connection and start a new query.");
@@ -108,9 +128,11 @@ fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
     }
 }
 
-fn toolbar(state: &mut AppState, ui: &mut egui::Ui) {
-    let Some(tab_id) = state.active() else { return };
+fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
+    let Some(tab_id) = state.active() else { return false };
+    let find_open = find_bar_of(ui.ctx(), tab_id).open;
     let (mut run_clicked, mut cancel_clicked, mut save_clicked) = (false, false, false);
+    let (mut format_clicked, mut find_clicked) = (false, false);
     if state.tab(tab_id).is_some() {
         let running = matches!(
             state.tab(tab_id).map(|t| t.outcome()),
@@ -128,6 +150,11 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) {
                 ui.label(egui::RichText::new("Ctrl+Enter").small().weak());
                 save_clicked = ui.button("Save").clicked();
             }
+            format_clicked = ui.button("Format").clicked();
+            find_clicked = ui
+                .selectable_label(find_open, "Find")
+                .on_hover_text("Find (Ctrl+F)")
+                .clicked();
             match state.tab(tab_id).map(|t| t.outcome()) {
                 Some(RunOutcome::Running { started, .. }) => {
                     ui.spinner();
@@ -158,10 +185,20 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) {
     if save_clicked {
         state.open_save_prompt();
     }
+    if format_clicked {
+        if let Some(sql) = state.tab_sql_mut(tab_id) {
+            *sql = format_sql(sql);
+        }
+    }
+    let mut find_opened = false;
+    if find_clicked {
+        find_opened = toggle_find(ui.ctx(), tab_id);
+    }
     if run_clicked {
         let sql = state.tab(tab_id).map(|t| t.sql.clone()).unwrap_or_default();
         state.start_run(tab_id, &sql);
     }
+    find_opened
 }
 
 pub(crate) fn tab_title(sql: String) -> String {
@@ -183,6 +220,130 @@ pub fn new_tab_shortcut() -> egui::KeyboardShortcut {
 
 pub fn close_tab_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::W)
+}
+
+pub fn find_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::F)
+}
+
+/// Per-tab find bar state, kept in the egui context data keyed by tab id.
+#[derive(Clone, Default)]
+struct FindBar {
+    open: bool,
+    selected: Option<usize>,
+    state: FindState,
+}
+
+/// Find bar state id for one tab, the ctx-data pattern `complete.rs` uses.
+fn find_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_find", tab))
+}
+
+fn find_bar_of(ctx: &egui::Context, tab: TabId) -> FindBar {
+    ctx.data_mut(|d| d.get_temp(find_id(tab)).unwrap_or_default())
+}
+
+fn store_find_bar(ctx: &egui::Context, tab: TabId, bar: FindBar) {
+    ctx.data_mut(|d| d.insert_temp(find_id(tab), bar));
+}
+
+/// Flip the find bar open and report the new state.
+fn toggle_find(ctx: &egui::Context, tab: TabId) -> bool {
+    let mut bar = find_bar_of(ctx, tab);
+    bar.open = !bar.open;
+    if bar.open {
+        bar.selected = None;
+    }
+    let open = bar.open;
+    store_find_bar(ctx, tab, bar);
+    open
+}
+
+fn close_find(ctx: &egui::Context, tab: TabId) {
+    let mut bar = find_bar_of(ctx, tab);
+    bar.open = false;
+    store_find_bar(ctx, tab, bar);
+}
+
+/// Drop the find bar and the editor selection for a tab that is gone.
+fn forget_find(ctx: &egui::Context, tab: TabId) {
+    ctx.data_mut(|d| d.remove::<FindBar>(find_id(tab)));
+    super::complete::clear_selection(ctx, tab);
+}
+
+/// Find state is keyed by tab id, so a closed tab leaves it behind. Diff
+/// against the live tab list instead of hooking every close path.
+fn prune_find(state: &AppState, ctx: &egui::Context) {
+    let id = egui::Id::new("crusty_find_tabs");
+    let known: Vec<TabId> = ctx.data_mut(|d| d.get_temp(id).unwrap_or_default());
+    let live: Vec<TabId> = state.tabs().iter().map(|t| t.id).collect();
+    for tab in known.iter().filter(|t| !live.contains(t)) {
+        forget_find(ctx, *tab);
+    }
+    if known != live {
+        ctx.data_mut(|d| d.insert_temp(id, live));
+    }
+}
+
+/// Find bar for the active tab. The count comes from `FindState::find_all`;
+/// Next and Prev move the editor selection onto the match.
+fn find_bar(state: &AppState, ui: &mut egui::Ui, just_opened: bool) {
+    let Some(tab_id) = state.active() else { return };
+    let mut bar = find_bar_of(ui.ctx(), tab_id);
+    if !bar.open {
+        return;
+    }
+    let sql = state.tab(tab_id).map(|t| t.sql.as_str()).unwrap_or("");
+    let hits = bar.state.find(sql);
+    if bar.selected.is_some_and(|i| i >= hits.len()) {
+        bar.selected = None;
+    }
+    let mut pick: Option<usize> = None;
+    let mut close = false;
+    ui.horizontal(|ui| {
+        ui.label("Find");
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut bar.state.query)
+                .desired_width(200.0)
+                .hint_text("text to find"),
+        );
+        if just_opened {
+            field.request_focus();
+        }
+        if field.changed() {
+            bar.selected = None;
+        }
+        ui.label(format!(
+            "{}/{}",
+            bar.selected.map_or(0, |i| i + 1),
+            hits.len()
+        ));
+        if !hits.is_empty() {
+            let count = hits.len();
+            if ui.button("Prev").clicked() {
+                pick = Some(bar.selected.map_or(count - 1, |i| (i + count - 1) % count));
+            }
+            if ui.button("Next").clicked() {
+                pick = Some(bar.selected.map_or(0, |i| (i + 1) % count));
+            }
+        }
+        if ui.small_button("×").clicked() {
+            close = true;
+        }
+    });
+    if let Some(i) = pick {
+        bar.selected = Some(i);
+        if let Some(bytes) = hits.get(i) {
+            super::complete::set_selection(ui.ctx(), tab_id, char_range(sql, bytes));
+            // egui paints a selection only while the TextEdit holds focus.
+            ui.ctx()
+                .memory_mut(|m| m.request_focus(super::complete::editor_id(tab_id)));
+        }
+    }
+    if close {
+        bar.open = false;
+    }
+    store_find_bar(ui.ctx(), tab_id, bar);
 }
 
 fn save_window(state: &mut AppState, ui: &mut egui::Ui) {
@@ -231,10 +392,15 @@ mod tests {
         let close_tab = close_tab_shortcut();
         assert_eq!(close_tab.modifiers, egui::Modifiers::CTRL);
         assert_eq!(close_tab.logical_key, egui::Key::W);
+        let find = find_shortcut();
+        assert_eq!(find.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(find.logical_key, egui::Key::F);
     }
 }
 // Manual check: Ctrl+T creates a tab on default_connection and activates it
 // (no-op with no connection), Ctrl+W closes the active tab (no-op with none),
-// both suppressed while a draft or save modal is open, using the same
-// new_tab/activate/close_tab/default_connection transitions as the plus and
-// cross buttons covered by AppState tests.
+// Ctrl+F toggles the find bar for the active tab, and all three stay off with
+// a draft, save, or password modal open, using the same new_tab/activate/
+// close_tab/default_connection transitions as the plus and cross buttons
+// covered by AppState tests. Format and the find bar's Next/Prev selection are
+// manual too.
