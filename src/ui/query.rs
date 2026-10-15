@@ -140,7 +140,7 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) {
     }
 }
 
-fn tab_title(sql: String) -> String {
+pub(crate) fn tab_title(sql: String) -> String {
     let first = sql.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("SQL");
     let mut title: String = first.chars().take(24).collect();
     if first.chars().count() > 24 {

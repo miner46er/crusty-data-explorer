@@ -9,6 +9,7 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::app::{AppState, RunOutcome, SortDir, Tab};
 use crate::db::{CELL_CAP, QueryResult, Value};
+use crate::export::to_csv;
 
 const AFFECT_GREEN: egui::Color32 = egui::Color32::from_rgb(115, 180, 115);
 
@@ -178,7 +179,22 @@ fn results_grid(tab: &mut Tab, ui: &mut egui::Ui) {
         if ui.button("Clear").clicked() {
             tab.set_filter(String::new());
         }
+        let can_export =
+            matches!(tab.outcome(), RunOutcome::Ok(result) if !result.columns().is_empty());
+        if ui
+            .add_enabled(can_export, egui::Button::new("Export CSV"))
+            .clicked()
+        {
+            export_current_view(tab);
+        }
     });
+    if let Some(notice) = tab.export_notice().map(str::to_owned) {
+        if tab.export_failed() {
+            ui.colored_label(ui.visuals().error_fg_color, notice);
+        } else {
+            ui.colored_label(AFFECT_GREEN, notice);
+        }
+    }
     let (sort_col, sort_dir, filter) = (tab.sort_col(), tab.sort_dir(), tab.filter().to_owned());
     let visible = {
         let result = match tab.outcome() {
@@ -248,6 +264,35 @@ fn results_grid(tab: &mut Tab, ui: &mut egui::Ui) {
     });
     if let Some(col) = pending_sort {
         tab.set_sort(col);
+    }
+}
+
+fn export_current_view(tab: &mut Tab) {
+    let (csv, default_name, nrows) = match tab.outcome() {
+        RunOutcome::Ok(result) => {
+            if result.columns().is_empty() {
+                return;
+            }
+            let visible = visible_rows(result, tab.sort_col(), tab.sort_dir(), tab.filter());
+            let csv = to_csv(result, &visible);
+            let name = format!("{}.csv", super::query::tab_title(tab.sql.clone()));
+            (csv, name, visible.len())
+        }
+        _ => return,
+    };
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("CSV", &["csv"])
+        .set_file_name(&default_name)
+        .save_file()
+    else {
+        return;
+    };
+    match std::fs::write(&path, csv) {
+        Ok(()) => tab.set_export_notice(
+            format!("Exported {nrows} rows to {}", path.display()),
+            false,
+        ),
+        Err(e) => tab.set_export_notice(format!("Export failed: {e}"), true),
     }
 }
 

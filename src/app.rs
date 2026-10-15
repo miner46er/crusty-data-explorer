@@ -76,6 +76,8 @@ pub struct Tab {
     sort_col: Option<usize>,
     sort_dir: SortDir,
     filter: String,
+    export_notice: Option<String>,
+    export_failed: bool,
 }
 
 impl Tab {
@@ -110,6 +112,20 @@ impl Tab {
     }
     pub fn set_filter(&mut self, filter: String) {
         self.filter = filter;
+    }
+    pub fn export_notice(&self) -> Option<&str> {
+        self.export_notice.as_deref()
+    }
+    pub fn export_failed(&self) -> bool {
+        self.export_failed
+    }
+    pub fn set_export_notice(&mut self, notice: String, is_error: bool) {
+        self.export_notice = Some(notice);
+        self.export_failed = is_error;
+    }
+    pub fn clear_export_notice(&mut self) {
+        self.export_notice = None;
+        self.export_failed = false;
     }
 }
 
@@ -304,6 +320,8 @@ impl AppState {
             sort_col: None,
             sort_dir: SortDir::Asc,
             filter: String::new(),
+            export_notice: None,
+            export_failed: false,
         });
         if self.active.is_none() {
             self.active = Some(id);
@@ -680,6 +698,7 @@ impl AppState {
     fn set_outcome(&mut self, tab: TabId, outcome: RunOutcome) {
         if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
             t.outcome = outcome;
+            t.clear_export_notice();
         }
     }
 
@@ -793,6 +812,7 @@ impl AppState {
                 };
                 let conn = t.conn;
                 t.outcome = outcome;
+                t.clear_export_notice();
                 Some((conn, record.map(|(succeeded, rows, took)| (sql, succeeded, rows, took))))
             }
             None => None,
