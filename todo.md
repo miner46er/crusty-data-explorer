@@ -32,15 +32,15 @@
 ## Parity plan (DBeaver / Beekeeper gaps, ranked 2026-10-16)
 
 Wave 0 — scaffold, blocks all.
-- [ ] T0 Baseline capture: record `cargo check`, `cargo check --features postgres`, `cargo test`, `cargo test --features postgres` outputs at head. No code.
+- [x] T0 Baseline capture: record `cargo check`, `cargo check --features postgres`, `cargo test`, `cargo test --features postgres` outputs at head. No code.
 
 Wave 1 — parallel, additive only, separate owned files.
-- [ ] T1 Autocomplete: new `src/ui/complete.rs` over `SchemaInfo` + keywords, hook into `src/ui/query.rs` (Ctrl+Space popup). No `Tab` shape change. Tests: suggestion unit tests.
-- [ ] T3 DDL view + Generate SQL: new `src/ui/ddl.rs` pure builder over loaded schema, read-only pane. No state change. Tests: DDL string tests.
-- [ ] T5 Editor quality: new `src/ui/editor.rs` (highlight + format + find), hook into `src/ui/query.rs` AFTER T1 lands (shared hook point). Tests: formatter idempotence.
-- [ ] T7a Extended export: extend `src/export.rs` with JSON + SQL-inserts + clipboard copy. No `QueryResult` change. Tests: quoting + roundtrip.
-- [ ] T8a Postgres SSL modes: additive `ssl` field on Postgres config in `src/db.rs` + sqlx connect options + persist. Tests: URL builder per mode.
-- [ ] T9a Env types (dev/test/prod colors + prod confirm): AFTER T8a (shared config shape), copies its additive-field pattern. Tests: default dev + guard.
+- [x] T1 Autocomplete: new `src/ui/complete.rs` over `SchemaInfo` + keywords, hook into `src/ui/query.rs` (Ctrl+Space popup). No `Tab` shape change. Tests: suggestion unit tests. Landed 23ee7c7.
+- [x] T3 DDL view + Generate SQL: new `src/ui/ddl.rs` pure builder over loaded schema, read-only pane. No state change. Tests: DDL string tests. Landed 4895a07.
+- [x] T5 Editor logic: `src/ui/editor.rs` format + find + highlight with 5 tests. Landed ea40967. Hook unit in flight on deepseek.
+- [x] T7a Extended export: extend `src/export.rs` with JSON + SQL-inserts + clipboard copy. No `QueryResult` change. Tests: quoting + roundtrip. Landed 77b0771.
+- [x] T8a Postgres SSL modes: additive `ssl` field on Postgres config in `src/db.rs` + sqlx connect options + persist. Tests: URL builder per mode. Landed 69b32e0. Live roundtrip green.
+- [ ] T9a Env types (dev/test/prod colors + prod confirm): AFTER T8a (shared config shape), copies its additive-field pattern. Tests: default dev + guard. In flight on deepseek.
 
 Wave 2 — serial core chain on `src/app.rs` Tab machine + `src/db.rs` worker.
 - [ ] T4 Run scope + multi-statement + resultset picker (after Wave 1). Extends `RunOutcome`, splitter, picker UI. Blocks T6, T2. Tests + live run + cancel regression.
