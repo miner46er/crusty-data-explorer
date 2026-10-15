@@ -58,17 +58,58 @@ impl Connection {
     }
 }
 
+/// Sort direction for one grid column. `Asc` is the default a fresh tab
+/// carries while `sort_col` is `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortDir {
+    #[default]
+    Asc,
+    Desc,
+}
+
 #[derive(Debug)]
 pub struct Tab {
     pub id: TabId,
     pub conn: ConnectionId,
     pub sql: String,
     outcome: RunOutcome,
+    sort_col: Option<usize>,
+    sort_dir: SortDir,
+    filter: String,
 }
 
 impl Tab {
     pub fn outcome(&self) -> &RunOutcome {
         &self.outcome
+    }
+    pub fn sort_col(&self) -> Option<usize> {
+        self.sort_col
+    }
+    pub fn sort_dir(&self) -> SortDir {
+        self.sort_dir
+    }
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+    /// Cycle one column through none, asc, desc. A different column
+    /// starts at asc.
+    pub fn set_sort(&mut self, col: usize) {
+        match self.sort_col {
+            Some(current) if current == col => match self.sort_dir {
+                SortDir::Asc => self.sort_dir = SortDir::Desc,
+                SortDir::Desc => {
+                    self.sort_col = None;
+                    self.sort_dir = SortDir::Asc;
+                }
+            },
+            _ => {
+                self.sort_col = Some(col);
+                self.sort_dir = SortDir::Asc;
+            }
+        }
+    }
+    pub fn set_filter(&mut self, filter: String) {
+        self.filter = filter;
     }
 }
 
@@ -217,6 +258,9 @@ impl AppState {
     pub fn tab(&self, id: TabId) -> Option<&Tab> {
         self.tabs.iter().find(|t| t.id == id)
     }
+    pub fn tab_mut(&mut self, id: TabId) -> Option<&mut Tab> {
+        self.tabs.iter_mut().find(|t| t.id == id)
+    }
     pub fn tab_sql_mut(&mut self, id: TabId) -> Option<&mut String> {
         self.tabs.iter_mut().find(|t| t.id == id).map(|t| &mut t.sql)
     }
@@ -252,7 +296,15 @@ impl AppState {
 
     pub fn new_tab(&mut self, conn: ConnectionId) -> TabId {
         let id = self.ids.tab();
-        self.tabs.push(Tab { id, conn, sql: String::new(), outcome: RunOutcome::Never });
+        self.tabs.push(Tab {
+            id,
+            conn,
+            sql: String::new(),
+            outcome: RunOutcome::Never,
+            sort_col: None,
+            sort_dir: SortDir::Asc,
+            filter: String::new(),
+        });
         if self.active.is_none() {
             self.active = Some(id);
         }
@@ -982,6 +1034,31 @@ mod tests {
         )
         .unwrap();
         state.finish_run(run, RunOutcome::Ok(result));
+    }
+
+    #[test]
+    fn tab_sort_cycles_none_asc_desc() {
+        with_isolated_state("tab-sort", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            let view = state.tab(tab).expect("tab");
+            assert_eq!(view.sort_col(), None);
+            assert_eq!(view.sort_dir(), SortDir::Asc);
+            assert_eq!(view.filter(), "");
+            state.tab_mut(tab).expect("tab").set_sort(0);
+            assert_eq!(state.tab(tab).expect("tab").sort_col(), Some(0));
+            assert_eq!(state.tab(tab).expect("tab").sort_dir(), SortDir::Asc);
+            state.tab_mut(tab).expect("tab").set_sort(0);
+            assert_eq!(state.tab(tab).expect("tab").sort_col(), Some(0));
+            assert_eq!(state.tab(tab).expect("tab").sort_dir(), SortDir::Desc);
+            state.tab_mut(tab).expect("tab").set_sort(0);
+            assert_eq!(state.tab(tab).expect("tab").sort_col(), None);
+            state.tab_mut(tab).expect("tab").set_sort(1);
+            assert_eq!(state.tab(tab).expect("tab").sort_col(), Some(1));
+            assert_eq!(state.tab(tab).expect("tab").sort_dir(), SortDir::Asc);
+            state.tab_mut(tab).expect("tab").set_filter("ada".to_owned());
+            assert_eq!(state.tab(tab).expect("tab").filter(), "ada");
+        });
     }
 
     #[test]
