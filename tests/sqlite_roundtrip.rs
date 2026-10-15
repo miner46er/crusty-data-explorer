@@ -5,7 +5,7 @@ use crusty_data_explorer::db::{ConnectionConfig, ROW_CAP, Session, Value};
 #[test]
 fn sqlite_in_memory_roundtrip() {
     let config = ConnectionConfig::Sqlite { path: PathBuf::from(":memory:") };
-    let mut session = Session::open(&config, None).expect("open in-memory SQLite");
+    let mut session = Session::open(&config, None, None).expect("open in-memory SQLite");
 
     let created = session
         .query("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
@@ -46,7 +46,7 @@ fn sqlite_in_memory_roundtrip() {
 #[test]
 fn row_cap_truncates() {
     let config = ConnectionConfig::Sqlite { path: PathBuf::from(":memory:") };
-    let mut session = Session::open(&config, None).expect("open in-memory SQLite");
+    let mut session = Session::open(&config, None, None).expect("open in-memory SQLite");
 
     let sql = format!(
         "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < {}) SELECT n FROM c",

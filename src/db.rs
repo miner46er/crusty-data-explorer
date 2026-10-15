@@ -3,12 +3,16 @@
 //! Everything that touches rusqlite (or sqlx, behind the `postgres` and
 //! `mysql` features) lives in this module. Layers above only see [`Value`],
 //! [`QueryResult`], [`DbError`], and the [`DbCommand`]/[`DbEvent`]
-//! protocol. No client-library type crosses the boundary.
+//! protocol. No client-library type crosses the boundary. A session that
+//! needs an SSH tunnel owns it here for the session's whole life; the
+//! tunnel itself lives in [`crate::ssh`].
 
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
+
+use crate::ssh::SshConfig;
 
 /// Cap on materialized rows per statement. The result reports truncation.
 pub const ROW_CAP: usize = 10_000;
@@ -111,12 +115,14 @@ impl DbKind {
                 database: String::new(),
                 user: String::new(),
                 ssl_mode: PostgresSslMode::Disable,
+                ssh: None,
             },
             DbKind::Mysql => ConnectionConfig::Mysql {
                 host: "localhost".to_owned(),
                 port: 3306,
                 database: String::new(),
                 user: String::new(),
+                ssh: None,
             },
         }
     }
@@ -207,12 +213,16 @@ pub enum ConnectionConfig {
         user: String,
         #[serde(default)]
         ssl_mode: PostgresSslMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh: Option<SshConfig>,
     },
     Mysql {
         host: String,
         port: u16,
         database: String,
         user: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh: Option<SshConfig>,
     },
 }
 
@@ -237,8 +247,8 @@ impl ConnectionConfig {
                 }
                 Ok(())
             }
-            ConnectionConfig::Postgres { host, port, database, user, .. }
-            | ConnectionConfig::Mysql { host, port, database, user } => {
+            ConnectionConfig::Postgres { host, port, database, user, ssh, .. }
+            | ConnectionConfig::Mysql { host, port, database, user, ssh } => {
                 if host.trim().is_empty() {
                     return Err(DbError::Config("host is empty".to_owned()));
                 }
@@ -250,6 +260,9 @@ impl ConnectionConfig {
                 }
                 if user.trim().is_empty() {
                     return Err(DbError::Config("user is empty".to_owned()));
+                }
+                if let Some(ssh) = ssh {
+                    ssh.validate()?;
                 }
                 Ok(())
             }
@@ -966,41 +979,63 @@ pub enum Session {
 }
 
 impl Session {
-    pub fn open(config: &ConnectionConfig, password: Option<&str>) -> Result<Session, DbError> {
+    /// Opens the engine. `password` is the database secret and
+    /// `ssh_password` the SSH secret (an SSH password or key passphrase);
+    /// both are memory-only.
+    pub fn open(
+        config: &ConnectionConfig,
+        password: Option<&str>,
+        ssh_password: Option<&str>,
+    ) -> Result<Session, DbError> {
         match config {
             ConnectionConfig::Sqlite { path } => rusqlite::Connection::open(path)
                 .map(Session::Sqlite)
                 .map_err(|e| DbError::Open(e.to_string())),
-            ConnectionConfig::Postgres { .. } => Self::open_postgres(config, password),
-            ConnectionConfig::Mysql { .. } => Self::open_mysql(config, password),
+            ConnectionConfig::Postgres { .. } => {
+                Self::open_postgres(config, password, ssh_password)
+            }
+            ConnectionConfig::Mysql { .. } => Self::open_mysql(config, password, ssh_password),
         }
     }
 
     fn open_postgres(
         config: &ConnectionConfig,
         password: Option<&str>,
+        ssh_password: Option<&str>,
     ) -> Result<Session, DbError> {
         #[cfg(feature = "postgres")]
         {
-            return Ok(Session::Postgres(PgSession::connect(config, password)?));
+            return Ok(Session::Postgres(PgSession::connect(
+                config,
+                password,
+                ssh_password,
+            )?));
         }
         #[cfg(not(feature = "postgres"))]
         {
-            let _ = (config, password);
+            let _ = (config, password, ssh_password);
             return Err(DbError::NotSupported(
                 "postgres needs the `postgres` feature".to_owned(),
             ));
         }
     }
 
-    fn open_mysql(config: &ConnectionConfig, password: Option<&str>) -> Result<Session, DbError> {
+    fn open_mysql(
+        config: &ConnectionConfig,
+        password: Option<&str>,
+        ssh_password: Option<&str>,
+    ) -> Result<Session, DbError> {
         #[cfg(feature = "mysql")]
         {
-            return Ok(Session::Mysql(MySession::connect(config, password)?));
+            return Ok(Session::Mysql(MySession::connect(
+                config,
+                password,
+                ssh_password,
+            )?));
         }
         #[cfg(not(feature = "mysql"))]
         {
-            let _ = (config, password);
+            let _ = (config, password, ssh_password);
             return Err(DbError::Config("mysql feature not enabled".to_owned()));
         }
     }
@@ -1060,7 +1095,8 @@ impl Session {
 /// Behind the `postgres` feature. Owns a current-thread tokio runtime so the
 /// async sqlx model stays caged inside this driver file; the public trait
 /// shape never changes. The worker thread calls `block_on`, so the UI thread
-/// never blocks.
+/// never blocks. A configured SSH tunnel lives here for the whole session
+/// and drops with it, so disconnect tears it down.
 #[cfg(feature = "postgres")]
 pub struct PgSession {
     rt: tokio::runtime::Runtime,
@@ -1069,22 +1105,37 @@ pub struct PgSession {
     database: String,
     server_version: String,
     backend_pid: i32,
+    /// Held for the session's whole life, so disconnect tears the tunnel
+    /// down with the pool; declared last so it drops after the pool.
+    _tunnel: Option<crate::ssh::Tunnel>,
 }
 
 #[cfg(feature = "postgres")]
 impl PgSession {
-    fn connect(config: &ConnectionConfig, password: Option<&str>) -> Result<Self, DbError> {
+    fn connect(
+        config: &ConnectionConfig,
+        password: Option<&str>,
+        ssh_password: Option<&str>,
+    ) -> Result<Self, DbError> {
         let ConnectionConfig::Postgres {
             host,
             port,
             database,
             user,
             ssl_mode,
+            ssh,
         } = config
         else {
             return Err(DbError::Config("not a postgres connection".to_owned()));
         };
-        let connection_string = postgres_url(host, *port, database, user, password, *ssl_mode);
+        let (tunnel, dial_host, dial_port) = crate::ssh::forward(
+            ssh.as_ref(),
+            ssh_password.unwrap_or_default(),
+            host,
+            *port,
+        )?;
+        let connection_string =
+            postgres_url(&dial_host, dial_port, database, user, password, *ssl_mode);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1126,6 +1177,7 @@ impl PgSession {
             database: database.clone(),
             server_version,
             backend_pid,
+            _tunnel: tunnel,
         })
     }
 
@@ -1665,15 +1717,28 @@ pub struct MySession {
     database: String,
     server_version: String,
     connection_id: u64,
+    /// Held for the session's whole life, so disconnect tears the tunnel
+    /// down with the pool; declared last so it drops after the pool.
+    _tunnel: Option<crate::ssh::Tunnel>,
 }
 
 #[cfg(feature = "mysql")]
 impl MySession {
-    fn connect(config: &ConnectionConfig, password: Option<&str>) -> Result<Self, DbError> {
-        let ConnectionConfig::Mysql { host, port, database, user } = config else {
+    fn connect(
+        config: &ConnectionConfig,
+        password: Option<&str>,
+        ssh_password: Option<&str>,
+    ) -> Result<Self, DbError> {
+        let ConnectionConfig::Mysql { host, port, database, user, ssh } = config else {
             return Err(DbError::Config("not a mysql connection".to_owned()));
         };
-        let connection_string = mysql_url(host, *port, database, user, password);
+        let (tunnel, dial_host, dial_port) = crate::ssh::forward(
+            ssh.as_ref(),
+            ssh_password.unwrap_or_default(),
+            host,
+            *port,
+        )?;
+        let connection_string = mysql_url(&dial_host, dial_port, database, user, password);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1714,6 +1779,7 @@ impl MySession {
             database: database.clone(),
             server_version,
             connection_id,
+            _tunnel: tunnel,
         })
     }
 
@@ -2781,18 +2847,20 @@ fn sqlite_schema(conn: &rusqlite::Connection) -> Result<SchemaInfo, DbError> {
 }
 
 /// Spawns the connection's worker thread and returns its handle.
-/// `password` is memory-only and never persisted; SQLite ignores it.
+/// `password` and `ssh_password` are memory-only and never persisted;
+/// SQLite ignores both.
 pub fn spawn_session(
     conn: ConnectionId,
     config: ConnectionConfig,
     password: Option<String>,
+    ssh_password: Option<String>,
     ui: eframe::egui::Context,
     events: mpsc::Sender<DbEvent>,
 ) -> DbHandle {
     let (cmds_tx, cmds_rx) = mpsc::channel();
     std::thread::Builder::new()
         .name(format!("cde-conn-{}", conn.raw()))
-        .spawn(move || worker_loop(conn, config, password, ui, events, cmds_rx))
+        .spawn(move || worker_loop(conn, config, password, ssh_password, ui, events, cmds_rx))
         .expect("spawn db worker thread");
     DbHandle { cmds: cmds_tx }
 }
@@ -2801,12 +2869,13 @@ fn worker_loop(
     conn: ConnectionId,
     config: ConnectionConfig,
     password: Option<String>,
+    ssh_password: Option<String>,
     ui: eframe::egui::Context,
     events: mpsc::Sender<DbEvent>,
     cmds: mpsc::Receiver<DbCommand>,
 ) {
     let mut session = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        Session::open(&config, password.as_deref())
+        Session::open(&config, password.as_deref(), ssh_password.as_deref())
     })) {
         Ok(Ok(s)) => s,
         Ok(Err(error)) => {
@@ -3072,6 +3141,7 @@ mod tests {
                 database: "appdb".to_owned(),
                 user: "owner".to_owned(),
                 ssl_mode: mode,
+                ssh: None,
             };
             let json = serde_json::to_string(&config).unwrap();
             assert!(json.contains(mode.as_str()));
@@ -3098,9 +3168,155 @@ mod tests {
                 database: "appdb".to_owned(),
                 user: "owner".to_owned(),
                 ssl_mode: PostgresSslMode::Disable,
+                ssh: None,
             }
         );
         assert_eq!(PostgresSslMode::default(), PostgresSslMode::Disable);
+    }
+
+    /// An ssh config shared by the tunnel tests.
+    fn ssh_config() -> crate::ssh::SshConfig {
+        crate::ssh::SshConfig {
+            host: "jump.example".to_owned(),
+            port: 2222,
+            user: "deploy".to_owned(),
+            auth: crate::ssh::SshAuth::Password,
+        }
+    }
+
+    #[test]
+    fn config_serde_roundtrips_with_and_without_ssh() {
+        for ssh in [None, Some(ssh_config())] {
+            let postgres = ConnectionConfig::Postgres {
+                host: "db.internal".to_owned(),
+                port: 5432,
+                database: "appdb".to_owned(),
+                user: "owner".to_owned(),
+                ssl_mode: PostgresSslMode::Disable,
+                ssh: ssh.clone(),
+            };
+            let json = serde_json::to_string(&postgres).unwrap();
+            assert_eq!(serde_json::from_str::<ConnectionConfig>(&json).unwrap(), postgres);
+            let mysql = ConnectionConfig::Mysql {
+                host: "db.internal".to_owned(),
+                port: 3307,
+                database: "cde_test".to_owned(),
+                user: "root".to_owned(),
+                ssh,
+            };
+            let json = serde_json::to_string(&mysql).unwrap();
+            assert_eq!(serde_json::from_str::<ConnectionConfig>(&json).unwrap(), mysql);
+        }
+    }
+
+    #[test]
+    fn profiles_without_ssh_load_as_none_and_serialize_without_the_field() {
+        let legacy = serde_json::json!({
+            "kind": "postgres",
+            "host": "localhost",
+            "port": 5432,
+            "database": "appdb",
+            "user": "owner",
+        });
+        let back: ConnectionConfig = serde_json::from_value(legacy).unwrap();
+        let ConnectionConfig::Postgres { ssh, .. } = &back else {
+            panic!("expected a postgres profile");
+        };
+        assert!(ssh.is_none());
+        let json = serde_json::to_string(&back).unwrap();
+        assert!(!json.contains("ssh"), "{json}");
+    }
+
+    #[test]
+    fn ssh_tunnel_pool_url_points_at_the_forwarded_port() {
+        let (host, port) = crate::ssh::loopback_endpoint(41_234);
+        assert_eq!((host.as_str(), port), ("127.0.0.1", 41_234));
+        assert_eq!(
+            postgres_url(&host, port, "appdb", "owner", Some("s3cret"), PostgresSslMode::Disable),
+            "postgres://owner:s3cret@127.0.0.1:41234/appdb"
+        );
+        assert_eq!(
+            mysql_url(&host, port, "cde_test", "root", None),
+            "mysql://root@127.0.0.1:41234/cde_test"
+        );
+    }
+
+    #[test]
+    fn validate_checks_ssh_fields_when_present() {
+        let config = |ssh: crate::ssh::SshConfig| ConnectionConfig::Postgres {
+            host: "db.internal".to_owned(),
+            port: 5432,
+            database: "appdb".to_owned(),
+            user: "owner".to_owned(),
+            ssl_mode: PostgresSslMode::Disable,
+            ssh: Some(ssh),
+        };
+        let mut ssh = ssh_config();
+        assert!(config(ssh.clone()).validate().is_ok());
+        ssh.host = "  ".to_owned();
+        assert_eq!(
+            config(ssh.clone()).validate(),
+            Err(DbError::Config("ssh host is empty".to_owned()))
+        );
+        ssh.host = "jump.example".to_owned();
+        ssh.port = 0;
+        assert_eq!(
+            config(ssh.clone()).validate(),
+            Err(DbError::Config("ssh port is not set".to_owned()))
+        );
+        ssh.port = 22;
+        ssh.user = String::new();
+        assert_eq!(
+            config(ssh.clone()).validate(),
+            Err(DbError::Config("ssh user is empty".to_owned()))
+        );
+        ssh.user = "deploy".to_owned();
+        ssh.auth = crate::ssh::SshAuth::KeyFile { path: PathBuf::new(), passphrase: None };
+        assert_eq!(
+            config(ssh).validate(),
+            Err(DbError::Config("ssh key file is empty".to_owned()))
+        );
+    }
+
+    /// The real path: a Postgres profile with ssh configured through
+    /// `Session::open`, a SELECT over the forwarded port, then teardown.
+    #[cfg(all(feature = "ssh", feature = "postgres"))]
+    #[test]
+    #[ignore = "needs cde-ssh and cde-postgres; set SSH_HOST/SSH_PORT/SSH_USER/SSH_PASSWORD and PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_ssh_session_roundtrip() {
+        let ssh_password = std::env::var("SSH_PASSWORD").ok();
+        let config = ConnectionConfig::Postgres {
+            host: std::env::var("PGHOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+            port: std::env::var("PGPORT")
+                .ok()
+                .and_then(|port| port.parse().ok())
+                .unwrap_or(5432),
+            database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
+            user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+            ssl_mode: PostgresSslMode::Disable,
+            ssh: Some(crate::ssh::SshConfig {
+                host: std::env::var("SSH_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+                port: std::env::var("SSH_PORT")
+                    .ok()
+                    .and_then(|port| port.parse().ok())
+                    .unwrap_or(22),
+                user: std::env::var("SSH_USER").unwrap_or_else(|_| "root".to_owned()),
+                auth: crate::ssh::SshAuth::Password,
+            }),
+        };
+        let password = std::env::var("PGPASSWORD").ok();
+        let mut session = Session::open(&config, password.as_deref(), ssh_password.as_deref())
+            .expect("open through the tunnel");
+        let result = session.query("SELECT 42 AS answer").expect("select through the tunnel");
+        assert_eq!(result.cell(0, 0), Some(&Value::Integer(42)));
+        // The session owns the tunnel; dropping it must not hang.
+        let started = Instant::now();
+        drop(session);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "teardown took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -3114,6 +3330,7 @@ mod tests {
                 port: 3306,
                 database: String::new(),
                 user: String::new(),
+                ssh: None,
             }
         );
         assert_eq!(DbKind::Mysql.default_config().kind(), DbKind::Mysql);
@@ -3128,6 +3345,7 @@ mod tests {
             port: 3307,
             database: "cde_test".to_owned(),
             user: "root".to_owned(),
+            ssh: None,
         };
         assert_eq!(
             serde_json::to_string(&config).unwrap(),
@@ -3147,6 +3365,7 @@ mod tests {
             port,
             database: database.to_owned(),
             user: user.to_owned(),
+            ssh: None,
         };
         assert!(
             bad("localhost", 3306, "cde_test", "root").validate().is_ok()
@@ -3205,8 +3424,9 @@ mod tests {
             port: 3306,
             database: "cde_test".to_owned(),
             user: "root".to_owned(),
+            ssh: None,
         };
-        match Session::open(&config, Some("cdepass")) {
+        match Session::open(&config, Some("cdepass"), None) {
             Err(error) => {
                 assert_eq!(error, DbError::Config("mysql feature not enabled".to_owned()));
             }
@@ -3276,9 +3496,10 @@ mod tests {
             database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
             user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
             ssl_mode: PostgresSslMode::Disable,
+            ssh: None,
         };
         let password = std::env::var("PGPASSWORD").ok();
-        let session = Session::open(&config, password.as_deref()).expect("open");
+        let session = Session::open(&config, password.as_deref(), None).expect("open");
         match &session {
             Session::Postgres(pg) => assert!(pg.backend_pid > 0),
             Session::Sqlite(_) => panic!("expected a Postgres session"),
@@ -3314,9 +3535,10 @@ mod tests {
             database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
             user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
             ssl_mode: PostgresSslMode::Disable,
+            ssh: None,
         };
         let password = std::env::var("PGPASSWORD").ok();
-        let mut session = Session::open(&config, password.as_deref()).expect("open");
+        let mut session = Session::open(&config, password.as_deref(), None).expect("open");
         assert!(!session.server_version().is_empty());
         session
             .query(
@@ -3355,9 +3577,10 @@ mod tests {
             database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
             user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
             ssl_mode: PostgresSslMode::Disable,
+            ssh: None,
         };
         let password = std::env::var("PGPASSWORD").ok();
-        let mut session = Session::open(&config, password.as_deref()).expect("open");
+        let mut session = Session::open(&config, password.as_deref(), None).expect("open");
         let statements: Vec<String> = vec![
             "CREATE TEMPORARY TABLE cde_batch (id INT4)".to_owned(),
             "INSERT INTO cde_batch VALUES (1)".to_owned(),
@@ -3394,9 +3617,10 @@ mod tests {
             database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
             user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
             ssl_mode: PostgresSslMode::Disable,
+            ssh: None,
         };
         let password = std::env::var("PGPASSWORD").ok();
-        let session = Session::open(&config, password.as_deref()).expect("open");
+        let session = Session::open(&config, password.as_deref(), None).expect("open");
         let cancel = session.cancel_handle();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -3432,9 +3656,10 @@ mod tests {
             database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
             user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
             ssl_mode: PostgresSslMode::Disable,
+            ssh: None,
         };
         let password = std::env::var("PGPASSWORD").ok();
-        let mut session = Session::open(&config, password.as_deref()).expect("open");
+        let mut session = Session::open(&config, password.as_deref(), None).expect("open");
         let plan = explain_sql(DbKind::Postgres, "SELECT 1");
         let result = session.query(&plan).expect("explain runs");
         assert!(result.row_count() > 0);
@@ -3453,9 +3678,10 @@ mod tests {
             database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
             user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
             ssl_mode: PostgresSslMode::Disable,
+            ssh: None,
         };
         let password = std::env::var("PGPASSWORD").ok();
-        let mut session = Session::open(&config, password.as_deref()).expect("open");
+        let mut session = Session::open(&config, password.as_deref(), None).expect("open");
         session
             .query("CREATE TEMPORARY TABLE cde_edit (id INT4 PRIMARY KEY, name TEXT)")
             .expect("create");
@@ -3609,6 +3835,7 @@ mod tests {
                 .unwrap_or(3306),
             database: std::env::var("MYSQLDATABASE").unwrap_or_else(|_| "cde_test".to_owned()),
             user: std::env::var("MYSQLUSER").unwrap_or_else(|_| "root".to_owned()),
+            ssh: None,
         }
     }
 
@@ -3616,7 +3843,7 @@ mod tests {
     fn mysql_live_open() -> Session {
         let config = mysql_live_config();
         let password = std::env::var("MYSQLPASSWORD").ok();
-        Session::open(&config, password.as_deref()).expect("open MySQL")
+        Session::open(&config, password.as_deref(), None).expect("open MySQL")
     }
 
     #[cfg(feature = "mysql")]
@@ -4118,6 +4345,7 @@ mod tests {
         let handle = spawn_session(
             ConnectionId::from_raw(9001),
             ConnectionConfig::Sqlite { path: ":memory:".into() },
+            None,
             None,
             eframe::egui::Context::default(),
             tx,

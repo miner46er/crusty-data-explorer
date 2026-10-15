@@ -4,4 +4,5 @@ pub mod edit;
 pub mod export;
 pub mod import;
 pub mod sql;
+pub mod ssh;
 pub mod ui;

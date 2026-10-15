@@ -49,6 +49,8 @@ pub struct Connection {
     pub env: Environment,
     pub config: ConnectionConfig,
     pub password: String,
+    /// SSH secret (a password or key passphrase), never persisted.
+    pub ssh_password: String,
     state: ConnectionState,
 }
 
@@ -495,6 +497,8 @@ pub struct ConnectDraft {
     pub env: Environment,
     pub config: ConnectionConfig,
     pub password: String,
+    /// SSH secret (a password or key passphrase), never persisted.
+    pub ssh_password: String,
     pub error: Option<String>,
 }
 
@@ -1113,33 +1117,45 @@ impl AppState {
     /// The spawn path. Confirmation and password continuations enter here so
     /// a confirmed prod connection is never re-armed.
     fn connect_now(&mut self, id: ConnectionId) {
-        let (config, password) = match self.connections.iter().find(|c| c.id == id) {
-            Some(c) => {
-                if matches!(
-                    c.state,
-                    ConnectionState::Connecting { .. }
-                        | ConnectionState::Connected { .. }
-                        | ConnectionState::QueryRunning { .. }
-                ) {
-                    return;
+        let (config, password, ssh_password) =
+            match self.connections.iter().find(|c| c.id == id) {
+                Some(c) => {
+                    if matches!(
+                        c.state,
+                        ConnectionState::Connecting { .. }
+                            | ConnectionState::Connected { .. }
+                            | ConnectionState::QueryRunning { .. }
+                    ) {
+                        return;
+                    }
+                    let password = if c.password.is_empty() {
+                        None
+                    } else {
+                        Some(c.password.clone())
+                    };
+                    let ssh_password = if c.ssh_password.is_empty() {
+                        None
+                    } else {
+                        Some(c.ssh_password.clone())
+                    };
+                    (c.config.clone(), password, ssh_password)
                 }
-                let password = if c.password.is_empty() {
-                    None
-                } else {
-                    Some(c.password.clone())
-                };
-                (c.config.clone(), password)
-            }
-            None => return,
-        };
+                None => return,
+            };
         if let Err(error) = config.validate() {
             if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
                 c.state = ConnectionState::Error { message: error.to_string() };
             }
             return;
         }
-        let handle =
-            spawn_session(id, config, password, self.ui_ctx.clone(), self.events_tx.clone());
+        let handle = spawn_session(
+            id,
+            config,
+            password,
+            ssh_password,
+            self.ui_ctx.clone(),
+            self.events_tx.clone(),
+        );
         if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
             c.state = ConnectionState::Connecting { handle };
         }
@@ -1173,6 +1189,14 @@ impl AppState {
     pub fn set_password(&mut self, id: ConnectionId, password: String) {
         if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
             c.password = password;
+        }
+    }
+
+    /// Memory-only SSH secret update (a password or key passphrase). Never
+    /// persisted.
+    pub fn set_ssh_password(&mut self, id: ConnectionId, password: String) {
+        if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
+            c.ssh_password = password;
         }
     }
 
@@ -1445,7 +1469,15 @@ impl AppState {
                 String::new(),
             ),
         };
-        self.draft = Some(ConnectDraft { editing, name, env, config, password, error: None });
+        self.draft = Some(ConnectDraft {
+            editing,
+            name,
+            env,
+            config,
+            password,
+            ssh_password: String::new(),
+            error: None,
+        });
     }
 
     pub fn cancel_draft(&mut self) {
@@ -1475,6 +1507,7 @@ impl AppState {
                     c.env = draft.env;
                     c.config = draft.config;
                     c.password = draft.password;
+                    c.ssh_password = draft.ssh_password;
                 }
             }
             None => {
@@ -1485,6 +1518,7 @@ impl AppState {
                     env: draft.env,
                     config: draft.config,
                     password: draft.password,
+                    ssh_password: draft.ssh_password,
                     state: ConnectionState::Disconnected,
                 });
             }
@@ -1774,6 +1808,7 @@ fn load_connections() -> Vec<Connection> {
                 env: p.env,
                 config: p.config,
                 password: String::new(),
+                ssh_password: String::new(),
                 state: ConnectionState::Disconnected,
             })
             .collect(),
@@ -1945,6 +1980,7 @@ mod tests {
                 database: "appdb".to_owned(),
                 user: "owner".to_owned(),
                 ssl_mode: PostgresSslMode::Disable,
+                ssh: None,
             };
             draft.password = password.to_owned();
         }
@@ -1963,6 +1999,7 @@ mod tests {
                 port: 3307,
                 database: "cde_test".to_owned(),
                 user: "root".to_owned(),
+                ssh: None,
             };
             draft.password = password.to_owned();
         }
@@ -2931,6 +2968,7 @@ mod tests {
                 database: "appdb".to_owned(),
                 user: "owner".to_owned(),
                 ssl_mode: PostgresSslMode::Disable,
+                ssh: None,
             },
         };
         let json = serde_json::to_string(&profile).unwrap();
@@ -2955,8 +2993,10 @@ mod tests {
                 database: "appdb".to_owned(),
                 user: "owner".to_owned(),
                 ssl_mode: PostgresSslMode::Disable,
+                ssh: None,
             },
             password: "transient-only".to_owned(),
+            ssh_password: "ssh-transient-only".to_owned(),
             state: ConnectionState::Disconnected,
         }];
         let result = save_connections(&conns);
@@ -2971,10 +3011,124 @@ mod tests {
         result.unwrap();
         assert!(!raw.contains("transient-only"));
         assert!(!raw.contains("password"));
+        assert!(!raw.contains("ssh-transient-only"));
+        assert!(!raw.contains("ssh_password"));
         assert_eq!(loaded.len(), 1);
         assert!(loaded[0].password.is_empty());
+        assert!(loaded[0].ssh_password.is_empty());
         assert_eq!(loaded[0].name, "pg");
         assert_eq!(loaded[0].env, Environment::Test);
+    }
+
+    #[test]
+    fn ssh_password_rides_the_draft_without_persisting() {
+        with_isolated_state("ssh-pw", |state| {
+            state.open_draft(None);
+            {
+                let draft = state.draft_mut().expect("draft");
+                draft.name = "pg".to_owned();
+                draft.config = ConnectionConfig::Postgres {
+                    host: "localhost".to_owned(),
+                    port: 5432,
+                    database: "appdb".to_owned(),
+                    user: "owner".to_owned(),
+                    ssl_mode: PostgresSslMode::Disable,
+                    ssh: None,
+                };
+                draft.password = "db-secret".to_owned();
+                draft.ssh_password = "ssh-secret".to_owned();
+            }
+            state.save_draft();
+            let id = state.connections().last().expect("saved").id;
+            assert_eq!(state.connections().last().expect("saved").ssh_password, "ssh-secret");
+            let raw = std::fs::read_to_string(profiles_path()).expect("profiles file");
+            assert!(!raw.contains("ssh-secret"));
+            assert!(!raw.contains("db-secret"));
+
+            // Both secrets are gone after a reload.
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert!(reloaded.connections()[0].ssh_password.is_empty());
+            assert!(reloaded.connections()[0].password.is_empty());
+
+            // set_ssh_password mirrors set_password; an edit draft starts
+            // with the ssh secret empty while the db password is copied.
+            state.set_ssh_password(id, "again".to_owned());
+            assert_eq!(state.connections()[0].ssh_password, "again");
+            state.open_draft(Some(id));
+            let draft = state.draft().expect("edit draft");
+            assert_eq!(draft.ssh_password, "");
+            assert_eq!(draft.password, "db-secret");
+        });
+    }
+
+    #[test]
+    fn draft_window_offers_the_ssh_section_for_engines_only() {
+        with_isolated_state("draft-ssh", |state| {
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let frame = |state: &mut AppState| {
+                let mut output = ctx.run_ui(input.clone(), |ui| {
+                    crate::ui::connections::draft_window(state, ui);
+                });
+                output.textures_delta.clear();
+                output
+            };
+
+            state.open_draft(None);
+            frame(state);
+            let sqlite_text = rendered_text(&frame(state));
+            assert!(!sqlite_text.iter().any(|t| t == "Use SSH tunnel"), "{sqlite_text:?}");
+
+            if let Some(draft) = state.draft_mut() {
+                draft.config = crate::db::DbKind::Postgres.default_config();
+            }
+            frame(state);
+            let postgres = frame(state);
+            let text = rendered_text(&postgres);
+            assert!(text.iter().any(|t| t == "Use SSH tunnel"), "{text:?}");
+            assert!(!text.iter().any(|t| t == "SSH host:"), "{text:?}");
+
+            let pos = text_center(&postgres, "Use SSH tunnel").expect("checkbox label paints");
+            let click = |pos: eframe::egui::Pos2, pressed: bool| eframe::egui::Event::PointerButton {
+                pos,
+                button: eframe::egui::PointerButton::Primary,
+                pressed,
+                modifiers: eframe::egui::Modifiers::NONE,
+            };
+            let mut events = input.clone();
+            events.events = vec![
+                eframe::egui::Event::PointerMoved(pos),
+                click(pos, true),
+                click(pos, false),
+            ];
+            let mut clicked = ctx.run_ui(events, |ui| {
+                crate::ui::connections::draft_window(state, ui);
+            });
+            clicked.textures_delta.clear();
+            let after = frame(state);
+            let text = rendered_text(&after);
+            assert!(text.iter().any(|t| t == "SSH host:"), "{text:?}");
+            assert!(text.iter().any(|t| t == "SSH password:"), "{text:?}");
+            let draft = state.draft().expect("draft");
+            assert!(matches!(
+                &draft.config,
+                ConnectionConfig::Postgres { ssh: Some(_), .. }
+            ));
+
+            // MySQL gets the same section; SQLite never does.
+            if let Some(draft) = state.draft_mut() {
+                draft.config = crate::db::DbKind::Mysql.default_config();
+            }
+            frame(state);
+            let mysql_text = rendered_text(&frame(state));
+            assert!(mysql_text.iter().any(|t| t == "Use SSH tunnel"), "{mysql_text:?}");
+        });
     }
 
     #[test]
@@ -2999,6 +3153,7 @@ mod tests {
                 database: "appdb".to_owned(),
                 user: "owner".to_owned(),
                 ssl_mode: PostgresSslMode::Disable,
+                ssh: None,
             };
             draft.password = "first".to_owned();
         }
@@ -3019,6 +3174,7 @@ mod tests {
                     database: "appdb".to_owned(),
                     user: "owner".to_owned(),
                     ssl_mode: PostgresSslMode::Disable,
+                    ssh: None,
                 }
             );
             assert_eq!(draft.password, "first");
@@ -3032,6 +3188,7 @@ mod tests {
                 database: "analytics".to_owned(),
                 user: "reader".to_owned(),
                 ssl_mode: PostgresSslMode::Disable,
+                ssh: None,
             };
             draft.password = "second".to_owned();
         }
@@ -3049,6 +3206,7 @@ mod tests {
                 database: "analytics".to_owned(),
                 user: "reader".to_owned(),
                 ssl_mode: PostgresSslMode::Disable,
+                ssh: None,
             }
         );
         assert_eq!(conn.password, "second");
@@ -3122,6 +3280,7 @@ mod tests {
                     port: 3307,
                     database: "cde_test".to_owned(),
                     user: "root".to_owned(),
+                    ssh: None,
                 }
             );
             assert!(conn.password.is_empty());

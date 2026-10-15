@@ -1,9 +1,12 @@
 //! Connection sidebar and the new/edit connection modal.
 
+use std::path::PathBuf;
+
 use eframe::egui;
 
 use crate::app::{AppState, ConnectionState, Environment};
 use crate::db::{ConnectionConfig, ConnectionId, PostgresSslMode};
+use crate::ssh::{SshAuth, SshConfig};
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(58, 110, 165);
 const LIVE_GREEN: egui::Color32 = egui::Color32::from_rgb(115, 180, 115);
@@ -436,7 +439,7 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
                 });
                 ui.small("Use :memory: for a throwaway database.");
             }
-            ConnectionConfig::Postgres { host, port, database, user, ssl_mode } => {
+            ConnectionConfig::Postgres { host, port, database, user, ssl_mode, ssh } => {
                 ui.horizontal(|ui| {
                     ui.label("Host:");
                     ui.text_edit_singleline(host);
@@ -468,8 +471,9 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
                             }
                         });
                 });
+                ssh_section(ui, ssh, &mut draft.ssh_password);
             }
-            ConnectionConfig::Mysql { host, port, database, user } => {
+            ConnectionConfig::Mysql { host, port, database, user, ssh } => {
                 ui.horizontal(|ui| {
                     ui.label("Host:");
                     ui.text_edit_singleline(host);
@@ -492,6 +496,7 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
                     ui.text_edit_singleline(user);
                 });
                 // MySQL TLS options land with their own unit, so no SSL row yet.
+                ssh_section(ui, ssh, &mut draft.ssh_password);
             }
         }
         if draft.config.prompts_for_password() {
@@ -522,5 +527,66 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
         }
     } else if close {
         state.cancel_draft();
+    }
+}
+
+/// The SSH tunnel fields, rendered for Postgres and MySQL drafts only. The
+/// password box binds the draft's transient ssh secret, never the config.
+fn ssh_section(ui: &mut egui::Ui, ssh: &mut Option<SshConfig>, secret: &mut String) {
+    let mut enabled = ssh.is_some();
+    if ui.checkbox(&mut enabled, "Use SSH tunnel").changed() {
+        *ssh = enabled.then(SshConfig::default);
+    }
+    let Some(ssh) = ssh.as_mut() else { return };
+    ui.horizontal(|ui| {
+        ui.label("SSH host:");
+        ui.text_edit_singleline(&mut ssh.host);
+    });
+    ui.horizontal(|ui| {
+        ui.label("SSH port:");
+        let mut text = ssh.port.to_string();
+        if ui.text_edit_singleline(&mut text).changed() {
+            if let Ok(port) = text.parse() {
+                ssh.port = port;
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("SSH user:");
+        ui.text_edit_singleline(&mut ssh.user);
+    });
+    ui.horizontal(|ui| {
+        ui.label("SSH auth:");
+        let password_auth = matches!(ssh.auth, SshAuth::Password);
+        if ui.selectable_label(password_auth, "Password").clicked() && !password_auth {
+            ssh.auth = SshAuth::Password;
+        }
+        if ui.selectable_label(!password_auth, "Key file").clicked() && password_auth {
+            ssh.auth = SshAuth::KeyFile { path: PathBuf::new(), passphrase: None };
+        }
+    });
+    match &mut ssh.auth {
+        SshAuth::Password => {
+            ui.horizontal(|ui| {
+                ui.label("SSH password:");
+                ui.add(egui::TextEdit::singleline(secret).password(true));
+            });
+        }
+        SshAuth::KeyFile { path, passphrase } => {
+            ui.horizontal(|ui| {
+                ui.label("Key file:");
+                let mut text = path.to_string_lossy().into_owned();
+                if ui.text_edit_singleline(&mut text).changed() {
+                    *path = text.into();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Passphrase:");
+                let mut text = passphrase.clone().unwrap_or_default();
+                if ui.add(egui::TextEdit::singleline(&mut text).password(true)).changed() {
+                    *passphrase = (!text.is_empty()).then_some(text);
+                }
+            });
+        }
     }
 }
