@@ -3,7 +3,9 @@
 use eframe::egui;
 
 use crate::app::AppState;
-use crate::db::{ConnectionId, TableInfo};
+use crate::db::{ConnectionId, DbKind, TableInfo, TableKind};
+
+use super::ddl;
 
 pub enum SchemaAction {
     Refresh(ConnectionId),
@@ -51,6 +53,12 @@ pub fn connection_schema(
                         .weak(),
                 );
             }
+            let dialect = state
+                .connections()
+                .iter()
+                .find(|c| c.id == conn)
+                .map(|c| c.config.kind())
+                .unwrap_or(DbKind::Sqlite);
             egui::CollapsingHeader::new(egui::RichText::new("Databases").small().strong())
                 .default_open(true)
                 .show(ui, |ui| {
@@ -66,7 +74,7 @@ pub fn connection_schema(
                             .default_open(true)
                             .show(ui, |ui| {
                                 for schema_node in db.schemas() {
-                                    show_schema(ui, conn, schema_node, &mut actions);
+                                    show_schema(ui, conn, schema_node, dialect, &mut actions);
                                 }
                             });
                         });
@@ -80,6 +88,7 @@ fn show_schema(
     ui: &mut egui::Ui,
     conn: ConnectionId,
     schema_node: &crate::db::SchemaNode,
+    dialect: DbKind,
     actions: &mut Vec<SchemaAction>,
 ) {
     egui::CollapsingHeader::new(
@@ -99,7 +108,7 @@ fn show_schema(
                     if i > 0 {
                         ui.separator();
                     }
-                    show_table(ui, conn, schema_node.name(), table, actions);
+                    show_table(ui, conn, schema_node.name(), table, dialect, actions);
                 }
             });
             ui.add_space(4.0);
@@ -116,7 +125,7 @@ fn show_schema(
                     if i > 0 {
                         ui.separator();
                     }
-                    show_table(ui, conn, schema_node.name(), view, actions);
+                    show_table(ui, conn, schema_node.name(), view, dialect, actions);
                 }
             });
             ui.add_space(4.0);
@@ -170,6 +179,7 @@ fn show_table(
     conn: ConnectionId,
     schema: &str,
     table: &TableInfo,
+    dialect: DbKind,
     actions: &mut Vec<SchemaAction>,
 ) {
     let name = table.name().to_owned();
@@ -351,6 +361,9 @@ fn show_table(
             && table.indexes().is_empty()
         {
             ui.label(egui::RichText::new("No columns.").small().weak());
+        }
+        if table.kind() == TableKind::Table {
+            ddl::show_table_ddl(ui, table, dialect);
         }
     });
     if resp.header_response.clicked() {

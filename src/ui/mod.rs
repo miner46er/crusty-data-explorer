@@ -7,6 +7,7 @@ use crate::app::{AppState, ConnectionState};
 
 pub mod complete;
 pub mod connections;
+pub mod ddl;
 pub mod grid;
 pub mod query;
 pub mod schema;
