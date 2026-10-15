@@ -50,6 +50,8 @@ Wave 2 — serial core chain on `src/app.rs` Tab machine + `src/db.rs` worker.
 
 Wave 3 — serial drivers on config shape, after Wave 2 (shared `src/db.rs`).
 - [x] T9b MySQL session cage mirroring `PgSession` behind feature. Landed with live roundtrip, schema, and cancel tests against cde-mysql on port 3307.
-- [ ] T8b SSH tunnel (last, heaviest). Spike prototype first, then real build. Tests: forward + connect. In flight on deepseek max.
+- [x] T8b SSH tunnel (last, heaviest). Spike prototype first, then real build. Landed 187d097; live tunnel proof green.
+
+Plan status: all waves landed and verified 2026-10-16. Final sweep passes: `--all-features` check clean, full test matrix green, live suite 13 of 13 across SQLite, Postgres, MySQL, and the SSH tunnel. The tunnel tests read PGHOST/PGPORT as the address the jump host dials, which matches how DBeaver and Beekeeper configure a tunnel.
 
 Per-unit verify: `cargo check`, `cargo check --features postgres`, `cargo test`, `cargo test --features postgres` (live ignored), plus live probe where noted.
