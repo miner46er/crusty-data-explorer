@@ -48,13 +48,16 @@ fn status_bar(state: &AppState, ui: &mut egui::Ui) {
         ui.separator();
         match state.active().and_then(|id| state.tab(id)) {
             Some(tab) => match tab.outcome() {
-                crate::app::RunOutcome::Ok(result) => {
-                    let mut text = format!("{} rows", result.row_count());
-                    if result.is_truncated() {
-                        text += " (truncated)";
-                    }
-                    if let Some(affected) = result.affected() {
-                        text = format!("{affected} rows affected");
+                crate::app::RunOutcome::Ok { .. } => {
+                    let mut text = "0 rows".to_owned();
+                    if let Some(result) = tab.active_query_result() {
+                        text = format!("{} rows", result.row_count());
+                        if result.is_truncated() {
+                            text += " (truncated)";
+                        }
+                        if let Some(affected) = result.affected() {
+                            text = format!("{affected} rows affected");
+                        }
                     }
                     ui.label(text);
                 }

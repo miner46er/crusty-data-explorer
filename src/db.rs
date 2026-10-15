@@ -899,9 +899,18 @@ impl DbHandle {
     }
 }
 
+/// Test seam: a handle whose commands land in the returned receiver, so a
+/// caller can assert what it sends without spawning a worker thread.
+#[cfg(test)]
+pub fn test_handle() -> (DbHandle, mpsc::Receiver<DbCommand>) {
+    let (cmds_tx, cmds_rx) = mpsc::channel();
+    (DbHandle { cmds: cmds_tx }, cmds_rx)
+}
+
 #[derive(Debug)]
 pub enum DbCommand {
     Query { run: RunId, sql: String },
+    QueryBatch { run: RunId, statements: Vec<String> },
     LoadSchema,
 }
 
@@ -910,6 +919,7 @@ pub enum DbEvent {
     Connected { conn: ConnectionId, cancel: CancelHandle, server_version: String },
     ConnectFailed { conn: ConnectionId, error: DbError },
     QueryOk { run: RunId, result: QueryResult },
+    BatchOk { run: RunId, results: Vec<QueryResult> },
     QueryErr { run: RunId, error: DbError },
     SchemaOk { conn: ConnectionId, schema: SchemaInfo },
     SchemaErr { conn: ConnectionId, error: DbError },
@@ -2148,6 +2158,19 @@ fn worker_loop(
                 }
                 ui.request_repaint();
             }
+            DbCommand::QueryBatch { run, statements } => {
+                let event = match run_statements(&mut session, &statements) {
+                    Ok(results) => DbEvent::BatchOk { run, results },
+                    Err((index, error)) => DbEvent::QueryErr {
+                        run,
+                        error: statement_error(index, error),
+                    },
+                };
+                if events.send(event).is_err() {
+                    break;
+                }
+                ui.request_repaint();
+            }
             DbCommand::LoadSchema => {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     session.schema()
@@ -2163,6 +2186,36 @@ fn worker_loop(
                 emit(&events, &ui, event);
             }
         }
+    }
+}
+
+/// Runs statements in order, one engine call each, and stops at the first
+/// failure. The error carries the zero-based index of the failing statement.
+fn run_statements(
+    session: &mut Session,
+    statements: &[String],
+) -> Result<Vec<QueryResult>, (usize, DbError)> {
+    let mut results = Vec::with_capacity(statements.len());
+    for (index, sql) in statements.iter().enumerate() {
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.query(sql)));
+        match outcome {
+            Ok(Ok(result)) => results.push(result),
+            Ok(Err(error)) => return Err((index, error)),
+            Err(_) => {
+                return Err((index, DbError::Query("driver panicked while running".to_owned())));
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// Names the failing statement in a batch error. Only engine failures gain the
+/// prefix; fatal errors stay as they are.
+fn statement_error(index: usize, error: DbError) -> DbError {
+    match error {
+        DbError::Query(message) => DbError::Query(format!("statement {index}: {message}")),
+        other => other,
     }
 }
 
@@ -2480,6 +2533,83 @@ mod tests {
         assert_eq!(result.cell(0, 5), Some(&Value::Null));
     }
 
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_batch_runs_in_order_and_names_the_failing_statement() {
+        let config = ConnectionConfig::Postgres {
+            host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
+            port: std::env::var("PGPORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
+            user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+            ssl_mode: PostgresSslMode::Disable,
+        };
+        let password = std::env::var("PGPASSWORD").ok();
+        let mut session = Session::open(&config, password.as_deref()).expect("open");
+        let statements: Vec<String> = vec![
+            "CREATE TEMPORARY TABLE cde_batch (id INT4)".to_owned(),
+            "INSERT INTO cde_batch VALUES (1)".to_owned(),
+            "SELECT id FROM cde_batch".to_owned(),
+        ];
+        let results = run_statements(&mut session, &statements).expect("batch runs");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].affected(), Some(0));
+        assert_eq!(results[1].affected(), Some(1));
+        assert_eq!(results[2].row_count(), 1);
+        assert_eq!(results[2].cell(0, 0), Some(&Value::Integer(1)));
+
+        let failing: Vec<String> = vec![
+            "SELECT 1".to_owned(),
+            "SELECT * FROM cde_missing_table".to_owned(),
+            "SELECT 3".to_owned(),
+        ];
+        let (index, error) = run_statements(&mut session, &failing).expect_err("stops");
+        assert_eq!(index, 1);
+        let named = statement_error(index, error).to_string();
+        assert!(named.contains("statement 1"), "{named}");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_cancel_stops_a_running_batch() {
+        let config = ConnectionConfig::Postgres {
+            host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
+            port: std::env::var("PGPORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
+            user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+            ssl_mode: PostgresSslMode::Disable,
+        };
+        let password = std::env::var("PGPASSWORD").ok();
+        let session = Session::open(&config, password.as_deref()).expect("open");
+        let cancel = session.cancel_handle();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut session = session;
+            let statements: Vec<String> = vec![
+                "SELECT 1".to_owned(),
+                "SELECT pg_sleep(30)".to_owned(),
+                "SELECT 3".to_owned(),
+            ];
+            let _ = tx.send(run_statements(&mut session, &statements));
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        cancel.cancel();
+        cancel.cancel();
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("batch returns within 10s after cancel");
+        let (index, error) = outcome.expect_err("cancelled batch fails");
+        assert_eq!(index, 1);
+        assert!(matches!(error, DbError::Query(_)));
+    }
+
     #[test]
     fn schema_constructors_reject_empty_names() {
         assert!(ColumnInfo::new(String::new(), "TEXT".into(), true, None).is_err());
@@ -2723,5 +2853,84 @@ mod tests {
             .collect();
         assert!(agg.contains(&("child", "idx_child_parent_unique")));
         assert!(agg.contains(&("child", "idx_child_id_plain")));
+    }
+
+    #[test]
+    fn batch_runs_in_order_and_stops_at_the_failing_statement() {
+        let mut session = Session::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        let statements: Vec<String> = vec![
+            "CREATE TABLE t (id INTEGER)".to_owned(),
+            "INSERT INTO t VALUES (1)".to_owned(),
+            "SELECT id FROM t".to_owned(),
+        ];
+        let results = run_statements(&mut session, &statements).expect("batch runs");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].affected(), Some(0));
+        assert_eq!(results[1].affected(), Some(1));
+        assert_eq!(results[2].row_count(), 1);
+        assert_eq!(results[2].cell(0, 0), Some(&Value::Integer(1)));
+
+        let failing: Vec<String> = vec![
+            "SELECT 1".to_owned(),
+            "SELECT nope FROM missing_table".to_owned(),
+            "SELECT 3".to_owned(),
+        ];
+        let (index, error) = run_statements(&mut session, &failing).expect_err("stops");
+        assert_eq!(index, 1);
+        assert!(matches!(&error, DbError::Query(_)));
+        let named = statement_error(index, error).to_string();
+        assert!(named.contains("statement 1"), "{named}");
+        assert!(named.contains("missing_table"), "{named}");
+    }
+
+    #[test]
+    fn worker_batch_protocol_roundtrip() {
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn_session(
+            ConnectionId::from_raw(9001),
+            ConnectionConfig::Sqlite { path: ":memory:".into() },
+            None,
+            eframe::egui::Context::default(),
+            tx,
+        );
+        match rx.recv_timeout(Duration::from_secs(10)).expect("connects") {
+            DbEvent::Connected { .. } => {}
+            other => panic!("expected Connected, got {other:?}"),
+        }
+        let mut ids = Ids::new();
+        let run = ids.run();
+        handle
+            .send(DbCommand::QueryBatch {
+                run,
+                statements: vec!["SELECT 1".to_owned(), "SELECT 2".to_owned()],
+            })
+            .expect("send");
+        match rx.recv_timeout(Duration::from_secs(10)).expect("batch event") {
+            DbEvent::BatchOk { run: got, results } => {
+                assert_eq!(got, run);
+                assert_eq!(results.len(), 2);
+                assert_eq!(results[0].cell(0, 0), Some(&Value::Integer(1)));
+                assert_eq!(results[1].cell(0, 0), Some(&Value::Integer(2)));
+            }
+            other => panic!("expected BatchOk, got {other:?}"),
+        }
+        let failed_run = ids.run();
+        handle
+            .send(DbCommand::QueryBatch {
+                run: failed_run,
+                statements: vec![
+                    "SELECT 1".to_owned(),
+                    "SELECT * FROM missing_table".to_owned(),
+                    "SELECT 3".to_owned(),
+                ],
+            })
+            .expect("send");
+        match rx.recv_timeout(Duration::from_secs(10)).expect("failure event") {
+            DbEvent::QueryErr { run: got, error } => {
+                assert_eq!(got, failed_run);
+                assert!(error.to_string().contains("statement 1"), "{error}");
+            }
+            other => panic!("expected QueryErr, got {other:?}"),
+        }
     }
 }

@@ -94,7 +94,7 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
         return;
     };
     match tab.outcome() {
-        RunOutcome::Ok(_) => {}
+        RunOutcome::Ok { .. } => {}
         RunOutcome::Never => {
             ui.label("Type SQL above and press Run (Ctrl+Enter).");
             return;
@@ -108,23 +108,49 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
         }
         RunOutcome::Err(msg) => {
             ui.colored_label(ui.visuals().error_fg_color, msg);
-            ui.label(
-                egui::RichText::new("Check SQL syntax and the connection, then press Run again.")
+            if tab.results().is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "Check SQL syntax and the connection, then press Run again.",
+                    )
                     .small()
                     .weak(),
+                );
+                return;
+            }
+            ui.label(
+                egui::RichText::new("Showing the last completed run.").small().weak(),
             );
-            return;
         }
     }
     results_grid(tab, ui);
 }
 
+/// Result picker for a run that produced more than one result set.
+fn result_tabs(tab: &mut Tab, ui: &mut egui::Ui) {
+    let count = tab.results().len();
+    if count <= 1 {
+        return;
+    }
+    let mut pick: Option<usize> = None;
+    let active = tab.active_result();
+    ui.horizontal(|ui| {
+        for index in 0..count {
+            let label = format!("Result {}", index + 1);
+            if ui.selectable_label(active == index, label).clicked() {
+                pick = Some(index);
+            }
+        }
+    });
+    if let Some(index) = pick {
+        tab.set_active_result(index);
+    }
+}
+
 fn results_grid(tab: &mut Tab, ui: &mut egui::Ui) {
+    result_tabs(tab, ui);
     let (cols, total) = {
-        let result = match tab.outcome() {
-            RunOutcome::Ok(result) => result,
-            _ => return,
-        };
+        let Some(result) = tab.active_query_result() else { return };
         if result.columns().is_empty() {
             match result.affected() {
                 Some(n) => {
@@ -179,8 +205,9 @@ fn results_grid(tab: &mut Tab, ui: &mut egui::Ui) {
         if ui.button("Clear").clicked() {
             tab.set_filter(String::new());
         }
-        let can_export =
-            matches!(tab.outcome(), RunOutcome::Ok(result) if !result.columns().is_empty());
+        let can_export = tab
+            .active_query_result()
+            .is_some_and(|result| !result.columns().is_empty());
         if ui
             .add_enabled(can_export, egui::Button::new("Export CSV"))
             .clicked()
@@ -214,12 +241,9 @@ fn results_grid(tab: &mut Tab, ui: &mut egui::Ui) {
         }
     }
     let (sort_col, sort_dir, filter) = (tab.sort_col(), tab.sort_dir(), tab.filter().to_owned());
-    let visible = {
-        let result = match tab.outcome() {
-            RunOutcome::Ok(result) => result,
-            _ => return,
-        };
-        visible_rows(result, sort_col, sort_dir, &filter)
+    let visible = match tab.active_query_result() {
+        Some(result) => visible_rows(result, sort_col, sort_dir, &filter),
+        None => return,
     };
     ui.label(
         egui::RichText::new(format!("{} of {} rows", visible.len(), total)).small().weak(),
@@ -267,13 +291,11 @@ fn results_grid(tab: &mut Tab, ui: &mut egui::Ui) {
                     let r = visible[row.index()];
                     for c in 0..ncols {
                         row.col(|ui| {
-                            let text = match tab.outcome() {
-                                RunOutcome::Ok(result) => result
-                                    .cell(r, c)
-                                    .map(|v| v.display(CELL_CAP).into_owned())
-                                    .unwrap_or_default(),
-                                _ => String::new(),
-                            };
+                            let text = tab
+                                .active_query_result()
+                                .and_then(|result| result.cell(r, c))
+                                .map(|v| v.display(CELL_CAP).into_owned())
+                                .unwrap_or_default();
                             ui.monospace(text);
                         });
                     }
@@ -286,8 +308,8 @@ fn results_grid(tab: &mut Tab, ui: &mut egui::Ui) {
 }
 
 fn export_current_view(tab: &mut Tab) {
-    let (csv, default_name, nrows) = match tab.outcome() {
-        RunOutcome::Ok(result) => {
+    let (csv, default_name, nrows) = match tab.active_query_result() {
+        Some(result) => {
             if result.columns().is_empty() {
                 return;
             }
@@ -296,7 +318,7 @@ fn export_current_view(tab: &mut Tab) {
             let name = format!("{}.csv", super::query::tab_title(tab.sql.clone()));
             (csv, name, visible.len())
         }
-        _ => return,
+        None => return,
     };
     let Some(path) = rfd::FileDialog::new()
         .add_filter("CSV", &["csv"])
@@ -315,8 +337,8 @@ fn export_current_view(tab: &mut Tab) {
 }
 
 fn export_json_view(tab: &mut Tab) {
-    let (json, default_name, nrows) = match tab.outcome() {
-        RunOutcome::Ok(result) => {
+    let (json, default_name, nrows) = match tab.active_query_result() {
+        Some(result) => {
             if result.columns().is_empty() {
                 return;
             }
@@ -325,7 +347,7 @@ fn export_json_view(tab: &mut Tab) {
             let name = format!("{}.json", super::query::tab_title(tab.sql.clone()));
             (json, name, visible.len())
         }
-        _ => return,
+        None => return,
     };
     let Some(path) = rfd::FileDialog::new()
         .add_filter("JSON", &["json"])
@@ -344,8 +366,8 @@ fn export_json_view(tab: &mut Tab) {
 }
 
 fn copy_inserts_view(tab: &mut Tab, ctx: &egui::Context) {
-    let (text, nrows) = match tab.outcome() {
-        RunOutcome::Ok(result) => {
+    let (text, nrows) = match tab.active_query_result() {
+        Some(result) => {
             if result.columns().is_empty() {
                 return;
             }
@@ -353,15 +375,15 @@ fn copy_inserts_view(tab: &mut Tab, ctx: &egui::Context) {
             let text = to_inserts("result", result, &visible);
             (text, visible.len())
         }
-        _ => return,
+        None => return,
     };
     ctx.copy_text(text);
     tab.set_export_notice(format!("Copied {nrows} rows as INSERTs"), false);
 }
 
 fn copy_markdown_view(tab: &mut Tab, ctx: &egui::Context) {
-    let (text, nrows) = match tab.outcome() {
-        RunOutcome::Ok(result) => {
+    let (text, nrows) = match tab.active_query_result() {
+        Some(result) => {
             if result.columns().is_empty() {
                 return;
             }
@@ -369,7 +391,7 @@ fn copy_markdown_view(tab: &mut Tab, ctx: &egui::Context) {
             let text = to_markdown(result, &visible);
             (text, visible.len())
         }
-        _ => return,
+        None => return,
     };
     ctx.copy_text(text);
     tab.set_export_notice(format!("Copied {nrows} rows as Markdown"), false);

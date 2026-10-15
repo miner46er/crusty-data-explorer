@@ -6,7 +6,7 @@
 use eframe::egui;
 
 use super::editor::{char_range, format_sql, FindState};
-use crate::app::{AppState, RunOutcome};
+use crate::app::{AppState, RunOutcome, RunScope};
 use crate::db::TabId;
 
 const RUN_GREEN: egui::Color32 = egui::Color32::from_rgb(115, 180, 115);
@@ -133,6 +133,7 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
     let find_open = find_bar_of(ui.ctx(), tab_id).open;
     let (mut run_clicked, mut cancel_clicked, mut save_clicked) = (false, false, false);
     let (mut format_clicked, mut find_clicked) = (false, false);
+    let mut scope = state.tab(tab_id).map(|t| t.run_scope()).unwrap_or_default();
     if state.tab(tab_id).is_some() {
         let running = matches!(
             state.tab(tab_id).map(|t| t.outcome()),
@@ -142,12 +143,23 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
             if running {
                 cancel_clicked = ui.button("Cancel").clicked();
             } else {
+                egui::ComboBox::from_id_salt(("crusty_run_scope", tab_id))
+                    .selected_text(scope.label())
+                    .show_ui(ui, |ui| {
+                        for option in RunScope::ALL {
+                            ui.selectable_value(&mut scope, option, option.label());
+                        }
+                    });
                 run_clicked = ui
                     .add(
                         egui::Button::new(egui::RichText::new("▶ Run").strong()).fill(RUN_GREEN),
                     )
                     .clicked();
-                ui.label(egui::RichText::new("Ctrl+Enter").small().weak());
+                ui.label(
+                    egui::RichText::new(format!("{} · Ctrl+Enter", scope.hint()))
+                        .small()
+                        .weak(),
+                );
                 save_clicked = ui.button("Save").clicked();
             }
             format_clicked = ui.button("Format").clicked();
@@ -163,20 +175,24 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                 Some(RunOutcome::Err(msg)) => {
                     ui.colored_label(ui.visuals().error_fg_color, msg);
                 }
-                Some(RunOutcome::Ok(result)) => {
+                Some(RunOutcome::Ok { .. }) => {
+                    let (rows, ms) = state
+                        .tab(tab_id)
+                        .and_then(|t| t.active_query_result())
+                        .map(|r| (r.row_count(), r.took().as_secs_f64() * 1000.0))
+                        .unwrap_or((0, 0.0));
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{} rows · {:.0} ms",
-                            result.row_count(),
-                            result.took().as_secs_f64() * 1000.0
-                        ))
-                        .small()
-                        .weak(),
+                        egui::RichText::new(format!("{rows} rows · {ms:.0} ms")).small().weak(),
                     );
                 }
                 Some(RunOutcome::Never) | None => {}
             }
         });
+    }
+    if scope != state.tab(tab_id).map(|t| t.run_scope()).unwrap_or_default() {
+        if let Some(tab) = state.tab_mut(tab_id) {
+            tab.set_run_scope(scope);
+        }
     }
     run_clicked |= ui.input_mut(|i| i.consume_shortcut(&run_shortcut()));
     if cancel_clicked {
@@ -196,7 +212,8 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
     }
     if run_clicked {
         let sql = state.tab(tab_id).map(|t| t.sql.clone()).unwrap_or_default();
-        state.start_run(tab_id, &sql);
+        let (cursor, selection) = super::complete::editor_offsets(ui.ctx(), tab_id, &sql);
+        state.start_run(tab_id, &sql, cursor, selection);
     }
     find_opened
 }

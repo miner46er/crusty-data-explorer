@@ -293,6 +293,30 @@ pub fn clear_selection(ctx: &egui::Context, tab: TabId) {
     }
 }
 
+/// The editor's cursor and any non-empty selection for one tab, as byte
+/// offsets into `sql`. A tab whose editor has not rendered yet reads as a
+/// cursor at the end with no selection, so a programmatic run still has a
+/// statement under the cursor.
+pub fn editor_offsets(
+    ctx: &egui::Context,
+    tab: TabId,
+    sql: &str,
+) -> (usize, Option<Range<usize>>) {
+    let Some(state) = egui::widgets::text_edit::TextEditState::load(ctx, editor_id(tab)) else {
+        return (sql.len(), None);
+    };
+    let Some(range) = state.cursor.char_range() else {
+        return (sql.len(), None);
+    };
+    let cursor = char_to_byte(sql, range.primary.index.0);
+    let chars = range.as_sorted_char_range();
+    if chars.start == chars.end {
+        (cursor, None)
+    } else {
+        (cursor, Some(char_to_byte(sql, chars.start.0)..char_to_byte(sql, chars.end.0)))
+    }
+}
+
 #[derive(Clone, Default)]
 struct CompleteState {
     open: bool,
@@ -580,6 +604,27 @@ mod tests {
         let sql = "SELECT * FROM ";
         let items = suggest(&schema, sql, sql.len());
         assert_eq!(items.len(), 50);
+    }
+
+    #[test]
+    fn editor_offsets_read_cursor_and_selection_bytes() {
+        let ctx = egui::Context::default();
+        let tab = crate::db::Ids::new().tab();
+        let sql = "SELECT 'a'; SELECT 2";
+        // No editor state yet: cursor at the end, no selection.
+        assert_eq!(editor_offsets(&ctx, tab, sql), (sql.len(), None));
+        // The primary cursor is the moving end, so it reads as the byte cursor.
+        set_selection(&ctx, tab, 12..20);
+        assert_eq!(editor_offsets(&ctx, tab, sql), (20, Some(12..20)));
+        // Character offsets convert to byte offsets.
+        let unicode = "é; SELECT 2";
+        set_selection(&ctx, tab, 3..11);
+        assert_eq!(editor_offsets(&ctx, tab, unicode), (12, Some(4..12)));
+        // An empty selection reads as no selection.
+        set_selection(&ctx, tab, 5..5);
+        assert_eq!(editor_offsets(&ctx, tab, unicode), (6, None));
+        clear_selection(&ctx, tab);
+        assert_eq!(editor_offsets(&ctx, tab, unicode), (unicode.len(), None));
     }
 
     #[test]

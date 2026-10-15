@@ -6,6 +6,7 @@
 //! exactly one place: [`AppState::apply`], drained from [`AppState::logic`].
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -13,6 +14,7 @@ use crate::db::{
     CancelHandle, ConnectionConfig, ConnectionId, DbCommand, DbEvent, DbHandle, DbKind,
     DriverRegistry, Ids, QueryResult, RunId, SchemaInfo, TabId, spawn_session,
 };
+use crate::sql::{current_statement, split_statements, statement_ranges};
 
 /// Everything that changes about one connection's lifecycle, in five states.
 /// `Connected` and `QueryRunning` carry a [`LiveSession`], so SQL can only
@@ -68,12 +70,47 @@ pub enum SortDir {
     Desc,
 }
 
+/// Which statements a run sends. `All` is the whole editor buffer, `Current`
+/// the statement under the cursor, `Selection` the statements overlapping the
+/// editor selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunScope {
+    #[default]
+    All,
+    Current,
+    Selection,
+}
+
+impl RunScope {
+    pub const ALL: [RunScope; 3] = [RunScope::All, RunScope::Current, RunScope::Selection];
+    pub fn label(self) -> &'static str {
+        match self {
+            RunScope::All => "All",
+            RunScope::Current => "Current",
+            RunScope::Selection => "Selection",
+        }
+    }
+    /// Muted toolbar hint naming what the scope runs.
+    pub fn hint(self) -> &'static str {
+        match self {
+            RunScope::All => "all statements",
+            RunScope::Current => "statement at cursor",
+            RunScope::Selection => "selected statements",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Tab {
     pub id: TabId,
     pub conn: ConnectionId,
     pub sql: String,
     outcome: RunOutcome,
+    run_scope: RunScope,
+    /// Display results kept when the outcome stops being `Ok`, so a failed
+    /// run leaves the last finished grid on screen.
+    results: Vec<QueryResult>,
+    active_result: usize,
     sort_col: Option<usize>,
     sort_dir: SortDir,
     filter: String,
@@ -84,6 +121,41 @@ pub struct Tab {
 impl Tab {
     pub fn outcome(&self) -> &RunOutcome {
         &self.outcome
+    }
+    pub fn run_scope(&self) -> RunScope {
+        self.run_scope
+    }
+    pub fn set_run_scope(&mut self, scope: RunScope) {
+        self.run_scope = scope;
+    }
+    /// Results on display: the finished run's while the outcome is `Ok`, else
+    /// the last finished run's.
+    pub fn results(&self) -> &[QueryResult] {
+        match &self.outcome {
+            RunOutcome::Ok { results, .. } => results,
+            _ => &self.results,
+        }
+    }
+    pub fn active_result(&self) -> usize {
+        match &self.outcome {
+            RunOutcome::Ok { active, .. } => *active,
+            _ => self.active_result,
+        }
+    }
+    /// The result the grid, exports, and counts read. Bounds-checked.
+    pub fn active_query_result(&self) -> Option<&QueryResult> {
+        self.results().get(self.active_result())
+    }
+    pub fn set_active_result(&mut self, index: usize) {
+        let count = self.results().len();
+        if count == 0 {
+            return;
+        }
+        let index = index.min(count - 1);
+        self.active_result = index;
+        if let RunOutcome::Ok { active, .. } = &mut self.outcome {
+            *active = index;
+        }
     }
     pub fn sort_col(&self) -> Option<usize> {
         self.sort_col
@@ -130,12 +202,13 @@ impl Tab {
     }
 }
 
-/// One state per tab. `Running` carries the run id events must match.
+/// One state per tab. `Running` carries the run id events must match and the
+/// statements that run, so history can name each one.
 #[derive(Debug)]
 pub enum RunOutcome {
     Never,
-    Running { run: RunId, started: Instant },
-    Ok(QueryResult),
+    Running { run: RunId, started: Instant, statements: Vec<String> },
+    Ok { results: Vec<QueryResult>, active: usize },
     Err(String),
 }
 
@@ -194,6 +267,35 @@ fn now_unix_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// The statements a run sends for `scope`, in editor order. `Selection` falls
+/// back to the statement under the cursor when nothing is selected, so a
+/// programmatic run and an empty selection still run something.
+fn effective_statements(
+    sql: &str,
+    scope: RunScope,
+    cursor: usize,
+    selection: Option<Range<usize>>,
+) -> Vec<String> {
+    match scope {
+        RunScope::All => split_statements(sql),
+        RunScope::Current => {
+            let statements = split_statements(sql);
+            current_statement(sql, cursor)
+                .and_then(|index| statements.get(index).cloned())
+                .into_iter()
+                .collect()
+        }
+        RunScope::Selection => match selection {
+            Some(selection) => statement_ranges(sql)
+                .into_iter()
+                .filter(|range| range.start < selection.end && selection.start < range.end)
+                .map(|range| sql[range].to_owned())
+                .collect(),
+            None => effective_statements(sql, RunScope::Current, cursor, None),
+        },
+    }
 }
 
 /// Target tier for a connection. Prod connects route through a confirmation
@@ -355,6 +457,9 @@ impl AppState {
             conn,
             sql: String::new(),
             outcome: RunOutcome::Never,
+            run_scope: RunScope::All,
+            results: Vec::new(),
+            active_result: 0,
             sort_col: None,
             sort_dir: SortDir::Asc,
             filter: String::new(),
@@ -378,11 +483,19 @@ impl AppState {
         }
     }
 
-    pub fn start_run(&mut self, tab: TabId, sql: &str) {
+    /// Resolve the tab's scope against the editor text and send the batch.
+    /// An empty effective set is an error before anything reaches the worker.
+    pub fn start_run(
+        &mut self,
+        tab: TabId,
+        sql: &str,
+        cursor: usize,
+        selection: Option<Range<usize>>,
+    ) {
         let run = self.ids.run();
-        let (conn_id, handle) = match self.tabs.iter().find(|t| t.id == tab) {
+        let (conn_id, handle, scope) = match self.tabs.iter().find(|t| t.id == tab) {
             Some(t) => match self.connections.iter().find(|c| c.id == t.conn) {
-                Some(c) => (t.conn, c.handle()),
+                Some(c) => (t.conn, c.handle(), t.run_scope),
                 None => {
                     self.set_outcome(tab, RunOutcome::Err("connection not found".to_owned()));
                     return;
@@ -390,19 +503,30 @@ impl AppState {
             },
             None => return,
         };
+        let statements = effective_statements(sql, scope, cursor, selection);
+        if statements.is_empty() {
+            self.set_outcome(tab, RunOutcome::Err("nothing to run".to_owned()));
+            return;
+        }
         match handle {
-            Some(handle) => match handle.send(DbCommand::Query { run, sql: sql.to_owned() }) {
-                Ok(()) => {
-                    self.set_outcome(tab, RunOutcome::Running { run, started: Instant::now() });
-                    if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn_id) {
-                        if let ConnectionState::Connected { session } = &c.state {
-                            let session = session.clone();
-                            c.state = ConnectionState::QueryRunning { session, run, tab };
+            Some(handle) => {
+                match handle.send(DbCommand::QueryBatch { run, statements: statements.clone() })
+                {
+                    Ok(()) => {
+                        self.set_outcome(
+                            tab,
+                            RunOutcome::Running { run, started: Instant::now(), statements },
+                        );
+                        if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn_id) {
+                            if let ConnectionState::Connected { session } = &c.state {
+                                let session = session.clone();
+                                c.state = ConnectionState::QueryRunning { session, run, tab };
+                            }
                         }
                     }
+                    Err(error) => self.set_outcome(tab, RunOutcome::Err(error.to_string())),
                 }
-                Err(error) => self.set_outcome(tab, RunOutcome::Err(error.to_string())),
-            },
+            }
             None => self.set_outcome(tab, RunOutcome::Err("not connected".to_owned())),
         }
     }
@@ -604,7 +728,7 @@ impl AppState {
         match existing {
             Some(id) => {
                 self.activate(id);
-                self.start_run(id, &sql.clone());
+                self.start_run(id, &sql.clone(), sql.len(), None);
             }
             None => {
                 let id = self.new_tab(conn);
@@ -612,7 +736,7 @@ impl AppState {
                     *slot = sql.clone();
                 }
                 self.activate(id);
-                self.start_run(id, &sql);
+                self.start_run(id, &sql, sql.len(), None);
             }
         }
     }
@@ -758,7 +882,7 @@ impl AppState {
             )
         });
         if live {
-            self.start_run(id, sql);
+            self.start_run(id, sql, sql.len(), None);
         } else {
             self.set_outcome(id, RunOutcome::Never);
         }
@@ -824,8 +948,15 @@ impl AppState {
         self.persist();
     }
 
+    /// The one write of a tab's outcome. Leaving `Ok` moves its results into
+    /// the tab's display state, so a later failed or refused run keeps the
+    /// last finished grid on screen.
     fn set_outcome(&mut self, tab: TabId, outcome: RunOutcome) {
         if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+            if let RunOutcome::Ok { results, active } = &mut t.outcome {
+                t.results = std::mem::take(results);
+                t.active_result = *active;
+            }
             t.outcome = outcome;
             t.clear_export_notice();
         }
@@ -878,7 +1009,10 @@ impl AppState {
                 self.schema_loading.remove(&conn);
             }
             DbEvent::QueryOk { run, result } => {
-                self.finish_run(run, RunOutcome::Ok(result));
+                self.finish_run(run, RunOutcome::Ok { results: vec![result], active: 0 });
+            }
+            DbEvent::BatchOk { run, results } => {
+                self.finish_run(run, RunOutcome::Ok { results, active: 0 });
             }
             DbEvent::SchemaOk { conn, schema } => {
                 self.schema_loading.remove(&conn);
@@ -925,33 +1059,48 @@ impl AppState {
             .find(|t| matches!(&t.outcome, RunOutcome::Running { run: r, .. } if *r == run))
         {
             Some(t) => {
-                let started = match &t.outcome {
-                    RunOutcome::Running { started, .. } => *started,
-                    _ => Instant::now(),
-                };
-                let sql = t.sql.clone();
-                let record = match &outcome {
-                    RunOutcome::Ok(result) => Some((
-                        true,
-                        Some(result.affected().unwrap_or(result.row_count() as u64)),
-                        result.took(),
-                    )),
-                    RunOutcome::Err(_) => Some((false, None, started.elapsed())),
-                    _ => None,
+                let (started, statements) = match &t.outcome {
+                    RunOutcome::Running { started, statements, .. } => {
+                        (*started, statements.clone())
+                    }
+                    _ => (Instant::now(), Vec::new()),
                 };
                 let conn = t.conn;
+                let sql = t.sql.clone();
+                let entries: Vec<HistoryEntry> = match &outcome {
+                    RunOutcome::Ok { results, .. } => results
+                        .iter()
+                        .enumerate()
+                        .map(|(index, result)| HistoryEntry {
+                            conn,
+                            sql: statements.get(index).cloned().unwrap_or_else(|| sql.clone()),
+                            succeeded: true,
+                            rows: Some(
+                                result.affected().unwrap_or(result.row_count() as u64),
+                            ),
+                            took: result.took(),
+                            at: now_unix_secs(),
+                        })
+                        .collect(),
+                    RunOutcome::Err(_) => vec![HistoryEntry {
+                        conn,
+                        sql,
+                        succeeded: false,
+                        rows: None,
+                        took: started.elapsed(),
+                        at: now_unix_secs(),
+                    }],
+                    _ => Vec::new(),
+                };
                 t.outcome = outcome;
                 t.clear_export_notice();
-                Some((conn, record.map(|(succeeded, rows, took)| (sql, succeeded, rows, took))))
+                Some((conn, entries))
             }
             None => None,
         };
-        let Some((conn, record)) = matched else { return };
-        if let Some((sql, succeeded, rows, took)) = record {
-            self.history.insert(
-                0,
-                HistoryEntry { conn, sql, succeeded, rows, took, at: now_unix_secs() },
-            );
+        let Some((conn, entries)) = matched else { return };
+        if !entries.is_empty() {
+            self.history.splice(0..0, entries);
             self.history.truncate(HISTORY_CAP);
             self.persist_history();
         }
@@ -1220,7 +1369,14 @@ mod tests {
             *slot = sql.to_owned();
         }
         let run = state.ids.run();
-        state.set_outcome(tab, RunOutcome::Running { run, started: Instant::now() });
+        state.set_outcome(
+            tab,
+            RunOutcome::Running {
+                run,
+                started: Instant::now(),
+                statements: vec![sql.to_owned()],
+            },
+        );
         let result = QueryResult::from_columns(
             Vec::new(),
             false,
@@ -1228,7 +1384,69 @@ mod tests {
             std::time::Duration::from_millis(1),
         )
         .unwrap();
-        state.finish_run(run, RunOutcome::Ok(result));
+        state.finish_run(run, RunOutcome::Ok { results: vec![result], active: 0 });
+    }
+
+    fn rows_result(rows: i64) -> QueryResult {
+        QueryResult::from_columns(
+            vec![crate::db::Column::new(
+                "n".to_owned(),
+                "INTEGER".to_owned(),
+                (0..rows).map(crate::db::Value::Integer).collect(),
+            )],
+            false,
+            None,
+            std::time::Duration::from_millis(2),
+        )
+        .unwrap()
+    }
+
+    fn affected_result(affected: u64) -> QueryResult {
+        QueryResult::from_columns(
+            Vec::new(),
+            false,
+            Some(affected),
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap()
+    }
+
+    fn start_running(state: &mut AppState, tab: TabId, statements: &[&str]) -> RunId {
+        let run = state.ids.run();
+        state.set_outcome(
+            tab,
+            RunOutcome::Running {
+                run,
+                started: Instant::now(),
+                statements: statements.iter().map(|s| (*s).to_owned()).collect(),
+            },
+        );
+        run
+    }
+
+    /// A connection whose worker channel is a scripted receiver, so a test can
+    /// read the exact command `start_run` sends without a worker thread.
+    fn scripted_connection(
+        state: &mut AppState,
+        name: &str,
+    ) -> (ConnectionId, mpsc::Receiver<DbCommand>) {
+        let id = add_sqlite_connection(state, name);
+        let (handle, commands) = crate::db::test_handle();
+        let conn = state.connections.iter_mut().find(|c| c.id == id).expect("connection");
+        conn.state = ConnectionState::Connecting { handle };
+        (id, commands)
+    }
+
+    /// Every text galley painted in one frame, for render assertions.
+    fn rendered_text(output: &eframe::egui::FullOutput) -> Vec<String> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                eframe::egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -1280,7 +1498,14 @@ mod tests {
                 *slot = "SELECT 1".to_owned();
             }
             let run = state.ids.run();
-            state.set_outcome(tab, RunOutcome::Running { run, started: Instant::now() });
+            state.set_outcome(
+                tab,
+                RunOutcome::Running {
+                    run,
+                    started: Instant::now(),
+                    statements: vec!["SELECT 1".to_owned()],
+                },
+            );
             let result = QueryResult::from_columns(
                 vec![crate::db::Column::new(
                     "n".to_owned(),
@@ -1295,7 +1520,7 @@ mod tests {
                 std::time::Duration::from_millis(42),
             )
             .unwrap();
-            state.finish_run(run, RunOutcome::Ok(result));
+            state.finish_run(run, RunOutcome::Ok { results: vec![result], active: 0 });
             assert_eq!(state.history().len(), 1);
             let entry = &state.history()[0];
             assert_eq!(entry.conn, conn);
@@ -1311,7 +1536,11 @@ mod tests {
             let affected_run = state.ids.run();
             state.set_outcome(
                 affected_tab,
-                RunOutcome::Running { run: affected_run, started: Instant::now() },
+                RunOutcome::Running {
+                    run: affected_run,
+                    started: Instant::now(),
+                    statements: vec!["DELETE FROM t".to_owned()],
+                },
             );
             let affected = QueryResult::from_columns(
                 Vec::new(),
@@ -1320,7 +1549,7 @@ mod tests {
                 std::time::Duration::from_millis(5),
             )
             .unwrap();
-            state.finish_run(affected_run, RunOutcome::Ok(affected));
+            state.finish_run(affected_run, RunOutcome::Ok { results: vec![affected], active: 0 });
             assert_eq!(state.history()[0].rows, Some(3));
 
             let err_tab = state.new_tab(conn);
@@ -1330,7 +1559,11 @@ mod tests {
             let err_run = state.ids.run();
             state.set_outcome(
                 err_tab,
-                RunOutcome::Running { run: err_run, started: Instant::now() },
+                RunOutcome::Running {
+                    run: err_run,
+                    started: Instant::now(),
+                    statements: vec!["SELECT bad".to_owned()],
+                },
             );
             state.finish_run(err_run, RunOutcome::Err("query failed".to_owned()));
             assert_eq!(state.history().len(), 3);
@@ -1346,6 +1579,322 @@ mod tests {
             let reloaded = AppState::new(&eframe::egui::Context::default());
             assert_eq!(reloaded.history().len(), state.history().len());
             assert_eq!(reloaded.history()[0].sql, "SELECT bad");
+        });
+    }
+
+    #[test]
+    fn batch_ok_lands_three_results_with_active_zero() {
+        with_isolated_state("batch-ok", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 1; SELECT 2; UPDATE t SET x = 1".to_owned();
+            }
+            let run =
+                start_running(state, tab, &["SELECT 1", "SELECT 2", "UPDATE t SET x = 1"]);
+            state.apply(DbEvent::BatchOk {
+                run,
+                results: vec![rows_result(1), rows_result(2), affected_result(1)],
+            });
+            let tab_view = state.tab(tab).expect("tab");
+            match tab_view.outcome() {
+                RunOutcome::Ok { results, active } => {
+                    assert_eq!(results.len(), 3);
+                    assert_eq!(*active, 0);
+                }
+                other => panic!("expected Ok, got {other:?}"),
+            }
+            assert_eq!(tab_view.results().len(), 3);
+            assert_eq!(tab_view.active_result(), 0);
+            assert_eq!(tab_view.active_query_result().map(|r| r.row_count()), Some(1));
+            assert_eq!(state.history().len(), 3);
+            assert_eq!(state.history()[0].sql, "SELECT 1");
+            assert_eq!(state.history()[1].sql, "SELECT 2");
+            assert_eq!(state.history()[2].sql, "UPDATE t SET x = 1");
+            assert!(state.history().iter().all(|e| e.succeeded));
+            assert_eq!(state.history()[2].rows, Some(1));
+
+            // A late duplicate of the same run id stays dropped.
+            state.apply(DbEvent::BatchOk { run, results: vec![rows_result(9)] });
+            assert_eq!(state.history().len(), 3);
+            assert_eq!(state.tab(tab).expect("tab").results().len(), 3);
+        });
+    }
+
+    #[test]
+    fn batch_ok_returns_connection_to_connected() {
+        with_isolated_state("batch-conn", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            let run = start_running(state, tab, &["SELECT 1"]);
+            let (handle, _commands) = crate::db::test_handle();
+            let session = LiveSession {
+                handle,
+                cancel: CancelHandle::new(|| {}),
+                server_version: "test".to_owned(),
+            };
+            if let Some(c) = state.connections.iter_mut().find(|c| c.id == conn) {
+                c.state = ConnectionState::QueryRunning { session, run, tab };
+            }
+            state.apply(DbEvent::BatchOk { run, results: vec![rows_result(1)] });
+            let conn = state.connections().iter().find(|c| c.id == conn).expect("conn");
+            assert!(matches!(conn.state(), ConnectionState::Connected { .. }));
+        });
+    }
+
+    #[test]
+    fn batch_failure_keeps_the_first_result_and_names_the_index() {
+        with_isolated_state("batch-fail", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            let run =
+                start_running(state, tab, &["SELECT 1", "SELECT 2", "UPDATE t SET x = 1"]);
+            state.apply(DbEvent::BatchOk {
+                run,
+                results: vec![rows_result(1), rows_result(2), affected_result(1)],
+            });
+            assert_eq!(state.tab(tab).expect("tab").results().len(), 3);
+
+            let failed = start_running(state, tab, &["SELECT 1", "SELECT * FROM missing"]);
+            state.apply(DbEvent::QueryErr {
+                run: failed,
+                error: crate::db::DbError::Query(
+                    "statement 1: no such table: missing".to_owned(),
+                ),
+            });
+            let tab = state.tab(tab).expect("tab");
+            match tab.outcome() {
+                RunOutcome::Err(message) => {
+                    assert!(message.contains("statement 1"), "{message}");
+                }
+                other => panic!("expected Err, got {other:?}"),
+            }
+            // The first result of the last finished run stays on screen.
+            assert_eq!(tab.results().len(), 3);
+            assert_eq!(tab.active_result(), 0);
+            assert!(tab.active_query_result().is_some());
+            assert_eq!(state.history().len(), 4);
+            assert!(!state.history()[0].succeeded);
+        });
+    }
+
+    #[test]
+    fn active_result_switches_and_clamps() {
+        with_isolated_state("active-result", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            let run = start_running(state, tab, &["SELECT 1", "SELECT 2"]);
+            state.apply(DbEvent::BatchOk { run, results: vec![rows_result(1), rows_result(2)] });
+            state.tab_mut(tab).expect("tab").set_active_result(1);
+            let tab_view = state.tab(tab).expect("tab");
+            assert_eq!(tab_view.active_result(), 1);
+            assert_eq!(tab_view.active_query_result().map(|r| r.row_count()), Some(2));
+            match tab_view.outcome() {
+                RunOutcome::Ok { active, .. } => assert_eq!(*active, 1),
+                other => panic!("expected Ok, got {other:?}"),
+            }
+            state.tab_mut(tab).expect("tab").set_active_result(9);
+            assert_eq!(state.tab(tab).expect("tab").active_result(), 1);
+        });
+    }
+
+    #[test]
+    fn scope_all_sends_every_statement() {
+        with_isolated_state("scope-all", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            assert_eq!(state.tab(tab).expect("tab").run_scope(), RunScope::All);
+            let sql = "SELECT 1; SELECT 2;";
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = sql.to_owned();
+            }
+            state.start_run(tab, sql, 0, None);
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["SELECT 1", "SELECT 2"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+            assert!(matches!(
+                state.tab(tab).expect("tab").outcome(),
+                RunOutcome::Running { .. }
+            ));
+        });
+    }
+
+    #[test]
+    fn scope_current_sends_only_the_statement_at_the_cursor() {
+        with_isolated_state("scope-current", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.tab_mut(tab).expect("tab").set_run_scope(RunScope::Current);
+            let sql = "SELECT 1;\nSELECT 2;\nSELECT 3";
+            let cursor = sql.find("SELECT 2").expect("second statement") + 3;
+            state.start_run(tab, sql, cursor, None);
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["SELECT 2"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn scope_selection_sends_the_overlapping_statements() {
+        with_isolated_state("scope-selection", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.tab_mut(tab).expect("tab").set_run_scope(RunScope::Selection);
+            let sql = "SELECT 1;\nSELECT 2;\nSELECT 3";
+            let start = sql.find("2;").expect("second statement");
+            let end = sql.find("SELECT 3").expect("third statement") + 3;
+            state.start_run(tab, sql, start, Some(start..end));
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["SELECT 2", "SELECT 3"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+
+            // No selection falls back to the statement at the cursor.
+            let fallback = state.new_tab(conn);
+            state.tab_mut(fallback).expect("tab").set_run_scope(RunScope::Selection);
+            state.start_run(fallback, sql, 12, None);
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["SELECT 2"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn empty_effective_set_errors_without_sending() {
+        with_isolated_state("scope-empty", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.start_run(tab, "   ", 0, None);
+            assert!(matches!(
+                state.tab(tab).expect("tab").outcome(),
+                RunOutcome::Err(message) if message.as_str() == "nothing to run"
+            ));
+            assert!(commands.try_recv().is_err());
+
+            let current = state.new_tab(conn);
+            state.tab_mut(current).expect("tab").set_run_scope(RunScope::Current);
+            state.start_run(current, "", 0, None);
+            assert!(matches!(
+                state.tab(current).expect("tab").outcome(),
+                RunOutcome::Err(message) if message.as_str() == "nothing to run"
+            ));
+            assert!(commands.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn all_scope_runs_a_script_through_the_sqlite_worker() {
+        with_isolated_state("batch-live", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            state.connect(conn);
+            let tab = state.new_tab(conn);
+            let sql = "CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1); SELECT id FROM t";
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = sql.to_owned();
+            }
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                state.drain_events();
+                if matches!(state.connections()[0].state(), ConnectionState::Connected { .. }) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "connection did not come up");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            state.start_run(tab, sql, 0, None);
+            loop {
+                state.drain_events();
+                let running = matches!(
+                    state.tab(tab).expect("tab").outcome(),
+                    RunOutcome::Running { .. }
+                );
+                if !running {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "run did not finish");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let tab = state.tab(tab).expect("tab");
+            match tab.outcome() {
+                RunOutcome::Ok { results, active } => {
+                    assert_eq!(results.len(), 3);
+                    assert_eq!(*active, 0);
+                    assert_eq!(results[0].affected(), Some(0));
+                    assert_eq!(results[1].affected(), Some(1));
+                    assert_eq!(results[2].row_count(), 1);
+                    assert_eq!(results[2].cell(0, 0), Some(&crate::db::Value::Integer(1)));
+                }
+                other => panic!("expected Ok, got {other:?}"),
+            }
+            assert_eq!(state.history().len(), 3);
+            assert!(matches!(
+                state.connections()[0].state(),
+                ConnectionState::Connected { .. }
+            ));
+        });
+    }
+
+    #[test]
+    fn grid_and_toolbar_render_multi_result_state() {
+        with_isolated_state("render", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 1; SELECT 2".to_owned();
+            }
+            let run = start_running(state, tab, &["SELECT 1", "SELECT 2"]);
+            state.apply(DbEvent::BatchOk { run, results: vec![rows_result(2), rows_result(3)] });
+            state.activate(tab);
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let mut grid = ctx.run_ui(input.clone(), |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            grid.textures_delta.clear();
+            let grid_text = rendered_text(&grid);
+            assert!(grid_text.iter().any(|t| t == "Result 1"), "{grid_text:?}");
+            assert!(grid_text.iter().any(|t| t == "Result 2"), "{grid_text:?}");
+            assert!(grid_text.iter().any(|t| t == "2 rows · 2 ms"), "{grid_text:?}");
+
+            let mut toolbar = ctx.run_ui(input.clone(), |ui| {
+                crate::ui::query::editor(state, ui);
+            });
+            toolbar.textures_delta.clear();
+            let toolbar_text = rendered_text(&toolbar);
+            assert!(toolbar_text.iter().any(|t| t == "▶ Run"), "{toolbar_text:?}");
+            assert!(
+                toolbar_text.iter().any(|t| t.contains("all statements")),
+                "{toolbar_text:?}"
+            );
+            assert_eq!(state.tab(tab).expect("tab").active_result(), 0);
+
+            // Switching the active result re-renders the grid for that result.
+            state.tab_mut(tab).expect("tab").set_active_result(1);
+            let mut switched = ctx.run_ui(input, |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            switched.textures_delta.clear();
+            let switched_text = rendered_text(&switched);
+            assert!(switched_text.iter().any(|t| t == "3 rows · 2 ms"), "{switched_text:?}");
+            assert!(switched_text.iter().any(|t| t == "3 of 3 rows"), "{switched_text:?}");
+            assert!(!switched_text.iter().any(|t| t == "2 rows · 2 ms"), "{switched_text:?}");
         });
     }
 
