@@ -21,7 +21,7 @@ enum SidebarAction {
     Edit(ConnectionId),
     Delete(ConnectionId),
     RefreshSchema(ConnectionId),
-    PreviewTable(ConnectionId, String),
+    PreviewTable(ConnectionId, String, String),
 }
 
 pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
@@ -195,8 +195,10 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                                         super::schema::SchemaAction::Refresh(id) => {
                                             actions.push(SidebarAction::RefreshSchema(id));
                                         }
-                                        super::schema::SchemaAction::Preview(id, table) => {
-                                            actions.push(SidebarAction::PreviewTable(id, table));
+                                        super::schema::SchemaAction::Preview(id, schema, table) => {
+                                            actions.push(SidebarAction::PreviewTable(
+                                                id, schema, table,
+                                            ));
                                         }
                                     }
                                 }
@@ -216,7 +218,9 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                         SidebarAction::Edit(id) => state.open_draft(Some(id)),
                         SidebarAction::Delete(id) => state.delete_connection(id),
                         SidebarAction::RefreshSchema(id) => state.refresh_schema(id),
-                        SidebarAction::PreviewTable(id, table) => state.preview_table(id, &table),
+                        SidebarAction::PreviewTable(id, schema, table) => {
+                            state.preview_table(id, &schema, &table)
+                        }
                     }
                 }
             });

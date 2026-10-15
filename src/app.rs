@@ -328,11 +328,15 @@ impl AppState {
         }
     }
 
-    pub fn preview_table(&mut self, conn: ConnectionId, table: &str) {
+    pub fn preview_table(&mut self, conn: ConnectionId, schema: &str, table: &str) {
         if self.connections.iter().find(|c| c.id == conn).is_none() {
             return;
         }
-        let sql = format!("SELECT * FROM \"{}\" LIMIT 100", table.replace('"', "\"\""));
+        let sql = format!(
+            "SELECT * FROM \"{}\".\"{}\" LIMIT 100",
+            schema.replace('"', "\"\""),
+            table.replace('"', "\"\"")
+        );
         let existing = self.tabs.iter().find(|t| t.conn == conn && t.sql == sql).map(|t| t.id);
         match existing {
             Some(id) => {
