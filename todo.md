@@ -37,13 +37,13 @@ Wave 0 — scaffold, blocks all.
 Wave 1 — parallel, additive only, separate owned files.
 - [x] T1 Autocomplete: new `src/ui/complete.rs` over `SchemaInfo` + keywords, hook into `src/ui/query.rs` (Ctrl+Space popup). No `Tab` shape change. Tests: suggestion unit tests. Landed 23ee7c7.
 - [x] T3 DDL view + Generate SQL: new `src/ui/ddl.rs` pure builder over loaded schema, read-only pane. No state change. Tests: DDL string tests. Landed 4895a07.
-- [x] T5 Editor logic: `src/ui/editor.rs` format + find + highlight with 5 tests. Landed ea40967. Hook unit in flight on deepseek.
+- [x] T5 Editor: `src/ui/editor.rs` logic landed ea40967; hook with Format, Ctrl+F find bar, and syntax highlight landed a401b4d.
 - [x] T7a Extended export: extend `src/export.rs` with JSON + SQL-inserts + clipboard copy. No `QueryResult` change. Tests: quoting + roundtrip. Landed 77b0771.
 - [x] T8a Postgres SSL modes: additive `ssl` field on Postgres config in `src/db.rs` + sqlx connect options + persist. Tests: URL builder per mode. Landed 69b32e0. Live roundtrip green.
-- [ ] T9a Env types (dev/test/prod colors + prod confirm): AFTER T8a (shared config shape), copies its additive-field pattern. Tests: default dev + guard. In flight on deepseek.
+- [x] T9a Env types (dev/test/prod badges + prod confirm): landed 6fba7f2 with 8 tests; old profiles load as dev.
 
 Wave 2 — serial core chain on `src/app.rs` Tab machine + `src/db.rs` worker.
-- [ ] T4 Run scope + multi-statement + resultset picker (after Wave 1). Extends `RunOutcome`, splitter, picker UI. Blocks T6, T2. Tests + live run + cancel regression.
+- [ ] T4 Run scope + multi-statement + resultset picker (after Wave 1). Extends `RunOutcome`, splitter, picker UI. Blocks T6, T2. Tests + live run + cancel regression. In flight on deepseek max.
 - [ ] T6 EXPLAIN plan view (after T4). EXPLAIN runner, rows rendered in grid. Read-only. Tests + live EXPLAIN on both engines.
 - [ ] T2 Inline editing (after T4, T6). Grid dirty tracking + PK-aware UPDATE/INSERT/DELETE + worker write command. Tests + live write + cancel regression.
 - [ ] T7b CSV import (after T2). Column mapper + batched INSERT on T2 write path. Tests + live import.
