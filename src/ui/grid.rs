@@ -9,7 +9,7 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::app::{AppState, RunOutcome, SortDir, Tab};
 use crate::db::{CELL_CAP, QueryResult, Value};
-use crate::export::to_csv;
+use crate::export::{to_csv, to_inserts, to_json, to_markdown};
 
 const AFFECT_GREEN: egui::Color32 = egui::Color32::from_rgb(115, 180, 115);
 
@@ -187,6 +187,24 @@ fn results_grid(tab: &mut Tab, ui: &mut egui::Ui) {
         {
             export_current_view(tab);
         }
+        if ui
+            .add_enabled(can_export, egui::Button::new("Export JSON"))
+            .clicked()
+        {
+            export_json_view(tab);
+        }
+        if ui
+            .add_enabled(can_export, egui::Button::new("Copy INSERTs"))
+            .clicked()
+        {
+            copy_inserts_view(tab, ui.ctx());
+        }
+        if ui
+            .add_enabled(can_export, egui::Button::new("Copy Markdown"))
+            .clicked()
+        {
+            copy_markdown_view(tab, ui.ctx());
+        }
     });
     if let Some(notice) = tab.export_notice().map(str::to_owned) {
         if tab.export_failed() {
@@ -294,6 +312,67 @@ fn export_current_view(tab: &mut Tab) {
         ),
         Err(e) => tab.set_export_notice(format!("Export failed: {e}"), true),
     }
+}
+
+fn export_json_view(tab: &mut Tab) {
+    let (json, default_name, nrows) = match tab.outcome() {
+        RunOutcome::Ok(result) => {
+            if result.columns().is_empty() {
+                return;
+            }
+            let visible = visible_rows(result, tab.sort_col(), tab.sort_dir(), tab.filter());
+            let json = to_json(result, &visible);
+            let name = format!("{}.json", super::query::tab_title(tab.sql.clone()));
+            (json, name, visible.len())
+        }
+        _ => return,
+    };
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("JSON", &["json"])
+        .set_file_name(&default_name)
+        .save_file()
+    else {
+        return;
+    };
+    match std::fs::write(&path, json) {
+        Ok(()) => tab.set_export_notice(
+            format!("Exported {nrows} rows to {}", path.display()),
+            false,
+        ),
+        Err(e) => tab.set_export_notice(format!("Export failed: {e}"), true),
+    }
+}
+
+fn copy_inserts_view(tab: &mut Tab, ctx: &egui::Context) {
+    let (text, nrows) = match tab.outcome() {
+        RunOutcome::Ok(result) => {
+            if result.columns().is_empty() {
+                return;
+            }
+            let visible = visible_rows(result, tab.sort_col(), tab.sort_dir(), tab.filter());
+            let text = to_inserts("result", result, &visible);
+            (text, visible.len())
+        }
+        _ => return,
+    };
+    ctx.copy_text(text);
+    tab.set_export_notice(format!("Copied {nrows} rows as INSERTs"), false);
+}
+
+fn copy_markdown_view(tab: &mut Tab, ctx: &egui::Context) {
+    let (text, nrows) = match tab.outcome() {
+        RunOutcome::Ok(result) => {
+            if result.columns().is_empty() {
+                return;
+            }
+            let visible = visible_rows(result, tab.sort_col(), tab.sort_dir(), tab.filter());
+            let text = to_markdown(result, &visible);
+            (text, visible.len())
+        }
+        _ => return,
+    };
+    ctx.copy_text(text);
+    tab.set_export_notice(format!("Copied {nrows} rows as Markdown"), false);
 }
 
 #[cfg(test)]
