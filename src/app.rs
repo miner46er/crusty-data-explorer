@@ -108,6 +108,10 @@ pub struct Connection {
     pub password: String,
     /// SSH secret (a password or key passphrase), never persisted.
     pub ssh_password: String,
+    /// Slash-separated folder path placing the card in a sidebar tree.
+    /// None is the ungrouped root. Always normalized through
+    /// [`normalize_folder_path`], so it never holds blanks or stray slashes.
+    folder: Option<String>,
     state: ConnectionState,
     /// The observed transaction flag. A BEGIN batch landing Ok opens it; a
     /// COMMIT or ROLLBACK batch landing Ok closes it, and a fatal worker
@@ -124,6 +128,10 @@ pub struct Connection {
 impl Connection {
     pub fn state(&self) -> &ConnectionState {
         &self.state
+    }
+    /// The sidebar folder path, None at the ungrouped root.
+    pub fn folder(&self) -> Option<&str> {
+        self.folder.as_deref()
     }
     /// The observed transaction flag, for the tab and card indicators.
     pub fn transaction(&self) -> Transaction {
@@ -608,8 +616,9 @@ pub struct HistoryEntry {
 
 /// One named query. Newest first in [`AppState::saved`]. Holds the SQL and
 /// its connection only, never credentials. `folder` places it in a sidebar
-/// group (`None` is the group at the top); `pinned` floats it to the top of
-/// its group. Both default so files written before folders still load.
+/// tree as a slash-separated path (`Some("ops/db")` nests under `ops`);
+/// `None` is the ungrouped root. `pinned` floats it to the top of its own
+/// tree node. Both default so files written before folders still load.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SavedQuery {
     pub id: u64,
@@ -645,8 +654,132 @@ impl SavedQuery {
     }
 }
 
-/// One sidebar group. `folder` is `None` for the no-folder group, which leads.
-/// Entries are pinned first, each pin class in stored order.
+/// Normalize a raw folder path into slash-separated segments: trims each
+/// segment, drops blanks and stray slashes, so `" //ops// db/ "` becomes
+/// `Some("ops/db")`. None or blank becomes None, the ungrouped root. Every
+/// folder write funnels through here, so stored paths are always canonical.
+pub fn normalize_folder_path(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let parts: Vec<&str> =
+        raw.split('/').map(str::trim).filter(|part| !part.is_empty()).collect();
+    if parts.is_empty() { None } else { Some(parts.join("/")) }
+}
+
+/// One sidebar tree node. `path` is the full slash-separated path (empty at
+/// the root) and `name` its last segment. `entries` holds the node's direct
+/// entries only; `children` nest alphabetically by name.
+#[derive(Debug)]
+pub struct FolderNode<T> {
+    pub name: String,
+    pub path: String,
+    pub entries: Vec<T>,
+    pub children: Vec<FolderNode<T>>,
+}
+
+impl<T> FolderNode<T> {
+    /// Ensure the nested path exists, creating intermediate nodes. Used for
+    /// freshly created empty folders, which have no entry carrying the path.
+    /// Siblings stay alphabetical at every level.
+    pub fn ensure_path(&mut self, path: &str) {
+        let mut node = self;
+        let mut prefix = String::new();
+        for segment in path.split('/').map(str::trim).filter(|s| !s.is_empty()) {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(segment);
+            if !node.children.iter().any(|child| child.name == segment) {
+                node.children.push(FolderNode {
+                    name: segment.to_owned(),
+                    path: prefix.clone(),
+                    entries: Vec::new(),
+                    children: Vec::new(),
+                });
+            }
+            node.children.sort_by(|a, b| a.name.cmp(&b.name));
+            let index = node
+                .children
+                .iter()
+                .position(|child| child.name == segment)
+                .expect("the segment was just ensured");
+            node = &mut node.children[index];
+        }
+    }
+}
+
+/// Push one entry onto the node its normalized path names, creating
+/// intermediates. Paths are already canonical on write; the segment filter
+/// keeps hand-built test shapes honest too.
+fn insert_folder_entry<T>(root: &mut FolderNode<T>, path: Option<&str>, entry: T) {
+    let mut node = root;
+    let mut prefix = String::new();
+    let segments: Vec<&str> =
+        path.iter().flat_map(|p| p.split('/')).map(str::trim).filter(|s| !s.is_empty()).collect();
+    for segment in segments {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(segment);
+        let index = match node.children.iter().position(|child| child.name == segment) {
+            Some(index) => index,
+            None => {
+                node.children.push(FolderNode {
+                    name: segment.to_owned(),
+                    path: prefix.clone(),
+                    entries: Vec::new(),
+                    children: Vec::new(),
+                });
+                node.children.len() - 1
+            }
+        };
+        node = &mut node.children[index];
+    }
+    node.entries.push(entry);
+}
+
+/// The saved-query sidebar tree: entries grouped by nested folder path with
+/// pinned entries first inside every node, each pin class in stored order.
+pub fn saved_folder_tree(saved: &[SavedQuery]) -> FolderNode<&SavedQuery> {
+    let mut root = FolderNode { name: String::new(), path: String::new(), entries: Vec::new(), children: Vec::new() };
+    for query in saved {
+        insert_folder_entry(&mut root, query.folder.as_deref(), query);
+    }
+    sort_saved_tree(&mut root);
+    root
+}
+
+/// Sort one saved tree node: children alphabetically, entries pinned first
+/// (stable, so each pin class keeps the stored newest-first order).
+fn sort_saved_tree(node: &mut FolderNode<&SavedQuery>) {
+    node.children.sort_by(|a, b| a.name.cmp(&b.name));
+    node.entries.sort_by(|a, b| b.pinned.cmp(&a.pinned));
+    for child in &mut node.children {
+        sort_saved_tree(child);
+    }
+}
+
+/// The connection sidebar tree: cards grouped by nested folder path in
+/// stored order, folders alphabetically.
+pub fn connection_folder_tree(connections: &[Connection]) -> FolderNode<&Connection> {
+    let mut root = FolderNode { name: String::new(), path: String::new(), entries: Vec::new(), children: Vec::new() };
+    for conn in connections {
+        insert_folder_entry(&mut root, conn.folder.as_deref(), conn);
+    }
+    sort_connection_tree(&mut root);
+    root
+}
+
+/// Sort one connection tree node: children alphabetically, entries keep the
+/// stored sidebar order.
+fn sort_connection_tree(node: &mut FolderNode<&Connection>) {
+    node.children.sort_by(|a, b| a.name.cmp(&b.name));
+    for child in &mut node.children {
+        sort_connection_tree(child);
+    }
+}
+
+/// One flat sidebar group. `folder` is `None` for the no-folder group, which
+/// leads. Entries are pinned first, each pin class in stored order.
 #[derive(Debug)]
 pub struct SavedGroup<'a> {
     pub folder: Option<&'a str>,
@@ -1285,6 +1418,8 @@ pub struct ConnectDraft {
     pub password: String,
     /// SSH secret (a password or key passphrase), never persisted.
     pub ssh_password: String,
+    /// Raw sidebar folder path; normalized to nested segments on save.
+    pub folder: String,
     pub error: Option<String>,
 }
 
@@ -2994,11 +3129,11 @@ impl AppState {
         &self.saved
     }
 
-    /// Save the active tab's SQL under `name` in `folder`. A duplicate name
-    /// replaces the entry in place when it sits in the same folder and keeps
-    /// its id; the same name in another folder saves beside it. The active
-    /// tab remembers the entry, so a later save prompt reopens with its
-    /// folder and pin.
+    /// Save the active tab's SQL under `name` in `folder`, a slash-separated
+    /// path (`"ops/db"` nests under `ops`). A duplicate name replaces the
+    /// entry in place when it sits in the same folder and keeps its id; the
+    /// same name in another folder saves beside it. The active tab remembers
+    /// the entry, so a later save prompt reopens with its folder and pin.
     pub fn save_active_tab(
         &mut self,
         name: &str,
@@ -3009,7 +3144,7 @@ impl AppState {
         if trimmed.is_empty() {
             return None;
         }
-        let folder = folder.map(str::trim).filter(|f| !f.is_empty());
+        let folder = normalize_folder_path(folder);
         let (conn, sql) = match self.active.and_then(|id| self.tab(id)) {
             Some(tab) => match tab.conn {
                 Some(conn) => (conn, tab.sql.clone()),
@@ -3020,7 +3155,7 @@ impl AppState {
         if let Some(existing) = self
             .saved
             .iter_mut()
-            .find(|q| q.name == trimmed && q.folder.as_deref() == folder)
+            .find(|q| q.name == trimmed && q.folder.as_deref() == folder.as_deref())
         {
             existing.sql = sql;
             existing.conn = conn;
@@ -3036,7 +3171,7 @@ impl AppState {
             trimmed.to_owned(),
             sql,
             conn,
-            folder.map(str::to_owned),
+            folder,
             pinned,
         ) {
             Ok(query) => {
@@ -3084,6 +3219,19 @@ impl AppState {
             return false;
         };
         query.name = trimmed.to_owned();
+        self.persist_saved();
+        true
+    }
+
+    /// Retarget one saved query to a nested folder path, creating the folders
+    /// by naming them. None (or blank) moves it back to the ungrouped root.
+    /// Persists, so the move survives a restart. False for an unknown id.
+    /// The sidebar drag and drop lands here.
+    pub fn move_saved(&mut self, id: u64, folder: Option<&str>) -> bool {
+        let Some(query) = self.saved.iter_mut().find(|q| q.id == id) else {
+            return false;
+        };
+        query.folder = normalize_folder_path(folder);
         self.persist_saved();
         true
     }
@@ -3389,15 +3537,22 @@ impl AppState {
     }
 
     pub fn open_draft(&mut self, editing: Option<ConnectionId>) {
-        let (name, env, config, password) = match editing {
+        let (name, env, config, password, folder) = match editing {
             Some(id) => match self.connections.iter().find(|c| c.id == id) {
-                Some(c) => (c.name.clone(), c.env, c.config.clone(), c.password.clone()),
+                Some(c) => (
+                    c.name.clone(),
+                    c.env,
+                    c.config.clone(),
+                    c.password.clone(),
+                    c.folder.clone().unwrap_or_default(),
+                ),
                 None => return,
             },
             None => (
                 String::new(),
                 Environment::default(),
                 DbKind::Sqlite.default_config(),
+                String::new(),
                 String::new(),
             ),
         };
@@ -3408,6 +3563,7 @@ impl AppState {
             config,
             password,
             ssh_password: String::new(),
+            folder,
             error: None,
         });
     }
@@ -3440,10 +3596,12 @@ impl AppState {
                     c.config = draft.config;
                     c.password = draft.password;
                     c.ssh_password = draft.ssh_password;
+                    c.folder = normalize_folder_path(Some(draft.folder.as_str()));
                 }
             }
             None => {
                 let id = self.ids.connection();
+                let folder = normalize_folder_path(Some(draft.folder.as_str()));
                 self.connections.push(Connection {
                     id,
                     name: draft.name,
@@ -3451,6 +3609,7 @@ impl AppState {
                     config: draft.config,
                     password: draft.password,
                     ssh_password: draft.ssh_password,
+                    folder,
                     state: ConnectionState::Disconnected,
                     transaction: Transaction::Closed,
                     autocommit: true,
@@ -3458,6 +3617,18 @@ impl AppState {
             }
         }
         self.persist();
+    }
+
+    /// Retarget one connection to a nested folder path, creating the folders
+    /// by naming them. None (or blank) moves it back to the ungrouped root.
+    /// Persists, so the move survives a restart. False for an unknown id.
+    pub fn move_connection(&mut self, id: ConnectionId, folder: Option<&str>) -> bool {
+        let Some(conn) = self.connections.iter_mut().find(|c| c.id == id) else {
+            return false;
+        };
+        conn.folder = normalize_folder_path(folder);
+        self.persist();
+        true
     }
 
     /// The one write of a tab's outcome. Leaving `Ok` moves its results into
@@ -3843,6 +4014,10 @@ struct PersistedProfile {
     #[serde(default)]
     env: Environment,
     config: ConnectionConfig,
+    /// Slash-separated sidebar folder path. Defaults so old files load at
+    /// the ungrouped root.
+    #[serde(default)]
+    folder: Option<String>,
 }
 
 fn profiles_path() -> std::path::PathBuf {
@@ -3871,6 +4046,7 @@ fn load_connections() -> Vec<Connection> {
                 config: p.config,
                 password: String::new(),
                 ssh_password: String::new(),
+                folder: normalize_folder_path(p.folder.as_deref()),
                 state: ConnectionState::Disconnected,
                 transaction: Transaction::Closed,
                 autocommit: true,
@@ -3895,6 +4071,7 @@ fn save_connections(conns: &[Connection]) -> std::io::Result<()> {
             name: c.name.clone(),
             env: c.env,
             config: c.config.clone(),
+            folder: c.folder.clone(),
         })
         .collect();
     let tmp = path.with_extension("json.tmp");
@@ -3950,13 +4127,7 @@ fn load_saved_queries() -> Vec<SavedQuery> {
         Ok(mut queries) => {
             queries.retain(|q| !q.name.trim().is_empty());
             for query in &mut queries {
-                let folder = query
-                    .folder
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|f| !f.is_empty())
-                    .map(str::to_owned);
-                query.folder = folder;
+                query.folder = normalize_folder_path(query.folder.as_deref());
             }
             queries.truncate(SAVED_CAP);
             queries
@@ -6015,6 +6186,331 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ensured_empty_folders_sort_beside_entry_folders() {
+        let conn = ConnectionId::from_raw(1);
+        let saved = vec![
+            SavedQuery::new(1, "q".to_owned(), "SELECT 1".to_owned(), conn, Some("ops".to_owned()), false)
+                .expect("named"),
+        ];
+        let mut tree = saved_folder_tree(&saved);
+        tree.ensure_path("alpha");
+        tree.ensure_path("ops/db");
+        assert_eq!(
+            tree.children.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "ops"]
+        );
+        let ops = &tree.children[1];
+        assert_eq!(ops.entries.len(), 1);
+        assert_eq!(ops.children.len(), 1);
+        assert_eq!(ops.children[0].path, "ops/db");
+        assert!(ops.children[0].entries.is_empty());
+    }
+
+    #[test]
+    fn folder_paths_normalize_slashes_and_blanks() {        assert_eq!(normalize_folder_path(None), None);
+        assert_eq!(normalize_folder_path(Some("")), None);
+        assert_eq!(normalize_folder_path(Some("   ")), None);
+        assert_eq!(normalize_folder_path(Some("///")), None);
+        assert_eq!(normalize_folder_path(Some("ops")), Some("ops".to_owned()));
+        assert_eq!(
+            normalize_folder_path(Some(" //ops// db/ ")),
+            Some("ops/db".to_owned())
+        );
+        assert_eq!(
+            normalize_folder_path(Some("a/b/c")),
+            Some("a/b/c".to_owned())
+        );
+        assert_eq!(normalize_folder_path(Some("a//b")), Some("a/b".to_owned()));
+    }
+
+    #[test]
+    fn nested_folder_paths_group_into_a_tree_with_literal_shape() {
+        let conn = ConnectionId::from_raw(1);
+        let query = |id: u64, name: &str, folder: Option<&str>| {
+            SavedQuery::new(
+                id,
+                name.to_owned(),
+                "SELECT 1".to_owned(),
+                conn,
+                normalize_folder_path(folder),
+                false,
+            )
+            .expect("named")
+        };
+        let saved = vec![
+            query(1, "root-q", None),
+            query(2, "db-q", Some("ops/db")),
+            query(3, "api-q", Some("ops/api")),
+            query(4, "ops-q", Some("ops")),
+            query(5, "solo-q", Some("personal")),
+        ];
+        let tree = saved_folder_tree(&saved);
+        assert_eq!(
+            tree.entries.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(),
+            vec!["root-q"]
+        );
+        assert_eq!(
+            tree.children
+                .iter()
+                .map(|c| (c.name.as_str(), c.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("ops", "ops"), ("personal", "personal")]
+        );
+        let ops = &tree.children[0];
+        assert_eq!(
+            ops.entries.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(),
+            vec!["ops-q"]
+        );
+        assert_eq!(
+            ops.children
+                .iter()
+                .map(|c| (c.name.as_str(), c.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("api", "ops/api"), ("db", "ops/db")]
+        );
+        assert_eq!(ops.children[0].entries[0].name, "api-q");
+        assert_eq!(ops.children[1].entries[0].name, "db-q");
+        assert_eq!(tree.children[1].entries[0].name, "solo-q");
+    }
+
+    #[test]
+    fn pin_precedence_holds_inside_nested_folders() {
+        let conn = ConnectionId::from_raw(1);
+        let query = |id: u64, name: &str, folder: Option<&str>, pinned: bool| {
+            SavedQuery::new(
+                id,
+                name.to_owned(),
+                "SELECT 1".to_owned(),
+                conn,
+                normalize_folder_path(folder),
+                pinned,
+            )
+            .expect("named")
+        };
+        let saved = vec![
+            query(1, "root-plain", None, false),
+            query(2, "root-pinned", None, true),
+            query(3, "nested-plain", Some("ops/db"), false),
+            query(4, "nested-pinned", Some("ops/db"), true),
+            query(5, "mid-plain", Some("ops"), false),
+            query(6, "mid-pinned", Some("ops"), true),
+        ];
+        let tree = saved_folder_tree(&saved);
+        assert_eq!(
+            tree.entries.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(),
+            vec!["root-pinned", "root-plain"]
+        );
+        let ops = tree.children.iter().find(|c| c.name == "ops").expect("ops node");
+        assert_eq!(
+            ops.entries.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(),
+            vec!["mid-pinned", "mid-plain"]
+        );
+        let db = ops.children.iter().find(|c| c.name == "db").expect("db node");
+        assert_eq!(db.path, "ops/db");
+        assert_eq!(
+            db.entries.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(),
+            vec!["nested-pinned", "nested-plain"]
+        );
+    }
+
+    #[test]
+    fn move_saved_retargets_and_persists_across_restart() {
+        with_isolated_state("saved-move", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 1".to_owned();
+            }
+            state.activate(tab);
+            let id = state.save_active_tab("daily", Some("ops"), false).expect("saved");
+            assert!(state.move_saved(id, Some("ops/db")));
+            assert_eq!(
+                state.saved_queries().iter().find(|q| q.id == id).unwrap().folder.as_deref(),
+                Some("ops/db")
+            );
+            assert!(state.move_saved(id, Some(" //ops// db/deep/ ")));
+            assert_eq!(
+                state.saved_queries().iter().find(|q| q.id == id).unwrap().folder.as_deref(),
+                Some("ops/db/deep")
+            );
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(
+                reloaded.saved_queries().iter().find(|q| q.id == id).unwrap().folder.as_deref(),
+                Some("ops/db/deep")
+            );
+            assert!(state.move_saved(id, None));
+            assert_eq!(
+                state.saved_queries().iter().find(|q| q.id == id).unwrap().folder,
+                None
+            );
+            let back = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(
+                back.saved_queries().iter().find(|q| q.id == id).unwrap().folder,
+                None
+            );
+            assert!(!state.move_saved(999_999, Some("ops")));
+        });
+    }
+
+    #[test]
+    fn move_connection_retargets_and_persists_across_restart() {
+        with_isolated_state("conn-move", |state| {
+            let id = add_sqlite_connection(state, "mem");
+            assert_eq!(state.connections().iter().find(|c| c.id == id).unwrap().folder(), None);
+            assert!(state.move_connection(id, Some("team/a")));
+            assert_eq!(
+                state.connections().iter().find(|c| c.id == id).unwrap().folder(),
+                Some("team/a")
+            );
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(
+                reloaded.connections().iter().find(|c| c.id == id).unwrap().folder(),
+                Some("team/a")
+            );
+            assert!(state.move_connection(id, Some("  //team//b/ ")));
+            assert_eq!(
+                state.connections().iter().find(|c| c.id == id).unwrap().folder(),
+                Some("team/b")
+            );
+            assert!(state.move_connection(id, None));
+            assert_eq!(state.connections().iter().find(|c| c.id == id).unwrap().folder(), None);
+            let back = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(back.connections().iter().find(|c| c.id == id).unwrap().folder(), None);
+            assert!(!state.move_connection(ConnectionId::from_raw(999_999), Some("team")));
+        });
+    }
+
+    #[test]
+    fn connection_folder_tree_groups_nested_paths_with_literal_shape() {
+        with_isolated_state("conn-tree", |state| {
+            let first = add_sqlite_connection(state, "root-conn");
+            let second = add_sqlite_connection(state, "db-conn");
+            let third = add_sqlite_connection(state, "deep-conn");
+            assert!(state.move_connection(second, Some("ops/db")));
+            assert!(state.move_connection(third, Some("ops/db/deep")));
+            let tree = connection_folder_tree(state.connections());
+            assert_eq!(tree.entries.len(), 1);
+            assert_eq!(tree.entries[0].id, first);
+            assert_eq!(
+                tree.children
+                    .iter()
+                    .map(|c| (c.name.as_str(), c.path.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![("ops", "ops")]
+            );
+            let ops = &tree.children[0];
+            assert!(ops.entries.is_empty());
+            assert_eq!(ops.children.len(), 1);
+            assert_eq!(ops.children[0].path, "ops/db");
+            assert_eq!(ops.children[0].entries.len(), 1);
+            assert_eq!(ops.children[0].entries[0].id, second);
+            assert_eq!(ops.children[0].children.len(), 1);
+            assert_eq!(ops.children[0].children[0].path, "ops/db/deep");
+            assert_eq!(ops.children[0].children[0].entries[0].id, third);
+        });
+    }
+
+    #[test]
+    fn draft_folder_roundtrips_through_save_and_edit() {
+        with_isolated_state("draft-folder", |state| {
+            state.open_draft(None);
+            {
+                let draft = state.draft_mut().expect("new draft");
+                draft.name = "nested".to_owned();
+                draft.config = ConnectionConfig::Sqlite { read_only: false, path: ":memory:".into() };
+                draft.folder = " //team// a/ ".to_owned();
+            }
+            state.save_draft();
+            let id = state.connections().last().expect("saved").id;
+            assert_eq!(
+                state.connections().iter().find(|c| c.id == id).unwrap().folder(),
+                Some("team/a")
+            );
+            state.open_draft(Some(id));
+            assert_eq!(state.draft().expect("edit draft").folder, "team/a");
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(
+                reloaded.connections().iter().find(|c| c.id == id).unwrap().folder(),
+                Some("team/a")
+            );
+        });
+    }
+
+    #[test]
+    fn old_files_without_folders_load_at_root() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("cde-folders-old-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crusty-data-explorer")).unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        std::fs::write(
+            dir.join("crusty-data-explorer").join("saved_queries.json"),
+            br#"[{"id":7,"name":"daily","sql":"SELECT 1","conn":1},{"id":8,"name":"flat","sql":"SELECT 2","conn":1,"folder":"ops"}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("crusty-data-explorer").join("connections.json"),
+            br#"[{"id":1,"name":"pg","config":{"kind":"sqlite","read_only":false,"path":":memory:"}}]"#,
+        )
+        .unwrap();
+        let state = AppState::new(&eframe::egui::Context::default());
+        assert_eq!(state.saved_queries().len(), 2);
+        assert_eq!(state.saved_queries()[0].folder, None);
+        assert_eq!(state.saved_queries()[1].folder.as_deref(), Some("ops"));
+        let tree = saved_folder_tree(state.saved_queries());
+        assert_eq!(tree.entries.len(), 1);
+        assert_eq!(tree.entries[0].name, "daily");
+        assert_eq!(tree.children.len(), 1);
+        assert_eq!(tree.children[0].name, "ops");
+        assert_eq!(tree.children[0].entries[0].name, "flat");
+        assert_eq!(state.connections().len(), 1);
+        assert_eq!(state.connections()[0].folder(), None);
+        let conn_tree = connection_folder_tree(state.connections());
+        assert_eq!(conn_tree.entries.len(), 1);
+        assert!(conn_tree.children.is_empty());
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sidebar_renders_nested_folders_with_their_entries() {
+        with_isolated_state("sidebar-tree", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let other = add_sqlite_connection(state, "other");
+            assert!(state.move_connection(other, Some("ops/db")));
+            let tab = state.new_tab(conn);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 1".to_owned();
+            }
+            state.activate(tab);
+            state.save_active_tab("root-q", None, false).expect("saved");
+            state.save_active_tab("nested-q", Some("ops/db"), true).expect("saved");
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input.clone(), |ui| {
+                crate::ui::connections::sidebar(state, ui);
+            });
+            output.textures_delta.clear();
+            let second = ctx.run_ui(input, |ui| {
+                crate::ui::connections::sidebar(state, ui);
+            });
+            let text = rendered_text(&second);
+            for wanted in ["CONNECTIONS", "SAVED", "mem", "other", "root-q", "nested-q", "ops", "db"] {
+                assert!(text.iter().any(|t| t.contains(wanted)), "{wanted} paints in {text:?}");
+            }
+        });
+    }
+
     fn search_candidate(
         result: SearchResult,
         name: &str,
@@ -6979,6 +7475,7 @@ mod tests {
             id: 1,
             name: "pg".to_owned(),
             env: Environment::Prod,
+            folder: Some("ops/db".to_owned()),
             config: ConnectionConfig::Postgres { read_only: false,
                 host: "localhost".to_owned(),
                 port: 5432,
@@ -6991,6 +7488,7 @@ mod tests {
         let json = serde_json::to_string(&profile).unwrap();
         assert!(!json.contains("password"));
         assert!(json.contains("\"kind\":\"postgres\""));
+        assert!(json.contains("ops/db"));
     }
 
     #[test]
@@ -7004,6 +7502,7 @@ mod tests {
             id: ConnectionId::from_raw(7),
             name: "pg".to_owned(),
             env: Environment::Test,
+            folder: Some("ops/db".to_owned()),
             config: ConnectionConfig::Postgres { read_only: false,
                 host: "localhost".to_owned(),
                 port: 5432,

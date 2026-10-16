@@ -1,11 +1,14 @@
 //! Connection sidebar and the new/edit connection modal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use eframe::egui;
 
-use crate::app::{AppState, ConnectionState, Environment, SavedQuery, saved_groups};
+use crate::app::{
+    AppState, Connection, ConnectionState, Environment, FolderNode, SavedQuery,
+    connection_folder_tree, normalize_folder_path, saved_folder_tree,
+};
 use crate::db::{ConnectionConfig, ConnectionId, MysqlSslMode, PostgresSslMode, parse_connection_url};
 use crate::ssh::{SshAuth, SshConfig};
 
@@ -32,6 +35,187 @@ enum SidebarAction {
     ClearHistory,
     OpenSaved(u64),
     DeleteSaved(u64),
+    MoveSaved(u64, Option<String>),
+    MoveConnection(ConnectionId, Option<String>),
+    NewConnectionInFolder(String),
+}
+
+/// Drag payload for a saved query row. A distinct type from [`ConnDrag`] so
+/// a query can only land on saved folders, never on connection folders.
+#[derive(Clone)]
+struct SavedDrag {
+    id: u64,
+}
+
+/// Drag payload for a connection card, landing on connection folders only.
+#[derive(Clone, Copy)]
+struct ConnDrag {
+    id: ConnectionId,
+}
+
+/// Temp-data id for one folder's collapse state.
+fn folder_open_id(scope: &str, path: &str) -> egui::Id {
+    egui::Id::new(format!("crusty_{scope}_folder_open#{path}"))
+}
+
+/// Whether one tree folder renders expanded. Defaults to open.
+fn folder_is_open(ctx: &egui::Context, scope: &str, path: &str) -> bool {
+    let id = folder_open_id(scope, path);
+    ctx.data_mut(|d| d.get_temp(id)).unwrap_or(true)
+}
+
+/// Flip one tree folder's collapse state.
+fn set_folder_open(ctx: &egui::Context, scope: &str, path: &str, open: bool) {
+    let id = folder_open_id(scope, path);
+    ctx.data_mut(|d| d.insert_temp(id, open));
+}
+
+/// Temp-data id for the set of freshly created empty folders. Creation names
+/// a path before any entry targets it; the set keeps it visible this
+/// session, and the first entry moved into it persists it through the
+/// entry's own folder string.
+fn created_id(scope: &str) -> egui::Id {
+    egui::Id::new(format!("crusty_{scope}_created_folders"))
+}
+
+/// The freshly created empty folders for one section.
+fn created_folders(ctx: &egui::Context, scope: &str) -> HashSet<String> {
+    let id = created_id(scope);
+    ctx.data_mut(|d| d.get_temp(id).unwrap_or_default())
+}
+
+/// Remember one freshly created empty folder for one section.
+fn remember_created_folder(ctx: &egui::Context, scope: &str, path: String) {
+    let mut created = created_folders(ctx, scope);
+    created.insert(path);
+    let id = created_id(scope);
+    ctx.data_mut(|d| d.insert_temp(id, created));
+}
+
+/// Temp-data id for one folder creation input.
+fn folder_input_id(scope: &str, parent: &str, part: &str) -> egui::Id {
+    egui::Id::new(format!("crusty_{scope}_folder_input#{parent}#{part}"))
+}
+
+/// The text of one folder creation input.
+fn folder_input(ctx: &egui::Context, scope: &str, parent: &str, part: &str) -> String {
+    ctx.data_mut(|d| d.get_temp(folder_input_id(scope, parent, part)).unwrap_or_default())
+}
+
+/// Replace the text of one folder creation input.
+fn set_folder_input(ctx: &egui::Context, scope: &str, parent: &str, part: &str, text: String) {
+    ctx.data_mut(|d| d.insert_temp(folder_input_id(scope, parent, part), text));
+}
+
+/// How many entries sit under one tree node, direct and nested, for the
+/// folder header count.
+fn subtree_count<T>(node: &FolderNode<T>) -> usize {
+    node.entries.len() + node.children.iter().map(subtree_count).sum::<usize>()
+}
+
+/// One flattened saved row in display order: root entries first, then each
+/// folder pre-order with its direct entries before its subfolders.
+enum SavedPlan<'a> {
+    Folder { path: String, name: String, depth: usize, open: bool, count: usize },
+    Entry { query: &'a SavedQuery, depth: usize },
+}
+
+/// Flatten one saved tree level into the display plan, skipping the
+/// children of collapsed folders.
+fn flatten_saved<'s>(
+    ctx: &egui::Context,
+    node: &FolderNode<&'s SavedQuery>,
+    depth: usize,
+    plan: &mut Vec<SavedPlan<'s>>,
+) {
+    for child in &node.children {
+        let open = folder_is_open(ctx, "saved", &child.path);
+        plan.push(SavedPlan::Folder {
+            path: child.path.clone(),
+            name: child.name.clone(),
+            depth,
+            open,
+            count: subtree_count(child),
+        });
+        if open {
+            for query in &child.entries {
+                plan.push(SavedPlan::Entry { query, depth: depth + 1 });
+            }
+            flatten_saved(ctx, child, depth + 1, plan);
+        }
+    }
+}
+
+/// One flattened connection row in display order, mirroring [`SavedPlan`].
+enum ConnPlan {
+    Folder { path: String, name: String, depth: usize, open: bool, count: usize },
+    Card { id: ConnectionId, depth: usize },
+}
+
+/// Flatten one connection tree level into the display plan.
+fn flatten_connections(
+    ctx: &egui::Context,
+    node: &FolderNode<&Connection>,
+    depth: usize,
+    plan: &mut Vec<ConnPlan>,
+) {
+    for child in &node.children {
+        let open = folder_is_open(ctx, "conn", &child.path);
+        plan.push(ConnPlan::Folder {
+            path: child.path.clone(),
+            name: child.name.clone(),
+            depth,
+            open,
+            count: subtree_count(child),
+        });
+        if open {
+            for entry in &child.entries {
+                plan.push(ConnPlan::Card { id: entry.id, depth: depth + 1 });
+            }
+            flatten_connections(ctx, child, depth + 1, plan);
+        }
+    }
+}
+
+/// Render contents indented one step per tree depth.
+fn indented<R>(ui: &mut egui::Ui, depth: usize, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    if depth == 0 {
+        add_contents(ui)
+    } else {
+        ui.horizontal(|ui| {
+            ui.add_space(depth as f32 * 14.0);
+            ui.vertical(add_contents).inner
+        })
+        .inner
+    }
+}
+
+/// Confirm one folder creation input: normalize the typed name under
+/// `parent`, remember the path so the empty folder renders, and disarm the
+/// input. Blank input only disarms.
+fn confirm_folder_input(ctx: &egui::Context, scope: &str, parent: &str) {
+    let text = folder_input(ctx, scope, parent, "text");
+    let full = if parent.is_empty() { text.clone() } else { format!("{parent}/{text}") };
+    if let Some(path) = normalize_folder_path(Some(&full)) {
+        remember_created_folder(ctx, scope, path);
+    }
+    disarm_folder_input(ctx, scope, parent);
+}
+
+/// Whether one folder creation input is armed.
+fn folder_input_armed(ctx: &egui::Context, scope: &str, parent: &str) -> bool {
+    folder_input(ctx, scope, parent, "armed") == "1"
+}
+
+/// Arm one folder creation input.
+fn arm_folder_input(ctx: &egui::Context, scope: &str, parent: &str) {
+    set_folder_input(ctx, scope, parent, "armed", "1".to_owned());
+}
+
+/// Disarm one folder creation input without creating anything.
+fn disarm_folder_input(ctx: &egui::Context, scope: &str, parent: &str) {
+    set_folder_input(ctx, scope, parent, "text", String::new());
+    set_folder_input(ctx, scope, parent, "armed", String::new());
 }
 
 fn history_title(sql: &str) -> String {
@@ -55,7 +239,9 @@ fn env_badge(ui: &mut egui::Ui, env: Environment) {
         });
 }
 
-/// One saved-query row: pin mark, open button, connection name, delete.
+/// One saved-query row: pin mark, open button, connection name, delete. The
+/// name button is the drag source: dragging it onto a folder header moves
+/// the entry there through [`SidebarAction::MoveSaved`].
 fn saved_row(
     ui: &mut egui::Ui,
     palette: &Palette,
@@ -67,13 +253,309 @@ fn saved_row(
         if query.pinned {
             ui.label(egui::RichText::new("★").small().color(palette.accent));
         }
-        if ui.small_button(&query.name).clicked() {
+        let name = ui
+            .dnd_drag_source(
+                egui::Id::new(("crusty_saved_drag", query.id)),
+                SavedDrag { id: query.id },
+                |ui| ui.small_button(&query.name),
+            )
+            .inner;
+        let name = name.on_hover_text("drag onto a folder to move");
+        if name.clicked() {
             actions.push(SidebarAction::OpenSaved(query.id));
         }
         let conn_name = conn_names.get(&query.conn).map(String::as_str).unwrap_or("deleted");
         ui.label(egui::RichText::new(conn_name).small().weak());
         if ui.small_button("Delete").clicked() {
             actions.push(SidebarAction::DeleteSaved(query.id));
+        }
+    });
+}
+
+/// One connection card: status dot, name, environment, state, buttons, and
+/// the live schema tree. The status dot is the drag source: dragging it
+/// onto a folder header moves the card there through
+/// [`SidebarAction::MoveConnection`].
+#[allow(clippy::too_many_arguments)]
+fn connection_card(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    conn_id: ConnectionId,
+    conn_name: &str,
+    env: Environment,
+    state_label: &str,
+    selected: bool,
+    dot_color: egui::Color32,
+    actions: &mut Vec<SidebarAction>,
+) {
+    let (dot, state_text) = match state_label.split_once(' ') {
+        Some((d, t)) => (d.to_owned(), t.to_owned()),
+        None => ("○".to_owned(), state_label.to_owned()),
+    };
+    let frame_fill = if selected {
+        ui.visuals().selection.bg_fill.gamma_multiply(0.35)
+    } else {
+        ui.visuals().faint_bg_color
+    };
+    let frame_stroke = if selected {
+        egui::Stroke::new(1.0, palette.accent)
+    } else {
+        ui.visuals().widgets.noninteractive.bg_stroke
+    };
+    let kind: ConnectionStateKind = {
+        let conn = state
+            .connections()
+            .iter()
+            .find(|c| c.id == conn_id)
+            .map(|c| match c.state() {
+                ConnectionState::Connected { .. } => ConnectionStateKind::Live,
+                ConnectionState::QueryRunning { .. } => ConnectionStateKind::Live,
+                ConnectionState::Connecting { .. } => {
+                    ConnectionStateKind::Connecting
+                }
+                ConnectionState::Disconnected => ConnectionStateKind::Offline,
+                ConnectionState::Error { .. } => ConnectionStateKind::Offline,
+            })
+            .unwrap_or(ConnectionStateKind::Offline);
+        conn
+    };
+    let transaction_open = state
+        .connections()
+        .iter()
+        .find(|c| c.id == conn_id)
+        .is_some_and(|c| c.transaction().is_open());
+    egui::Frame::group(ui.style())
+        .fill(frame_fill)
+        .stroke(frame_stroke)
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width() - 16.0);
+            ui.horizontal(|ui| {
+                let _ = ui
+                    .dnd_drag_source(
+                        egui::Id::new(("crusty_conn_drag", conn_id.raw())),
+                        ConnDrag { id: conn_id },
+                        |ui| ui.colored_label(dot_color, &dot),
+                    )
+                    .inner
+                    .on_hover_text("drag onto a folder to move");
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(conn_name).strong());
+                        env_badge(ui, env);
+                    });
+                    ui.label(
+                        egui::RichText::new(&state_text).small().weak(),
+                    );
+                    if transaction_open {
+                        ui.label(
+                            egui::RichText::new("transaction open")
+                                .small()
+                                .color(palette.success),
+                        );
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                match kind {
+                    ConnectionStateKind::Live => {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("New query")
+                                        .small()
+                                        .strong(),
+                                )
+                                .fill(palette.accent)
+                                .small(),
+                            )
+                            .clicked()
+                        {
+                            actions.push(SidebarAction::NewQuery(conn_id));
+                        }
+                        if ui.small_button("Disconnect").clicked() {
+                            actions.push(SidebarAction::Disconnect(conn_id));
+                        }
+                    }
+                    ConnectionStateKind::Connecting => {
+                        if ui.small_button("Stop").clicked() {
+                            actions.push(SidebarAction::Disconnect(conn_id));
+                        }
+                    }
+                    ConnectionStateKind::Offline => {
+                        if ui.small_button("Connect").clicked() {
+                            actions.push(SidebarAction::Connect(conn_id));
+                        }
+                    }
+                }
+                if ui.small_button("Edit").clicked() {
+                    actions.push(SidebarAction::Edit(conn_id));
+                }
+                if ui.small_button("Delete").clicked() {
+                    actions.push(SidebarAction::Delete(conn_id));
+                }
+            });
+            if matches!(kind, ConnectionStateKind::Live) {
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+                let schema_actions = super::schema::connection_schema(
+                    state, ui, conn_id,
+                );
+                for sa in schema_actions {
+                    match sa {
+                        super::schema::SchemaAction::Refresh(id) => {
+                            actions.push(SidebarAction::RefreshSchema(id));
+                        }
+                        super::schema::SchemaAction::Preview(id, schema, table) => {
+                            actions.push(SidebarAction::PreviewTable(
+                                id, schema, table,
+                            ));
+                        }
+                        super::schema::SchemaAction::Reveal(id, schema, table) => {
+                            actions.push(SidebarAction::RevealTable(
+                                id, schema, table,
+                            ));
+                        }
+                        super::schema::SchemaAction::Count(id, schema, table) => {
+                            actions.push(SidebarAction::TableCount(
+                                id, schema, table,
+                            ));
+                        }
+                        super::schema::SchemaAction::Bookmark(id, schema, table) => {
+                            actions.push(SidebarAction::ToggleBookmark(
+                                id, schema, table,
+                            ));
+                        }
+                        super::schema::SchemaAction::RevealHandled => {
+                            state.clear_navigator_reveal();
+                        }
+                    }
+                }
+            }
+        });
+}
+
+/// The inline editor for one armed folder creation input: a name box with
+/// Create and Cancel. Enter while the box holds focus creates too.
+fn folder_creation_editor(ui: &mut egui::Ui, scope: &str, parent: &str) {
+    ui.horizontal(|ui| {
+        let mut text = folder_input(ui.ctx(), scope, parent, "text");
+        let editor = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .hint_text("folder name")
+                .desired_width(120.0),
+        );
+        if text.is_empty() {
+            editor.request_focus();
+        }
+        set_folder_input(ui.ctx(), scope, parent, "text", text);
+        let mut confirm = ui.small_button("Create").clicked();
+        if editor.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            confirm = true;
+        }
+        if confirm {
+            confirm_folder_input(ui.ctx(), scope, parent);
+        }
+        if ui.small_button("Cancel").clicked() {
+            disarm_folder_input(ui.ctx(), scope, parent);
+        }
+    });
+}
+
+/// Paint the drop highlight on a folder row while a matching payload hovers.
+fn paint_drop_highlight(ui: &mut egui::Ui, palette: &Palette, rect: egui::Rect) {
+    ui.painter().rect_stroke(
+        rect.expand(2.0),
+        egui::CornerRadius::same(4),
+        egui::Stroke::new(1.5, palette.accent),
+        egui::StrokeKind::Middle,
+    );
+}
+
+/// One connection folder header: collapse arrow, name, entry count, new
+/// subfolder and new-connection-here affordances. The row is the drop zone
+/// for its path; a matching release moves the card there.
+#[allow(clippy::too_many_arguments)]
+fn conn_folder_header(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    path: &str,
+    name: &str,
+    depth: usize,
+    open: bool,
+    count: usize,
+    actions: &mut Vec<SidebarAction>,
+) {
+    indented(ui, depth, |ui| {
+        let resp = ui
+            .horizontal(|ui| {
+                let arrow = if open { "▾" } else { "▸" };
+                if ui.small_button(format!("{arrow} {name}")).clicked() {
+                    set_folder_open(ui.ctx(), "conn", path, !open);
+                }
+                ui.label(egui::RichText::new(format!("{count}")).small().weak());
+                if ui.small_button("+").on_hover_text("New subfolder").clicked() {
+                    arm_folder_input(ui.ctx(), "conn", path);
+                }
+                if ui
+                    .small_button("+conn")
+                    .on_hover_text("New connection in this folder")
+                    .clicked()
+                {
+                    actions.push(SidebarAction::NewConnectionInFolder(path.to_owned()));
+                }
+            })
+            .response;
+        if resp.dnd_hover_payload::<ConnDrag>().is_some() {
+            paint_drop_highlight(ui, palette, resp.rect);
+        }
+        if let Some(payload) = resp.dnd_release_payload::<ConnDrag>() {
+            actions.push(SidebarAction::MoveConnection(payload.id, Some(path.to_owned())));
+        }
+        if folder_input_armed(ui.ctx(), "conn", path) {
+            folder_creation_editor(ui, "conn", path);
+        }
+    });
+}
+
+/// One saved-query folder header: collapse arrow, name, entry count, and a
+/// new subfolder affordance. The row is the drop zone for its path.
+#[allow(clippy::too_many_arguments)]
+fn saved_folder_header(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    path: &str,
+    name: &str,
+    depth: usize,
+    open: bool,
+    count: usize,
+    actions: &mut Vec<SidebarAction>,
+) {
+    indented(ui, depth, |ui| {
+        let resp = ui
+            .horizontal(|ui| {
+                let arrow = if open { "▾" } else { "▸" };
+                if ui.small_button(format!("{arrow} {name}")).clicked() {
+                    set_folder_open(ui.ctx(), "saved", path, !open);
+                }
+                ui.label(egui::RichText::new(format!("{count}")).small().weak());
+                if ui.small_button("+").on_hover_text("New subfolder").clicked() {
+                    arm_folder_input(ui.ctx(), "saved", path);
+                }
+            })
+            .response;
+        if resp.dnd_hover_payload::<SavedDrag>().is_some() {
+            paint_drop_highlight(ui, palette, resp.rect);
+        }
+        if let Some(payload) = resp.dnd_release_payload::<SavedDrag>() {
+            actions.push(SidebarAction::MoveSaved(payload.id, Some(path.to_owned())));
+        }
+        if folder_input_armed(ui.ctx(), "saved", path) {
+            folder_creation_editor(ui, "saved", path);
         }
     });
 }
@@ -96,7 +578,29 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                ui.label(egui::RichText::new("CONNECTIONS").small().weak());
+                let mut actions: Vec<SidebarAction> = Vec::new();
+                let conn_header = ui
+                    .horizontal(|ui| {
+                        ui.label(egui::RichText::new("CONNECTIONS").small().weak());
+                        if ui.small_button("+ Folder").on_hover_text("New folder").clicked() {
+                            arm_folder_input(ui.ctx(), "conn", "");
+                        }
+                        if egui::DragAndDrop::has_payload_of_type::<ConnDrag>(ui.ctx()) {
+                            ui.label(
+                                egui::RichText::new("drop here for root").small().weak(),
+                            );
+                        }
+                    })
+                    .response;
+                if conn_header.dnd_hover_payload::<ConnDrag>().is_some() {
+                    paint_drop_highlight(ui, &palette, conn_header.rect);
+                }
+                if let Some(payload) = conn_header.dnd_release_payload::<ConnDrag>() {
+                    actions.push(SidebarAction::MoveConnection(payload.id, None));
+                }
+                if folder_input_armed(ui.ctx(), "conn", "") {
+                    folder_creation_editor(ui, "conn", "");
+                }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Filter tables:").small().weak());
@@ -125,7 +629,6 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                     .and_then(|id| state.tab(id))
                     .and_then(|tab| tab.conn);
 
-                let mut actions: Vec<SidebarAction> = Vec::new();
                 let snapshot: Vec<(ConnectionId, String, Environment, String, bool)> = state
                     .connections()
                     .iter()
@@ -165,151 +668,53 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                         (c.id, color)
                     })
                     .collect();
-                for (conn_id, conn_name, env, state_label, _is_live) in snapshot {
+                let conn_plan: Vec<ConnPlan> = {
+                    let mut tree = connection_folder_tree(state.connections());
+                    let mut extra: Vec<String> =
+                        created_folders(ui.ctx(), "conn").into_iter().collect();
+                    extra.sort();
+                    for path in &extra {
+                        tree.ensure_path(path);
+                    }
+                    let mut plan = Vec::new();
+                    for entry in &tree.entries {
+                        plan.push(ConnPlan::Card { id: entry.id, depth: 0 });
+                    }
+                    flatten_connections(ui.ctx(), &tree, 0, &mut plan);
+                    plan
+                };
+                for item in &conn_plan {
+                    let (conn_id, depth) = match item {
+                        ConnPlan::Folder { path, name, depth, open, count } => {
+                            conn_folder_header(
+                                ui, &palette, path, name, *depth, *open, *count, &mut actions,
+                            );
+                            continue;
+                        }
+                        ConnPlan::Card { id, depth } => (*id, *depth),
+                    };
+                    let Some((_, conn_name, env, state_label, _)) =
+                        snapshot.iter().find(|(id, ..)| *id == conn_id)
+                    else {
+                        continue;
+                    };
                     let selected = Some(conn_id) == active_conn;
                     let dot_color =
                         dot_colors.get(&conn_id).copied().unwrap_or(egui::Color32::GRAY);
-                    let (dot, state_text) = match state_label.split_once(' ') {
-                        Some((d, t)) => (d.to_owned(), t.to_owned()),
-                        None => ("○".to_owned(), state_label.clone()),
-                    };
-                    let frame_fill = if selected {
-                        ui.visuals().selection.bg_fill.gamma_multiply(0.35)
-                    } else {
-                        ui.visuals().faint_bg_color
-                    };
-                    let frame_stroke = if selected {
-                        egui::Stroke::new(1.0, palette.accent)
-                    } else {
-                        ui.visuals().widgets.noninteractive.bg_stroke
-                    };
-                    let kind: ConnectionStateKind = {
-                        let conn = state
-                            .connections()
-                            .iter()
-                            .find(|c| c.id == conn_id)
-                            .map(|c| match c.state() {
-                                ConnectionState::Connected { .. } => ConnectionStateKind::Live,
-                                ConnectionState::QueryRunning { .. } => ConnectionStateKind::Live,
-                                ConnectionState::Connecting { .. } => {
-                                    ConnectionStateKind::Connecting
-                                }
-                                ConnectionState::Disconnected => ConnectionStateKind::Offline,
-                                ConnectionState::Error { .. } => ConnectionStateKind::Offline,
-                            })
-                            .unwrap_or(ConnectionStateKind::Offline);
-                        conn
-                    };
-                    let transaction_open = state
-                        .connections()
-                        .iter()
-                        .find(|c| c.id == conn_id)
-                        .is_some_and(|c| c.transaction().is_open());
-                    egui::Frame::group(ui.style())
-                        .fill(frame_fill)
-                        .stroke(frame_stroke)
-                        .corner_radius(egui::CornerRadius::same(6))
-                        .inner_margin(egui::Margin::same(8))
-                        .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width() - 16.0);
-                            ui.horizontal(|ui| {
-                                ui.colored_label(dot_color, &dot);
-                                ui.vertical(|ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new(&conn_name).strong());
-                                        env_badge(ui, env);
-                                    });
-                                    ui.label(
-                                        egui::RichText::new(&state_text).small().weak(),
-                                    );
-                                    if transaction_open {
-                                        ui.label(
-                                            egui::RichText::new("transaction open")
-                                                .small()
-                                                .color(palette.success),
-                                        );
-                                    }
-                                });
-                            });
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                match kind {
-                                    ConnectionStateKind::Live => {
-                                        if ui
-                                            .add(
-                                                egui::Button::new(
-                                                    egui::RichText::new("New query")
-                                                        .small()
-                                                        .strong(),
-                                                )
-                                                .fill(palette.accent)
-                                                .small(),
-                                            )
-                                            .clicked()
-                                        {
-                                            actions.push(SidebarAction::NewQuery(conn_id));
-                                        }
-                                        if ui.small_button("Disconnect").clicked() {
-                                            actions.push(SidebarAction::Disconnect(conn_id));
-                                        }
-                                    }
-                                    ConnectionStateKind::Connecting => {
-                                        if ui.small_button("Stop").clicked() {
-                                            actions.push(SidebarAction::Disconnect(conn_id));
-                                        }
-                                    }
-                                    ConnectionStateKind::Offline => {
-                                        if ui.small_button("Connect").clicked() {
-                                            actions.push(SidebarAction::Connect(conn_id));
-                                        }
-                                    }
-                                }
-                                if ui.small_button("Edit").clicked() {
-                                    actions.push(SidebarAction::Edit(conn_id));
-                                }
-                                if ui.small_button("Delete").clicked() {
-                                    actions.push(SidebarAction::Delete(conn_id));
-                                }
-                            });
-                            if matches!(kind, ConnectionStateKind::Live) {
-                                ui.add_space(4.0);
-                                ui.separator();
-                                ui.add_space(4.0);
-                                let schema_actions = super::schema::connection_schema(
-                                    state, ui, conn_id,
-                                );
-                                for sa in schema_actions {
-                                    match sa {
-                                        super::schema::SchemaAction::Refresh(id) => {
-                                            actions.push(SidebarAction::RefreshSchema(id));
-                                        }
-                                        super::schema::SchemaAction::Preview(id, schema, table) => {
-                                            actions.push(SidebarAction::PreviewTable(
-                                                id, schema, table,
-                                            ));
-                                        }
-                                        super::schema::SchemaAction::Reveal(id, schema, table) => {
-                                            actions.push(SidebarAction::RevealTable(
-                                                id, schema, table,
-                                            ));
-                                        }
-                                        super::schema::SchemaAction::Count(id, schema, table) => {
-                                            actions.push(SidebarAction::TableCount(
-                                                id, schema, table,
-                                            ));
-                                        }
-                                        super::schema::SchemaAction::Bookmark(id, schema, table) => {
-                                            actions.push(SidebarAction::ToggleBookmark(
-                                                id, schema, table,
-                                            ));
-                                        }
-                                        super::schema::SchemaAction::RevealHandled => {
-                                            state.clear_navigator_reveal();
-                                        }
-                                    }
-                                }
-                            }
-                        });
+                    indented(ui, depth, |ui| {
+                        connection_card(
+                            state,
+                            ui,
+                            &palette,
+                            conn_id,
+                            conn_name,
+                            *env,
+                            state_label,
+                            selected,
+                            dot_color,
+                            &mut actions,
+                        );
+                    });
                     ui.add_space(4.0);
                 }
 
@@ -338,41 +743,66 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                 }
                 ui.add_space(8.0);
 
-                ui.label(egui::RichText::new("SAVED").small().weak());
+                let saved_header = ui
+                    .horizontal(|ui| {
+                        ui.label(egui::RichText::new("SAVED").small().weak());
+                        if ui.small_button("+ Folder").on_hover_text("New folder").clicked() {
+                            arm_folder_input(ui.ctx(), "saved", "");
+                        }
+                        if egui::DragAndDrop::has_payload_of_type::<SavedDrag>(ui.ctx()) {
+                            ui.label(
+                                egui::RichText::new("drop here for root").small().weak(),
+                            );
+                        }
+                    })
+                    .response;
+                if saved_header.dnd_hover_payload::<SavedDrag>().is_some() {
+                    paint_drop_highlight(ui, &palette, saved_header.rect);
+                }
+                if let Some(payload) = saved_header.dnd_release_payload::<SavedDrag>() {
+                    actions.push(SidebarAction::MoveSaved(payload.id, None));
+                }
+                if folder_input_armed(ui.ctx(), "saved", "") {
+                    folder_creation_editor(ui, "saved", "");
+                }
                 ui.add_space(4.0);
-                if state.saved_queries().is_empty() {
+                let conn_names: HashMap<ConnectionId, String> = state
+                    .connections()
+                    .iter()
+                    .map(|c| (c.id, c.name.clone()))
+                    .collect();
+                let saved_plan: Vec<SavedPlan<'_>> = {
+                    let mut tree = saved_folder_tree(state.saved_queries());
+                    let mut extra: Vec<String> =
+                        created_folders(ui.ctx(), "saved").into_iter().collect();
+                    extra.sort();
+                    for path in &extra {
+                        tree.ensure_path(path);
+                    }
+                    let mut plan = Vec::new();
+                    for query in &tree.entries {
+                        plan.push(SavedPlan::Entry { query, depth: 0 });
+                    }
+                    flatten_saved(ui.ctx(), &tree, 0, &mut plan);
+                    plan
+                };
+                if saved_plan.is_empty() {
                     ui.label(egui::RichText::new("No saved queries.").small().weak());
                 } else {
-                    let conn_names: HashMap<ConnectionId, String> = state
-                        .connections()
-                        .iter()
-                        .map(|c| (c.id, c.name.clone()))
-                        .collect();
-                    for group in saved_groups(state.saved_queries()) {
-                        let Some(folder) = group.folder else {
-                            for query in &group.entries {
-                                saved_row(ui, &palette, query, &conn_names, &mut actions);
+                    for item in &saved_plan {
+                        match item {
+                            SavedPlan::Folder { path, name, depth, open, count } => {
+                                saved_folder_header(
+                                    ui, &palette, path, name, *depth, *open, *count,
+                                    &mut actions,
+                                );
                             }
-                            continue;
-                        };
-                        let open_id = egui::Id::new(("crusty_saved_folder", folder));
-                        let mut open: bool =
-                            ui.ctx().data_mut(|d| d.get_temp(open_id)).unwrap_or(true);
-                        ui.horizontal(|ui| {
-                            let arrow = if open { "▾" } else { "▸" };
-                            if ui.small_button(format!("{arrow} {folder}")).clicked() {
-                                open = !open;
+                            SavedPlan::Entry { query, depth } => {
+                                indented(ui, *depth, |ui| {
+                                    saved_row(ui, &palette, query, &conn_names, &mut actions);
+                                });
                             }
-                        });
-                        ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
-                        if !open {
-                            continue;
                         }
-                        ui.indent(egui::Id::new(("crusty_saved_entries", folder)), |ui| {
-                            for query in &group.entries {
-                                saved_row(ui, &palette, query, &conn_names, &mut actions);
-                            }
-                        });
                     }
                 }
                 ui.add_space(8.0);
@@ -456,6 +886,18 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                         SidebarAction::OpenSaved(id) => state.open_saved(id),
                         SidebarAction::DeleteSaved(id) => {
                             state.delete_saved(id);
+                        }
+                        SidebarAction::MoveSaved(id, folder) => {
+                            state.move_saved(id, folder.as_deref());
+                        }
+                        SidebarAction::MoveConnection(id, folder) => {
+                            state.move_connection(id, folder.as_deref());
+                        }
+                        SidebarAction::NewConnectionInFolder(path) => {
+                            state.open_draft(None);
+                            if let Some(draft) = state.draft_mut() {
+                                draft.folder = path;
+                            }
                         }
                     }
                 }
@@ -589,6 +1031,13 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("Name:");
             ui.text_edit_singleline(&mut draft.name);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Folder:");
+            ui.add(
+                egui::TextEdit::singleline(&mut draft.folder)
+                    .hint_text("optional nested path like ops/db"),
+            );
         });
         ui.horizontal(|ui| {
             ui.label("Kind:");
