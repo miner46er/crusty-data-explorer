@@ -3,17 +3,158 @@
 //! Only visible rows render, via `TableBody::rows` virtualization.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use crate::app::{AppState, EditTarget, RunOutcome, SortDir, Tab};
 use crate::db::{CELL_CAP, QueryResult, TabId, Value};
-use crate::export::{to_csv, to_inserts, to_json, to_markdown};
+use crate::export::{to_csv, to_in_list, to_inserts, to_json, to_markdown, to_tsv};
+use crate::import::{ParsedCsv, parse_csv};
 
 const AFFECT_GREEN: egui::Color32 = egui::Color32::from_rgb(115, 180, 115);
 /// Translucent amber over a cell with a staged edit.
 const EDIT_TINT: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(227, 179, 65, 64);
+
+/// Identity of the result a [`Selection`] was made on. A new run, a result
+/// switch, or a shape change carries a new id and clears the selection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ResultId {
+    active: usize,
+    rows: usize,
+    cols: usize,
+    took: std::time::Duration,
+}
+
+/// Row selection for one result view: the selected result rows plus the
+/// active cell cursor. Click selects one row, shift-click extends from the
+/// anchor, ctrl-click toggles. Lives in egui temp data keyed by tab, so it
+/// needs no `AppState` field, and clears when the result changes.
+#[derive(Clone, Default, Debug)]
+struct Selection {
+    rows: BTreeSet<usize>,
+    active: Option<(usize, usize)>,
+    anchor: Option<usize>,
+    result: Option<ResultId>,
+}
+
+impl Selection {
+    /// Adopt a new result, dropping the rows when it changed.
+    fn sync(&mut self, id: ResultId) {
+        if self.result != Some(id) {
+            *self = Selection { result: Some(id), ..Selection::default() };
+        }
+    }
+    fn click(&mut self, row: usize, col: usize) {
+        self.rows.clear();
+        self.rows.insert(row);
+        self.active = Some((row, col));
+        self.anchor = Some(row);
+    }
+    fn toggle(&mut self, row: usize, col: usize) {
+        if !self.rows.remove(&row) {
+            self.rows.insert(row);
+        }
+        self.active = Some((row, col));
+        self.anchor = Some(row);
+    }
+    fn extend(&mut self, row: usize, col: usize) {
+        let origin =
+            self.anchor.or_else(|| self.active.map(|(row, _)| row)).unwrap_or(row);
+        self.rows.clear();
+        self.rows.extend(origin.min(row)..=origin.max(row));
+        self.active = Some((row, col));
+    }
+    /// One cell gesture: ctrl toggles, shift extends, else selects.
+    fn gesture(&mut self, row: usize, col: usize, shift: bool, ctrl: bool) {
+        if ctrl {
+            self.toggle(row, col);
+        } else if shift {
+            self.extend(row, col);
+        } else {
+            self.click(row, col);
+        }
+    }
+    fn is_selected(&self, row: usize) -> bool {
+        self.rows.contains(&row)
+    }
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+    fn active(&self) -> Option<(usize, usize)> {
+        self.active
+    }
+    /// Selected rows in `visible` order; the whole view when empty, so every
+    /// copy action covers the result set with nothing selected.
+    fn resolve(&self, visible: &[usize]) -> Vec<usize> {
+        if self.rows.is_empty() {
+            return visible.to_vec();
+        }
+        visible.iter().copied().filter(|row| self.rows.contains(row)).collect()
+    }
+}
+
+fn selection_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_selection", tab))
+}
+
+fn selection_of(ctx: &egui::Context, tab: TabId) -> Selection {
+    ctx.data(|data| data.get_temp(selection_id(tab))).unwrap_or_default()
+}
+
+fn store_selection(ctx: &egui::Context, tab: TabId, selection: &Selection) {
+    ctx.data_mut(|data| data.insert_temp(selection_id(tab), selection.clone()));
+}
+
+fn clear_selection(ctx: &egui::Context, tab: TabId) {
+    ctx.data_mut(|data| data.remove::<Selection>(selection_id(tab)));
+}
+
+/// Drop grid selection for closed tabs. Diffs against the live tab list, the
+/// way the find bar forgets its state.
+fn prune_selection(state: &AppState, ctx: &egui::Context) {
+    let id = egui::Id::new("crusty_selection_tabs");
+    let known: Vec<TabId> = ctx.data_mut(|data| data.get_temp(id).unwrap_or_default());
+    let live: Vec<TabId> = state.tabs().iter().map(|tab| tab.id).collect();
+    for tab in known.iter().filter(|tab| !live.contains(tab)) {
+        clear_selection(ctx, *tab);
+    }
+    if known != live {
+        ctx.data_mut(|data| data.insert_temp(id, live));
+    }
+}
+
+fn result_id_of(tab: &Tab) -> Option<ResultId> {
+    let result = tab.active_query_result()?;
+    if result.columns().is_empty() {
+        return None;
+    }
+    Some(ResultId {
+        active: tab.active_result(),
+        rows: result.row_count(),
+        cols: result.columns().len(),
+        took: result.took(),
+    })
+}
+
+/// The TSV headers toggle for one tab, kept beside the selection.
+fn tsv_headers_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_tsv_headers", tab))
+}
+
+fn tsv_headers_of(ctx: &egui::Context, tab: TabId) -> bool {
+    ctx.data(|data| data.get_temp(tsv_headers_id(tab))).unwrap_or(true)
+}
+
+/// The paste request in flight: set with the `RequestPaste` viewport command
+/// and cleared when its `Paste` event is handled.
+fn paste_armed_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_paste_armed", tab))
+}
 
 /// Row indices surviving `filter`, ordered by the sort column. The result
 /// is never mutated. An out-of-range sort column keeps natural order.
@@ -86,8 +227,148 @@ fn cmp_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
     }
 }
 
+/// One CSV field: quotes guard commas, quotes, and line breaks.
+fn csv_escape(raw: &str) -> String {
+    if raw.contains(|c| matches!(c, ',' | '"' | '\n' | '\r')) {
+        format!("\"{}\"", raw.replace('"', "\"\""))
+    } else {
+        raw.to_owned()
+    }
+}
+
+/// Tab-delimited records re-emitted as comma-delimited text. Quotes guard
+/// tabs and line breaks the way [`parse_csv`] guards commas, so one parser
+/// reads both shapes.
+fn tsv_to_csv(text: &str) -> String {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut records = Vec::new();
+    let mut record: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut at_field_start = true;
+    let mut pending = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    field.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' if at_field_start => {
+                in_quotes = true;
+                at_field_start = false;
+                pending = true;
+            }
+            '"' => {
+                field.push('"');
+                pending = true;
+            }
+            '\t' => {
+                record.push(std::mem::take(&mut field));
+                at_field_start = true;
+                pending = true;
+            }
+            '\r' | '\n' => {
+                if c == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                if pending {
+                    record.push(std::mem::take(&mut field));
+                    records.push(std::mem::take(&mut record));
+                }
+                at_field_start = true;
+                pending = false;
+            }
+            _ => {
+                field.push(c);
+                at_field_start = false;
+                pending = true;
+            }
+        }
+    }
+    if pending {
+        record.push(field);
+        records.push(record);
+    }
+    let mut out = String::new();
+    for record in records {
+        let line: Vec<String> = record.iter().map(|field| csv_escape(field)).collect();
+        out.push_str(&line.join(","));
+        out.push('\n');
+    }
+    out
+}
+
+/// Clipboard text into a parsed table: tab-separated text travels through
+/// [`tsv_to_csv`] first, so quotes around tab and newline cells survive,
+/// then everything parses through [`parse_csv`].
+fn parse_paste(text: &str) -> Option<ParsedCsv> {
+    if text.contains('\t') {
+        if let Some(parsed) = parse_csv(&tsv_to_csv(text)) {
+            return Some(parsed);
+        }
+    }
+    parse_csv(text)
+}
+
+/// A parsed paste into staged-row cells for `columns`: headers matched onto
+/// the result column names case-insensitively in column order, unmapped
+/// columns left empty, extra headers ignored. None when no header matches.
+/// Rows cap at the import [`crate::import::ROW_CAP`].
+fn stage_paste_rows(parsed: &ParsedCsv, columns: &[String]) -> Option<Vec<Vec<String>>> {
+    let mut used = vec![false; parsed.headers.len()];
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    for (col, name) in columns.iter().enumerate() {
+        let found = parsed
+            .headers
+            .iter()
+            .enumerate()
+            .find(|(index, header)| !used[*index] && header.eq_ignore_ascii_case(name));
+        if let Some((index, _)) = found {
+            used[index] = true;
+            pairs.push((index, col));
+        }
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    let capped = parsed.rows.len().min(crate::import::ROW_CAP);
+    Some(
+        parsed.rows[..capped]
+            .iter()
+            .map(|row| {
+                let mut cells = vec![String::new(); columns.len()];
+                for (header, col) in &pairs {
+                    cells[*col] = row[*header].clone();
+                }
+                cells
+            })
+            .collect(),
+    )
+}
+
+fn column_names(tab: &Tab) -> Vec<String> {
+    tab.active_query_result()
+        .map(|result| result.columns().iter().map(|c| c.name().to_owned()).collect())
+        .unwrap_or_default()
+}
+
 pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
     import_window(state, ui);
+    prune_selection(state, ui.ctx());
+    let modal_open = state.draft().is_some()
+        || state.save_prompt().is_some()
+        || state.password_prompt().is_some()
+        || state.import_draft().is_some();
     let Some(tab_id) = state.active() else {
         ui.label("No query tab.");
         return;
@@ -105,6 +386,7 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
         RunOutcome::Running { .. } => {
             // A new run replaces the rows under any open field.
             store_edit_field(ui.ctx(), tab_id, None);
+            clear_selection(ui.ctx(), tab_id);
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label("Running… Cancel in the toolbar to abandon.");
@@ -130,7 +412,7 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
     }
     let target = state.edit_target(tab_id);
     let Some(tab) = state.tab_mut(tab_id) else { return };
-    let actions = results_grid(tab, target.as_ref(), ui);
+    let actions = results_grid(tab, target.as_ref(), modal_open, ui);
     apply_edit_actions(state, tab_id, actions);
 }
 
@@ -142,6 +424,7 @@ enum EditAction {
     Apply,
     Discard,
     ImportCsv,
+    PasteRows(Vec<Vec<String>>),
 }
 
 fn apply_edit_actions(state: &mut AppState, tab: TabId, actions: Vec<EditAction>) {
@@ -153,6 +436,7 @@ fn apply_edit_actions(state: &mut AppState, tab: TabId, actions: Vec<EditAction>
             EditAction::Apply => state.apply_edits(tab),
             EditAction::Discard => state.discard_edits(tab),
             EditAction::ImportCsv => pick_import_file(state, tab),
+            EditAction::PasteRows(staged) => paste_staged_rows_into(state, tab, staged),
         }
     }
 }
@@ -164,6 +448,36 @@ fn pick_import_file(state: &mut AppState, tab: TabId) {
         return;
     };
     state.begin_import(tab, &path);
+}
+
+/// Stage clipboard rows as new inserts: one added row per pasted row, every
+/// cell through the normal staged-edit path so the user reviews before
+/// apply. Pre-existing added rows keep their indices.
+fn paste_staged_rows_into(state: &mut AppState, tab: TabId, staged: Vec<Vec<String>>) {
+    if state.edit_target(tab).is_none() {
+        if let Some(current) = state.tab_mut(tab) {
+            current.set_export_notice("Paste failed: the table is not editable".to_owned(), true);
+        }
+        return;
+    }
+    let shape = state.tab(tab).and_then(|current| {
+        current
+            .active_query_result()
+            .map(|result| (result.row_count(), current.added_rows().len()))
+    });
+    let Some((total, base)) = shape else { return };
+    for (index, cells) in staged.iter().enumerate() {
+        state.add_row(tab);
+        for (col, text) in cells.iter().enumerate() {
+            state.stage_edit(tab, total + base + index, col, text.clone());
+        }
+    }
+    if let Some(current) = state.tab_mut(tab) {
+        current.set_export_notice(
+            format!("Pasted {} rows for review — Apply to insert", staged.len()),
+            false,
+        );
+    }
 }
 
 /// The confirmation modal for a pending import: every mapped header beside
@@ -275,6 +589,7 @@ fn result_tabs(tab: &mut Tab, ui: &mut egui::Ui) {
 fn results_grid(
     tab: &mut Tab,
     target: Option<&EditTarget>,
+    modal_open: bool,
     ui: &mut egui::Ui,
 ) -> Vec<EditAction> {
     let mut actions = Vec::new();
@@ -355,18 +670,6 @@ fn results_grid(
         {
             export_json_view(tab);
         }
-        if ui
-            .add_enabled(can_export, egui::Button::new("Copy INSERTs"))
-            .clicked()
-        {
-            copy_inserts_view(tab, ui.ctx());
-        }
-        if ui
-            .add_enabled(can_export, egui::Button::new("Copy Markdown"))
-            .clicked()
-        {
-            copy_markdown_view(tab, ui.ctx());
-        }
         ui.separator();
         match target {
             Some(target) => {
@@ -419,6 +722,18 @@ fn results_grid(
         }
     }
     let (sort_col, sort_dir, filter) = (tab.sort_col(), tab.sort_dir(), tab.filter().to_owned());
+    let mut selection = match result_id_of(tab) {
+        Some(id) => {
+            let mut current = selection_of(ui.ctx(), tab.id);
+            current.sync(id);
+            current
+        }
+        None => {
+            clear_selection(ui.ctx(), tab.id);
+            Selection::default()
+        }
+    };
+    let mut gestures: Vec<(usize, usize, bool, bool)> = Vec::new();
     let visible = match tab.active_query_result() {
         Some(result) => visible_rows(result, sort_col, sort_dir, &filter),
         None => return actions,
@@ -426,6 +741,7 @@ fn results_grid(
     ui.label(
         egui::RichText::new(format!("{} of {} rows", visible.len(), total)).small().weak(),
     );
+    copy_bar(tab, editable, &selection, &visible, ui);
     let ncols = cols.len();
     let active_result = tab.active_result();
     let added = tab.added_rows().len();
@@ -545,6 +861,21 @@ fn results_grid(
                                     .unwrap_or_default(),
                             };
                             let cell_rect = ui.max_rect();
+                            if selection.is_selected(r) {
+                                ui.painter().rect_filled(
+                                    cell_rect,
+                                    egui::CornerRadius::ZERO,
+                                    ui.visuals().selection.bg_fill,
+                                );
+                            }
+                            if selection.active() == Some((r, c)) {
+                                ui.painter().rect_stroke(
+                                    cell_rect,
+                                    egui::CornerRadius::ZERO,
+                                    ui.visuals().selection.stroke,
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
                             if staged.is_some() && !deleted {
                                 ui.painter().rect_filled(
                                     cell_rect,
@@ -564,6 +895,12 @@ fn results_grid(
                                 ui.id().with("edit_cell"),
                                 egui::Sense::click(),
                             ));
+                            if response.clicked() {
+                                let (shift, ctrl) = ui.input(|i| {
+                                    (i.modifiers.shift, i.modifiers.ctrl || i.modifiers.command)
+                                });
+                                gestures.push((r, c, shift, ctrl));
+                            }
                             if !deleted && editable && response.double_clicked() {
                                 let cell = tab
                                     .active_query_result()
@@ -599,6 +936,12 @@ fn results_grid(
                 });
             });
     });
+    for (row, col, shift, ctrl) in gestures {
+        selection.gesture(row, col, shift, ctrl);
+    }
+    let mut keyed = grid_clipboard_keys(tab, editable, &selection, &visible, modal_open, ui);
+    actions.append(&mut keyed);
+    store_selection(ui.ctx(), tab.id, &selection);
     if let Some(col) = pending_sort {
         tab.set_sort(col);
     }
@@ -663,36 +1006,212 @@ fn export_json_view(tab: &mut Tab) {
     }
 }
 
-fn copy_inserts_view(tab: &mut Tab, ctx: &egui::Context) {
-    let (text, nrows) = match tab.active_query_result() {
-        Some(result) => {
-            if result.columns().is_empty() {
-                return;
-            }
-            let visible = visible_rows(result, tab.sort_col(), tab.sort_dir(), tab.filter());
-            let text = to_inserts("result", result, &visible);
-            (text, visible.len())
+/// The selection copy row: TSV with a headers option, CSV, JSON, Markdown,
+/// and SQL INSERTs from the selection (or the whole view when empty), the
+/// IN-list builder from the active column, and paste as new rows.
+fn copy_bar(
+    tab: &mut Tab,
+    editable: bool,
+    selection: &Selection,
+    visible: &[usize],
+    ui: &mut egui::Ui,
+) {
+    ui.horizontal(|ui| {
+        if tab.active_query_result().is_none_or(|result| result.columns().is_empty()) {
+            return;
         }
-        None => return,
-    };
-    ctx.copy_text(text);
-    tab.set_export_notice(format!("Copied {nrows} rows as INSERTs"), false);
+        let tab_id = tab.id;
+        let rows = selection.resolve(visible);
+        let nrows = rows.len();
+        let headers = tsv_headers_of(ui.ctx(), tab_id);
+        if ui
+            .button("Copy TSV")
+            .on_hover_text("Copy the selection as tab-separated values")
+            .clicked()
+        {
+            let text = tab
+                .active_query_result()
+                .map(|result| to_tsv(result, &rows, headers))
+                .unwrap_or_default();
+            ui.ctx().copy_text(text);
+            tab.set_export_notice(format!("Copied {nrows} rows as TSV"), false);
+        }
+        let mut headers = headers;
+        if ui
+            .checkbox(&mut headers, "Headers")
+            .on_hover_text("Include the header row in TSV copies")
+            .changed()
+        {
+            ui.ctx().data_mut(|data| data.insert_temp(tsv_headers_id(tab_id), headers));
+        }
+        if ui.button("Copy CSV").on_hover_text("Copy the selection as CSV").clicked() {
+            let text = tab
+                .active_query_result()
+                .map(|result| to_csv(result, &rows))
+                .unwrap_or_default();
+            ui.ctx().copy_text(text);
+            tab.set_export_notice(format!("Copied {nrows} rows as CSV"), false);
+        }
+        if ui.button("Copy JSON").on_hover_text("Copy the selection as JSON").clicked() {
+            let text = tab
+                .active_query_result()
+                .map(|result| to_json(result, &rows))
+                .unwrap_or_default();
+            ui.ctx().copy_text(text);
+            tab.set_export_notice(format!("Copied {nrows} rows as JSON"), false);
+        }
+        if ui
+            .button("Copy Markdown")
+            .on_hover_text("Copy the selection as a Markdown table")
+            .clicked()
+        {
+            let text = tab
+                .active_query_result()
+                .map(|result| to_markdown(result, &rows))
+                .unwrap_or_default();
+            ui.ctx().copy_text(text);
+            tab.set_export_notice(format!("Copied {nrows} rows as Markdown"), false);
+        }
+        if ui
+            .button("Copy INSERTs")
+            .on_hover_text("Copy the selection as SQL INSERTs")
+            .clicked()
+        {
+            let text = tab
+                .active_query_result()
+                .map(|result| to_inserts("result", result, &rows))
+                .unwrap_or_default();
+            ui.ctx().copy_text(text);
+            tab.set_export_notice(format!("Copied {nrows} rows as INSERTs"), false);
+        }
+        if ui
+            .button("IN (...)")
+            .on_hover_text("Copy a typed IN list from the active column")
+            .clicked()
+        {
+            let pick = selection
+                .active()
+                .and_then(|(_, col)| column_names(tab).get(col).cloned().map(|name| (col, name)));
+            match pick {
+                None => tab.set_export_notice(
+                    "Click a cell to choose the IN column".to_owned(),
+                    true,
+                ),
+                Some((col, name)) => {
+                    let clause = tab
+                        .active_query_result()
+                        .and_then(|result| to_in_list(result, &rows, col));
+                    match clause {
+                        Some(text) => {
+                            ui.ctx().copy_text(text);
+                            tab.set_export_notice(
+                                format!("Copied {name} IN list ({nrows} rows)"),
+                                false,
+                            );
+                        }
+                        None => tab.set_export_notice(
+                            format!("No non-NULL values in {name}"),
+                            true,
+                        ),
+                    }
+                }
+            }
+        }
+        if editable
+            && ui
+                .button("Paste rows")
+                .on_hover_text("Paste TSV or CSV from the clipboard as new rows for review")
+                .clicked()
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            ui.ctx().data_mut(|data| data.insert_temp(paste_armed_id(tab_id), true));
+        }
+        if selection.is_empty() {
+            ui.label(egui::RichText::new("whole view").small().weak());
+        } else if let Some((_, col)) = selection.active() {
+            let name = column_names(tab).get(col).cloned().unwrap_or_default();
+            ui.label(
+                egui::RichText::new(format!("{} selected · {}", selection.len(), name))
+                    .small()
+                    .weak(),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(format!("{} selected", selection.len())).small().weak(),
+            );
+        }
+    });
 }
 
-fn copy_markdown_view(tab: &mut Tab, ctx: &egui::Context) {
-    let (text, nrows) = match tab.active_query_result() {
-        Some(result) => {
-            if result.columns().is_empty() {
-                return;
+pub fn copy_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C)
+}
+
+/// Grid clipboard keys, gated like the query editor: dead while any modal
+/// is open, while a cell editor is open, or while a text field holds focus,
+/// so typing never copies the grid or stages rows. Paste arrives as an
+/// `Event::Paste` the frame after the button requests it.
+fn grid_clipboard_keys(
+    tab: &mut Tab,
+    editable: bool,
+    selection: &Selection,
+    visible: &[usize],
+    modal_open: bool,
+    ui: &mut egui::Ui,
+) -> Vec<EditAction> {
+    let mut actions = Vec::new();
+    let pastes: Vec<String> = ui.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Paste(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    });
+    if !pastes.is_empty() {
+        let armed: bool =
+            ui.ctx().data(|data| data.get_temp(paste_armed_id(tab.id))).unwrap_or(false);
+        let typing = edit_field_of(ui.ctx(), tab.id).is_some()
+            || ui.ctx().memory(|memory| memory.focused().is_some());
+        if editable && (armed || (!modal_open && !typing)) {
+            for text in &pastes {
+                match parse_paste(text) {
+                    None => tab.set_export_notice(
+                        "Paste failed: the clipboard needs a header and rows of one width"
+                            .to_owned(),
+                        true,
+                    ),
+                    Some(parsed) => match stage_paste_rows(&parsed, &column_names(tab)) {
+                        Some(staged) => actions.push(EditAction::PasteRows(staged)),
+                        None => tab.set_export_notice(
+                            "Paste failed: no pasted header matches the result columns"
+                                .to_owned(),
+                            true,
+                        ),
+                    },
+                }
             }
-            let visible = visible_rows(result, tab.sort_col(), tab.sort_dir(), tab.filter());
-            let text = to_markdown(result, &visible);
-            (text, visible.len())
+            ui.ctx().data_mut(|data| data.remove::<bool>(paste_armed_id(tab.id)));
         }
-        None => return,
-    };
-    ctx.copy_text(text);
-    tab.set_export_notice(format!("Copied {nrows} rows as Markdown"), false);
+    }
+    let typing = edit_field_of(ui.ctx(), tab.id).is_some()
+        || ui.ctx().memory(|memory| memory.focused().is_some());
+    if !modal_open
+        && !typing
+        && ui.input_mut(|i| i.consume_shortcut(&copy_shortcut()))
+    {
+        let rows = selection.resolve(visible);
+        let headers = tsv_headers_of(ui.ctx(), tab.id);
+        let text = tab
+            .active_query_result()
+            .map(|result| to_tsv(result, &rows, headers))
+            .unwrap_or_default();
+        let nrows = rows.len();
+        ui.ctx().copy_text(text);
+        tab.set_export_notice(format!("Copied {nrows} rows as TSV"), false);
+    }
+    actions
 }
 
 #[cfg(test)]
@@ -902,5 +1421,112 @@ mod tests {
             visible_rows(&result, Some(0), SortDir::Desc, ""),
             vec![0, 1, 2]
         );
+    }
+
+    #[test]
+    fn click_shift_and_ctrl_gestures_shape_the_selection() {
+        let mut selection = Selection::default();
+        selection.gesture(1, 0, false, false);
+        assert_eq!(selection.resolve(&[0, 1, 2]), vec![1]);
+        assert_eq!(selection.active(), Some((1, 0)));
+        selection.gesture(2, 1, true, false);
+        assert_eq!(selection.resolve(&[0, 1, 2]), vec![1, 2]);
+        assert_eq!(selection.active(), Some((2, 1)));
+        selection.gesture(0, 0, false, true);
+        assert_eq!(selection.resolve(&[2, 0, 1]), vec![2, 0, 1]);
+        assert_eq!(selection.active(), Some((0, 0)));
+        selection.gesture(1, 0, false, true);
+        assert_eq!(selection.resolve(&[0, 1, 2]), vec![0, 2]);
+    }
+
+    #[test]
+    fn shift_without_an_anchor_selects_one_row() {
+        let mut selection = Selection::default();
+        selection.gesture(2, 1, true, false);
+        assert_eq!(selection.resolve(&[0, 1, 2]), vec![2]);
+        assert_eq!(selection.active(), Some((2, 1)));
+    }
+
+    #[test]
+    fn an_empty_selection_resolves_to_the_whole_view() {
+        let selection = Selection::default();
+        assert!(selection.is_empty());
+        assert_eq!(selection.resolve(&[2, 0]), vec![2, 0]);
+    }
+
+    #[test]
+    fn sync_keeps_the_rows_until_the_result_changes() {
+        use std::time::Duration;
+        let first =
+            ResultId { active: 0, rows: 2, cols: 2, took: Duration::from_millis(1) };
+        let rerun =
+            ResultId { active: 0, rows: 2, cols: 2, took: Duration::from_millis(2) };
+        let mut selection = Selection::default();
+        selection.sync(first);
+        selection.gesture(0, 0, false, false);
+        selection.sync(first);
+        assert_eq!(selection.resolve(&[0, 1]), vec![0]);
+        selection.sync(rerun);
+        assert!(selection.is_empty());
+        assert_eq!(selection.active(), None);
+        assert_eq!(selection.resolve(&[0, 1]), vec![0, 1]);
+    }
+
+    fn paste_columns() -> Vec<String> {
+        vec!["id".to_owned(), "name".to_owned()]
+    }
+
+    #[test]
+    fn paste_csv_maps_headers_case_insensitively_in_column_order() {
+        let parsed = parse_paste("NAME,extra,ID\nada,x,1\ngrace,y,2\n").expect("parses");
+        assert_eq!(
+            stage_paste_rows(&parsed, &paste_columns()),
+            Some(vec![
+                vec!["1".to_owned(), "ada".to_owned()],
+                vec!["2".to_owned(), "grace".to_owned()],
+            ])
+        );
+    }
+
+    #[test]
+    fn paste_tsv_roundtrip_keeps_quoted_cells() {
+        let parsed =
+            parse_paste("id\tname\n1\t\"a\tb\"\n2\tplain\n").expect("parses");
+        assert_eq!(
+            stage_paste_rows(&parsed, &paste_columns()),
+            Some(vec![
+                vec!["1".to_owned(), "a\tb".to_owned()],
+                vec!["2".to_owned(), "plain".to_owned()],
+            ])
+        );
+    }
+
+    #[test]
+    fn paste_rejects_garbage_and_unmatched_headers() {
+        assert_eq!(parse_paste("just text"), None);
+        assert_eq!(parse_paste("a,b\n1\n"), None);
+        let parsed = parse_paste("zzz\n1\n").expect("parses");
+        assert_eq!(stage_paste_rows(&parsed, &paste_columns()), None);
+    }
+
+    #[test]
+    fn paste_caps_rows_at_the_import_cap() {
+        let mut text = String::from("id\n");
+        for i in 0..1005 {
+            text.push_str(&format!("{i}\n"));
+        }
+        let parsed = parse_paste(&text).expect("parses");
+        let staged =
+            stage_paste_rows(&parsed, &["id".to_owned()]).expect("stages");
+        assert_eq!(staged.len(), crate::import::ROW_CAP);
+        assert_eq!(staged[0], vec!["0".to_owned()]);
+        assert_eq!(staged[staged.len() - 1], vec!["999".to_owned()]);
+    }
+
+    #[test]
+    fn copy_shortcut_is_ctrl_c() {
+        let shortcut = copy_shortcut();
+        assert_eq!(shortcut.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(shortcut.logical_key, egui::Key::C);
     }
 }

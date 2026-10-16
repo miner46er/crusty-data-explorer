@@ -1,4 +1,5 @@
 use crate::db::{QueryResult, Value};
+use crate::edit::to_literal;
 
 fn escape_field(raw: &str) -> String {
     if raw.contains(',') || raw.contains('"') || raw.contains('\n') || raw.contains('\r') {
@@ -162,6 +163,64 @@ pub fn to_markdown(result: &QueryResult, rows: &[usize]) -> String {
     out
 }
 
+/// One TSV field: tabs and line breaks become spaces so a spreadsheet
+/// paste stays rectangular.
+fn tsv_field(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if matches!(c, '\t' | '\r' | '\n') { ' ' } else { c }
+        })
+        .collect()
+}
+
+/// Tab-separated values for spreadsheet paste: fields joined with tabs,
+/// rows with newlines, and an optional header row. Values render like the
+/// CSV export; an empty row list with headers still writes the header.
+pub fn to_tsv(result: &QueryResult, rows: &[usize], headers: bool) -> String {
+    let mut out = String::new();
+    if headers {
+        let header: Vec<String> =
+            result.columns().iter().map(|c| tsv_field(c.name())).collect();
+        out.push_str(&header.join("\t"));
+        out.push('\n');
+    }
+    for &r in rows {
+        let mut fields = Vec::with_capacity(result.columns().len());
+        for c in 0..result.columns().len() {
+            fields.push(tsv_field(&value_to_field(result.cell(r, c))));
+        }
+        out.push_str(&fields.join("\t"));
+        out.push('\n');
+    }
+    out
+}
+
+/// `"col" IN (...)` over one column's values across `rows`. Every value
+/// renders through [`to_literal`] so text quotes and numbers stay bare;
+/// NULL and empty cells never enter the list. None when the column is out
+/// of range, no rows are given, or no value survives.
+pub fn to_in_list(result: &QueryResult, rows: &[usize], col: usize) -> Option<String> {
+    if col >= result.columns().len() {
+        return None;
+    }
+    let mut items = Vec::new();
+    for &r in rows {
+        let text = match result.cell(r, col) {
+            None | Some(Value::Null) => continue,
+            Some(value) => value.display(usize::MAX).into_owned(),
+        };
+        let literal = to_literal(&text, false);
+        if literal == "NULL" {
+            continue;
+        }
+        items.push(literal);
+    }
+    if items.is_empty() {
+        return None;
+    }
+    Some(format!("{} IN ({})", quote_ident(result.columns()[col].name()), items.join(", ")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +365,78 @@ mod tests {
             to_markdown(&r, &[0, 1]),
             "| id | name |\n| --- | --- |\n| 1 | x |\n| 2 | y\\|z |\n"
         );
+    }
+
+    #[test]
+    fn tsv_with_headers_is_tabs_and_newlines() {
+        let r = result(vec![
+            col("id", vec![Value::Integer(1), Value::Integer(2)]),
+            col(
+                "name",
+                vec![Value::Text("ada".to_owned()), Value::Text("grace".to_owned())],
+            ),
+        ]);
+        assert_eq!(to_tsv(&r, &[0, 1], true), "id\tname\n1\tada\n2\tgrace\n");
+    }
+
+    #[test]
+    fn tsv_without_headers_skips_the_first_line() {
+        let r = result(vec![
+            col("id", vec![Value::Integer(1), Value::Integer(2)]),
+            col(
+                "name",
+                vec![Value::Text("ada".to_owned()), Value::Text("grace".to_owned())],
+            ),
+        ]);
+        assert_eq!(to_tsv(&r, &[1, 0], false), "2\tgrace\n1\tada\n");
+    }
+
+    #[test]
+    fn tsv_flattens_tabs_and_line_breaks_to_spaces() {
+        let r = result(vec![col(
+            "note",
+            vec![Value::Text("a\tb\nc\rd\ne".to_owned()), Value::Null],
+        )]);
+        assert_eq!(to_tsv(&r, &[0, 1], true), "note\na b c d e\n\n");
+    }
+
+    #[test]
+    fn in_list_quotes_text_and_leaves_numbers_bare() {
+        let r = result(vec![
+            col(
+                "id",
+                vec![Value::Integer(1), Value::Integer(2), Value::Null],
+            ),
+            col(
+                "name",
+                vec![
+                    Value::Text("O'Brien".to_owned()),
+                    Value::Text("42".to_owned()),
+                    Value::Null,
+                ],
+            ),
+        ]);
+        assert_eq!(to_in_list(&r, &[0, 1, 2], 0), Some("\"id\" IN (1, 2)".to_owned()));
+        assert_eq!(
+            to_in_list(&r, &[0, 1, 2], 1),
+            Some("\"name\" IN ('O''Brien', 42)".to_owned())
+        );
+    }
+
+    #[test]
+    fn in_list_skips_null_and_empty_cells() {
+        let r = result(vec![col(
+            "name",
+            vec![Value::Null, Value::Text(String::new()), Value::Text("ada".to_owned())],
+        )]);
+        assert_eq!(to_in_list(&r, &[0, 1, 2], 0), Some("\"name\" IN ('ada')".to_owned()));
+    }
+
+    #[test]
+    fn in_list_is_none_without_a_surviving_value() {
+        let r = result(vec![col("name", vec![Value::Null, Value::Null])]);
+        assert_eq!(to_in_list(&r, &[0, 1], 0), None);
+        assert_eq!(to_in_list(&r, &[], 0), None);
+        assert_eq!(to_in_list(&r, &[0], 9), None);
     }
 }
