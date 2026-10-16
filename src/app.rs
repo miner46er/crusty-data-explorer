@@ -520,6 +520,18 @@ pub struct ImportDraft {
     pub table: String,
 }
 
+/// A run held for its write guard: the tab and connection it would run on,
+/// the exact prepared batch Confirm would send, and the unqualified
+/// statement the modal names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWriteConfirm {
+    pub tab: TabId,
+    pub conn: ConnectionId,
+    pub statements: Vec<String>,
+    pub kind: String,
+    pub table: String,
+}
+
 pub struct AppState {
     connections: Vec<Connection>,
     tabs: Vec<Tab>,
@@ -527,6 +539,7 @@ pub struct AppState {
     draft: Option<ConnectDraft>,
     password_prompt: Option<ConnectionId>,
     pending_prod: Option<ConnectionId>,
+    pending_write: Option<PendingWriteConfirm>,
     prompt_password: String,
     ids: Ids,
     registry: DriverRegistry,
@@ -560,6 +573,7 @@ impl AppState {
             draft: None,
             password_prompt: None,
             pending_prod: None,
+            pending_write: None,
             prompt_password: String::new(),
             ids,
             registry: DriverRegistry::bundled(),
@@ -702,6 +716,9 @@ impl AppState {
 
     pub fn close_tab(&mut self, tab: TabId) {
         self.tabs.retain(|t| t.id != tab);
+        if self.pending_write.as_ref().is_some_and(|pending| pending.tab == tab) {
+            self.pending_write = None;
+        }
         self.repair_active();
     }
 
@@ -741,7 +758,9 @@ impl AppState {
     /// The shared body of run and explain. Resolves the tab's connection, its
     /// handle, and the effective statements, maps each through `prepare`, and
     /// sends one batch. Both entry points share these error paths: a missing
-    /// connection or an empty effective set never sends.
+    /// connection or an empty effective set never sends. A read-only
+    /// connection refuses the batch when any prepared statement writes, and
+    /// an UPDATE or DELETE without WHERE arms the write confirm instead.
     fn start_batch(
         &mut self,
         tab: TabId,
@@ -750,18 +769,24 @@ impl AppState {
         selection: Option<Range<usize>>,
         prepare: impl Fn(DbKind, String) -> String,
     ) {
-        let (conn_id, kind, handle, scope) = match self.tabs.iter().find(|t| t.id == tab) {
-            Some(t) => {
-                match t.conn.and_then(|id| self.connections.iter().find(|c| c.id == id)) {
-                    Some(c) => (c.id, c.config.kind(), c.handle(), t.run_scope),
-                    None => {
-                        self.set_outcome(tab, RunOutcome::Err("connection not found".to_owned()));
-                        return;
+        let (conn_id, kind, handle, scope, read_only) =
+            match self.tabs.iter().find(|t| t.id == tab) {
+                Some(t) => {
+                    match t.conn.and_then(|id| self.connections.iter().find(|c| c.id == id)) {
+                        Some(c) => {
+                            (c.id, c.config.kind(), c.handle(), t.run_scope, c.config.is_read_only())
+                        }
+                        None => {
+                            self.set_outcome(
+                                tab,
+                                RunOutcome::Err("connection not found".to_owned()),
+                            );
+                            return;
+                        }
                     }
                 }
-            }
-            None => return,
-        };
+                None => return,
+            };
         let statements = effective_statements(sql, scope, cursor, selection);
         if statements.is_empty() {
             self.set_outcome(tab, RunOutcome::Err("nothing to run".to_owned()));
@@ -769,7 +794,56 @@ impl AppState {
         }
         let statements: Vec<String> =
             statements.into_iter().map(|statement| prepare(kind, statement)).collect();
+        if read_only {
+            if let Some(kind) =
+                statements.iter().find_map(|statement| crate::db::write_statement_kind(statement))
+            {
+                self.set_outcome(
+                    tab,
+                    RunOutcome::Err(
+                        crate::db::DbError::Config(format!(
+                            "read-only connection refused {kind}"
+                        ))
+                        .to_string(),
+                    ),
+                );
+                return;
+            }
+        }
+        if let Some(found) =
+            statements.iter().find_map(|statement| crate::db::unqualified_write(statement))
+        {
+            self.pending_write = Some(PendingWriteConfirm {
+                tab,
+                conn: conn_id,
+                statements,
+                kind: found.kind.to_owned(),
+                table: found.table,
+            });
+            return;
+        }
         self.send_batch(tab, conn_id, handle, statements, BatchPurpose::Run);
+    }
+
+    /// The run held for its write guard, if any.
+    pub fn pending_write(&self) -> Option<&PendingWriteConfirm> {
+        self.pending_write.as_ref()
+    }
+
+    /// Send the held batch exactly as prepared.
+    pub fn confirm_write(&mut self) {
+        let Some(pending) = self.pending_write.take() else { return };
+        let handle = self
+            .connections
+            .iter()
+            .find(|c| c.id == pending.conn)
+            .and_then(|c| c.handle());
+        self.send_batch(pending.tab, pending.conn, handle, pending.statements, BatchPurpose::Run);
+    }
+
+    /// Drop the held batch without sending anything.
+    pub fn cancel_write(&mut self) {
+        self.pending_write = None;
     }
 
     /// One prepared batch: mint the run, send it, and fold the tab's outcome
@@ -957,22 +1031,37 @@ impl AppState {
 
     /// Send every staged change as one batch: an UPDATE per dirty row, a
     /// DELETE per deleted row, then an INSERT per added row. Nothing sends
-    /// when nothing is staged or the target does not resolve.
+    /// when nothing is staged or the target does not resolve. A read-only
+    /// connection refuses the batch with the same error a run reports.
     pub fn apply_edits(&mut self, tab: TabId) {
         let Some(target) = self.edit_target(tab) else { return };
         let Some(statements) = self.edit_statements(tab, &target) else { return };
         if statements.is_empty() {
             return;
         }
-        let (conn_id, handle) = match self.tabs.iter().find(|t| t.id == tab) {
+        let (conn_id, handle, read_only) = match self.tabs.iter().find(|t| t.id == tab) {
             Some(t) => {
                 match t.conn.and_then(|id| self.connections.iter().find(|c| c.id == id)) {
-                    Some(c) => (c.id, c.handle()),
+                    Some(c) => (c.id, c.handle(), c.config.is_read_only()),
                     None => return,
                 }
             }
             None => return,
         };
+        if read_only {
+            let kind = statements
+                .iter()
+                .find_map(|statement| crate::db::write_statement_kind(statement))
+                .unwrap_or("write");
+            self.set_outcome(
+                tab,
+                RunOutcome::Err(
+                    crate::db::DbError::Config(format!("read-only connection refused {kind}"))
+                        .to_string(),
+                ),
+            );
+            return;
+        }
         self.send_batch(tab, conn_id, handle, statements, BatchPurpose::ApplyEdits);
     }
 
@@ -1057,15 +1146,28 @@ impl AppState {
             );
             return;
         }
-        let (conn_id, handle) = match self.tabs.iter().find(|t| t.id == draft.tab) {
+        let (conn_id, handle, read_only) = match self.tabs.iter().find(|t| t.id == draft.tab) {
             Some(t) => {
                 match t.conn.and_then(|id| self.connections.iter().find(|c| c.id == id)) {
-                    Some(c) => (c.id, c.handle()),
+                    Some(c) => (c.id, c.handle(), c.config.is_read_only()),
                     None => return,
                 }
             }
             None => return,
         };
+        if read_only {
+            let kind = statements
+                .iter()
+                .find_map(|statement| crate::db::write_statement_kind(statement))
+                .unwrap_or("write");
+            self.set_tab_notice(
+                draft.tab,
+                crate::db::DbError::Config(format!("read-only connection refused {kind}"))
+                    .to_string(),
+                true,
+            );
+            return;
+        }
         let inserted = draft.rows.len().min(ROW_CAP);
         let skipped = draft.map.skipped.len();
         let dropped = dropped_rows(draft.rows.len());
@@ -2125,7 +2227,7 @@ mod tests {
             let draft = state.draft_mut().expect("new draft");
             draft.name = name.to_owned();
             draft.env = env;
-            draft.config = ConnectionConfig::Sqlite { path: ":memory:".into() };
+            draft.config = ConnectionConfig::Sqlite { read_only: false, path: ":memory:".into() };
         }
         state.save_draft();
         state.connections().last().map(|c| c.id).expect("saved connection")
@@ -2150,7 +2252,7 @@ mod tests {
             let draft = state.draft_mut().expect("new draft");
             draft.name = name.to_owned();
             draft.env = env;
-            draft.config = ConnectionConfig::Postgres {
+            draft.config = ConnectionConfig::Postgres { read_only: false,
                 host: "localhost".to_owned(),
                 port: 5432,
                 database: "appdb".to_owned(),
@@ -2170,7 +2272,7 @@ mod tests {
             let draft = state.draft_mut().expect("new draft");
             draft.name = name.to_owned();
             draft.env = Environment::Dev;
-            draft.config = ConnectionConfig::Mysql {
+            draft.config = ConnectionConfig::Mysql { read_only: false,
                 host: "localhost".to_owned(),
                 port: 3307,
                 database: "cde_test".to_owned(),
@@ -3250,7 +3352,7 @@ mod tests {
             id: 1,
             name: "pg".to_owned(),
             env: Environment::Prod,
-            config: ConnectionConfig::Postgres {
+            config: ConnectionConfig::Postgres { read_only: false,
                 host: "localhost".to_owned(),
                 port: 5432,
                 database: "appdb".to_owned(),
@@ -3275,7 +3377,7 @@ mod tests {
             id: ConnectionId::from_raw(7),
             name: "pg".to_owned(),
             env: Environment::Test,
-            config: ConnectionConfig::Postgres {
+            config: ConnectionConfig::Postgres { read_only: false,
                 host: "localhost".to_owned(),
                 port: 5432,
                 database: "appdb".to_owned(),
@@ -3315,7 +3417,7 @@ mod tests {
             {
                 let draft = state.draft_mut().expect("draft");
                 draft.name = "pg".to_owned();
-                draft.config = ConnectionConfig::Postgres {
+                draft.config = ConnectionConfig::Postgres { read_only: false,
                     host: "localhost".to_owned(),
                     port: 5432,
                     database: "appdb".to_owned(),
@@ -3435,7 +3537,7 @@ mod tests {
         {
             let draft = state.draft_mut().expect("new draft");
             draft.name = "pg".to_owned();
-            draft.config = ConnectionConfig::Postgres {
+            draft.config = ConnectionConfig::Postgres { read_only: false,
                 host: "localhost".to_owned(),
                 port: 5432,
                 database: "appdb".to_owned(),
@@ -3456,7 +3558,7 @@ mod tests {
             assert_eq!(draft.name, "pg");
             assert_eq!(
                 draft.config,
-                ConnectionConfig::Postgres {
+                ConnectionConfig::Postgres { read_only: false,
                     host: "localhost".to_owned(),
                     port: 5432,
                     database: "appdb".to_owned(),
@@ -3470,7 +3572,7 @@ mod tests {
         {
             let draft = state.draft_mut().expect("edit draft mut");
             draft.name = "pg-renamed".to_owned();
-            draft.config = ConnectionConfig::Postgres {
+            draft.config = ConnectionConfig::Postgres { read_only: false,
                 host: "db.internal".to_owned(),
                 port: 5433,
                 database: "analytics".to_owned(),
@@ -3488,7 +3590,7 @@ mod tests {
         assert_eq!(conn.name, "pg-renamed");
         assert_eq!(
             conn.config,
-            ConnectionConfig::Postgres {
+            ConnectionConfig::Postgres { read_only: false,
                 host: "db.internal".to_owned(),
                 port: 5433,
                 database: "analytics".to_owned(),
@@ -3563,7 +3665,7 @@ mod tests {
             assert_eq!(conn.name, "mysql");
             assert_eq!(
                 conn.config,
-                ConnectionConfig::Mysql {
+                ConnectionConfig::Mysql { read_only: false,
                     host: "localhost".to_owned(),
                     port: 3307,
                     database: "cde_test".to_owned(),
@@ -4619,6 +4721,180 @@ mod tests {
             let text = rendered_text(&output);
             assert!(!text.iter().any(|t| t == "Import CSV"), "{text:?}");
             let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    fn add_read_only_sqlite_connection(state: &mut AppState, name: &str) -> ConnectionId {
+        let id = add_sqlite_connection(state, name);
+        state
+            .connections
+            .iter_mut()
+            .find(|c| c.id == id)
+            .expect("connection")
+            .config
+            .set_read_only(true);
+        id
+    }
+
+    #[test]
+    fn read_only_connection_refuses_each_write_kind() {
+        with_isolated_state("read-only-gate", |state| {
+            let conn = add_read_only_sqlite_connection(state, "mem-ro");
+            let commands = attach_test_handle(state, conn);
+            let tab = state.new_tab(conn);
+            for (sql, kind) in [
+                ("INSERT INTO t (a) VALUES (1)", "INSERT"),
+                ("UPDATE t SET a = 1 WHERE id = 2", "UPDATE"),
+                ("DELETE FROM t WHERE id = 1", "DELETE"),
+                ("CREATE TABLE t (a INTEGER)", "CREATE"),
+                ("ALTER TABLE t ADD COLUMN b TEXT", "ALTER"),
+                ("DROP TABLE t", "DROP"),
+                ("TRUNCATE TABLE t", "TRUNCATE"),
+                ("REPLACE INTO t (a) VALUES (1)", "REPLACE"),
+                ("MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN UPDATE SET a = 1", "MERGE"),
+                ("COPY t FROM 'f.csv'", "COPY"),
+                ("VACUUM", "VACUUM"),
+                ("GRANT SELECT ON t TO reader", "GRANT"),
+                ("REVOKE SELECT ON t FROM reader", "REVOKE"),
+                ("SELECT 1; DELETE FROM t", "DELETE"),
+            ] {
+                state.start_run(tab, sql, 0, None);
+                let expected = format!("invalid settings: read-only connection refused {kind}");
+                match state.tab(tab).expect("tab").outcome() {
+                    RunOutcome::Err(message) => assert_eq!(message, &expected, "{sql}"),
+                    other => panic!("expected Err for {sql}, got {other:?}"),
+                }
+                assert!(commands.try_recv().is_err(), "{sql} sent nothing");
+                assert!(state.pending_write().is_none(), "{sql} arms no confirm");
+            }
+        });
+    }
+
+    #[test]
+    fn read_only_connection_runs_reads_explain_and_pure_batches() {
+        with_isolated_state("read-only-reads", |state| {
+            let conn = add_read_only_sqlite_connection(state, "mem-ro");
+            let commands = attach_test_handle(state, conn);
+            let tab = state.new_tab(conn);
+            state.start_run(tab, "SELECT * FROM t", 0, None);
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["SELECT * FROM t"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+            let second = state.new_tab(conn);
+            state.start_run(second, "SELECT 1; SELECT 2", 0, None);
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["SELECT 1", "SELECT 2"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+            let explained = state.new_tab(conn);
+            state.start_explain(explained, "DELETE FROM t", 0, None);
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["EXPLAIN QUERY PLAN DELETE FROM t"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn read_only_connection_refuses_apply_and_import() {
+        with_isolated_state("read-only-edits", |state| {
+            let (tab, conn, commands) = editable_tab(state);
+            state
+                .connections
+                .iter_mut()
+                .find(|c| c.id == conn)
+                .expect("connection")
+                .config
+                .set_read_only(true);
+            state.stage_edit(tab, 0, 2, "Ada".to_owned());
+            state.apply_edits(tab);
+            match state.tab(tab).expect("tab").outcome() {
+                RunOutcome::Err(message) => assert_eq!(
+                    message,
+                    "invalid settings: read-only connection refused UPDATE"
+                ),
+                other => panic!("expected Err, got {other:?}"),
+            }
+            assert!(commands.try_recv().is_err());
+
+            let path = write_csv("ro-import", "tenant,id,name\nacme,1,ada\n");
+            state.begin_import(tab, &path);
+            assert!(state.import_draft().is_some(), "draft staged");
+            state.commit_import();
+            assert!(state.import_draft().is_none());
+            let view = state.tab(tab).expect("tab");
+            assert_eq!(
+                view.export_notice(),
+                Some("invalid settings: read-only connection refused INSERT")
+            );
+            assert!(view.export_failed());
+            assert!(commands.try_recv().is_err());
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn unqualified_delete_arms_confirm_that_sends_the_exact_batch() {
+        with_isolated_state("write-confirm", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.start_run(tab, "SELECT 1; DELETE FROM users", 0, None);
+            assert!(commands.try_recv().is_err());
+            let pending = state.pending_write().expect("held batch").clone();
+            assert_eq!(pending.tab, tab);
+            assert_eq!(pending.conn, conn);
+            assert_eq!(pending.statements, vec!["SELECT 1", "DELETE FROM users"]);
+            assert_eq!(pending.kind, "DELETE");
+            assert_eq!(pending.table, "users");
+            state.confirm_write();
+            assert!(state.pending_write().is_none());
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["SELECT 1", "DELETE FROM users"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+            assert!(matches!(
+                state.tab(tab).expect("tab").outcome(),
+                RunOutcome::Running { .. }
+            ));
+        });
+    }
+
+    #[test]
+    fn unqualified_update_cancel_sends_nothing() {
+        with_isolated_state("write-cancel", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.start_run(tab, "UPDATE users SET name = 'ada'", 0, None);
+            assert!(commands.try_recv().is_err());
+            let pending = state.pending_write().expect("held batch");
+            assert_eq!(pending.kind, "UPDATE");
+            assert_eq!(pending.table, "users");
+            state.cancel_write();
+            assert!(state.pending_write().is_none());
+            assert!(commands.try_recv().is_err());
+            assert!(matches!(
+                state.tab(tab).expect("tab").outcome(),
+                RunOutcome::Never
+            ));
+
+            let qualified = state.new_tab(conn);
+            state.start_run(qualified, "DELETE FROM users WHERE id = 1", 0, None);
+            assert!(state.pending_write().is_none());
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["DELETE FROM users WHERE id = 1"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
         });
     }
 }

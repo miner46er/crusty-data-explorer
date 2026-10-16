@@ -479,8 +479,16 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
                 ui.selectable_value(&mut draft.env, env, env.label());
             }
         });
+        let mut read_only = draft.config.is_read_only();
+        if ui
+            .checkbox(&mut read_only, "Read only")
+            .on_hover_text("Refuse statements that write when set")
+            .changed()
+        {
+            draft.config.set_read_only(read_only);
+        }
         match &mut draft.config {
-            ConnectionConfig::Sqlite { path } => {
+            ConnectionConfig::Sqlite { path, .. } => {
                 ui.horizontal(|ui| {
                     ui.label("Path:");
                     let mut text = path.to_string_lossy().into_owned();
@@ -490,7 +498,7 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
                 });
                 ui.small("Use :memory: for a throwaway database.");
             }
-            ConnectionConfig::Postgres { host, port, database, user, ssl_mode, ssh } => {
+            ConnectionConfig::Postgres { host, port, database, user, ssl_mode, ssh, .. } => {
                 ui.horizontal(|ui| {
                     ui.label("Host:");
                     ui.text_edit_singleline(host);
@@ -524,7 +532,7 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
                 });
                 ssh_section(ui, ssh, &mut draft.ssh_password);
             }
-            ConnectionConfig::Mysql { host, port, database, user, ssh } => {
+            ConnectionConfig::Mysql { host, port, database, user, ssh, .. } => {
                 ui.horizontal(|ui| {
                     ui.label("Host:");
                     ui.text_edit_singleline(host);

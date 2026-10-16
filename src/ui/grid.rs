@@ -366,7 +366,8 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
     let modal_open = state.draft().is_some()
         || state.save_prompt().is_some()
         || state.password_prompt().is_some()
-        || state.import_draft().is_some();
+        || state.import_draft().is_some()
+        || state.pending_write().is_some();
     let Some(tab_id) = state.active() else {
         ui.label("No query tab.");
         return;

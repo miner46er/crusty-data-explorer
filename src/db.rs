@@ -108,6 +108,7 @@ impl DbKind {
         match self {
             DbKind::Sqlite => ConnectionConfig::Sqlite {
                 path: PathBuf::new(),
+                read_only: false,
             },
             DbKind::Postgres => ConnectionConfig::Postgres {
                 host: "localhost".to_owned(),
@@ -116,6 +117,7 @@ impl DbKind {
                 user: String::new(),
                 ssl_mode: PostgresSslMode::Disable,
                 ssh: None,
+                read_only: false,
             },
             DbKind::Mysql => ConnectionConfig::Mysql {
                 host: "localhost".to_owned(),
@@ -123,6 +125,7 @@ impl DbKind {
                 database: String::new(),
                 user: String::new(),
                 ssh: None,
+                read_only: false,
             },
         }
     }
@@ -135,6 +138,286 @@ pub fn explain_sql(kind: DbKind, statement: &str) -> String {
         DbKind::Sqlite => format!("EXPLAIN QUERY PLAN {}", statement.trim()),
         DbKind::Postgres | DbKind::Mysql => format!("EXPLAIN {}", statement.trim()),
     }
+}
+
+/// One write kind the read-only guard refuses, as uppercase text for errors.
+/// The single classifier behind the guard; callers never match keywords.
+pub fn write_statement_kind(sql: &str) -> Option<&'static str> {
+    let keyword = first_keyword(sql)?;
+    Some(match keyword.as_str() {
+        "INSERT" => "INSERT",
+        "UPDATE" => "UPDATE",
+        "DELETE" => "DELETE",
+        "CREATE" => "CREATE",
+        "ALTER" => "ALTER",
+        "DROP" => "DROP",
+        "TRUNCATE" => "TRUNCATE",
+        "REPLACE" => "REPLACE",
+        "MERGE" => "MERGE",
+        "COPY" => "COPY",
+        "VACUUM" => "VACUUM",
+        "GRANT" => "GRANT",
+        "REVOKE" => "REVOKE",
+        _ => return None,
+    })
+}
+
+/// True when [`write_statement_kind`] names a write.
+pub fn is_write_statement(sql: &str) -> bool {
+    write_statement_kind(sql).is_some()
+}
+
+/// An UPDATE or DELETE with no outer WHERE: its kind and affected table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnqualifiedWrite {
+    pub kind: &'static str,
+    pub table: String,
+}
+
+/// Some only for an UPDATE or DELETE with no WHERE at paren depth zero.
+/// Leading comments and wrapping parens are skipped; matching is
+/// case-insensitive and strings, quoted identifiers, and comments never
+/// count as WHERE.
+pub fn unqualified_write(sql: &str) -> Option<UnqualifiedWrite> {
+    let (keyword, end) = keyword_span(sql)?;
+    match keyword.as_str() {
+        "UPDATE" => {
+            let (table, _) = identifier_at(sql, end)?;
+            (!has_outer_where(sql)).then(|| UnqualifiedWrite { kind: "UPDATE", table })
+        }
+        "DELETE" => {
+            let mut pos = skip_ignorable(sql, end);
+            let (word, next) = word_at(sql, pos)?;
+            if !word.eq_ignore_ascii_case("from") {
+                return None;
+            }
+            pos = next;
+            let (table, _) = identifier_at(sql, pos)?;
+            (!has_outer_where(sql)).then(|| UnqualifiedWrite { kind: "DELETE", table })
+        }
+        _ => None,
+    }
+}
+
+/// First keyword uppercased, skipping whitespace, line and block comments,
+/// and wrapping open parens, so a parenthesized SELECT reads as SELECT.
+fn first_keyword(sql: &str) -> Option<String> {
+    keyword_span(sql).map(|(keyword, _)| keyword)
+}
+
+fn keyword_span(sql: &str) -> Option<(String, usize)> {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if sql[i..].starts_with("--") {
+            match sql[i..].find('\n') {
+                Some(nl) => {
+                    i += nl + 1;
+                    continue;
+                }
+                None => return None,
+            }
+        }
+        if sql[i..].starts_with("/*") {
+            match sql[i..].find("*/") {
+                Some(end) => {
+                    i += end + 2;
+                    continue;
+                }
+                None => return None,
+            }
+        }
+        if bytes.get(i) == Some(&b'(') {
+            i += 1;
+            continue;
+        }
+        if bytes.get(i) == Some(&b';') {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let start = i;
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
+    {
+        i += 1;
+    }
+    if start == i {
+        return None;
+    }
+    Some((sql[start..i].to_ascii_uppercase(), i))
+}
+
+/// Byte offset past whitespace and SQL comments.
+fn skip_ignorable(sql: &str, mut i: usize) -> usize {
+    let bytes = sql.as_bytes();
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if sql[i..].starts_with("--") {
+            match sql[i..].find('\n') {
+                Some(nl) => {
+                    i += nl + 1;
+                    continue;
+                }
+                None => return sql.len(),
+            }
+        }
+        if sql[i..].starts_with("/*") {
+            match sql[i..].find("*/") {
+                Some(end) => {
+                    i += end + 2;
+                    continue;
+                }
+                None => return sql.len(),
+            }
+        }
+        break;
+    }
+    i
+}
+
+/// One ASCII word at `i` with the offset after it.
+fn word_at(sql: &str, i: usize) -> Option<(String, usize)> {
+    let bytes = sql.as_bytes();
+    let mut end = i;
+    while end < bytes.len()
+        && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'$')
+    {
+        end += 1;
+    }
+    if end == i {
+        return None;
+    }
+    Some((sql[i..end].to_owned(), end))
+}
+
+/// One table name at `i`: a bare or double-quoted part with dots joining
+/// further parts. Quoted parts unescape; each part keeps its text.
+fn identifier_at(sql: &str, i: usize) -> Option<(String, usize)> {
+    let mut pos = skip_ignorable(sql, i);
+    let mut parts = Vec::new();
+    loop {
+        let bytes = sql.as_bytes();
+        if bytes.get(pos) == Some(&b'"') {
+            let mut text = String::new();
+            pos += 1;
+            loop {
+                let c = sql[pos..].chars().next()?;
+                if c == '"' {
+                    if sql[pos + 1..].starts_with('"') {
+                        text.push('"');
+                        pos += 2;
+                        continue;
+                    }
+                    pos += 1;
+                    break;
+                }
+                text.push(c);
+                pos += c.len_utf8();
+            }
+            if text.trim().is_empty() {
+                return None;
+            }
+            parts.push(text);
+        } else {
+            let (word, next) = word_at(sql, pos)?;
+            parts.push(word);
+            pos = next;
+        }
+        let after = skip_ignorable(sql, pos);
+        if sql.as_bytes().get(after) == Some(&b'.') {
+            pos = skip_ignorable(sql, after + 1);
+            continue;
+        }
+        pos = after;
+        break;
+    }
+    (!parts.is_empty()).then(|| (parts.join("."), pos))
+}
+
+/// True when a WHERE keyword sits at paren depth zero outside strings,
+/// quoted identifiers, and comments.
+fn has_outer_where(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut depth: i32 = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if bytes.get(i + 1) == Some(&b'"') {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'(' {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b')' {
+            depth = depth.saturating_sub(1);
+            i += 1;
+            continue;
+        }
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
+            {
+                i += 1;
+            }
+            if depth == 0 && sql[start..i].eq_ignore_ascii_case("where") {
+                return true;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// The single list of bundled engines. The connection form iterates
@@ -205,7 +488,11 @@ impl PostgresSslMode {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConnectionConfig {
-    Sqlite { path: PathBuf },
+    Sqlite {
+        path: PathBuf,
+        #[serde(default)]
+        read_only: bool,
+    },
     Postgres {
         host: String,
         port: u16,
@@ -215,6 +502,8 @@ pub enum ConnectionConfig {
         ssl_mode: PostgresSslMode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ssh: Option<SshConfig>,
+        #[serde(default)]
+        read_only: bool,
     },
     Mysql {
         host: String,
@@ -223,6 +512,8 @@ pub enum ConnectionConfig {
         user: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ssh: Option<SshConfig>,
+        #[serde(default)]
+        read_only: bool,
     },
 }
 
@@ -238,17 +529,31 @@ impl ConnectionConfig {
     pub fn prompts_for_password(&self) -> bool {
         matches!(self, ConnectionConfig::Postgres { .. } | ConnectionConfig::Mysql { .. })
     }
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            ConnectionConfig::Sqlite { read_only, .. }
+            | ConnectionConfig::Postgres { read_only, .. }
+            | ConnectionConfig::Mysql { read_only, .. } => *read_only,
+        }
+    }
+    pub fn set_read_only(&mut self, read_only: bool) {
+        match self {
+            ConnectionConfig::Sqlite { read_only: flag, .. }
+            | ConnectionConfig::Postgres { read_only: flag, .. }
+            | ConnectionConfig::Mysql { read_only: flag, .. } => *flag = read_only,
+        }
+    }
     /// Boundary check before a session opens. Shared by the form and the worker.
     pub fn validate(&self) -> Result<(), DbError> {
         match self {
-            ConnectionConfig::Sqlite { path } => {
+            ConnectionConfig::Sqlite { path, .. } => {
                 if path.as_os_str().is_empty() {
                     return Err(DbError::Config("SQLite path is empty".to_owned()));
                 }
                 Ok(())
             }
             ConnectionConfig::Postgres { host, port, database, user, ssh, .. }
-            | ConnectionConfig::Mysql { host, port, database, user, ssh } => {
+            | ConnectionConfig::Mysql { host, port, database, user, ssh, .. } => {
                 if host.trim().is_empty() {
                     return Err(DbError::Config("host is empty".to_owned()));
                 }
@@ -988,7 +1293,7 @@ impl Session {
         ssh_password: Option<&str>,
     ) -> Result<Session, DbError> {
         match config {
-            ConnectionConfig::Sqlite { path } => rusqlite::Connection::open(path)
+            ConnectionConfig::Sqlite { path, .. } => rusqlite::Connection::open(path)
                 .map(Session::Sqlite)
                 .map_err(|e| DbError::Open(e.to_string())),
             ConnectionConfig::Postgres { .. } => {
@@ -1124,6 +1429,7 @@ impl PgSession {
             user,
             ssl_mode,
             ssh,
+            ..
         } = config
         else {
             return Err(DbError::Config("not a postgres connection".to_owned()));
@@ -1729,7 +2035,7 @@ impl MySession {
         password: Option<&str>,
         ssh_password: Option<&str>,
     ) -> Result<Self, DbError> {
-        let ConnectionConfig::Mysql { host, port, database, user, ssh } = config else {
+        let ConnectionConfig::Mysql { host, port, database, user, ssh, .. } = config else {
             return Err(DbError::Config("not a mysql connection".to_owned()));
         };
         let (tunnel, dial_host, dial_port) = crate::ssh::forward(
@@ -2578,8 +2884,11 @@ fn parse_network_url(kind: DbKind, rest: &str) -> Result<ParsedConnectionUrl, Db
             user,
             ssl_mode,
             ssh: None,
+            read_only: false,
         },
-        DbKind::Mysql => ConnectionConfig::Mysql { host, port, database, user, ssh: None },
+        DbKind::Mysql => {
+            ConnectionConfig::Mysql { host, port, database, user, ssh: None, read_only: false }
+        }
         DbKind::Sqlite => return Err(invalid_url()),
     };
     Ok(ParsedConnectionUrl { kind, config, password })
@@ -2658,7 +2967,7 @@ fn parse_sqlite_path(path: &str, encoded: bool) -> Result<ParsedConnectionUrl, D
     }
     Ok(ParsedConnectionUrl {
         kind: DbKind::Sqlite,
-        config: ConnectionConfig::Sqlite { path: PathBuf::from(decoded) },
+        config: ConnectionConfig::Sqlite { path: PathBuf::from(decoded), read_only: false },
         password: None,
     })
 }
@@ -3365,7 +3674,7 @@ mod tests {
     #[test]
     fn postgres_ssl_mode_roundtrips_through_json() {
         for mode in PostgresSslMode::ALL {
-            let config = ConnectionConfig::Postgres {
+            let config = ConnectionConfig::Postgres { read_only: false,
                 host: "localhost".to_owned(),
                 port: 5432,
                 database: "appdb".to_owned(),
@@ -3392,7 +3701,7 @@ mod tests {
         let back: ConnectionConfig = serde_json::from_value(old).unwrap();
         assert_eq!(
             back,
-            ConnectionConfig::Postgres {
+            ConnectionConfig::Postgres { read_only: false,
                 host: "localhost".to_owned(),
                 port: 5432,
                 database: "appdb".to_owned(),
@@ -3417,7 +3726,7 @@ mod tests {
     #[test]
     fn config_serde_roundtrips_with_and_without_ssh() {
         for ssh in [None, Some(ssh_config())] {
-            let postgres = ConnectionConfig::Postgres {
+            let postgres = ConnectionConfig::Postgres { read_only: false,
                 host: "db.internal".to_owned(),
                 port: 5432,
                 database: "appdb".to_owned(),
@@ -3427,7 +3736,7 @@ mod tests {
             };
             let json = serde_json::to_string(&postgres).unwrap();
             assert_eq!(serde_json::from_str::<ConnectionConfig>(&json).unwrap(), postgres);
-            let mysql = ConnectionConfig::Mysql {
+            let mysql = ConnectionConfig::Mysql { read_only: false,
                 host: "db.internal".to_owned(),
                 port: 3307,
                 database: "cde_test".to_owned(),
@@ -3473,7 +3782,7 @@ mod tests {
 
     #[test]
     fn validate_checks_ssh_fields_when_present() {
-        let config = |ssh: crate::ssh::SshConfig| ConnectionConfig::Postgres {
+        let config = |ssh: crate::ssh::SshConfig| ConnectionConfig::Postgres { read_only: false,
             host: "db.internal".to_owned(),
             port: 5432,
             database: "appdb".to_owned(),
@@ -3515,7 +3824,7 @@ mod tests {
     #[ignore = "needs cde-ssh and cde-postgres; set SSH_HOST/SSH_PORT/SSH_USER/SSH_PASSWORD and PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
     fn pg_live_ssh_session_roundtrip() {
         let ssh_password = std::env::var("SSH_PASSWORD").ok();
-        let config = ConnectionConfig::Postgres {
+        let config = ConnectionConfig::Postgres { read_only: false,
             host: std::env::var("PGHOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
             port: std::env::var("PGPORT")
                 .ok()
@@ -3555,7 +3864,7 @@ mod tests {
         assert_eq!(DbKind::Mysql.default_port(), Some(3306));
         assert_eq!(
             DbKind::Mysql.default_config(),
-            ConnectionConfig::Mysql {
+            ConnectionConfig::Mysql { read_only: false,
                 host: "localhost".to_owned(),
                 port: 3306,
                 database: String::new(),
@@ -3570,7 +3879,7 @@ mod tests {
 
     #[test]
     fn mysql_config_roundtrips_through_json() {
-        let config = ConnectionConfig::Mysql {
+        let config = ConnectionConfig::Mysql { read_only: false,
             host: "db.internal".to_owned(),
             port: 3307,
             database: "cde_test".to_owned(),
@@ -3579,18 +3888,18 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&config).unwrap(),
-            r#"{"kind":"mysql","host":"db.internal","port":3307,"database":"cde_test","user":"root"}"#
+            r#"{"kind":"mysql","host":"db.internal","port":3307,"database":"cde_test","user":"root","read_only":false}"#
         );
         let back: ConnectionConfig = serde_json::from_str(&serde_json::to_string(&config).unwrap())
             .unwrap();
         assert_eq!(back, config);
         assert!(back.prompts_for_password());
-        assert!(!ConnectionConfig::Sqlite { path: ":memory:".into() }.prompts_for_password());
+        assert!(!ConnectionConfig::Sqlite { read_only: false, path: ":memory:".into() }.prompts_for_password());
     }
 
     #[test]
     fn mysql_config_validate_matches_postgres_rules() {
-        let bad = |host: &str, port: u16, database: &str, user: &str| ConnectionConfig::Mysql {
+        let bad = |host: &str, port: u16, database: &str, user: &str| ConnectionConfig::Mysql { read_only: false,
             host: host.to_owned(),
             port,
             database: database.to_owned(),
@@ -3654,7 +3963,7 @@ mod tests {
         assert_eq!(parsed.kind, DbKind::Postgres);
         assert_eq!(
             parsed.config,
-            ConnectionConfig::Postgres {
+            ConnectionConfig::Postgres { read_only: false,
                 host: "db.internal".to_owned(),
                 port: 5433,
                 database: "analytics".to_owned(),
@@ -3672,7 +3981,7 @@ mod tests {
         assert_eq!(parsed.kind, DbKind::Postgres);
         assert_eq!(
             parsed.config,
-            ConnectionConfig::Postgres {
+            ConnectionConfig::Postgres { read_only: false,
                 host: "localhost".to_owned(),
                 port: 5432,
                 database: "appdb".to_owned(),
@@ -3691,7 +4000,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.kind, DbKind::Postgres);
-        let ConnectionConfig::Postgres { host, port, database, user, ssl_mode, ssh } =
+        let ConnectionConfig::Postgres { host, port, database, user, ssl_mode, ssh, .. } =
             parsed.config
         else {
             panic!("expected a postgres config");
@@ -3752,7 +4061,7 @@ mod tests {
         assert_eq!(parsed.kind, DbKind::Mysql);
         assert_eq!(
             parsed.config,
-            ConnectionConfig::Mysql {
+            ConnectionConfig::Mysql { read_only: false,
                 host: "db.internal".to_owned(),
                 port: 3307,
                 database: "cde_test".to_owned(),
@@ -3769,7 +4078,7 @@ mod tests {
         assert_eq!(parsed.kind, DbKind::Mysql);
         assert_eq!(
             parsed.config,
-            ConnectionConfig::Mysql {
+            ConnectionConfig::Mysql { read_only: false,
                 host: "localhost".to_owned(),
                 port: 3306,
                 database: "cde_test".to_owned(),
@@ -3789,7 +4098,7 @@ mod tests {
         assert_eq!(parsed.kind, DbKind::Mysql);
         assert_eq!(
             parsed.config,
-            ConnectionConfig::Mysql {
+            ConnectionConfig::Mysql { read_only: false,
                 host: "localhost".to_owned(),
                 port: 3306,
                 database: "cde test".to_owned(),
@@ -3816,15 +4125,15 @@ mod tests {
         }
         assert_eq!(
             parse_connection_url("sqlite:///tmp/app.db").unwrap().config,
-            ConnectionConfig::Sqlite { path: PathBuf::from("/tmp/app.db") }
+            ConnectionConfig::Sqlite { read_only: false, path: PathBuf::from("/tmp/app.db") }
         );
         assert_eq!(
             parse_connection_url("/tmp/app.db").unwrap().config,
-            ConnectionConfig::Sqlite { path: PathBuf::from("/tmp/app.db") }
+            ConnectionConfig::Sqlite { read_only: false, path: PathBuf::from("/tmp/app.db") }
         );
         assert_eq!(
             parse_connection_url(":memory:").unwrap().config,
-            ConnectionConfig::Sqlite { path: PathBuf::from(":memory:") }
+            ConnectionConfig::Sqlite { read_only: false, path: PathBuf::from(":memory:") }
         );
     }
 
@@ -3854,7 +4163,7 @@ mod tests {
 
     #[test]
     fn postgres_url_roundtrips_through_parse() {
-        let config = ConnectionConfig::Postgres {
+        let config = ConnectionConfig::Postgres { read_only: false,
             host: "db.internal".to_owned(),
             port: 5433,
             database: "analytics".to_owned(),
@@ -3883,7 +4192,7 @@ mod tests {
             PostgresSslMode::VerifyFull,
         );
         let parsed = parse_connection_url(&encoded).unwrap();
-        let ConnectionConfig::Postgres { host, port, database, user, ssl_mode, ssh } =
+        let ConnectionConfig::Postgres { host, port, database, user, ssl_mode, ssh, .. } =
             parsed.config
         else {
             panic!("expected a postgres config");
@@ -3901,7 +4210,7 @@ mod tests {
         assert_eq!(parsed.password, None);
         assert_eq!(
             parsed.config,
-            ConnectionConfig::Postgres {
+            ConnectionConfig::Postgres { read_only: false,
                 host: "localhost".to_owned(),
                 port: 5432,
                 database: "appdb".to_owned(),
@@ -3914,7 +4223,7 @@ mod tests {
 
     #[test]
     fn mysql_url_roundtrips_through_parse() {
-        let config = ConnectionConfig::Mysql {
+        let config = ConnectionConfig::Mysql { read_only: false,
             host: "db.internal".to_owned(),
             port: 3307,
             database: "cde_test".to_owned(),
@@ -3930,7 +4239,7 @@ mod tests {
         let parsed = parse_connection_url(&encoded).unwrap();
         assert_eq!(
             parsed.config,
-            ConnectionConfig::Mysql {
+            ConnectionConfig::Mysql { read_only: false,
                 host: "localhost".to_owned(),
                 port: 3306,
                 database: "cde test".to_owned(),
@@ -3944,7 +4253,7 @@ mod tests {
     #[cfg(not(feature = "mysql"))]
     #[test]
     fn mysql_feature_off_reports_config_error() {
-        let config = ConnectionConfig::Mysql {
+        let config = ConnectionConfig::Mysql { read_only: false,
             host: "localhost".to_owned(),
             port: 3306,
             database: "cde_test".to_owned(),
@@ -4012,7 +4321,7 @@ mod tests {
     #[test]
     #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
     fn pg_live_cancel_frees_sleeping_worker() {
-        let config = ConnectionConfig::Postgres {
+        let config = ConnectionConfig::Postgres { read_only: false,
             host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
             port: std::env::var("PGPORT")
                 .ok()
@@ -4051,7 +4360,7 @@ mod tests {
     #[test]
     #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
     fn pg_live_roundtrip_covers_result_and_affected_paths() {
-        let config = ConnectionConfig::Postgres {
+        let config = ConnectionConfig::Postgres { read_only: false,
             host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
             port: std::env::var("PGPORT")
                 .ok()
@@ -4093,7 +4402,7 @@ mod tests {
     #[test]
     #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
     fn pg_live_batch_runs_in_order_and_names_the_failing_statement() {
-        let config = ConnectionConfig::Postgres {
+        let config = ConnectionConfig::Postgres { read_only: false,
             host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
             port: std::env::var("PGPORT")
                 .ok()
@@ -4133,7 +4442,7 @@ mod tests {
     #[test]
     #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
     fn pg_live_cancel_stops_a_running_batch() {
-        let config = ConnectionConfig::Postgres {
+        let config = ConnectionConfig::Postgres { read_only: false,
             host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
             port: std::env::var("PGPORT")
                 .ok()
@@ -4172,7 +4481,7 @@ mod tests {
     #[test]
     #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
     fn pg_live_explain_returns_rows() {
-        let config = ConnectionConfig::Postgres {
+        let config = ConnectionConfig::Postgres { read_only: false,
             host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
             port: std::env::var("PGPORT")
                 .ok()
@@ -4194,7 +4503,7 @@ mod tests {
     #[test]
     #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
     fn pg_live_edit_statements_update_a_temp_table() {
-        let config = ConnectionConfig::Postgres {
+        let config = ConnectionConfig::Postgres { read_only: false,
             host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
             port: std::env::var("PGPORT")
                 .ok()
@@ -4352,7 +4661,7 @@ mod tests {
 
     #[cfg(feature = "mysql")]
     fn mysql_live_config() -> ConnectionConfig {
-        ConnectionConfig::Mysql {
+        ConnectionConfig::Mysql { read_only: false,
             host: std::env::var("MYSQLHOST").unwrap_or_else(|_| "localhost".to_owned()),
             port: std::env::var("MYSQLPORT")
                 .ok()
@@ -4869,7 +5178,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let handle = spawn_session(
             ConnectionId::from_raw(9001),
-            ConnectionConfig::Sqlite { path: ":memory:".into() },
+            ConnectionConfig::Sqlite { read_only: false, path: ":memory:".into() },
             None,
             None,
             eframe::egui::Context::default(),
@@ -4914,5 +5223,118 @@ mod tests {
             }
             other => panic!("expected QueryErr, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn write_classifier_names_each_write_kind() {
+        for (sql, kind) in [
+            ("INSERT INTO t (a) VALUES (1)", "INSERT"),
+            ("UPDATE t SET a = 1", "UPDATE"),
+            ("DELETE FROM t", "DELETE"),
+            ("CREATE TABLE t (a INTEGER)", "CREATE"),
+            ("ALTER TABLE t ADD COLUMN b TEXT", "ALTER"),
+            ("DROP TABLE t", "DROP"),
+            ("TRUNCATE TABLE t", "TRUNCATE"),
+            ("REPLACE INTO t (a) VALUES (1)", "REPLACE"),
+            ("MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN UPDATE SET a = 1", "MERGE"),
+            ("COPY t FROM 'f.csv'", "COPY"),
+            ("VACUUM", "VACUUM"),
+            ("GRANT SELECT ON t TO reader", "GRANT"),
+            ("REVOKE SELECT ON t FROM reader", "REVOKE"),
+            ("  insert into t (a) values (1)", "INSERT"),
+            ("-- wipe\nDELETE FROM t", "DELETE"),
+            ("/* plan */ DROP TABLE t", "DROP"),
+        ] {
+            assert_eq!(write_statement_kind(sql), Some(kind), "{sql}");
+            assert!(is_write_statement(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn write_classifier_passes_reads_explain_and_parenthesized_selects() {
+        for sql in [
+            "SELECT * FROM t",
+            "select * from t",
+            "WITH ids AS (SELECT 1) SELECT * FROM ids",
+            "EXPLAIN SELECT * FROM t",
+            "EXPLAIN QUERY PLAN SELECT * FROM t",
+            "EXPLAIN UPDATE t SET a = 1",
+            "PRAGMA table_info(t)",
+            "(SELECT * FROM t)",
+            "((SELECT * FROM t))",
+            "-- comment\nSELECT * FROM t",
+            "/* comment */ SELECT * FROM t",
+            "VALUES (1), (2)",
+            "",
+            "   ",
+        ] {
+            assert_eq!(write_statement_kind(sql), None, "{sql:?}");
+            assert!(!is_write_statement(sql), "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn read_only_flag_defaults_off_and_leaves_validate_green() {
+        let old = serde_json::json!({
+            "kind": "sqlite",
+            "path": ":memory:",
+        });
+        let back: ConnectionConfig = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            back,
+            ConnectionConfig::Sqlite { path: ":memory:".into(), read_only: false }
+        );
+        assert!(!back.is_read_only());
+        assert!(back.validate().is_ok());
+        let mut flagged = back;
+        flagged.set_read_only(true);
+        assert!(flagged.is_read_only());
+        assert!(flagged.validate().is_ok());
+        let json = serde_json::to_string(&flagged).unwrap();
+        assert!(json.contains("\"read_only\":true"), "{json}");
+        let roundtrip: ConnectionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, flagged);
+    }
+
+    #[test]
+    fn unqualified_write_names_kind_and_table() {
+        assert_eq!(
+            unqualified_write("UPDATE users SET name = 'ada'"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "users".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("DELETE FROM users"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "users".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("update users set name = 'ada'"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "users".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("-- wipe\nDELETE FROM users"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "users".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("UPDATE public.users SET name = 'ada'"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "public.users".to_owned() })
+        );
+        assert_eq!(unqualified_write("UPDATE users SET name = 'ada' WHERE id = 1"), None);
+        assert_eq!(unqualified_write("DELETE FROM users WHERE id = 1"), None);
+        assert_eq!(
+            unqualified_write("delete from users where id = 1"),
+            None
+        );
+        assert_eq!(unqualified_write("(SELECT * FROM t)"), None);
+        assert_eq!(unqualified_write("-- only\n(SELECT * FROM t)"), None);
+        assert_eq!(unqualified_write("SELECT * FROM t"), None);
+        assert_eq!(unqualified_write("INSERT INTO t (a) VALUES (1)"), None);
+        assert_eq!(unqualified_write("UPDATE t SET a = 'where'"), Some(UnqualifiedWrite {
+            kind: "UPDATE",
+            table: "t".to_owned()
+        }));
+        assert_eq!(
+            unqualified_write("UPDATE t SET a = (SELECT max(a) FROM u WHERE u.id = t.id)"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "t".to_owned() })
+        );
     }
 }

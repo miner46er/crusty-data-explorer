@@ -4,7 +4,7 @@ use crusty_data_explorer::db::{ConnectionConfig, ROW_CAP, Session, Value};
 
 #[test]
 fn sqlite_in_memory_roundtrip() {
-    let config = ConnectionConfig::Sqlite { path: PathBuf::from(":memory:") };
+    let config = ConnectionConfig::Sqlite { read_only: false, path: PathBuf::from(":memory:") };
     let mut session = Session::open(&config, None, None).expect("open in-memory SQLite");
 
     let created = session
@@ -45,7 +45,7 @@ fn sqlite_in_memory_roundtrip() {
 
 #[test]
 fn row_cap_truncates() {
-    let config = ConnectionConfig::Sqlite { path: PathBuf::from(":memory:") };
+    let config = ConnectionConfig::Sqlite { read_only: false, path: PathBuf::from(":memory:") };
     let mut session = Session::open(&config, None, None).expect("open in-memory SQLite");
 
     let sql = format!(

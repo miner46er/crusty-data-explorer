@@ -16,7 +16,8 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     let modal_open = state.draft().is_some()
         || state.save_prompt().is_some()
         || state.password_prompt().is_some()
-        || state.import_draft().is_some();
+        || state.import_draft().is_some()
+        || state.pending_write().is_some();
     let (new_tab_shortcut_pressed, close_tab_shortcut_pressed, find_shortcut_pressed) = ui
         .input_mut(|i| {
             (
@@ -49,6 +50,7 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     find_opened |= toolbar(state, ui);
     ui.add_space(4.0);
     save_window(state, ui);
+    write_confirm_window(state, ui);
     if let Some(id) = state.active() {
         let hint = state
             .tab(id)
@@ -403,6 +405,34 @@ fn save_window(state: &mut AppState, ui: &mut egui::Ui) {
         state.confirm_save_prompt();
     } else if close {
         state.close_save_prompt();
+    }
+}
+
+/// The write guard modal for an UPDATE or DELETE without WHERE. Names the
+/// statement kind and the affected table; Confirm sends the held batch
+/// exactly as prepared, Cancel drops it.
+pub fn write_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
+    let Some(pending) = state.pending_write().cloned() else { return };
+    let mut confirm = false;
+    let mut cancel = false;
+    egui::Window::new(format!("{} without WHERE?", pending.kind)).show(ui.ctx(), |ui| {
+        ui.label(format!(
+            "{} on {} has no WHERE clause and affects every row.",
+            pending.kind, pending.table
+        ));
+        ui.horizontal(|ui| {
+            if ui.button("Confirm").clicked() {
+                confirm = true;
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+        });
+    });
+    if confirm {
+        state.confirm_write();
+    } else if cancel {
+        state.cancel_write();
     }
 }
 
