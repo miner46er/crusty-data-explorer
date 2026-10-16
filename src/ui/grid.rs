@@ -10,7 +10,7 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::app::{AppState, EditTarget, FilterClause, FilterOp, RunOutcome, SavedFilter, SortDir, Tab};
 use crate::db::{CELL_CAP, QueryResult, TabId, Value};
-use crate::edit::editable_table;
+use crate::edit::{STAGED_DEFAULT, editable_table};
 use crate::export::{
     to_csv, to_in_list, to_inserts, to_json, to_jsonl, to_markdown, to_tsv, to_xlsx,
 };
@@ -453,7 +453,8 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
         || state.password_prompt().is_some()
         || state.import_draft().is_some()
         || state.pending_write().is_some()
-        || state.palette_open();
+        || state.palette_open()
+        || state.active().is_some_and(|id| cell_editor_of(ui.ctx(), id).is_some());
     let Some(tab_id) = state.active() else {
         ui.label("No query tab.");
         return;
@@ -766,6 +767,236 @@ fn type_edit_field(row: usize, col: usize, result: usize, seed: String) -> EditF
     EditField { row, col, result, text: seed, fresh: true }
 }
 
+/// Largest text the cell editor stages. A guard beside the grid's display
+/// truncation, so a multi-megabyte value cannot flood the staged batch.
+const CELL_EDITOR_LIMIT: usize = 1_000_000;
+
+/// The dedicated cell editor modal, kept in the egui context data keyed by
+/// tab, the pattern the find bar uses. Unlike the inline [`EditField`], it
+/// shows the full value past [`CELL_CAP`] truncation, blobs as hex, with
+/// explicit Set NULL and Set DEFAULT actions beside Save.
+#[derive(Clone, Debug)]
+struct CellEditor {
+    row: usize,
+    col: usize,
+    /// The active result the editor opened on, so switching results closes it.
+    result: usize,
+    text: String,
+    /// The seed shows a blob, so the modal warns the save writes text.
+    is_blob: bool,
+    /// Focus is requested on the first frame the modal draws.
+    fresh: bool,
+}
+
+fn cell_editor_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_cell_editor", tab))
+}
+
+fn cell_editor_of(ctx: &egui::Context, tab: TabId) -> Option<CellEditor> {
+    ctx.data(|d| d.get_temp(cell_editor_id(tab)))
+}
+
+fn store_cell_editor(ctx: &egui::Context, tab: TabId, editor: Option<CellEditor>) {
+    ctx.data_mut(|d| match editor {
+        Some(editor) => {
+            d.insert_temp(cell_editor_id(tab), editor);
+        }
+        None => {
+            d.remove::<CellEditor>(cell_editor_id(tab));
+        }
+    });
+}
+
+/// Show the modal and withdraw any inline field, so the two editors never
+/// stage over each other.
+fn show_cell_editor(ctx: &egui::Context, tab: TabId, editor: CellEditor) {
+    store_edit_field(ctx, tab, None);
+    store_cell_editor(ctx, tab, Some(editor));
+}
+
+/// Modal seed for one cell: the staged text when one exists (empty for a
+/// staged DEFAULT, since empty stages NULL), else the full untruncated value
+/// with blobs as hex. The flag says the seed shows a blob.
+fn editor_seed(staged: Option<&str>, cell: Option<&Value>) -> (String, bool) {
+    if let Some(staged) = staged {
+        if staged == STAGED_DEFAULT {
+            return (String::new(), false);
+        }
+        return (staged.to_owned(), false);
+    }
+    match cell {
+        Some(Value::Text(text)) => (text.clone(), false),
+        Some(Value::Blob(bytes)) => (blob_hex(bytes), true),
+        Some(Value::Null) | None => (String::new(), false),
+        Some(value) => (value.display(usize::MAX).into_owned(), false),
+    }
+}
+
+/// Lowercase hex of raw bytes, so a blob is fully visible with no dependency.
+fn blob_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// True when the modal may stage `text`: the byte cap beside the grid's
+/// display truncation.
+fn editor_size_ok(text: &str) -> bool {
+    text.len() <= CELL_EDITOR_LIMIT
+}
+
+/// Open the modal over one result cell: bounds-checked, never on a deleted
+/// row, seeded from the staged text or the full value.
+fn open_cell_editor(tab: &Tab, row: usize, col: usize, result: usize) -> Option<CellEditor> {
+    let (rows, cols) = tab
+        .active_query_result()
+        .map(|result| (result.row_count(), result.columns().len()))?;
+    if row >= rows || col >= cols || tab.is_row_deleted(row) {
+        return None;
+    }
+    let (text, is_blob) = editor_seed(
+        tab.edit_text(row, col),
+        tab.active_query_result().and_then(|result| result.cell(row, col)),
+    );
+    Some(CellEditor { row, col, result, text, is_blob, fresh: true })
+}
+
+/// Stage the SQL DEFAULT keyword for one cell through the normal staged-edit
+/// path, via the [`STAGED_DEFAULT`] marker.
+fn default_stage(row: usize, col: usize) -> EditAction {
+    EditAction::Stage { row, col, text: STAGED_DEFAULT.to_owned() }
+}
+
+/// One-line state above the modal field: the staged edit when one exists,
+/// else the original value with long text and blobs spelled out.
+fn editor_status(tab: &Tab, editor: &CellEditor) -> String {
+    match tab.edit_text(editor.row, editor.col) {
+        Some(staged) if staged == STAGED_DEFAULT => "Staged: DEFAULT".to_owned(),
+        Some("") => "Staged: NULL".to_owned(),
+        Some(staged) => {
+            let preview: String = staged.chars().take(120).collect();
+            let more = if staged.chars().count() > 120 { "…" } else { "" };
+            format!("Staged: {preview}{more}")
+        }
+        None => match tab
+            .active_query_result()
+            .and_then(|result| result.cell(editor.row, editor.col))
+        {
+            Some(Value::Null) | None => "Currently NULL".to_owned(),
+            Some(Value::Text(text)) if text.chars().count() > CELL_CAP => {
+                format!("{} chars; the grid shows the first {CELL_CAP}", text.chars().count())
+            }
+            Some(value) => format!("Currently: {}", value.display(usize::MAX)),
+        },
+    }
+}
+
+/// The dedicated cell editor modal: the full value past the grid's display
+/// truncation with blobs as hex, and Save beside explicit Set NULL and Set
+/// DEFAULT. Every write defers through [`EditAction::Stage`], so the normal
+/// staged-edit path builds the UPDATE on apply. A stale result or a lost
+/// edit target closes it, the way a run closes the inline field.
+fn cell_editor_window(
+    tab: &mut Tab,
+    cols: &[(String, String)],
+    editable: bool,
+    active_result: usize,
+    ui: &mut egui::Ui,
+) -> Vec<EditAction> {
+    let mut actions = Vec::new();
+    let Some(mut editor) = cell_editor_of(ui.ctx(), tab.id) else { return actions };
+    if !editable || editor.result != active_result || cols.get(editor.col).is_none() {
+        store_cell_editor(ui.ctx(), tab.id, None);
+        return actions;
+    }
+    let (name, type_name) = cols[editor.col].clone();
+    let status = editor_status(tab, &editor);
+    let title = format!("Cell editor — {name} (row {})", editor.row + 1);
+    let mut save = false;
+    let mut set_null = false;
+    let mut set_default = false;
+    let mut cancel = false;
+    egui::Window::new(title).collapsible(false).resizable(true).show(ui.ctx(), |ui| {
+        ui.label(egui::RichText::new(format!("{name} · {type_name}")).small().weak());
+        ui.label(egui::RichText::new(status).small().weak());
+        if editor.is_blob {
+            ui.label(
+                egui::RichText::new("The blob shows as hex; saving writes the field as text.")
+                    .small()
+                    .weak(),
+            );
+        }
+        let response = ui.add(
+            egui::TextEdit::multiline(&mut editor.text)
+                .desired_rows(12)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        );
+        if editor.fresh {
+            response.request_focus();
+            editor.fresh = false;
+        }
+        if editor_size_ok(&editor.text) {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} chars · {} bytes",
+                    editor.text.chars().count(),
+                    editor.text.len()
+                ))
+                .small()
+                .weak(),
+            );
+        } else {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!(
+                    "{} bytes pass the {CELL_EDITOR_LIMIT} byte cap; shorten the text or use Set NULL or Set DEFAULT",
+                    editor.text.len()
+                ),
+            );
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(editor_size_ok(&editor.text), egui::Button::new("Save"))
+                .clicked()
+            {
+                save = true;
+            }
+            if ui.button("Set NULL").clicked() {
+                set_null = true;
+            }
+            if ui.button("Set DEFAULT").clicked() {
+                set_default = true;
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+        });
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            cancel = true;
+        }
+        store_cell_editor(ui.ctx(), tab.id, Some(editor.clone()));
+    });
+    let (row, col) = (editor.row, editor.col);
+    if save {
+        actions.push(EditAction::Stage { row, col, text: editor.text.clone() });
+        store_cell_editor(ui.ctx(), tab.id, None);
+    } else if set_null {
+        actions.push(null_stage(row, col));
+        store_cell_editor(ui.ctx(), tab.id, None);
+    } else if set_default {
+        actions.push(default_stage(row, col));
+        store_cell_editor(ui.ctx(), tab.id, None);
+    } else if cancel {
+        store_cell_editor(ui.ctx(), tab.id, None);
+    }
+    actions
+}
+
 /// Stage empty text for one cell. Empty renders as NULL through
 /// [`crate::edit::to_literal`], so Backspace sets NULL.
 fn null_stage(row: usize, col: usize) -> EditAction {
@@ -896,6 +1127,7 @@ fn results_grid(
     if !editable {
         // A run or a target change withdraws editing; drop any open field.
         store_edit_field(ui.ctx(), tab.id, None);
+        store_cell_editor(ui.ctx(), tab.id, None);
     }
     ui.horizontal(|ui| {
         ui.label("Filter");
@@ -1041,6 +1273,7 @@ fn results_grid(
     actions.append(&mut copied);
     let ncols = cols.len();
     let active_result = tab.active_result();
+    let editor_open = cell_editor_of(ui.ctx(), tab.id).is_some();
     let added = tab.added_rows().len();
     let open_field = edit_field_of(ui.ctx(), tab.id);
     let field_cell = open_field
@@ -1182,6 +1415,7 @@ fn results_grid(
                             let deleted = tab.is_row_deleted(r);
                             let staged = tab.edit_text(r, c);
                             let text = match staged {
+                                Some(text) if text == STAGED_DEFAULT => "DEFAULT".to_owned(),
                                 Some(text) => text.to_owned(),
                                 None => tab
                                     .active_query_result()
@@ -1230,14 +1464,22 @@ fn results_grid(
                                 });
                                 gestures.push((r, c, shift, ctrl));
                             }
-                            if !deleted && editable && response.double_clicked() {
-                                let cell = tab
+                            if !deleted && editable && !editor_open && response.double_clicked() {
+                                let blob = tab
                                     .active_query_result()
-                                    .and_then(|result| result.cell(r, c));
-                                let preload = cell
-                                    .map(|v| v.display(usize::MAX).into_owned())
-                                    .unwrap_or_default();
-                                if !matches!(cell, Some(Value::Blob(_))) {
+                                    .and_then(|result| result.cell(r, c))
+                                    .is_some_and(|cell| matches!(cell, Value::Blob(_)));
+                                if blob {
+                                    if let Some(editor) = open_cell_editor(tab, r, c, active_result)
+                                    {
+                                        show_cell_editor(ui.ctx(), tab.id, editor);
+                                    }
+                                } else {
+                                    let preload = tab
+                                        .active_query_result()
+                                        .and_then(|result| result.cell(r, c))
+                                        .map(|v| v.display(usize::MAX).into_owned())
+                                        .unwrap_or_default();
                                     store_edit_field(
                                         ui.ctx(),
                                         tab.id,
@@ -1254,6 +1496,17 @@ fn results_grid(
                             if editable {
                                 let label = if deleted { "Restore row" } else { "Delete row" };
                                 response.context_menu(|ui| {
+                                    if !deleted
+                                        && !editor_open
+                                        && ui.button("Edit cell…").clicked()
+                                    {
+                                        if let Some(editor) =
+                                            open_cell_editor(tab, r, c, active_result)
+                                        {
+                                            show_cell_editor(ui.ctx(), tab.id, editor);
+                                        }
+                                        ui.close();
+                                    }
                                     if ui.button(label).clicked() {
                                         actions.push(EditAction::ToggleDelete(r));
                                         ui.close();
@@ -1272,6 +1525,8 @@ fn results_grid(
     actions.append(&mut keyed);
     let mut clipboard = grid_clipboard_keys(tab, editable, &selection, &visible, modal_open, ui);
     actions.append(&mut clipboard);
+    let mut editor_modal = cell_editor_window(tab, &cols, editable, active_result, ui);
+    actions.append(&mut editor_modal);
     store_selection(ui.ctx(), tab.id, &selection);
     store_grid_view(ui.ctx(), tab.id, &view);
     if let Some(col) = pending_sort {
@@ -1880,7 +2135,8 @@ fn grid_clipboard_keys(
 /// [`grid_clipboard_keys`]: dead while any modal is open, while a cell editor
 /// is open, or while a text field holds focus, so typing never stages rows by
 /// accident. Typing replaces the cell through the staged-edit path, Backspace
-/// stages NULL, Ctrl+D fills the selection, and Ctrl+V arms a paste through
+/// stages NULL, Enter opens the cell editor modal, Ctrl+D fills the selection,
+/// and Ctrl+V arms a paste through
 /// the existing mapping. Hiding and resizing are view state and stay
 /// available read-only, the way sorting does.
 fn grid_edit_keys(
@@ -1937,6 +2193,12 @@ fn grid_edit_keys(
     }
     if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)) {
         actions.push(null_stage(row, col));
+        return actions;
+    }
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+        && let Some(editor) = open_cell_editor(tab, row, col, tab.active_result())
+    {
+        show_cell_editor(ui.ctx(), tab.id, editor);
         return actions;
     }
     if ui.input_mut(|i| i.consume_shortcut(&fill_shortcut())) {
@@ -2506,5 +2768,80 @@ mod tests {
             insert_statement("users", &columns, &staged[0]),
             "INSERT INTO \"users\" (\"id\", \"name\") VALUES (1, 'ada')"
         );
+    }
+
+    #[test]
+    fn cell_editor_null_action_stages_empty_which_renders_null() {
+        let action = null_stage(3, 2);
+        match action {
+            EditAction::Stage { row, col, text } => {
+                assert_eq!((row, col), (3, 2));
+                assert_eq!(text, String::new());
+                assert_eq!(to_literal(&text, false), "NULL");
+            }
+            _ => panic!("Set NULL must stage through the edit path"),
+        }
+    }
+
+    #[test]
+    fn cell_editor_default_action_stages_the_default_keyword() {
+        let action = default_stage(1, 2);
+        match action {
+            EditAction::Stage { row, col, text } => {
+                assert_eq!((row, col), (1, 2));
+                assert_eq!(text, STAGED_DEFAULT);
+                assert_eq!(to_literal(&text, false), "DEFAULT");
+            }
+            _ => panic!("Set DEFAULT must stage through the edit path"),
+        }
+    }
+
+    #[test]
+    fn typed_default_stays_quoted_text() {
+        assert_eq!(to_literal("DEFAULT", false), "'DEFAULT'");
+    }
+
+    #[test]
+    fn cell_editor_seed_shows_full_text_past_the_display_cap() {
+        let long = "x".repeat(CELL_CAP + 50);
+        let value = Value::Text(long.clone());
+        assert!(value.display(CELL_CAP).into_owned().len() < long.len());
+        let (seed, is_blob) = editor_seed(None, Some(&value));
+        assert_eq!(seed, long);
+        assert!(!is_blob);
+        assert_eq!(to_literal(&seed, false), format!("'{long}'"));
+    }
+
+    #[test]
+    fn cell_editor_seed_renders_blobs_as_hex_and_null_as_empty() {
+        let blob = Value::Blob(vec![0xDE, 0xAD, 0x00, 0xFF]);
+        assert_eq!(editor_seed(None, Some(&blob)), ("dead00ff".to_owned(), true));
+        assert_eq!(editor_seed(None, Some(&Value::Null)), (String::new(), false));
+        assert_eq!(editor_seed(None, None), (String::new(), false));
+        assert_eq!(
+            editor_seed(None, Some(&Value::Integer(7))),
+            ("7".to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn cell_editor_seed_prefers_the_staged_text() {
+        let value = Value::Text("orig".to_owned());
+        assert_eq!(
+            editor_seed(Some("edited"), Some(&value)),
+            ("edited".to_owned(), false)
+        );
+        assert_eq!(editor_seed(Some(""), Some(&value)), (String::new(), false));
+        assert_eq!(
+            editor_seed(Some(STAGED_DEFAULT), Some(&value)),
+            (String::new(), false)
+        );
+    }
+
+    #[test]
+    fn cell_editor_size_guard_caps_staging_at_one_million_bytes() {
+        assert!(editor_size_ok(""));
+        assert!(editor_size_ok(&"a".repeat(CELL_EDITOR_LIMIT)));
+        assert!(!editor_size_ok(&"a".repeat(CELL_EDITOR_LIMIT + 1)));
     }
 }

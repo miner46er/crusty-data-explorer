@@ -160,10 +160,19 @@ fn lex(sql: &str) -> Vec<Token> {
     tokens
 }
 
+/// Staged text meaning the SQL `DEFAULT` keyword. A control-wrapped marker
+/// rather than the bare word, so typing DEFAULT as plain text still quotes
+/// as `'DEFAULT'` through [`to_literal`].
+pub const STAGED_DEFAULT: &str = "\u{241e}DEFAULT\u{241e}";
+
 /// One cell text as a SQL literal. An empty text or a value the caller knows
-/// to be NULL renders as `NULL`; a text that parses as a number stays bare;
-/// everything else is single-quoted with quotes doubled.
+/// to be NULL renders as `NULL`; the [`STAGED_DEFAULT`] marker renders as
+/// `DEFAULT`; a text that parses as a number stays bare; everything else is
+/// single-quoted with quotes doubled.
 pub fn to_literal(text: &str, was_null: bool) -> String {
+    if text == STAGED_DEFAULT {
+        return "DEFAULT".to_owned();
+    }
     if text.is_empty() || was_null {
         return "NULL".to_owned();
     }
