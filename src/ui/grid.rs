@@ -13,9 +13,7 @@ use crate::db::{CELL_CAP, QueryResult, TabId, Value};
 use crate::export::{to_csv, to_in_list, to_inserts, to_json, to_markdown, to_tsv};
 use crate::import::{ParsedCsv, parse_csv};
 
-const AFFECT_GREEN: egui::Color32 = egui::Color32::from_rgb(115, 180, 115);
-/// Translucent amber over a cell with a staged edit.
-const EDIT_TINT: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(227, 179, 65, 64);
+use super::Palette;
 
 /// Identity of the result a [`Selection`] was made on. A new run, a result
 /// switch, or a shape change carries a new id and clears the selection.
@@ -594,13 +592,14 @@ fn results_grid(
 ) -> Vec<EditAction> {
     let mut actions = Vec::new();
     result_tabs(tab, ui);
+    let palette = Palette::of(ui.ctx().theme());
     let (cols, total) = {
         let Some(result) = tab.active_query_result() else { return actions };
         if result.columns().is_empty() {
             match result.affected() {
                 Some(n) => {
                     ui.colored_label(
-                        AFFECT_GREEN,
+                        palette.success,
                         egui::RichText::new(format!("✓ {n} rows affected")).strong(),
                     );
                 }
@@ -718,7 +717,7 @@ fn results_grid(
         if tab.export_failed() {
             ui.colored_label(ui.visuals().error_fg_color, notice);
         } else {
-            ui.colored_label(AFFECT_GREEN, notice);
+            ui.colored_label(palette.success, notice);
         }
     }
     let (sort_col, sort_dir, filter) = (tab.sort_col(), tab.sort_dir(), tab.filter().to_owned());
@@ -880,7 +879,7 @@ fn results_grid(
                                 ui.painter().rect_filled(
                                     cell_rect,
                                     egui::CornerRadius::ZERO,
-                                    EDIT_TINT,
+                                    palette.edit_tint,
                                 );
                             }
                             let label = if deleted {

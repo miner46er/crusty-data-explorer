@@ -27,7 +27,7 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     connections::password_window(state, ui);
 }
 
-fn status_bar(state: &AppState, ui: &mut egui::Ui) {
+fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         let live = state
             .connections()
@@ -76,6 +76,13 @@ fn status_bar(state: &AppState, ui: &mut egui::Ui) {
             }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let label = match state.theme() {
+                Theme::Dark => "☀ Light",
+                Theme::Light => "🌙 Dark",
+            };
+            if ui.button(label).on_hover_text("Flip the app theme").clicked() {
+                state.toggle_theme();
+            }
             let backend = state
                 .active()
                 .and_then(|id| state.tab(id))
@@ -87,59 +94,242 @@ fn status_bar(state: &AppState, ui: &mut egui::Ui) {
     });
 }
 
-/// Dark Beekeeper-ish visuals, installed once at startup.
-pub fn install(ctx: &egui::Context) {
-    ctx.all_styles_mut(|style| {
-        let mut visuals = egui::Visuals::dark();
-        visuals.dark_mode = true;
-        visuals.window_fill = egui::Color32::from_rgb(24, 29, 37);
-        visuals.panel_fill = egui::Color32::from_rgb(32, 39, 50);
-        visuals.faint_bg_color = egui::Color32::from_rgb(42, 50, 63);
-        visuals.extreme_bg_color = egui::Color32::from_rgb(18, 23, 30);
-        visuals.code_bg_color = egui::Color32::from_rgb(40, 48, 60);
-        visuals.selection.bg_fill = egui::Color32::from_rgb(58, 110, 165);
-        visuals.selection.stroke =
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(192, 222, 255));
-        visuals.hyperlink_color = egui::Color32::from_rgb(120, 170, 220);
-        visuals.window_corner_radius = egui::CornerRadius::same(6);
-        visuals.menu_corner_radius = egui::CornerRadius::same(6);
-        for widget in [
-            &mut visuals.widgets.noninteractive,
-            &mut visuals.widgets.inactive,
-            &mut visuals.widgets.hovered,
-            &mut visuals.widgets.active,
-            &mut visuals.widgets.open,
-        ] {
-            widget.corner_radius = egui::CornerRadius::same(4);
+/// App theme. Dark is the default and the pre-theme behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Theme {
+    pub fn egui(self) -> egui::Theme {
+        match self {
+            Theme::Dark => egui::Theme::Dark,
+            Theme::Light => egui::Theme::Light,
         }
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(58, 110, 165);
-        visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(58, 110, 165);
-        style.visuals = visuals;
+    }
+    /// The opposite theme, so the status-bar toggle is one call.
+    pub fn flipped(self) -> Theme {
+        match self {
+            Theme::Dark => Theme::Light,
+            Theme::Light => Theme::Dark,
+        }
+    }
+    pub fn from_egui(theme: egui::Theme) -> Theme {
+        match theme {
+            egui::Theme::Dark => Theme::Dark,
+            egui::Theme::Light => Theme::Light,
+        }
+    }
+}
 
-        style.spacing.item_spacing = egui::vec2(8.0, 4.0);
-        style.spacing.button_padding = egui::vec2(10.0, 6.0);
-        style.spacing.indent = 16.0;
+/// Every app-specific color the modules use, resolved from the egui theme.
+/// Module constants read through this instead of hardcoding dark values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    pub accent: egui::Color32,
+    pub success: egui::Color32,
+    pub edit_tint: egui::Color32,
+    pub keyword: egui::Color32,
+    pub string: egui::Color32,
+    pub comment: egui::Color32,
+    pub number: egui::Color32,
+    pub badge_dev: egui::Color32,
+    pub badge_test: egui::Color32,
+    pub badge_prod: egui::Color32,
+}
 
-        use egui::{FontFamily, FontId, TextStyle};
-        style.text_styles.insert(
-            TextStyle::Heading,
-            FontId::new(16.0, FontFamily::Proportional),
+impl Palette {
+    pub fn dark() -> Self {
+        Self {
+            accent: egui::Color32::from_rgb(58, 110, 165),
+            success: egui::Color32::from_rgb(115, 180, 115),
+            edit_tint: egui::Color32::from_rgba_unmultiplied(227, 179, 65, 64),
+            keyword: egui::Color32::from_rgb(120, 170, 220),
+            string: egui::Color32::from_rgb(140, 200, 150),
+            comment: egui::Color32::from_rgb(130, 140, 155),
+            number: egui::Color32::from_rgb(220, 170, 110),
+            badge_dev: egui::Color32::from_rgb(148, 155, 166),
+            badge_test: egui::Color32::from_rgb(227, 179, 65),
+            badge_prod: egui::Color32::from_rgb(224, 91, 91),
+        }
+    }
+    pub fn light() -> Self {
+        Self {
+            accent: egui::Color32::from_rgb(58, 110, 165),
+            success: egui::Color32::from_rgb(56, 142, 60),
+            edit_tint: egui::Color32::from_rgba_unmultiplied(227, 179, 65, 64),
+            keyword: egui::Color32::from_rgb(25, 118, 210),
+            string: egui::Color32::from_rgb(46, 125, 50),
+            comment: egui::Color32::from_rgb(110, 119, 129),
+            number: egui::Color32::from_rgb(170, 100, 30),
+            badge_dev: egui::Color32::from_rgb(95, 105, 115),
+            badge_test: egui::Color32::from_rgb(150, 110, 15),
+            badge_prod: egui::Color32::from_rgb(190, 60, 60),
+        }
+    }
+    /// The palette for the current egui theme.
+    pub fn of(theme: egui::Theme) -> Self {
+        match theme {
+            egui::Theme::Dark => Self::dark(),
+            egui::Theme::Light => Self::light(),
+        }
+    }
+}
+/// Spacing and text setup shared by both themes.
+fn apply_shared(style: &mut egui::Style) {
+    style.spacing.item_spacing = egui::vec2(8.0, 4.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.indent = 16.0;
+
+    use egui::{FontFamily, FontId, TextStyle};
+    style.text_styles.insert(
+        TextStyle::Heading,
+        FontId::new(16.0, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        TextStyle::Body,
+        FontId::new(13.0, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        TextStyle::Button,
+        FontId::new(13.0, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        TextStyle::Small,
+        FontId::new(11.0, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        TextStyle::Monospace,
+        FontId::new(12.5, FontFamily::Monospace),
+    );
+}
+
+/// Dark Beekeeper-ish visuals, byte-identical to the pre-theme setup.
+fn dark_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.dark_mode = true;
+    visuals.window_fill = egui::Color32::from_rgb(24, 29, 37);
+    visuals.panel_fill = egui::Color32::from_rgb(32, 39, 50);
+    visuals.faint_bg_color = egui::Color32::from_rgb(42, 50, 63);
+    visuals.extreme_bg_color = egui::Color32::from_rgb(18, 23, 30);
+    visuals.code_bg_color = egui::Color32::from_rgb(40, 48, 60);
+    visuals.selection.bg_fill = egui::Color32::from_rgb(58, 110, 165);
+    visuals.selection.stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(192, 222, 255));
+    visuals.hyperlink_color = egui::Color32::from_rgb(120, 170, 220);
+    visuals.window_corner_radius = egui::CornerRadius::same(6);
+    visuals.menu_corner_radius = egui::CornerRadius::same(6);
+    for widget in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.corner_radius = egui::CornerRadius::same(4);
+    }
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(58, 110, 165);
+    visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(58, 110, 165);
+    visuals
+}
+
+fn light_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::light();
+    visuals.dark_mode = false;
+    visuals.window_fill = egui::Color32::from_rgb(242, 244, 247);
+    visuals.panel_fill = egui::Color32::from_rgb(236, 238, 242);
+    visuals.faint_bg_color = egui::Color32::from_rgb(228, 231, 236);
+    visuals.extreme_bg_color = egui::Color32::from_rgb(225, 228, 233);
+    visuals.code_bg_color = egui::Color32::from_rgb(240, 242, 245);
+    visuals.selection.bg_fill = egui::Color32::from_rgb(58, 110, 165);
+    visuals.selection.stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(30, 80, 140));
+    visuals.hyperlink_color = egui::Color32::from_rgb(25, 118, 210);
+    visuals.window_corner_radius = egui::CornerRadius::same(6);
+    visuals.menu_corner_radius = egui::CornerRadius::same(6);
+    for widget in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.corner_radius = egui::CornerRadius::same(4);
+    }
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(58, 110, 165);
+    visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(58, 110, 165);
+    visuals
+}
+
+fn dark_style() -> egui::Style {
+    let mut style = egui::Style::default();
+    style.visuals = dark_visuals();
+    apply_shared(&mut style);
+    style
+}
+
+fn light_style() -> egui::Style {
+    let mut style = egui::Style::default();
+    style.visuals = light_visuals();
+    apply_shared(&mut style);
+    style
+}
+
+/// Flip the live theme: set the preference and re-apply both palettes, so a
+/// flip mid-session repaints the whole app on the next frame.
+pub fn apply_theme(ctx: &egui::Context, theme: Theme) {
+    ctx.set_theme(theme.egui());
+    ctx.set_style_of(egui::Theme::Dark, dark_style());
+    ctx.set_style_of(egui::Theme::Light, light_style());
+}
+
+/// Theme setup, installed once at startup. Defaults to dark, the pre-theme
+/// behavior; `AppState::new` re-applies the persisted choice.
+pub fn install(ctx: &egui::Context) {
+    apply_theme(ctx, Theme::Dark);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn palette_apply_both_ways_paints_each_bucket() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx, Theme::Dark);
+        assert_eq!(
+            ctx.style_of(egui::Theme::Dark).visuals.window_fill,
+            egui::Color32::from_rgb(24, 29, 37)
         );
-        style.text_styles.insert(
-            TextStyle::Body,
-            FontId::new(13.0, FontFamily::Proportional),
+        assert_eq!(
+            ctx.style_of(egui::Theme::Light).visuals.window_fill,
+            egui::Color32::from_rgb(242, 244, 247)
         );
-        style.text_styles.insert(
-            TextStyle::Button,
-            FontId::new(13.0, FontFamily::Proportional),
+        apply_theme(&ctx, Theme::Light);
+        assert_eq!(
+            ctx.style_of(egui::Theme::Dark).visuals.window_fill,
+            egui::Color32::from_rgb(24, 29, 37)
         );
-        style.text_styles.insert(
-            TextStyle::Small,
-            FontId::new(11.0, FontFamily::Proportional),
+        assert_eq!(
+            ctx.style_of(egui::Theme::Light).visuals.window_fill,
+            egui::Color32::from_rgb(242, 244, 247)
         );
-        style.text_styles.insert(
-            TextStyle::Monospace,
-            FontId::new(12.5, FontFamily::Monospace),
-        );
-    });
+    }
+
+    #[test]
+    fn resolved_palette_carries_each_theme_literal() {
+        let dark = Palette::of(egui::Theme::Dark);
+        assert_eq!(dark.accent, egui::Color32::from_rgb(58, 110, 165));
+        assert_eq!(dark.success, egui::Color32::from_rgb(115, 180, 115));
+        assert_eq!(dark.keyword, egui::Color32::from_rgb(120, 170, 220));
+        let light = Palette::of(egui::Theme::Light);
+        assert_eq!(light.accent, egui::Color32::from_rgb(58, 110, 165));
+        assert_eq!(light.success, egui::Color32::from_rgb(56, 142, 60));
+        assert_eq!(light.keyword, egui::Color32::from_rgb(25, 118, 210));
+        assert_ne!(dark.success, light.success);
+        assert_ne!(dark.keyword, light.keyword);
+    }
 }

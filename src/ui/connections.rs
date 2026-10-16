@@ -8,8 +8,7 @@ use crate::app::{AppState, ConnectionState, Environment};
 use crate::db::{ConnectionConfig, ConnectionId, PostgresSslMode, parse_connection_url};
 use crate::ssh::{SshAuth, SshConfig};
 
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(58, 110, 165);
-const LIVE_GREEN: egui::Color32 = egui::Color32::from_rgb(115, 180, 115);
+use super::{Palette, Theme};
 
 enum ConnectionStateKind {
     Live,
@@ -41,7 +40,7 @@ fn history_title(sql: &str) -> String {
 }
 
 fn env_badge(ui: &mut egui::Ui, env: Environment) {
-    let color = env.badge_color();
+    let color = env.badge_color(Theme::from_egui(ui.ctx().theme()));
     egui::Frame::NONE
         .fill(color.gamma_multiply(0.2))
         .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.6)))
@@ -56,11 +55,12 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
     // root() pumps this module through the sidebar, so the prod confirm
     // renders with the connect gestures that raise it.
     prod_confirm_window(state, ui);
+    let palette = Palette::of(ui.ctx().theme());
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
         if ui
             .add_sized(
                 [ui.available_width(), 28.0],
-                egui::Button::new(egui::RichText::new("+ New connection").strong()).fill(ACCENT),
+                egui::Button::new(egui::RichText::new("+ New connection").strong()).fill(palette.accent),
             )
             .clicked()
         {
@@ -117,7 +117,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                             ConnectionState::Disconnected => egui::Color32::GRAY,
                             ConnectionState::Connecting { .. } => egui::Color32::YELLOW,
                             ConnectionState::Connected { .. }
-                            | ConnectionState::QueryRunning { .. } => LIVE_GREEN,
+                            | ConnectionState::QueryRunning { .. } => palette.success,
                             ConnectionState::Error { .. } => egui::Color32::RED,
                         };
                         (c.id, color)
@@ -137,7 +137,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                         ui.visuals().faint_bg_color
                     };
                     let frame_stroke = if selected {
-                        egui::Stroke::new(1.0, ACCENT)
+                        egui::Stroke::new(1.0, palette.accent)
                     } else {
                         ui.visuals().widgets.noninteractive.bg_stroke
                     };
@@ -188,7 +188,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                                                         .small()
                                                         .strong(),
                                                 )
-                                                .fill(ACCENT)
+                                                .fill(palette.accent)
                                                 .small(),
                                             )
                                             .clicked()
@@ -252,7 +252,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                     ui.label(egui::RichText::new("No runs yet.").small().weak());
                 } else {
                     for entry in state.history().iter().take(crate::app::HISTORY_SHOWN) {
-                        let dot = if entry.succeeded { LIVE_GREEN } else { egui::Color32::RED };
+                        let dot = if entry.succeeded { palette.success } else { egui::Color32::RED };
                         ui.horizontal(|ui| {
                             ui.colored_label(dot, "●");
                             if ui.small_button(history_title(&entry.sql)).clicked() {

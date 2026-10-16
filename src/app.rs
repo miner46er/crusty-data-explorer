@@ -480,12 +480,13 @@ impl Environment {
             Environment::Prod => "Prod",
         }
     }
-    /// Badge tint. Neutral for dev, amber for test, red for prod.
-    pub fn badge_color(self) -> eframe::egui::Color32 {
+    /// Badge tint per theme. Neutral for dev, amber for test, red for prod.
+    pub fn badge_color(self, theme: crate::ui::Theme) -> eframe::egui::Color32 {
+        let palette = crate::ui::Palette::of(theme.egui());
         match self {
-            Environment::Dev => eframe::egui::Color32::from_rgb(148, 155, 166),
-            Environment::Test => eframe::egui::Color32::from_rgb(227, 179, 65),
-            Environment::Prod => eframe::egui::Color32::from_rgb(224, 91, 91),
+            Environment::Dev => palette.badge_dev,
+            Environment::Test => palette.badge_test,
+            Environment::Prod => palette.badge_prod,
         }
     }
 }
@@ -539,6 +540,7 @@ pub struct AppState {
     saved: Vec<SavedQuery>,
     save_prompt: Option<SavePrompt>,
     imports: Option<ImportDraft>,
+    theme: crate::ui::Theme,
 }
 
 impl AppState {
@@ -548,6 +550,8 @@ impl AppState {
         ids.resume_after(&profiles.iter().map(|c| c.id).collect::<Vec<_>>());
         let saved = load_saved_queries();
         ids.resume_after_saved(&saved.iter().map(|q| q.id).collect::<Vec<_>>());
+        let settings = load_settings();
+        crate::ui::apply_theme(egui_ctx, settings.theme);
         let (events_tx, events_rx) = mpsc::channel();
         let mut state = Self {
             connections: profiles,
@@ -569,9 +573,27 @@ impl AppState {
             saved,
             save_prompt: None,
             imports: None,
+            theme: settings.theme,
         };
         state.restore_tabs();
         state
+    }
+
+    /// The current app theme, flipped from the status bar.
+    pub fn theme(&self) -> crate::ui::Theme {
+        self.theme
+    }
+
+    /// Apply one theme now and persist the choice, so it survives relaunch.
+    pub fn set_theme(&mut self, theme: crate::ui::Theme) {
+        self.theme = theme;
+        crate::ui::apply_theme(&self.ui_ctx, theme);
+        self.persist_settings();
+    }
+
+    /// Flip dark to light and back, through [`AppState::set_theme`].
+    pub fn toggle_theme(&mut self) {
+        self.set_theme(self.theme.flipped());
     }
 
     /// Reload the saved tabs as fresh tabs in file order. A row bound to a
@@ -1814,6 +1836,12 @@ impl AppState {
             log::warn!("persist tabs: {e}");
         }
     }
+
+    fn persist_settings(&self) {
+        if let Err(e) = save_settings(&Settings { theme: self.theme }) {
+            log::warn!("persist settings: {e}");
+        }
+    }
 }
 
 impl eframe::App for AppState {
@@ -1825,6 +1853,7 @@ impl eframe::App for AppState {
     }
     fn on_exit(&mut self) {
         self.persist_tabs();
+        self.persist_settings();
     }
 }
 
@@ -2011,6 +2040,44 @@ fn save_tabs(tabs: &[Tab]) -> std::io::Result<()> {
         .collect();
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&persisted).unwrap_or_default())?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// App settings beside the other stores. One field today, extendable later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+struct Settings {
+    #[serde(default)]
+    theme: crate::ui::Theme,
+}
+
+fn settings_path() -> std::path::PathBuf {
+    profiles_path().with_file_name("settings.json")
+}
+
+/// The saved choice, or dark when no settings file exists yet.
+fn load_settings() -> Settings {
+    let path = settings_path();
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return Settings::default(),
+    };
+    match serde_json::from_slice::<Settings>(&bytes) {
+        Ok(settings) => settings,
+        Err(e) => {
+            log::warn!("parse {}: {e}", path.display());
+            Settings::default()
+        }
+    }
+}
+
+fn save_settings(settings: &Settings) -> std::io::Result<()> {
+    let path = settings_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(settings).unwrap_or_default())?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
@@ -3560,9 +3627,61 @@ mod tests {
         assert_eq!(serde_json::to_string(&Environment::Dev).unwrap(), "\"dev\"");
         assert_eq!(serde_json::to_string(&Environment::Test).unwrap(), "\"test\"");
         assert_eq!(serde_json::to_string(&Environment::Prod).unwrap(), "\"prod\"");
-        assert_ne!(Environment::Dev.badge_color(), Environment::Test.badge_color());
-        assert_ne!(Environment::Test.badge_color(), Environment::Prod.badge_color());
-        assert_ne!(Environment::Dev.badge_color(), Environment::Prod.badge_color());
+        assert_ne!(
+            Environment::Dev.badge_color(crate::ui::Theme::Dark),
+            Environment::Test.badge_color(crate::ui::Theme::Dark)
+        );
+        assert_ne!(
+            Environment::Test.badge_color(crate::ui::Theme::Dark),
+            Environment::Prod.badge_color(crate::ui::Theme::Dark)
+        );
+        assert_ne!(
+            Environment::Dev.badge_color(crate::ui::Theme::Dark),
+            Environment::Prod.badge_color(crate::ui::Theme::Dark)
+        );
+        assert_eq!(
+            Environment::Dev.badge_color(crate::ui::Theme::Dark),
+            eframe::egui::Color32::from_rgb(148, 155, 166)
+        );
+        assert_eq!(
+            Environment::Dev.badge_color(crate::ui::Theme::Light),
+            eframe::egui::Color32::from_rgb(95, 105, 115)
+        );
+    }
+
+    #[test]
+    fn theme_toggle_flips_and_reapplies() {
+        with_isolated_state("theme-toggle", |state| {
+            assert_eq!(state.theme(), crate::ui::Theme::Dark);
+            state.toggle_theme();
+            assert_eq!(state.theme(), crate::ui::Theme::Light);
+            assert_eq!(state.ui_ctx.theme(), eframe::egui::Theme::Light);
+            state.toggle_theme();
+            assert_eq!(state.theme(), crate::ui::Theme::Dark);
+            assert_eq!(state.ui_ctx.theme(), eframe::egui::Theme::Dark);
+        });
+    }
+
+    #[test]
+    fn theme_roundtrips_through_save_and_load() {
+        with_isolated_state("theme-round", |state| {
+            state.set_theme(crate::ui::Theme::Light);
+            let raw = std::fs::read_to_string(settings_path()).expect("settings file");
+            let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(json["theme"], serde_json::json!("light"));
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.theme(), crate::ui::Theme::Light);
+        });
+    }
+
+    #[test]
+    fn missing_settings_file_starts_dark() {
+        with_isolated_state("theme-missing", |state| {
+            let _ = std::fs::remove_file(settings_path());
+            let fresh = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(fresh.theme(), crate::ui::Theme::Dark);
+            assert_eq!(state.theme(), crate::ui::Theme::Dark);
+        });
     }
 
     #[test]

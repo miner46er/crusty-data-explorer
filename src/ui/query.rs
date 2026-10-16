@@ -9,7 +9,7 @@ use super::editor::{char_range, format_sql, FindState};
 use crate::app::{AppState, RunOutcome, RunScope};
 use crate::db::TabId;
 
-const RUN_GREEN: egui::Color32 = egui::Color32::from_rgb(115, 180, 115);
+use super::Palette;
 
 pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     prune_find(state, ui.ctx());
@@ -154,7 +154,8 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                     });
                 run_clicked = ui
                     .add(
-                        egui::Button::new(egui::RichText::new("▶ Run").strong()).fill(RUN_GREEN),
+                        egui::Button::new(egui::RichText::new("▶ Run").strong())
+                            .fill(Palette::of(ui.ctx().theme()).success),
                     )
                     .clicked();
                 explain_clicked = ui

@@ -14,6 +14,8 @@ use eframe::egui;
 use super::editor;
 use crate::db::{SchemaInfo, TabId};
 
+use super::Palette;
+
 /// Cap on rows returned by [`suggest`].
 pub const SUGGEST_CAP: usize = 50;
 
@@ -372,8 +374,9 @@ pub fn editor_with_completion(
         .cloned()
         .unwrap_or_else(|| egui::FontId::monospace(12.5));
     let plain = ui.visuals().text_color();
+    let palette = Palette::of(ui.ctx().theme());
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-        ui.fonts_mut(|f| f.layout_job(syntax_job(buf.as_str(), &font, plain, wrap_width)))
+        ui.fonts_mut(|f| f.layout_job(syntax_job(buf.as_str(), &font, plain, &palette, wrap_width)))
     };
     let out = egui::TextEdit::multiline(sql)
         .code_editor()
@@ -437,18 +440,12 @@ pub fn editor_with_completion(
     ui.ctx().data_mut(|data| data.insert_temp(id, state));
 }
 
-/// Span colors picked from the dark palette in `ui::mod`.
-const KEYWORD_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 170, 220);
-const STRING_COLOR: egui::Color32 = egui::Color32::from_rgb(140, 200, 150);
-const COMMENT_COLOR: egui::Color32 = egui::Color32::from_rgb(130, 140, 155);
-const NUMBER_COLOR: egui::Color32 = egui::Color32::from_rgb(220, 170, 110);
-
-fn span_color(kind: editor::Kind) -> egui::Color32 {
+fn span_color(palette: &Palette, kind: editor::Kind) -> egui::Color32 {
     match kind {
-        editor::Kind::Keyword => KEYWORD_COLOR,
-        editor::Kind::Str => STRING_COLOR,
-        editor::Kind::Comment => COMMENT_COLOR,
-        editor::Kind::Number => NUMBER_COLOR,
+        editor::Kind::Keyword => palette.keyword,
+        editor::Kind::Str => palette.string,
+        editor::Kind::Comment => palette.comment,
+        editor::Kind::Number => palette.number,
     }
 }
 
@@ -466,6 +463,7 @@ fn syntax_job(
     text: &str,
     font: &egui::FontId,
     plain: egui::Color32,
+    palette: &Palette,
     wrap_width: f32,
 ) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
@@ -482,7 +480,7 @@ fn syntax_job(
             job.append(
                 &line[span.start..span.end],
                 0.0,
-                text_format(font, span_color(span.kind)),
+                text_format(font, span_color(palette, span.kind)),
             );
             last = span.end;
         }
@@ -630,10 +628,12 @@ mod tests {
     #[test]
     fn syntax_job_preserves_text_and_colors_spans() {
         let text = "select 'a' from t";
+        let palette = Palette::dark();
         let job = syntax_job(
             text,
             &egui::FontId::monospace(12.0),
             egui::Color32::WHITE,
+            &palette,
             400.0,
         );
         let rebuilt: String = job
@@ -650,8 +650,8 @@ mod tests {
                 })
                 .map(|s| s.format.color)
         };
-        assert_eq!(color(0..6), Some(KEYWORD_COLOR));
+        assert_eq!(color(0..6), Some(palette.keyword));
         assert_eq!(color(6..7), Some(egui::Color32::WHITE));
-        assert_eq!(color(7..10), Some(STRING_COLOR));
+        assert_eq!(color(7..10), Some(palette.string));
     }
 }
