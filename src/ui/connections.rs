@@ -7,7 +7,7 @@ use eframe::egui;
 
 use crate::app::{
     AppState, Connection, ConnectionState, Environment, FolderNode, SavedQuery,
-    connection_folder_tree, normalize_folder_path, saved_folder_tree,
+    SavedQueryVersion, connection_folder_tree, normalize_folder_path, saved_folder_tree,
 };
 use crate::db::{ConnectionConfig, ConnectionId, MysqlSslMode, PostgresSslMode, parse_connection_url};
 use crate::ssh::{SshAuth, SshConfig};
@@ -35,6 +35,8 @@ enum SidebarAction {
     ClearHistory,
     OpenSaved(u64),
     DeleteSaved(u64),
+    RestoreSavedVersion(u64, usize),
+    OpenSavedVersion(u64, usize),
     MoveSaved(u64, Option<String>),
     MoveConnection(ConnectionId, Option<String>),
     NewConnectionInFolder(String),
@@ -239,35 +241,129 @@ fn env_badge(ui: &mut egui::Ui, env: Environment) {
         });
 }
 
-/// One saved-query row: pin mark, open button, connection name, delete. The
-/// name button is the drag source: dragging it onto a folder header moves
-/// the entry there through [`SidebarAction::MoveSaved`].
+/// Temp-data id for one saved entry's version list collapse state.
+fn saved_versions_open_id(id: u64) -> egui::Id {
+    egui::Id::new(("crusty_saved_versions_open", id))
+}
+
+/// Whether one saved entry's version list renders expanded. Defaults to
+/// collapsed, so rows stay one line until asked.
+fn saved_versions_open(ctx: &egui::Context, id: u64) -> bool {
+    ctx.data_mut(|d| d.get_temp(saved_versions_open_id(id))).unwrap_or(false)
+}
+
+/// Flip one saved entry's version list collapse state.
+fn set_saved_versions_open(ctx: &egui::Context, id: u64, open: bool) {
+    ctx.data_mut(|d| d.insert_temp(saved_versions_open_id(id), open));
+}
+
+/// One version row label: its recency rank (v1 is newest) plus the truncated
+/// first line, so identical texts still tell apart by rank.
+fn saved_version_label(index: usize, version: &SavedQueryVersion) -> String {
+    format!("v{} · {}", index + 1, history_title(&version.sql))
+}
+
+/// The sidebar's restore gesture: restore one version's text into its saved
+/// entry, then open the entry so the restored text lands in a tab. True only
+/// when the version existed. Preview uses `open_saved_version` directly.
+pub(crate) fn restore_version_then_open(state: &mut AppState, id: u64, index: usize) -> bool {
+    if state.restore_saved_version(id, index) {
+        state.open_saved(id);
+        true
+    } else {
+        false
+    }
+}
+
+/// Whether a modal owns the keyboard, mirroring the editor's gate, so the
+/// version Restore and Preview buttons stay disabled under one.
+fn sidebar_modal_open(state: &AppState) -> bool {
+    state.draft().is_some()
+        || state.save_prompt().is_some()
+        || state.password_prompt().is_some()
+        || state.import_draft().is_some()
+        || state.pending_write().is_some()
+        || state.pending_params().is_some()
+        || state.pending_edit_preview().is_some()
+        || state.palette_open()
+}
+
+/// One saved-query row: pin mark, open button, connection name, delete, plus
+/// a collapsible version list. The list renders `versions` newest first with
+/// one Restore button (restore into the entry, then open it) and one Preview
+/// button (open the old text without touching the entry) per row. Clicks
+/// collect into `actions` like every other saved gesture, applied after the
+/// borrow ends; both buttons stay disabled while a modal is open.
 fn saved_row(
     ui: &mut egui::Ui,
     palette: &Palette,
     query: &SavedQuery,
+    versions: &[SavedQueryVersion],
+    modal_open: bool,
     conn_names: &HashMap<ConnectionId, String>,
     actions: &mut Vec<SidebarAction>,
 ) {
-    ui.horizontal(|ui| {
-        if query.pinned {
-            ui.label(egui::RichText::new("★").small().color(palette.accent));
-        }
-        let name = ui
-            .dnd_drag_source(
-                egui::Id::new(("crusty_saved_drag", query.id)),
-                SavedDrag { id: query.id },
-                |ui| ui.small_button(&query.name),
-            )
-            .inner;
-        let name = name.on_hover_text("drag onto a folder to move");
-        if name.clicked() {
-            actions.push(SidebarAction::OpenSaved(query.id));
-        }
-        let conn_name = conn_names.get(&query.conn).map(String::as_str).unwrap_or("deleted");
-        ui.label(egui::RichText::new(conn_name).small().weak());
-        if ui.small_button("Delete").clicked() {
-            actions.push(SidebarAction::DeleteSaved(query.id));
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            if query.pinned {
+                ui.label(egui::RichText::new("★").small().color(palette.accent));
+            }
+            let name = ui
+                .dnd_drag_source(
+                    egui::Id::new(("crusty_saved_drag", query.id)),
+                    SavedDrag { id: query.id },
+                    |ui| ui.small_button(&query.name),
+                )
+                .inner;
+            let name = name.on_hover_text("drag onto a folder to move");
+            if name.clicked() {
+                actions.push(SidebarAction::OpenSaved(query.id));
+            }
+            let conn_name = conn_names.get(&query.conn).map(String::as_str).unwrap_or("deleted");
+            ui.label(egui::RichText::new(conn_name).small().weak());
+            if ui.small_button("Delete").clicked() {
+                actions.push(SidebarAction::DeleteSaved(query.id));
+            }
+            if !versions.is_empty() {
+                let open = saved_versions_open(ui.ctx(), query.id);
+                let arrow = if open { "▾" } else { "▸" };
+                if ui
+                    .small_button(format!("{arrow} History ({})", versions.len()))
+                    .on_hover_text("Show per-save versions, newest first")
+                    .clicked()
+                {
+                    set_saved_versions_open(ui.ctx(), query.id, !open);
+                }
+            }
+        });
+        if saved_versions_open(ui.ctx(), query.id) && !versions.is_empty() {
+            indented(ui, 1, |ui| {
+                for (index, version) in versions.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(saved_version_label(index, version)).small().weak(),
+                        )
+                        .on_hover_text(version.sql.clone());
+                        if ui
+                            .add_enabled(
+                                !modal_open,
+                                egui::Button::new("Restore").small(),
+                            )
+                            .on_hover_text("Restore this text into the entry and open it")
+                            .clicked()
+                        {
+                            actions.push(SidebarAction::RestoreSavedVersion(query.id, index));
+                        }
+                        if ui
+                            .add_enabled(!modal_open, egui::Button::new("Preview").small())
+                            .on_hover_text("Open this text in a tab without changing the entry")
+                            .clicked()
+                        {
+                            actions.push(SidebarAction::OpenSavedVersion(query.id, index));
+                        }
+                    });
+                }
+            });
         }
     });
 }
@@ -854,10 +950,16 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                     folder_creation_editor(ui, "saved", "");
                 }
                 ui.add_space(4.0);
+                let modal_open = sidebar_modal_open(state);
                 let conn_names: HashMap<ConnectionId, String> = state
                     .connections()
                     .iter()
                     .map(|c| (c.id, c.name.clone()))
+                    .collect();
+                let saved_versions: HashMap<u64, Vec<SavedQueryVersion>> = state
+                    .saved_queries()
+                    .iter()
+                    .map(|q| (q.id, state.saved_versions(q.id)))
                     .collect();
                 let saved_plan: Vec<SavedPlan<'_>> = {
                     let mut tree = saved_folder_tree(state.saved_queries());
@@ -887,7 +989,19 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                             }
                             SavedPlan::Entry { query, depth } => {
                                 indented(ui, *depth, |ui| {
-                                    saved_row(ui, &palette, query, &conn_names, &mut actions);
+                                    let empty: Vec<SavedQueryVersion> = Vec::new();
+                                    let versions = saved_versions
+                                        .get(&query.id)
+                                        .unwrap_or(&empty);
+                                    saved_row(
+                                        ui,
+                                        &palette,
+                                        query,
+                                        versions,
+                                        modal_open,
+                                        &conn_names,
+                                        &mut actions,
+                                    );
                                 });
                             }
                         }
@@ -974,6 +1088,16 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                         SidebarAction::OpenSaved(id) => state.open_saved(id),
                         SidebarAction::DeleteSaved(id) => {
                             state.delete_saved(id);
+                        }
+                        SidebarAction::RestoreSavedVersion(id, index) => {
+                            if !modal_open {
+                                restore_version_then_open(state, id, index);
+                            }
+                        }
+                        SidebarAction::OpenSavedVersion(id, index) => {
+                            if !modal_open {
+                                state.open_saved_version(id, index);
+                            }
                         }
                         SidebarAction::MoveSaved(id, folder) => {
                             state.move_saved(id, folder.as_deref());
@@ -1321,3 +1445,26 @@ fn ssh_section(ui: &mut egui::Ui, ssh: &mut Option<SshConfig>, secret: &mut Stri
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::SavedQueryVersion;
+
+    #[test]
+    fn version_labels_rank_newest_first_and_truncate() {
+        let newest = SavedQueryVersion { at: 2, sql: "SELECT 2".to_owned() };
+        let oldest = SavedQueryVersion { at: 1, sql: "SELECT 1".to_owned() };
+        assert_eq!(saved_version_label(0, &newest), "v1 · SELECT 2");
+        assert_eq!(saved_version_label(1, &oldest), "v2 · SELECT 1");
+        let long = SavedQueryVersion {
+            at: 3,
+            sql: format!("SELECT {}", "x".repeat(40)),
+        };
+        assert_eq!(saved_version_label(0, &long), format!("v1 · SELECT {}", "x".repeat(21)) + "…");
+        let blank = SavedQueryVersion { at: 4, sql: "   ".to_owned() };
+        assert_eq!(saved_version_label(2, &blank), "v3 · SQL");
+    }
+}
+// Manual check: save SELECT 1 then SELECT 2 under one name, expand History on
+// the saved row, press Restore on v2, and a new tab opens with SELECT 1.

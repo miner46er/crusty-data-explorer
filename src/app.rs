@@ -630,11 +630,22 @@ pub fn history_stats(entry: &HistoryEntry) -> String {
     }
 }
 
+/// One saved-query version: the SQL text as saved and the save time as
+/// unix seconds. Newest first in [`SavedQuery::versions`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SavedQueryVersion {
+    pub at: u64,
+    pub sql: String,
+}
+
 /// One named query. Newest first in [`AppState::saved`]. Holds the SQL and
 /// its connection only, never credentials. `folder` places it in a sidebar
 /// tree as a slash-separated path (`Some("ops/db")` nests under `ops`);
 /// `None` is the ungrouped root. `pinned` floats it to the top of its own
 /// tree node. Both default so files written before folders still load.
+/// `versions` holds per-save snapshots newest first, capped at
+/// [`SAVED_VERSION_CAP`]. It defaults so files written before versions
+/// still load with empty history.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SavedQuery {
     pub id: u64,
@@ -645,6 +656,8 @@ pub struct SavedQuery {
     pub folder: Option<String>,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub versions: Vec<SavedQueryVersion>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -666,7 +679,13 @@ impl SavedQuery {
         if name.trim().is_empty() {
             return Err(SavedQueryError::EmptyName);
         }
-        Ok(Self { id, name, sql, conn, folder, pinned })
+        Ok(Self { id, name, sql, conn, folder, pinned, versions: Vec::new() })
+    }
+
+    /// Record one version snapshot newest first, capped.
+    fn push_version(&mut self, sql: &str, at: u64) {
+        self.versions.insert(0, SavedQueryVersion { at, sql: sql.to_owned() });
+        self.versions.truncate(SAVED_VERSION_CAP);
     }
 }
 
@@ -912,6 +931,8 @@ const HISTORY_CAP: usize = 200;
 pub const HISTORY_SHOWN: usize = 30;
 /// Cap on retained saved queries, newest first.
 const SAVED_CAP: usize = 200;
+/// Cap on retained versions per saved query, newest first.
+const SAVED_VERSION_CAP: usize = 20;
 /// Cap on palette rows for one query, best-ranked first.
 const SEARCH_CAP: usize = 50;
 
@@ -3212,9 +3233,11 @@ impl AppState {
             .iter_mut()
             .find(|q| q.name == trimmed && q.folder.as_deref() == folder.as_deref())
         {
-            existing.sql = sql;
+            existing.sql = sql.clone();
             existing.conn = conn;
             existing.pinned = pinned;
+            let at = now_unix_secs();
+            existing.push_version(&sql, at);
             let id = existing.id;
             self.link_active_tab_to_saved(id);
             self.persist_saved();
@@ -3224,12 +3247,13 @@ impl AppState {
         match SavedQuery::new(
             id,
             trimmed.to_owned(),
-            sql,
+            sql.clone(),
             conn,
             folder,
             pinned,
         ) {
-            Ok(query) => {
+            Ok(mut query) => {
+                query.push_version(&sql, now_unix_secs());
                 self.saved.insert(0, query);
                 self.saved.truncate(SAVED_CAP);
                 self.link_active_tab_to_saved(id);
@@ -3299,6 +3323,53 @@ impl AppState {
         }
         self.persist_saved();
         true
+    }
+
+    /// Every retained version for one saved query, newest first. Empty for
+    /// an unknown id. The sidebar version list renders this.
+    pub fn saved_versions(&self, id: u64) -> Vec<SavedQueryVersion> {
+        self.saved.iter().find(|q| q.id == id).map(|q| q.versions.clone()).unwrap_or_default()
+    }
+
+    /// Restore one version's text into its saved query. The restored text
+    /// becomes the query SQL and is recorded as a new newest version, so
+    /// the restore itself stays undoable. Persists. False for unknown id
+    /// or index. Callers open the query through [`AppState::open_saved`]
+    /// to show the restored text, reusing the existing open path.
+    pub fn restore_saved_version(&mut self, id: u64, index: usize) -> bool {
+        let Some(query) = self.saved.iter_mut().find(|q| q.id == id) else {
+            return false;
+        };
+        let Some(version) = query.versions.get(index).cloned() else {
+            return false;
+        };
+        query.sql = version.sql.clone();
+        let at = now_unix_secs();
+        query.push_version(&version.sql, at);
+        self.persist_saved();
+        true
+    }
+
+    /// Open one version's text in a fresh tab on the query's connection.
+    /// Never auto-runs and never changes the saved entry. The tab links to
+    /// the entry, so saving from it records a new version through the
+    /// existing save path.
+    pub fn open_saved_version(&mut self, id: u64, index: usize) {
+        let Some(query) = self.saved.iter().find(|q| q.id == id).cloned() else {
+            return;
+        };
+        let Some(version) = query.versions.get(index).cloned() else {
+            return;
+        };
+        let tab = self.new_tab(query.conn);
+        if let Some(slot) = self.tab_sql_mut(tab) {
+            *slot = version.sql;
+        }
+        if let Some(slot) = self.tab_mut(tab) {
+            slot.saved = Some(id);
+        }
+        self.activate(tab);
+        self.set_outcome(tab, RunOutcome::Never);
     }
 
     /// Every bookmarked table, newest first.
@@ -4183,6 +4254,7 @@ fn load_saved_queries() -> Vec<SavedQuery> {
             queries.retain(|q| !q.name.trim().is_empty());
             for query in &mut queries {
                 query.folder = normalize_folder_path(query.folder.as_deref());
+                query.versions.truncate(SAVED_VERSION_CAP);
             }
             queries.truncate(SAVED_CAP);
             queries
@@ -6206,6 +6278,7 @@ mod tests {
                 conn: ConnectionId::from_raw(1),
                 folder: None,
                 pinned: false,
+                versions: Vec::new(),
             })
             .collect();
         std::fs::write(
@@ -6240,11 +6313,138 @@ mod tests {
         assert_eq!(state.saved_queries()[0].name, "daily");
         assert_eq!(state.saved_queries()[0].folder, None);
         assert!(!state.saved_queries()[0].pinned);
+        assert!(state.saved_queries()[0].versions.is_empty());
+        assert!(state.saved_versions(7).is_empty());
         match prev {
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_versions_append_on_save_newest_first() {
+        with_isolated_state("saved-versions-append", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 1".to_owned();
+            }
+            let id = state.save_active_tab("daily", None, false).expect("saved");
+            assert_eq!(state.saved_versions(id).len(), 1);
+            assert_eq!(state.saved_versions(id)[0].sql, "SELECT 1");
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 2".to_owned();
+            }
+            let again = state.save_active_tab("daily", None, false).expect("replaced");
+            assert_eq!(id, again);
+            let versions = state.saved_versions(id);
+            assert_eq!(versions.len(), 2);
+            assert_eq!(versions[0].sql, "SELECT 2");
+            assert_eq!(versions[1].sql, "SELECT 1");
+            assert_eq!(state.saved_queries()[0].sql, "SELECT 2");
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.saved_versions(id).len(), 2);
+            assert_eq!(reloaded.saved_versions(id)[0].sql, "SELECT 2");
+            assert_eq!(reloaded.saved_versions(id)[1].sql, "SELECT 1");
+        });
+    }
+
+    #[test]
+    fn saved_version_restore_roundtrip_brings_old_text_back() {
+        with_isolated_state("saved-versions-restore", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 1".to_owned();
+            }
+            let id = state.save_active_tab("daily", None, false).expect("saved");
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 2".to_owned();
+            }
+            state.save_active_tab("daily", None, false).expect("replaced");
+            assert!(state.restore_saved_version(id, 1));
+            assert_eq!(state.saved_queries()[0].sql, "SELECT 1");
+            assert_eq!(state.saved_versions(id)[0].sql, "SELECT 1");
+            state.open_saved(id);
+            let opened = state.active().and_then(|t| state.tab(t)).expect("active tab");
+            assert_eq!(opened.sql, "SELECT 1");
+            assert!(!state.restore_saved_version(id, 99));
+            assert!(!state.restore_saved_version(999_999, 0));
+            assert!(state.saved_versions(999_999).is_empty());
+        });
+    }
+
+    #[test]
+    fn saved_version_open_shows_old_text_without_changing_saved() {
+        with_isolated_state("saved-versions-open", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 1".to_owned();
+            }
+            let id = state.save_active_tab("daily", None, false).expect("saved");
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 2".to_owned();
+            }
+            state.save_active_tab("daily", None, false).expect("replaced");
+            state.open_saved_version(id, 1);
+            let opened = state.active().and_then(|t| state.tab(t)).expect("active tab");
+            assert_eq!(opened.sql, "SELECT 1");
+            assert_eq!(state.saved_queries()[0].sql, "SELECT 2");
+        });
+    }
+
+    #[test]
+    fn saved_version_sidebar_restore_wiring_opens_restored_text() {
+        with_isolated_state("saved-versions-sidebar-wiring", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 1".to_owned();
+            }
+            let id = state.save_active_tab("daily", None, false).expect("saved");
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 2".to_owned();
+            }
+            state.save_active_tab("daily", None, false).expect("replaced");
+            assert!(crate::ui::connections::restore_version_then_open(state, id, 1));
+            let opened = state.active().and_then(|t| state.tab(t)).expect("active tab");
+            assert_eq!(opened.sql, "SELECT 1");
+            assert_eq!(state.saved_queries()[0].sql, "SELECT 1");
+            assert!(!crate::ui::connections::restore_version_then_open(state, id, 99));
+            assert!(!crate::ui::connections::restore_version_then_open(state, 999_999, 0));
+        });
+    }
+
+    #[test]
+    fn saved_versions_cap_at_20_newest_first() {
+        with_isolated_state("saved-versions-cap", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 0".to_owned();
+            }
+            let id = state.save_active_tab("daily", None, false).expect("saved");
+            for i in 1..30 {
+                if let Some(slot) = state.tab_sql_mut(tab) {
+                    *slot = format!("SELECT {i}");
+                }
+                state.save_active_tab("daily", None, false).expect("replaced");
+            }
+            let versions = state.saved_versions(id);
+            assert_eq!(versions.len(), SAVED_VERSION_CAP);
+            assert_eq!(versions[0].sql, "SELECT 29");
+            assert_eq!(versions[SAVED_VERSION_CAP - 1].sql, "SELECT 10");
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.saved_versions(id).len(), SAVED_VERSION_CAP);
+            assert_eq!(reloaded.saved_versions(id)[0].sql, "SELECT 29");
+        });
     }
 
     #[test]
