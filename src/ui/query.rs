@@ -7,7 +7,7 @@ use eframe::egui;
 
 use super::editor::{char_range, format_sql, FindState};
 use crate::app::{AppState, RunOutcome, RunScope, TransactionAction};
-use crate::db::TabId;
+use crate::db::{DbKind, TabId};
 
 use super::Palette;
 
@@ -149,6 +149,7 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
         (false, false, false, false);
     let (mut format_clicked, mut find_clicked) = (false, false);
     let mut transaction_clicked: Option<TransactionAction> = None;
+    let mut autocommit_clicked: Option<bool> = None;
     let mut scope = state.tab(tab_id).map(|t| t.run_scope()).unwrap_or_default();
     if state.tab(tab_id).is_some() {
         let running = matches!(
@@ -156,6 +157,12 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
             Some(RunOutcome::Running { .. })
         );
         let transaction_ready = state.transaction_ready(tab_id);
+        let (autocommit, sqlite) = state
+            .tab(tab_id)
+            .and_then(|t| t.conn)
+            .and_then(|id| state.connections().iter().find(|c| c.id == id))
+            .map(|c| (c.autocommit(), c.config.kind() == DbKind::Sqlite))
+            .unwrap_or((true, false));
         ui.horizontal(|ui| {
             if running {
                 cancel_clicked = ui.button("Cancel").clicked();
@@ -192,6 +199,20 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                 {
                     transaction_clicked = Some(action);
                 }
+            }
+            ui.add_space(6.0);
+            let mut shown = autocommit;
+            let toggle = ui
+                .add_enabled_ui(transaction_ready && !sqlite, |ui| {
+                    ui.toggle_value(&mut shown, "Autocommit")
+                })
+                .inner
+                .on_hover_text(
+                    "Off: every statement runs inside a transaction on one tagged \
+                     connection until Commit or Rollback",
+                );
+            if toggle.clicked() {
+                autocommit_clicked = Some(!autocommit);
             }
             format_clicked = ui.button("Format").clicked();
             find_clicked = ui
@@ -231,6 +252,9 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
     }
     if let Some(action) = transaction_clicked {
         state.start_transaction(tab_id, action);
+    }
+    if let Some(on) = autocommit_clicked {
+        state.set_autocommit(tab_id, on);
     }
     if save_clicked {
         state.open_save_prompt();
@@ -521,4 +545,6 @@ mod tests {
 // close_tab/default_connection transitions as the plus and cross buttons
 // covered by AppState tests. Explain runs start_explain with the same offsets
 // Run passes, and Format and the find bar's Next/Prev selection are manual
-// too.
+// too. The Autocommit toggle beside Begin/Commit/Rollback sends one
+// `SetAutocommit` through `set_autocommit` (disabled for SQLite and while a
+// run is in flight) and shows the landed state, covered by AppState tests.

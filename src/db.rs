@@ -205,12 +205,50 @@ fn first_keyword(sql: &str) -> Option<String> {
     keyword_span(sql).map(|(keyword, _)| keyword)
 }
 
-/// A BEGIN, COMMIT, or ROLLBACK statement. MySQL refuses BEGIN in the
-/// prepared statement protocol, so [`MySession::query`] runs these on the
-/// text protocol instead of probing them with `describe` first.
-#[cfg(feature = "mysql")]
-fn is_transaction_control(sql: &str) -> bool {
-    matches!(first_keyword(sql).as_deref(), Some("BEGIN" | "COMMIT" | "ROLLBACK"))
+/// The bare transaction controls. Only these spellings are special: the
+/// toolbar sends them, and a typed `begin` matches the button's `BEGIN`.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxControl {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+/// MySQL refuses BEGIN in the prepared statement protocol, so transaction
+/// controls run on the text protocol through `raw_sql` there.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+fn tx_control(sql: &str) -> Option<TxControl> {
+    match first_keyword(sql).as_deref() {
+        Some("BEGIN") => Some(TxControl::Begin),
+        Some("COMMIT") => Some(TxControl::Commit),
+        Some("ROLLBACK") => Some(TxControl::Rollback),
+        _ => None,
+    }
+}
+
+/// What a manual-mode statement needs before it runs on the pinned
+/// connection, given whether a transaction is already open there.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualPlan {
+    /// Run the statement alone.
+    Only,
+    /// Open the transaction implicitly, then run the statement inside it.
+    BeginThenRun,
+    /// BEGIN while a transaction is open: run nothing. MySQL's second BEGIN
+    /// would implicitly commit the open transaction; Postgres only warns.
+    Skip,
+}
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+fn manual_plan(open: bool, control: Option<TxControl>) -> ManualPlan {
+    match control {
+        Some(TxControl::Begin) if open => ManualPlan::Skip,
+        Some(_) => ManualPlan::Only,
+        None if open => ManualPlan::Only,
+        None => ManualPlan::BeginThenRun,
+    }
 }
 
 fn keyword_span(sql: &str) -> Option<(String, usize)> {
@@ -1398,10 +1436,40 @@ pub fn test_handle() -> (DbHandle, mpsc::Receiver<DbCommand>) {
     (DbHandle { cmds: cmds_tx }, cmds_rx)
 }
 
+/// Idle minutes before the worker rolls back an open manual transaction.
+/// The warning lands one minute earlier, derived from this one number.
+pub const TX_IDLE_ROLLBACK_MINUTES: u64 = 10;
+
+/// Idle timing for open manual transactions. The default follows
+/// [`TX_IDLE_ROLLBACK_MINUTES`]; tests inject a short schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxIdle {
+    /// Warn once when a transaction has been idle for this long.
+    pub warn: Duration,
+    /// Roll the transaction back when it has been idle this long.
+    pub rollback: Duration,
+}
+
+impl Default for TxIdle {
+    fn default() -> Self {
+        let rollback = Duration::from_secs(TX_IDLE_ROLLBACK_MINUTES * 60);
+        Self { warn: rollback - Duration::from_secs(60), rollback }
+    }
+}
+
+/// One idle tick's outcome for the worker to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleTick {
+    Warn,
+    Rollback,
+}
+
 #[derive(Debug)]
 pub enum DbCommand {
     QueryBatch { run: RunId, statements: Vec<String> },
     LoadSchema,
+    /// Flip the worker's autocommit for this session.
+    SetAutocommit { on: bool },
 }
 
 #[derive(Debug)]
@@ -1413,6 +1481,17 @@ pub enum DbEvent {
     QueryErr { run: RunId, error: DbError },
     SchemaOk { conn: ConnectionId, schema: SchemaInfo },
     SchemaErr { conn: ConnectionId, error: DbError },
+    /// The autocommit toggle landed. `on` and `tx_open` are the worker's
+    /// state after applying it; an error means a rollback on the way back to
+    /// autocommit failed and the connection was closed instead of returned.
+    AutocommitSet { conn: ConnectionId, on: bool, tx_open: bool, error: Option<DbError> },
+    /// The manual transaction opened or ended, so the observed flag can
+    /// track the worker's real state between explicit controls.
+    TxState { conn: ConnectionId, open: bool },
+    /// An open manual transaction sat idle for the warn span.
+    TxIdleWarning { conn: ConnectionId },
+    /// The worker rolled an idle manual transaction back.
+    TxIdleRollback { conn: ConnectionId },
 }
 
 /// Owned by one worker thread for its whole life. Not Sync, and that is the
@@ -1528,13 +1607,185 @@ impl Session {
 
     /// Ordered schema load, capped with truncation flags. No client type
     /// crosses the boundary.
-    pub fn schema(&self) -> Result<SchemaInfo, DbError> {
+    pub fn schema(&mut self) -> Result<SchemaInfo, DbError> {
         match self {
             Session::Sqlite(conn) => sqlite_schema(conn),
             #[cfg(feature = "postgres")]
             Session::Postgres(pg) => pg.schema(),
             #[cfg(feature = "mysql")]
             Session::Mysql(my) => my.schema(),
+        }
+    }
+
+    /// Switch the worker's autocommit. SQLite keeps it on: it has no pooled
+    /// connections to pin, so the T16b buttons stay its only transaction
+    /// controls.
+    pub fn set_autocommit(&mut self, _on: bool) -> Result<(), DbError> {
+        match self {
+            Session::Sqlite(_) => Ok(()),
+            #[cfg(feature = "postgres")]
+            Session::Postgres(pg) => pg.set_autocommit(_on),
+            #[cfg(feature = "mysql")]
+            Session::Mysql(my) => my.set_autocommit(_on),
+        }
+    }
+
+    /// The worker's autocommit after any toggle landed.
+    pub fn autocommit(&self) -> bool {
+        match self {
+            Session::Sqlite(_) => true,
+            #[cfg(feature = "postgres")]
+            Session::Postgres(pg) => pg.autocommit(),
+            #[cfg(feature = "mysql")]
+            Session::Mysql(my) => my.autocommit(),
+        }
+    }
+
+    /// Whether a manual transaction is open on the pinned connection.
+    pub fn manual_tx_open(&self) -> bool {
+        match self {
+            Session::Sqlite(_) => false,
+            #[cfg(feature = "postgres")]
+            Session::Postgres(pg) => pg.mode.tx_open(),
+            #[cfg(feature = "mysql")]
+            Session::Mysql(my) => my.mode.tx_open(),
+        }
+    }
+
+    /// Time until the open manual transaction's next idle deadline.
+    pub fn tx_idle_wait(&self, _idle: &TxIdle) -> Option<Duration> {
+        match self {
+            Session::Sqlite(_) => None,
+            #[cfg(feature = "postgres")]
+            Session::Postgres(pg) => pg.mode.idle_wait(_idle),
+            #[cfg(feature = "mysql")]
+            Session::Mysql(my) => my.mode.idle_wait(_idle),
+        }
+    }
+
+    /// One idle tick of the manual transaction, if any is open.
+    pub fn tick_tx_idle(&mut self, _idle: &TxIdle) -> Option<IdleTick> {
+        match self {
+            Session::Sqlite(_) => None,
+            #[cfg(feature = "postgres")]
+            Session::Postgres(pg) => pg.tick_tx_idle(_idle),
+            #[cfg(feature = "mysql")]
+            Session::Mysql(my) => my.tick_tx_idle(_idle),
+        }
+    }
+}
+
+/// Autocommit state for one engine session, a sum type so "autocommit with
+/// a pin" and "manual without a pin" cannot be written down.
+///
+/// Contract, worker side (the only owner of the session): with autocommit
+/// on, every statement acquires a connection for its call. With autocommit
+/// off, statements pin one connection and run inside a transaction on it.
+/// The first statement implicitly opens that transaction, `COMMIT` or
+/// `ROLLBACK` ends it, and the next statement implicitly opens a fresh one.
+/// Cancel stops the statement and leaves the transaction open; only
+/// autocommit switching back on, the idle guard, a failed rollback, or the
+/// session ending closes it otherwise.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+enum AutoMode<C> {
+    On,
+    /// Autocommit off with no pin yet: the first statement takes one.
+    Manual,
+    Pinned {
+        conn: C,
+        open: bool,
+        idle_since: Instant,
+        warned: bool,
+    },
+}
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl<C> AutoMode<C> {
+    fn tx_open(&self) -> bool {
+        matches!(self, AutoMode::Pinned { open: true, .. })
+    }
+
+    /// A statement ran on the transaction: restart its idle span.
+    fn note_activity(&mut self) {
+        if let AutoMode::Pinned { idle_since, warned, .. } = self {
+            *idle_since = Instant::now();
+            *warned = false;
+        }
+    }
+
+    fn tx_close(&mut self) {
+        if let AutoMode::Pinned { open, .. } = self {
+            *open = false;
+        }
+    }
+
+    /// Time until the next idle deadline, only while a transaction is open.
+    fn idle_wait(&self, idle: &TxIdle) -> Option<Duration> {
+        let AutoMode::Pinned { open: true, idle_since, warned, .. } = self else {
+            return None;
+        };
+        let deadline = if *warned { idle.rollback } else { idle.warn };
+        Some(deadline.saturating_sub(idle_since.elapsed()).max(Duration::from_millis(1)))
+    }
+
+    /// One idle tick. `Rollback` leaves the engine call to the caller, which
+    /// closes the transaction through [`AutoMode::tx_close`] either way.
+    fn idle_tick(&mut self, idle: &TxIdle) -> Option<IdleTick> {
+        let AutoMode::Pinned { open: true, idle_since, warned, .. } = self else {
+            return None;
+        };
+        let been_idle = idle_since.elapsed();
+        if been_idle >= idle.rollback {
+            return Some(IdleTick::Rollback);
+        }
+        if !*warned && been_idle >= idle.warn {
+            *warned = true;
+            return Some(IdleTick::Warn);
+        }
+        None
+    }
+}
+
+/// A pool lease for one synchronous call. Returns its connection inside the
+/// runtime on drop, because sqlx spawns the return-to-pool task on drop and
+/// that needs a Tokio context; an early `?` error path must not unwind past
+/// it on a bare thread.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+struct PooledLease<'a, C> {
+    rt: &'a tokio::runtime::Runtime,
+    conn: Option<C>,
+}
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl<'a, C> PooledLease<'a, C> {
+    fn new(rt: &'a tokio::runtime::Runtime, conn: C) -> Self {
+        Self { rt, conn: Some(conn) }
+    }
+}
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl<C> Drop for PooledLease<'_, C> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.rt.block_on(async { drop(conn) });
+        }
+    }
+}
+
+/// The connection a schema load runs on: the manual pin when one is held,
+/// else a pool lease for the load.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+enum SchemaConn<'a, C> {
+    Pinned(&'a mut C),
+    Leased(PooledLease<'a, C>),
+}
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl<C> SchemaConn<'_, C> {
+    fn conn(&mut self) -> &mut C {
+        match self {
+            SchemaConn::Pinned(conn) => conn,
+            SchemaConn::Leased(lease) => lease.conn.as_mut().expect("leased"),
         }
     }
 }
@@ -1548,6 +1799,8 @@ impl Session {
 pub struct PgSession {
     rt: tokio::runtime::Runtime,
     pool: sqlx::PgPool,
+    /// Autocommit state; see [`AutoMode`] for the manual-mode contract.
+    mode: AutoMode<sqlx::pool::PoolConnection<sqlx::Postgres>>,
     connection_string: String,
     database: String,
     server_version: String,
@@ -1621,6 +1874,7 @@ impl PgSession {
         Ok(Self {
             rt,
             pool,
+            mode: AutoMode::On,
             connection_string,
             database: database.clone(),
             server_version,
@@ -1629,52 +1883,176 @@ impl PgSession {
         })
     }
 
-    /// One statement per call. `describe` reports columns without executing,
-    /// so a data-changing statement runs exactly once on the `execute` path.
-    fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
-        let started = Instant::now();
-        let columns = self.describe_columns(sql)?;
-        if columns.is_empty() {
-            let done = self
-                .rt
-                .block_on(sqlx::query(sql).execute(&self.pool))
-                .map_err(|e| DbError::Query(e.to_string()))?;
-            return QueryResult::from_columns(
-                Vec::new(),
-                false,
-                Some(done.rows_affected()),
-                started.elapsed(),
-            )
-            .map_err(|e| DbError::Query(e.to_string()));
+    fn autocommit(&self) -> bool {
+        matches!(self.mode, AutoMode::On)
+    }
+
+    /// One statement per call. Autocommit on acquires a connection for the
+    /// call; autocommit off runs the statement on the pinned connection.
+    fn query(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        match self.mode {
+            AutoMode::On => {
+                let rt = &self.rt;
+                let pool = &self.pool;
+                rt.block_on(async {
+                    let mut conn = pool
+                        .acquire()
+                        .await
+                        .map_err(|e| DbError::Query(e.to_string()))?;
+                    pg_statement(&mut conn, sql).await
+                })
+            }
+            AutoMode::Manual | AutoMode::Pinned { .. } => self.query_manual(sql),
         }
-        let rows = self
-            .rt
-            .block_on(sqlx::query(sql).fetch_all(&self.pool))
-            .map_err(|e| DbError::Query(e.to_string()))?;
-        let mut builder = ResultBuilder::new(columns, ROW_CAP);
-        for row in &rows {
-            if !builder.push_row(map_pg_row(row)?) {
-                break;
+    }
+
+    fn query_manual(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        let Self { rt, pool, mode, .. } = self;
+        rt.block_on(async {
+            if let AutoMode::Manual = mode {
+                let conn = pool
+                    .acquire()
+                    .await
+                    .map_err(|e| DbError::Query(e.to_string()))?;
+                *mode = AutoMode::Pinned {
+                    conn,
+                    open: false,
+                    idle_since: Instant::now(),
+                    warned: false,
+                };
+            }
+            let AutoMode::Pinned { conn, open, .. } = mode else {
+                return Err(DbError::Query("autocommit is on".to_owned()));
+            };
+            let control = tx_control(sql);
+            let plan = manual_plan(*open, control);
+            let started = Instant::now();
+            let outcome = match plan {
+                ManualPlan::Skip => QueryResult::from_columns(
+                    Vec::new(),
+                    false,
+                    Some(0),
+                    started.elapsed(),
+                )
+                .map_err(|e| DbError::Query(e.to_string())),
+                ManualPlan::Only if control == Some(TxControl::Begin) => {
+                    match pg_begin(conn).await {
+                        Ok(()) => {
+                            *open = true;
+                            QueryResult::from_columns(
+                                Vec::new(),
+                                false,
+                                Some(0),
+                                started.elapsed(),
+                            )
+                            .map_err(|e| DbError::Query(e.to_string()))
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                ManualPlan::Only => {
+                    let result = pg_statement(conn, sql).await;
+                    if result.is_ok()
+                        && matches!(control, Some(TxControl::Commit | TxControl::Rollback))
+                    {
+                        *open = false;
+                    }
+                    result
+                }
+                ManualPlan::BeginThenRun => match pg_begin(conn).await {
+                    Ok(()) => {
+                        *open = true;
+                        pg_statement(conn, sql).await
+                    }
+                    Err(error) => Err(error),
+                },
+            };
+            if plan != ManualPlan::Skip {
+                mode.note_activity();
+            }
+            outcome
+        })
+    }
+
+    /// Switch autocommit. Leaving manual mode rolls an open transaction back
+    /// and returns the pin to the pool; a failed rollback closes the
+    /// connection instead, so the pool never hands out a dirty session.
+    fn set_autocommit(&mut self, on: bool) -> Result<(), DbError> {
+        if !on {
+            if matches!(self.mode, AutoMode::On) {
+                self.mode = AutoMode::Manual;
+            }
+            return Ok(());
+        }
+        match std::mem::replace(&mut self.mode, AutoMode::On) {
+            AutoMode::On | AutoMode::Manual => Ok(()),
+            AutoMode::Pinned { mut conn, open, .. } => {
+                let rt = &self.rt;
+                rt.block_on(async {
+                    let ended = if open {
+                        sqlx::raw_sql("ROLLBACK")
+                            .execute(&mut *conn)
+                            .await
+                            .map_err(|e| DbError::Query(e.to_string()))
+                            .map(|_| ())
+                    } else {
+                        Ok(())
+                    };
+                    match ended {
+                        Ok(()) => drop(conn),
+                        Err(error) => {
+                            conn.close_on_drop();
+                            drop(conn);
+                            return Err(error);
+                        }
+                    }
+                    Ok(())
+                })
             }
         }
-        Ok(builder.finish(started.elapsed()))
     }
 
-    fn describe_columns(&self, sql: &str) -> Result<Vec<(String, String)>, DbError> {
-        use sqlx::{Column as _, Executor as _, TypeInfo as _};
-        let described = self
-            .rt
-            .block_on(async { (&self.pool).describe(sql).await })
-            .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(described
-            .columns()
-            .iter()
-            .map(|c| (c.name().to_owned(), c.type_info().name().to_owned()))
-            .collect())
+    /// An idle tick: the rollback runs on the pin, which stays held; a
+    /// failed rollback closes the connection and drops the pin.
+    fn tick_tx_idle(&mut self, idle: &TxIdle) -> Option<IdleTick> {
+        let tick = self.mode.idle_tick(idle)?;
+        if tick == IdleTick::Rollback {
+            let rt = &self.rt;
+            let mode = &mut self.mode;
+            let failed = match mode {
+                AutoMode::Pinned { conn, open, .. } => {
+                    *open && rt.block_on(sqlx::raw_sql("ROLLBACK").execute(&mut **conn)).is_err()
+                }
+                _ => false,
+            };
+            mode.tx_close();
+            if failed {
+                if let AutoMode::Pinned { mut conn, .. } =
+                    std::mem::replace(mode, AutoMode::Manual)
+                {
+                    conn.close_on_drop();
+                    let _ = rt.block_on(async { drop(conn) });
+                }
+            }
+        }
+        Some(tick)
     }
 
-    fn schema(&self) -> Result<SchemaInfo, DbError> {
+    fn schema(&mut self) -> Result<SchemaInfo, DbError> {
         use sqlx::Row as _;
+        // Manual mode holds the pool's only connection, so the load runs on
+        // the pin instead of timing out on an acquire.
+        let mut held = match &mut self.mode {
+            AutoMode::Pinned { conn, .. } => SchemaConn::Pinned(conn),
+            _ => {
+                let conn = self
+                    .rt
+                    .block_on(self.pool.acquire())
+                    .map_err(|e| DbError::Query(e.to_string()))?;
+                SchemaConn::Leased(PooledLease::new(&self.rt, conn))
+            }
+        };
+        let conn: &mut sqlx::PgConnection = held.conn();
         let schema_names: Vec<String> = self
             .rt
             .block_on(
@@ -1684,7 +2062,7 @@ impl PgSession {
                      AND nspname <> 'information_schema' \
                      ORDER BY nspname",
                 )
-                .fetch_all(&self.pool),
+                .fetch_all(&mut *conn),
             )
             .map_err(|e| DbError::Query(e.to_string()))?
             .iter()
@@ -1734,7 +2112,7 @@ impl PgSession {
                          ORDER BY table_name",
                     )
                     .bind(schema_name)
-                    .fetch_all(&self.pool),
+                    .fetch_all(&mut *conn),
                 )
                 .map_err(|e| DbError::Query(e.to_string()))?
                 .iter()
@@ -1769,7 +2147,7 @@ impl PgSession {
                          ORDER BY table_name, ordinal_position",
                     )
                     .bind(schema_name)
-                    .fetch_all(&self.pool),
+                    .fetch_all(&mut *conn),
                 )
                 .map_err(|e| DbError::Query(e.to_string()))?
                 .iter()
@@ -1830,7 +2208,7 @@ impl PgSession {
                          ORDER BY t.relname, c.conname",
                     )
                     .bind(schema_name)
-                    .fetch_all(&self.pool),
+                    .fetch_all(&mut *conn),
                 )
                 .map_err(|e| DbError::Query(e.to_string()))?
                 .iter()
@@ -1953,7 +2331,7 @@ impl PgSession {
                            array_position(ix.indkey, a.attnum)",
                     )
                     .bind(schema_name)
-                    .fetch_all(&self.pool),
+                    .fetch_all(&mut *conn),
                 )
                 .map_err(|e| DbError::Query(e.to_string()))?
                 .iter()
@@ -2041,7 +2419,7 @@ impl PgSession {
                          ORDER BY sequencename",
                     )
                     .bind(schema_name)
-                    .fetch_all(&self.pool),
+                    .fetch_all(&mut *conn),
                 )
                 .map_err(|e| DbError::Query(e.to_string()))?
                 .iter()
@@ -2067,7 +2445,7 @@ impl PgSession {
                          ORDER BY c.relname, t.tgname",
                     )
                     .bind(schema_name)
-                    .fetch_all(&self.pool),
+                    .fetch_all(&mut *conn),
                 )
                 .map_err(|e| DbError::Query(e.to_string()))?
                 .iter()
@@ -2111,7 +2489,7 @@ impl PgSession {
                          ORDER BY p.proname",
                     )
                     .bind(schema_name)
-                    .fetch_all(&self.pool),
+                    .fetch_all(&mut *conn),
                 )
                 .map_err(|e| DbError::Query(e.to_string()))?
                 .iter()
@@ -2253,6 +2631,88 @@ impl PgSession {
     }
 }
 
+#[cfg(feature = "postgres")]
+async fn pg_begin(conn: &mut sqlx::PgConnection) -> Result<(), DbError> {
+    sqlx::raw_sql("BEGIN")
+        .execute(&mut *conn)
+        .await
+        .map(|_| ())
+        .map_err(|e| DbError::Query(e.to_string()))
+}
+
+/// One statement on one connection. `describe` reports columns without
+/// executing, so a data-changing statement runs exactly once on the
+/// `execute` path; transaction controls run on the text protocol.
+#[cfg(feature = "postgres")]
+async fn pg_statement(conn: &mut sqlx::PgConnection, sql: &str) -> Result<QueryResult, DbError> {
+    use sqlx::{Column as _, Executor as _, TypeInfo as _};
+    let started = Instant::now();
+    if tx_control(sql).is_some() {
+        let done = sqlx::raw_sql(sql)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        return QueryResult::from_columns(
+            Vec::new(),
+            false,
+            Some(done.rows_affected()),
+            started.elapsed(),
+        )
+        .map_err(|e| DbError::Query(e.to_string()));
+    }
+    let columns: Vec<(String, String)> = (&mut *conn)
+        .describe(sql)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?
+        .columns()
+        .iter()
+        .map(|c| (c.name().to_owned(), c.type_info().name().to_owned()))
+        .collect();
+    if columns.is_empty() {
+        let done = sqlx::query(sql)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        return QueryResult::from_columns(
+            Vec::new(),
+            false,
+            Some(done.rows_affected()),
+            started.elapsed(),
+        )
+        .map_err(|e| DbError::Query(e.to_string()));
+    }
+    let rows = sqlx::query(sql)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    let mut builder = ResultBuilder::new(columns, ROW_CAP);
+    for row in &rows {
+        if !builder.push_row(map_pg_row(row)?) {
+            break;
+        }
+    }
+    Ok(builder.finish(started.elapsed()))
+}
+
+#[cfg(feature = "postgres")]
+impl Drop for PgSession {
+    /// The pin must go back inside the runtime: sqlx spawns the
+    /// return-to-pool task on drop, and that needs a Tokio context.
+    fn drop(&mut self) {
+        if let AutoMode::Pinned { mut conn, open, .. } =
+            std::mem::replace(&mut self.mode, AutoMode::On)
+        {
+            let rt = &self.rt;
+            rt.block_on(async {
+                if open {
+                    let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
+                }
+                drop(conn);
+            });
+        }
+    }
+}
+
 /// Renders a `pg_trigger.tgtype` bitmask as the timing plus event words the
 /// definition prints, for example `BEFORE INSERT`. Bit assignments come from
 /// PostgreSQL's `TRIGGER_TYPE_*` constants.
@@ -2290,6 +2750,8 @@ fn pg_trigger_kind(tgtype: i16) -> String {
 pub struct MySession {
     rt: tokio::runtime::Runtime,
     pool: sqlx::MySqlPool,
+    /// Autocommit state; see [`AutoMode`] for the manual-mode contract.
+    mode: AutoMode<sqlx::pool::PoolConnection<sqlx::MySql>>,
     connection_string: String,
     database: String,
     server_version: String,
@@ -2352,6 +2814,7 @@ impl MySession {
         Ok(Self {
             rt,
             pool,
+            mode: AutoMode::On,
             connection_string,
             database: database.clone(),
             server_version,
@@ -2360,77 +2823,185 @@ impl MySession {
         })
     }
 
-    /// One statement per call. `describe` reports columns without executing,
-    /// so a data-changing statement runs exactly once on the `execute` path.
-    fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
-        let started = Instant::now();
-        // MySQL refuses BEGIN in the prepared statement protocol, and even an
-        // empty bind set prepares, so a transaction control skips `describe`
-        // and runs through `raw_sql` on the text protocol.
-        if is_transaction_control(sql) {
-            let done = self
-                .rt
-                .block_on(sqlx::raw_sql(sql).execute(&self.pool))
-                .map_err(|e| DbError::Query(e.to_string()))?;
-            return QueryResult::from_columns(
-                Vec::new(),
-                false,
-                Some(done.rows_affected()),
-                started.elapsed(),
-            )
-            .map_err(|e| DbError::Query(e.to_string()));
-        }
-        let columns = self.describe_columns(sql)?;
-        if columns.is_empty() {
-            let done = self
-                .rt
-                .block_on(sqlx::query(sql).execute(&self.pool))
-                .map_err(|e| DbError::Query(e.to_string()))?;
-            return QueryResult::from_columns(
-                Vec::new(),
-                false,
-                Some(done.rows_affected()),
-                started.elapsed(),
-            )
-            .map_err(|e| DbError::Query(e.to_string()));
-        }
-        let rows = self
-            .rt
-            .block_on(sqlx::query(sql).fetch_all(&self.pool))
-            .map_err(|e| DbError::Query(e.to_string()))?;
-        let mut builder = ResultBuilder::new(columns, ROW_CAP);
-        for row in &rows {
-            if !builder.push_row(map_my_row(row)?) {
-                break;
-            }
-        }
-        Ok(builder.finish(started.elapsed()))
+    fn autocommit(&self) -> bool {
+        matches!(self.mode, AutoMode::On)
     }
 
-    fn describe_columns(&self, sql: &str) -> Result<Vec<(String, String)>, DbError> {
-        use sqlx::{Column as _, Executor as _, TypeInfo as _};
-        let described = self
-            .rt
-            .block_on(async { (&self.pool).describe(sql).await })
-            .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(described
-            .columns()
-            .iter()
-            .map(|c| (c.name().to_owned(), c.type_info().name().to_owned()))
-            .collect())
+    /// One statement per call. Autocommit on acquires a connection for the
+    /// call; autocommit off runs the statement on the pinned connection.
+    fn query(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        match self.mode {
+            AutoMode::On => {
+                let rt = &self.rt;
+                let pool = &self.pool;
+                rt.block_on(async {
+                    let mut conn = pool
+                        .acquire()
+                        .await
+                        .map_err(|e| DbError::Query(e.to_string()))?;
+                    my_statement(&mut conn, sql).await
+                })
+            }
+            AutoMode::Manual | AutoMode::Pinned { .. } => self.query_manual(sql),
+        }
+    }
+
+    fn query_manual(&mut self, sql: &str) -> Result<QueryResult, DbError> {
+        let Self { rt, pool, mode, .. } = self;
+        rt.block_on(async {
+            if let AutoMode::Manual = mode {
+                let conn = pool
+                    .acquire()
+                    .await
+                    .map_err(|e| DbError::Query(e.to_string()))?;
+                *mode = AutoMode::Pinned {
+                    conn,
+                    open: false,
+                    idle_since: Instant::now(),
+                    warned: false,
+                };
+            }
+            let AutoMode::Pinned { conn, open, .. } = mode else {
+                return Err(DbError::Query("autocommit is on".to_owned()));
+            };
+            let control = tx_control(sql);
+            let plan = manual_plan(*open, control);
+            let started = Instant::now();
+            let outcome = match plan {
+                ManualPlan::Skip => QueryResult::from_columns(
+                    Vec::new(),
+                    false,
+                    Some(0),
+                    started.elapsed(),
+                )
+                .map_err(|e| DbError::Query(e.to_string())),
+                ManualPlan::Only if control == Some(TxControl::Begin) => {
+                    match my_begin(conn).await {
+                        Ok(()) => {
+                            *open = true;
+                            QueryResult::from_columns(
+                                Vec::new(),
+                                false,
+                                Some(0),
+                                started.elapsed(),
+                            )
+                            .map_err(|e| DbError::Query(e.to_string()))
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                ManualPlan::Only => {
+                    let result = my_statement(conn, sql).await;
+                    if result.is_ok()
+                        && matches!(control, Some(TxControl::Commit | TxControl::Rollback))
+                    {
+                        *open = false;
+                    }
+                    result
+                }
+                ManualPlan::BeginThenRun => match my_begin(conn).await {
+                    Ok(()) => {
+                        *open = true;
+                        my_statement(conn, sql).await
+                    }
+                    Err(error) => Err(error),
+                },
+            };
+            if plan != ManualPlan::Skip {
+                mode.note_activity();
+            }
+            outcome
+        })
+    }
+
+    /// Switch autocommit. Leaving manual mode rolls an open transaction back
+    /// and returns the pin to the pool; a failed rollback closes the
+    /// connection instead, so the pool never hands out a dirty session.
+    fn set_autocommit(&mut self, on: bool) -> Result<(), DbError> {
+        if !on {
+            if matches!(self.mode, AutoMode::On) {
+                self.mode = AutoMode::Manual;
+            }
+            return Ok(());
+        }
+        match std::mem::replace(&mut self.mode, AutoMode::On) {
+            AutoMode::On | AutoMode::Manual => Ok(()),
+            AutoMode::Pinned { mut conn, open, .. } => {
+                let rt = &self.rt;
+                rt.block_on(async {
+                    let ended = if open {
+                        sqlx::raw_sql("ROLLBACK")
+                            .execute(&mut *conn)
+                            .await
+                            .map_err(|e| DbError::Query(e.to_string()))
+                            .map(|_| ())
+                    } else {
+                        Ok(())
+                    };
+                    match ended {
+                        Ok(()) => drop(conn),
+                        Err(error) => {
+                            conn.close_on_drop();
+                            drop(conn);
+                            return Err(error);
+                        }
+                    }
+                    Ok(())
+                })
+            }
+        }
+    }
+
+    /// An idle tick: the rollback runs on the pin, which stays held; a
+    /// failed rollback closes the connection and drops the pin.
+    fn tick_tx_idle(&mut self, idle: &TxIdle) -> Option<IdleTick> {
+        let tick = self.mode.idle_tick(idle)?;
+        if tick == IdleTick::Rollback {
+            let rt = &self.rt;
+            let mode = &mut self.mode;
+            let failed = match mode {
+                AutoMode::Pinned { conn, open, .. } => {
+                    *open && rt.block_on(sqlx::raw_sql("ROLLBACK").execute(&mut **conn)).is_err()
+                }
+                _ => false,
+            };
+            mode.tx_close();
+            if failed {
+                if let AutoMode::Pinned { mut conn, .. } =
+                    std::mem::replace(mode, AutoMode::Manual)
+                {
+                    conn.close_on_drop();
+                    let _ = rt.block_on(async { drop(conn) });
+                }
+            }
+        }
+        Some(tick)
     }
 
     /// One `DatabaseNode` per visible database, each with a single schema
     /// node named after the database. A user without the privilege to list
     /// databases still sees the connected one.
-    fn schema(&self) -> Result<SchemaInfo, DbError> {
+    fn schema(&mut self) -> Result<SchemaInfo, DbError> {
+        // Manual mode holds the pool's only connection, so the load runs on
+        // the pin instead of timing out on an acquire.
+        let mut held = match &mut self.mode {
+            AutoMode::Pinned { conn, .. } => SchemaConn::Pinned(conn),
+            _ => {
+                let conn = self
+                    .rt
+                    .block_on(self.pool.acquire())
+                    .map_err(|e| DbError::Query(e.to_string()))?;
+                SchemaConn::Leased(PooledLease::new(&self.rt, conn))
+            }
+        };
+        let conn: &mut sqlx::MySqlConnection = held.conn();
         let database_names: Vec<String> = match self.rt.block_on(
             sqlx::query(
                 "SELECT schema_name FROM information_schema.schemata \
                  WHERE schema_name NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys') \
                  ORDER BY schema_name",
             )
-            .fetch_all(&self.pool),
+            .fetch_all(&mut *conn),
         ) {
             Ok(rows) => rows
                 .iter()
@@ -2454,7 +3025,7 @@ impl MySession {
                          ORDER BY table_name",
                     )
                     .bind(database)
-                    .fetch_all(&self.pool),
+                    .fetch_all(&mut *conn),
                 )
                 .map_err(|e| DbError::Query(e.to_string()))?
                 .iter()
@@ -2480,7 +3051,7 @@ impl MySession {
                          ORDER BY table_name, ordinal_position",
                     )
                     .bind(database)
-                    .fetch_all(&self.pool),
+                    .fetch_all(&mut *conn),
                 )
                 .map_err(|e| DbError::Query(e.to_string()))?
                 .iter()
@@ -2514,7 +3085,7 @@ impl MySession {
                          ORDER BY table_name, ordinal_position",
                     )
                     .bind(database)
-                    .fetch_all(&self.pool),
+                    .fetch_all(&mut *conn),
                 )
                 .map_err(|e| DbError::Query(e.to_string()))?
                 .iter()
@@ -2535,7 +3106,7 @@ impl MySession {
                          ORDER BY table_name, index_name, seq_in_index",
                     )
                     .bind(database)
-                    .fetch_all(&self.pool),
+                    .fetch_all(&mut *conn),
                 )
                 .map_err(|e| DbError::Query(e.to_string()))?
                 .iter()
@@ -2624,7 +3195,7 @@ impl MySession {
                          ORDER BY event_object_table, trigger_name",
                     )
                     .bind(database)
-                    .fetch_all(&self.pool),
+                    .fetch_all(&mut *conn),
                 )
                 .map_err(|e| DbError::Query(e.to_string()))?
                 .iter()
@@ -2664,7 +3235,7 @@ impl MySession {
                          ORDER BY routine_name",
                     )
                     .bind(database)
-                    .fetch_all(&self.pool),
+                    .fetch_all(&mut *conn),
                 )
                 .map_err(|e| DbError::Query(e.to_string()))?
                 .iter()
@@ -2755,6 +3326,89 @@ impl MySession {
             );
         }
         Ok(SchemaInfo::new(databases, tables_truncated, columns_truncated))
+    }
+}
+
+#[cfg(feature = "mysql")]
+async fn my_begin(conn: &mut sqlx::MySqlConnection) -> Result<(), DbError> {
+    sqlx::raw_sql("BEGIN")
+        .execute(&mut *conn)
+        .await
+        .map(|_| ())
+        .map_err(|e| DbError::Query(e.to_string()))
+}
+
+/// One statement on one connection. MySQL refuses BEGIN in the prepared
+/// statement protocol, and even an empty bind set prepares, so transaction
+/// controls run through `raw_sql` on the text protocol; everything else
+/// describes first so a data-changing statement runs exactly once.
+#[cfg(feature = "mysql")]
+async fn my_statement(conn: &mut sqlx::MySqlConnection, sql: &str) -> Result<QueryResult, DbError> {
+    use sqlx::{Column as _, Executor as _, TypeInfo as _};
+    let started = Instant::now();
+    if tx_control(sql).is_some() {
+        let done = sqlx::raw_sql(sql)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        return QueryResult::from_columns(
+            Vec::new(),
+            false,
+            Some(done.rows_affected()),
+            started.elapsed(),
+        )
+        .map_err(|e| DbError::Query(e.to_string()));
+    }
+    let columns: Vec<(String, String)> = (&mut *conn)
+        .describe(sql)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?
+        .columns()
+        .iter()
+        .map(|c| (c.name().to_owned(), c.type_info().name().to_owned()))
+        .collect();
+    if columns.is_empty() {
+        let done = sqlx::query(sql)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        return QueryResult::from_columns(
+            Vec::new(),
+            false,
+            Some(done.rows_affected()),
+            started.elapsed(),
+        )
+        .map_err(|e| DbError::Query(e.to_string()));
+    }
+    let rows = sqlx::query(sql)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    let mut builder = ResultBuilder::new(columns, ROW_CAP);
+    for row in &rows {
+        if !builder.push_row(map_my_row(row)?) {
+            break;
+        }
+    }
+    Ok(builder.finish(started.elapsed()))
+}
+
+#[cfg(feature = "mysql")]
+impl Drop for MySession {
+    /// The pin must go back inside the runtime: sqlx spawns the
+    /// return-to-pool task on drop, and that needs a Tokio context.
+    fn drop(&mut self) {
+        if let AutoMode::Pinned { mut conn, open, .. } =
+            std::mem::replace(&mut self.mode, AutoMode::On)
+        {
+            let rt = &self.rt;
+            rt.block_on(async {
+                if open {
+                    let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
+                }
+                drop(conn);
+            });
+        }
     }
 }
 
@@ -3797,7 +4451,8 @@ fn sqlite_schema(conn: &rusqlite::Connection) -> Result<SchemaInfo, DbError> {
 
 /// Spawns the connection's worker thread and returns its handle.
 /// `password` and `ssh_password` are memory-only and never persisted;
-/// SQLite ignores both.
+/// SQLite ignores both. `tx_idle` is the idle schedule for open manual
+/// transactions; tests pass short spans.
 pub fn spawn_session(
     conn: ConnectionId,
     config: ConnectionConfig,
@@ -3805,11 +4460,14 @@ pub fn spawn_session(
     ssh_password: Option<String>,
     ui: eframe::egui::Context,
     events: mpsc::Sender<DbEvent>,
+    tx_idle: TxIdle,
 ) -> DbHandle {
     let (cmds_tx, cmds_rx) = mpsc::channel();
     std::thread::Builder::new()
         .name(format!("cde-conn-{}", conn.raw()))
-        .spawn(move || worker_loop(conn, config, password, ssh_password, ui, events, cmds_rx))
+        .spawn(move || {
+            worker_loop(conn, config, password, ssh_password, ui, events, cmds_rx, tx_idle)
+        })
         .expect("spawn db worker thread");
     DbHandle { cmds: cmds_tx }
 }
@@ -3822,6 +4480,7 @@ fn worker_loop(
     ui: eframe::egui::Context,
     events: mpsc::Sender<DbEvent>,
     cmds: mpsc::Receiver<DbCommand>,
+    tx_idle: TxIdle,
 ) {
     let mut session = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Session::open(&config, password.as_deref(), ssh_password.as_deref())
@@ -3853,9 +4512,34 @@ fn worker_loop(
         },
     );
 
-    while let Ok(cmd) = cmds.recv() {
+    loop {
+        // An open manual transaction needs the worker to wake at its idle
+        // deadlines; with nothing open, block until the next command.
+        let cmd = match session.tx_idle_wait(&tx_idle) {
+            Some(wait) => match cmds.recv_timeout(wait) {
+                Ok(cmd) => cmd,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    match session.tick_tx_idle(&tx_idle) {
+                        Some(IdleTick::Warn) => {
+                            emit(&events, &ui, DbEvent::TxIdleWarning { conn });
+                        }
+                        Some(IdleTick::Rollback) => {
+                            emit(&events, &ui, DbEvent::TxIdleRollback { conn });
+                        }
+                        None => {}
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match cmds.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => break,
+            },
+        };
         match cmd {
             DbCommand::QueryBatch { run, statements } => {
+                let was_open = session.manual_tx_open();
                 let event = match run_statements(&mut session, &statements) {
                     Ok(results) => DbEvent::BatchOk { run, results },
                     Err((index, error)) => DbEvent::QueryErr {
@@ -3863,6 +4547,13 @@ fn worker_loop(
                         error: statement_error(index, error),
                     },
                 };
+                if session.manual_tx_open() != was_open {
+                    emit(
+                        &events,
+                        &ui,
+                        DbEvent::TxState { conn, open: session.manual_tx_open() },
+                    );
+                }
                 if events.send(event).is_err() {
                     break;
                 }
@@ -3881,6 +4572,27 @@ fn worker_loop(
                     },
                 };
                 emit(&events, &ui, event);
+            }
+            DbCommand::SetAutocommit { on } => {
+                let was_open = session.manual_tx_open();
+                let applied = session.set_autocommit(on);
+                if session.manual_tx_open() != was_open {
+                    emit(
+                        &events,
+                        &ui,
+                        DbEvent::TxState { conn, open: session.manual_tx_open() },
+                    );
+                }
+                emit(
+                    &events,
+                    &ui,
+                    DbEvent::AutocommitSet {
+                        conn,
+                        on: session.autocommit(),
+                        tx_open: session.manual_tx_open(),
+                        error: applied.err(),
+                    },
+                );
             }
         }
     }
@@ -5625,7 +6337,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let session = Session::Sqlite(conn);
+        let mut session = Session::Sqlite(conn);
         let schema = session.schema().unwrap();
         assert!(!schema.tables_truncated());
         assert!(!schema.columns_truncated());
@@ -5744,7 +6456,7 @@ mod tests {
             )
             .unwrap();
         }
-        let session = Session::Sqlite(conn);
+        let mut session = Session::Sqlite(conn);
         let schema = session.schema().unwrap();
         let main = &schema.databases()[0].schemas()[0];
         assert_eq!(main.triggers().len(), SCHEMA_TRIGGER_CAP);
@@ -5854,6 +6566,7 @@ mod tests {
             None,
             eframe::egui::Context::default(),
             tx,
+            TxIdle::default(),
         );
         match rx.recv_timeout(Duration::from_secs(10)).expect("connects") {
             DbEvent::Connected { .. } => {}
@@ -5894,6 +6607,82 @@ mod tests {
             }
             other => panic!("expected QueryErr, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn worker_set_autocommit_on_sqlite_keeps_autocommit_on() {
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn_session(
+            ConnectionId::from_raw(9002),
+            ConnectionConfig::Sqlite { read_only: false, path: ":memory:".into() },
+            None,
+            None,
+            eframe::egui::Context::default(),
+            tx,
+            TxIdle::default(),
+        );
+        match rx.recv_timeout(Duration::from_secs(10)).expect("connects") {
+            DbEvent::Connected { .. } => {}
+            other => panic!("expected Connected, got {other:?}"),
+        }
+        handle.send(DbCommand::SetAutocommit { on: false }).expect("send");
+        match rx.recv_timeout(Duration::from_secs(10)).expect("toggle event") {
+            DbEvent::AutocommitSet { conn, on, tx_open, error } => {
+                assert_eq!(conn.raw(), 9002);
+                assert!(on, "SQLite has no manual mode");
+                assert!(!tx_open);
+                assert!(error.is_none());
+            }
+            other => panic!("expected AutocommitSet, got {other:?}"),
+        }
+    }
+
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    #[test]
+    fn manual_plan_opens_the_transaction_only_when_one_is_not_open() {
+        use ManualPlan::{BeginThenRun, Only, Skip};
+        let insert = tx_control("INSERT INTO t VALUES (1)");
+        assert_eq!(manual_plan(false, insert), BeginThenRun);
+        assert_eq!(manual_plan(true, insert), Only);
+        assert_eq!(manual_plan(false, tx_control("begin")), Only);
+        assert_eq!(manual_plan(true, tx_control("begin")), Skip);
+        for control in [tx_control("COMMIT"), tx_control("rollback")] {
+            assert_eq!(manual_plan(false, control), Only);
+            assert_eq!(manual_plan(true, control), Only);
+        }
+        assert_eq!(tx_control("START TRANSACTION"), None);
+        assert_eq!(tx_control("SELECT 1"), None);
+    }
+
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    #[test]
+    fn the_idle_clock_warns_once_then_rolls_back_and_resets_on_activity() {
+        let idle = TxIdle {
+            warn: Duration::from_millis(20),
+            rollback: Duration::from_millis(60),
+        };
+        let pinned = || AutoMode::<()>::Pinned {
+            conn: (),
+            open: true,
+            idle_since: Instant::now(),
+            warned: false,
+        };
+        let mut mode = pinned();
+        assert!(mode.idle_wait(&idle).is_some_and(|wait| wait <= idle.warn));
+        assert_eq!(mode.idle_tick(&idle), None);
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(mode.idle_tick(&idle), Some(IdleTick::Warn));
+        assert_eq!(mode.idle_tick(&idle), None, "the warning fires once");
+        assert!(mode.idle_wait(&idle).is_some_and(|wait| wait <= idle.rollback));
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(mode.idle_tick(&idle), Some(IdleTick::Rollback));
+        mode.tx_close();
+        assert_eq!(mode.idle_wait(&idle), None, "a closed transaction has no clock");
+
+        let mut mode = pinned();
+        std::thread::sleep(Duration::from_millis(25));
+        mode.note_activity();
+        assert_eq!(mode.idle_tick(&idle), None, "activity restarts the span");
     }
 
     #[test]

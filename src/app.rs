@@ -12,8 +12,9 @@ use std::time::Instant;
 
 use crate::db::{
     CancelHandle, ConnectionConfig, ConnectionId, DbCommand, DbEvent, DbHandle, DbKind,
-    DriverRegistry, Ids, QueryResult, RunId, SchemaInfo, TabId, TableInfo, Value, explain_sql,
-    spawn_session,
+    DriverRegistry, Ids, QueryResult, RunId, SchemaInfo, TabId, TableInfo, TxIdle, Value,
+    explain_sql, spawn_session,
+    TX_IDLE_ROLLBACK_MINUTES,
 };
 use crate::edit::{
     delete_statement, editable_table, insert_statement, is_text_type, qualified_parts,
@@ -112,7 +113,12 @@ pub struct Connection {
     /// COMMIT or ROLLBACK batch landing Ok closes it, and a fatal worker
     /// error or disconnect closes it too. Cancel leaves it as it was, since
     /// stopping a statement says nothing about the server's transaction.
+    /// With autocommit off the worker's [`DbEvent::TxState`] reports win.
     transaction: Transaction,
+    /// The observed autocommit mode, for the toolbar toggle. Defaults to on
+    /// and moves only when [`DbEvent::AutocommitSet`] lands. SQLite keeps
+    /// it on: the toggle covers Postgres and MySQL only.
+    autocommit: bool,
 }
 
 impl Connection {
@@ -122,6 +128,10 @@ impl Connection {
     /// The observed transaction flag, for the tab and card indicators.
     pub fn transaction(&self) -> Transaction {
         self.transaction
+    }
+    /// The observed autocommit mode, for the toolbar toggle.
+    pub fn autocommit(&self) -> bool {
+        self.autocommit
     }
     /// Some only while a worker exists to queue commands to.
     pub fn handle(&self) -> Option<DbHandle> {
@@ -646,6 +656,9 @@ pub struct AppState {
     save_prompt: Option<SavePrompt>,
     imports: Option<ImportDraft>,
     theme: crate::ui::Theme,
+    /// The idle schedule for open manual transactions, threaded to each
+    /// worker at spawn. Tests swap in a short schedule.
+    tx_idle: TxIdle,
 }
 
 impl AppState {
@@ -681,6 +694,7 @@ impl AppState {
             save_prompt: None,
             imports: None,
             theme: settings.theme,
+            tx_idle: TxIdle::default(),
         };
         state.restore_tabs();
         state
@@ -952,6 +966,31 @@ impl AppState {
             false,
             None,
         );
+    }
+
+    /// Ask the worker to switch autocommit for the tab's connection. The
+    /// observed flag moves only when [`DbEvent::AutocommitSet`] lands, the
+    /// way the transaction flag moves on a control batch landing. SQLite
+    /// has no manual mode, so the toggle is a no-op there.
+    pub fn set_autocommit(&mut self, tab: TabId, on: bool) {
+        if !self.transaction_ready(tab) {
+            return;
+        }
+        let Some(conn) = self
+            .tabs
+            .iter()
+            .find(|t| t.id == tab)
+            .and_then(|t| t.conn)
+            .and_then(|id| self.connections.iter().find(|c| c.id == id))
+        else {
+            return;
+        };
+        if conn.config.kind() == DbKind::Sqlite {
+            return;
+        }
+        if let Some(handle) = conn.handle() {
+            let _ = handle.send(DbCommand::SetAutocommit { on });
+        }
     }
 
     /// The prepared tail of [`AppState::start_batch`]: map each statement
@@ -1440,6 +1479,20 @@ impl AppState {
         }
     }
 
+    /// The same notice on every tab bound to the connection, for events
+    /// about the connection rather than one tab.
+    fn notice_connection(&mut self, conn: ConnectionId, notice: String, is_error: bool) {
+        let tabs: Vec<TabId> = self
+            .tabs
+            .iter()
+            .filter(|t| t.conn == Some(conn))
+            .map(|t| t.id)
+            .collect();
+        for tab in tabs {
+            self.set_tab_notice(tab, notice.clone(), is_error);
+        }
+    }
+
     /// Rows and columns of the tab's active result. None when there is none.
     fn result_shape(&self, tab: TabId) -> Option<(usize, usize)> {
         let result = self.tabs.iter().find(|t| t.id == tab)?.active_query_result()?;
@@ -1556,6 +1609,7 @@ impl AppState {
             ssh_password,
             self.ui_ctx.clone(),
             self.events_tx.clone(),
+            self.tx_idle,
         );
         if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
             c.state = ConnectionState::Connecting { handle };
@@ -1926,6 +1980,7 @@ impl AppState {
                     ssh_password: draft.ssh_password,
                     state: ConnectionState::Disconnected,
                     transaction: Transaction::Closed,
+                    autocommit: true,
                 });
             }
         }
@@ -1968,6 +2023,10 @@ impl AppState {
                         };
                         let handle = session.handle.clone();
                         c.state = ConnectionState::Connected { session };
+                        // A fresh worker session starts with autocommit on, so
+                        // a reconnect must not keep a stale observed mode.
+                        c.autocommit = true;
+                        c.transaction = Transaction::Closed;
                         Some(handle)
                     } else {
                         None
@@ -2030,6 +2089,66 @@ impl AppState {
                         }
                     }
                 }
+            }
+            DbEvent::AutocommitSet { conn, on, tx_open, error } => {
+                if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn) {
+                    // A landing that arrives after a disconnect must not
+                    // move the observed state, same rule as the tx flag.
+                    if matches!(
+                        c.state,
+                        ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
+                    ) {
+                        c.autocommit = on;
+                        c.transaction =
+                            if tx_open { Transaction::Open } else { Transaction::Closed };
+                        if let Some(error) = error {
+                            // The rollback on the way back to autocommit
+                            // failed and the worker closed the connection.
+                            let message = error.to_string();
+                            c.state = ConnectionState::Error { message };
+                            c.transaction = Transaction::Closed;
+                        }
+                    }
+                }
+            }
+            DbEvent::TxState { conn, open } => {
+                if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn) {
+                    if matches!(
+                        c.state,
+                        ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
+                    ) {
+                        c.transaction = if open { Transaction::Open } else { Transaction::Closed };
+                    }
+                }
+            }
+            DbEvent::TxIdleWarning { conn } => {
+                self.notice_connection(
+                    conn,
+                    format!(
+                        "Open transaction idle for {} minutes; it rolls back at {}",
+                        TX_IDLE_ROLLBACK_MINUTES - 1,
+                        TX_IDLE_ROLLBACK_MINUTES
+                    ),
+                    false,
+                );
+            }
+            DbEvent::TxIdleRollback { conn } => {
+                if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn) {
+                    if matches!(
+                        c.state,
+                        ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
+                    ) {
+                        c.transaction = Transaction::Closed;
+                    }
+                }
+                self.notice_connection(
+                    conn,
+                    format!(
+                        "Rolled back the idle transaction after {} minutes",
+                        TX_IDLE_ROLLBACK_MINUTES
+                    ),
+                    false,
+                );
             }
         }
     }
@@ -2256,6 +2375,7 @@ fn load_connections() -> Vec<Connection> {
                 ssh_password: String::new(),
                 state: ConnectionState::Disconnected,
                 transaction: Transaction::Closed,
+                autocommit: true,
             })
             .collect(),
         Err(e) => {
@@ -2660,6 +2780,16 @@ mod tests {
             .is_open()
     }
 
+    /// The observed autocommit for one connection.
+    fn autocommit_on(state: &AppState, conn: ConnectionId) -> bool {
+        state
+            .connections()
+            .iter()
+            .find(|c| c.id == conn)
+            .expect("connection")
+            .autocommit()
+    }
+
     /// Send one transaction control through the button path, asserting the
     /// exact statement reached the worker, and hand back its run id.
     fn send_transaction(
@@ -2736,6 +2866,16 @@ mod tests {
     fn live_transaction(state: &mut AppState, tab: TabId, action: TransactionAction) {
         state.start_transaction(tab, action);
         settle(state, tab, action.statement());
+    }
+
+    /// Toggle autocommit through the button path and wait for the landing.
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    fn live_autocommit(state: &mut AppState, tab: TabId, conn: ConnectionId, on: bool) {
+        state.set_autocommit(tab, on);
+        assert!(
+            pump_until(state, |s| autocommit_on(s, conn) == on),
+            "the autocommit toggle to {on} lands"
+        );
     }
 
     /// The tab's first result cell as an integer.
@@ -3803,6 +3943,7 @@ mod tests {
             ssh_password: "ssh-transient-only".to_owned(),
             state: ConnectionState::Disconnected,
             transaction: Transaction::Closed,
+            autocommit: true,
         }];
         let result = save_connections(&conns);
         let raw = std::fs::read_to_string(dir.join("crusty-data-explorer").join("connections.json"))
@@ -5677,6 +5818,382 @@ mod tests {
             assert_eq!(integer_cell(state, tab), 1, "COMMIT kept the insert");
 
             live_run(state, tab, "DROP TABLE cde_tx_probe");
+        });
+    }
+
+    #[test]
+    fn autocommit_toggle_routes_one_command_and_moves_on_the_landing() {
+        with_isolated_state("ac-toggle", |state| {
+            let conn = add_postgres_connection(state, "pg-ac", "");
+            let commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+            assert!(autocommit_on(state, conn), "defaults on");
+
+            state.set_autocommit(tab, false);
+            assert!(autocommit_on(state, conn), "the observed mode moves only on the landing");
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::SetAutocommit { on } => assert!(!on, "asks for manual mode"),
+                other => panic!("expected SetAutocommit, got {other:?}"),
+            }
+
+            state.apply(DbEvent::AutocommitSet { conn, on: false, tx_open: false, error: None });
+            assert!(!autocommit_on(state, conn), "the landing moves it");
+        });
+    }
+
+    #[test]
+    fn sqlite_has_no_autocommit_toggle() {
+        with_isolated_state("ac-sqlite", |state| {
+            let conn = add_sqlite_connection(state, "mem-ac");
+            let commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+            state.set_autocommit(tab, false);
+            assert!(commands.try_recv().is_err(), "nothing reaches a SQLite worker");
+            assert!(autocommit_on(state, conn), "SQLite stays on");
+        });
+    }
+
+    #[test]
+    fn tx_state_landings_keep_the_observed_flag_in_sync() {
+        with_isolated_state("ac-txstate", |state| {
+            let conn = add_postgres_connection(state, "pg-ac", "");
+            let _commands = attach_test_session(state, conn);
+            let _tab = state.new_tab(conn);
+            assert!(!transaction_open(state, conn));
+
+            state.apply(DbEvent::TxState { conn, open: true });
+            assert!(transaction_open(state, conn), "the implicit BEGIN reports open");
+            state.apply(DbEvent::TxState { conn, open: false });
+            assert!(!transaction_open(state, conn), "the end of the transaction reports closed");
+        });
+    }
+
+    #[test]
+    fn idle_events_surface_the_notice_and_close_the_transaction() {
+        with_isolated_state("ac-idle", |state| {
+            let conn = add_postgres_connection(state, "pg-ac", "");
+            let _commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+            state.apply(DbEvent::TxState { conn, open: true });
+
+            state.apply(DbEvent::TxIdleWarning { conn });
+            assert_eq!(
+                state.tab(tab).expect("tab").export_notice(),
+                Some("Open transaction idle for 9 minutes; it rolls back at 10")
+            );
+
+            state.apply(DbEvent::TxIdleRollback { conn });
+            assert!(!transaction_open(state, conn), "the idle rollback closes the transaction");
+            assert_eq!(
+                state.tab(tab).expect("tab").export_notice(),
+                Some("Rolled back the idle transaction after 10 minutes")
+            );
+        });
+    }
+
+    #[test]
+    fn failed_rollback_on_the_way_to_autocommit_errors_the_connection() {
+        with_isolated_state("ac-error", |state| {
+            let conn = add_postgres_connection(state, "pg-ac", "");
+            let _commands = attach_test_session(state, conn);
+            let _tab = state.new_tab(conn);
+            state.apply(DbEvent::TxState { conn, open: true });
+
+            state.apply(DbEvent::AutocommitSet {
+                conn,
+                on: true,
+                tx_open: false,
+                error: Some(crate::db::DbError::Query("rollback failed".to_owned())),
+            });
+            assert!(matches!(state.connections()[0].state(), ConnectionState::Error { .. }));
+            assert!(!transaction_open(state, conn));
+        });
+    }
+
+    #[test]
+    fn a_toggle_landing_after_disconnect_does_not_move_the_observed_mode() {
+        with_isolated_state("ac-late", |state| {
+            let conn = add_postgres_connection(state, "pg-ac", "");
+            let _commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+            state.set_autocommit(tab, false);
+            state.disconnect(conn);
+            state.apply(DbEvent::AutocommitSet { conn, on: false, tx_open: true, error: None });
+            assert!(autocommit_on(state, conn), "a dead connection keeps its observed mode");
+            assert!(!transaction_open(state, conn));
+        });
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_manual_mode_rollback_discards_and_commit_keeps() {
+        with_isolated_state("pg-manual-live", |state| {
+            let conn = add_postgres_probe_connection(state);
+            state.connect(conn);
+            assert!(
+                pump_until(state, |s| {
+                    s.connections().iter().any(|c| {
+                        c.id == conn && matches!(c.state(), ConnectionState::Connected { .. })
+                    })
+                }),
+                "connects to live Postgres"
+            );
+            let tab = state.new_tab(conn);
+            live_run(state, tab, "DROP TABLE IF EXISTS cde_manual_probe");
+            live_run(state, tab, "CREATE TABLE cde_manual_probe (id INT PRIMARY KEY)");
+
+            live_autocommit(state, tab, conn, false);
+            live_run(state, tab, "INSERT INTO cde_manual_probe VALUES (1)");
+            live_run(state, tab, "INSERT INTO cde_manual_probe VALUES (2)");
+            assert!(transaction_open(state, conn), "the first statement opened the transaction");
+            live_transaction(state, tab, TransactionAction::Rollback);
+            assert!(!transaction_open(state, conn), "ROLLBACK closed the transaction");
+            live_run(state, tab, "SELECT COUNT(*) FROM cde_manual_probe");
+            assert_eq!(integer_cell(state, tab), 0, "ROLLBACK discarded both inserts");
+
+            live_run(state, tab, "INSERT INTO cde_manual_probe VALUES (3)");
+            live_transaction(state, tab, TransactionAction::Commit);
+            assert!(!transaction_open(state, conn), "COMMIT closed the transaction");
+            live_run(state, tab, "SELECT COUNT(*) FROM cde_manual_probe");
+            assert_eq!(integer_cell(state, tab), 1, "COMMIT kept the insert");
+
+            live_autocommit(state, tab, conn, true);
+            live_run(state, tab, "DROP TABLE cde_manual_probe");
+        });
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    #[ignore = "needs a live MySQL; set MYSQLHOST/MYSQLPORT/MYSQLDATABASE/MYSQLUSER/MYSQLPASSWORD"]
+    fn mysql_live_manual_mode_rollback_discards_and_commit_keeps() {
+        with_isolated_state("mysql-manual-live", |state| {
+            let conn = add_mysql_probe_connection(state);
+            state.connect(conn);
+            assert!(
+                pump_until(state, |s| {
+                    s.connections().iter().any(|c| {
+                        c.id == conn && matches!(c.state(), ConnectionState::Connected { .. })
+                    })
+                }),
+                "connects to live MySQL"
+            );
+            let tab = state.new_tab(conn);
+            live_run(state, tab, "DROP TABLE IF EXISTS cde_manual_probe");
+            live_run(state, tab, "CREATE TABLE cde_manual_probe (id INT PRIMARY KEY)");
+
+            live_autocommit(state, tab, conn, false);
+            live_run(state, tab, "INSERT INTO cde_manual_probe VALUES (1)");
+            live_run(state, tab, "INSERT INTO cde_manual_probe VALUES (2)");
+            assert!(transaction_open(state, conn), "the first statement opened the transaction");
+            live_transaction(state, tab, TransactionAction::Rollback);
+            assert!(!transaction_open(state, conn), "ROLLBACK closed the transaction");
+            live_run(state, tab, "SELECT COUNT(*) FROM cde_manual_probe");
+            assert_eq!(integer_cell(state, tab), 0, "ROLLBACK discarded both inserts");
+
+            live_run(state, tab, "INSERT INTO cde_manual_probe VALUES (3)");
+            live_transaction(state, tab, TransactionAction::Commit);
+            assert!(!transaction_open(state, conn), "COMMIT closed the transaction");
+            live_run(state, tab, "SELECT COUNT(*) FROM cde_manual_probe");
+            assert_eq!(integer_cell(state, tab), 1, "COMMIT kept the insert");
+
+            live_autocommit(state, tab, conn, true);
+            live_run(state, tab, "DROP TABLE cde_manual_probe");
+        });
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_cancel_keeps_the_manual_transaction_open() {
+        with_isolated_state("pg-cancel-live", |state| {
+            let conn = add_postgres_probe_connection(state);
+            state.connect(conn);
+            assert!(
+                pump_until(state, |s| {
+                    s.connections().iter().any(|c| {
+                        c.id == conn && matches!(c.state(), ConnectionState::Connected { .. })
+                    })
+                }),
+                "connects to live Postgres"
+            );
+            let tab = state.new_tab(conn);
+            live_run(state, tab, "DROP TABLE IF EXISTS cde_cancel_probe");
+            live_run(state, tab, "CREATE TABLE cde_cancel_probe (id INT PRIMARY KEY)");
+
+            live_autocommit(state, tab, conn, false);
+            live_run(state, tab, "INSERT INTO cde_cancel_probe VALUES (1)");
+            assert!(transaction_open(state, conn), "the insert is inside the transaction");
+
+            state.start_run(tab, "SELECT pg_sleep(30)", 0, None);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            state.cancel_run(tab);
+            assert!(transaction_open(state, conn), "cancel keeps the transaction open");
+
+            // Postgres aborts a transaction whose statement was cancelled, so
+            // the follow-up error itself proves the session never left it.
+            state.start_run(tab, "SELECT 1", 0, None);
+            assert!(
+                pump_until(state, |s| {
+                    !matches!(s.tab(tab).map(|t| t.outcome()), Some(RunOutcome::Running { .. }))
+                }),
+                "the follow-up lands"
+            );
+            match state.tab(tab).expect("tab").outcome() {
+                RunOutcome::Err(message) => {
+                    assert!(
+                        message.contains("aborted"),
+                        "the follow-up ran inside the aborted transaction: {message}"
+                    );
+                }
+                other => panic!("expected the aborted-transaction error, got {other:?}"),
+            }
+            assert!(transaction_open(state, conn), "the aborted transaction is still open");
+
+            live_transaction(state, tab, TransactionAction::Rollback);
+            live_run(state, tab, "SELECT COUNT(*) FROM cde_cancel_probe");
+            assert_eq!(integer_cell(state, tab), 0, "ROLLBACK discarded the pre-cancel insert");
+
+            live_autocommit(state, tab, conn, true);
+            live_run(state, tab, "DROP TABLE cde_cancel_probe");
+        });
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    #[ignore = "needs a live MySQL; set MYSQLHOST/MYSQLPORT/MYSQLDATABASE/MYSQLUSER/MYSQLPASSWORD"]
+    fn mysql_live_cancel_keeps_the_manual_transaction_open() {
+        with_isolated_state("mysql-cancel-live", |state| {
+            let conn = add_mysql_probe_connection(state);
+            state.connect(conn);
+            assert!(
+                pump_until(state, |s| {
+                    s.connections().iter().any(|c| {
+                        c.id == conn && matches!(c.state(), ConnectionState::Connected { .. })
+                    })
+                }),
+                "connects to live MySQL"
+            );
+            let tab = state.new_tab(conn);
+            live_run(state, tab, "DROP TABLE IF EXISTS cde_cancel_probe");
+            live_run(state, tab, "CREATE TABLE cde_cancel_probe (id INT PRIMARY KEY)");
+
+            live_autocommit(state, tab, conn, false);
+            live_run(state, tab, "INSERT INTO cde_cancel_probe VALUES (1)");
+            assert!(transaction_open(state, conn), "the insert is inside the transaction");
+
+            state.start_run(tab, "SELECT SLEEP(30)", 0, None);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            state.cancel_run(tab);
+            assert!(transaction_open(state, conn), "cancel keeps the transaction open");
+
+            // MySQL keeps the transaction usable after KILL QUERY, so a
+            // follow-up insert lands inside it and the rollback discards both.
+            live_run(state, tab, "INSERT INTO cde_cancel_probe VALUES (2)");
+            live_transaction(state, tab, TransactionAction::Rollback);
+            live_run(state, tab, "SELECT COUNT(*) FROM cde_cancel_probe");
+            assert_eq!(integer_cell(state, tab), 0, "ROLLBACK discarded the pre- and post-cancel inserts");
+
+            live_autocommit(state, tab, conn, true);
+            live_run(state, tab, "DROP TABLE cde_cancel_probe");
+        });
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_idle_rollback_fires_and_surfaces_the_notice() {
+        with_isolated_state("pg-idle-live", |state| {
+            state.tx_idle = TxIdle {
+                warn: std::time::Duration::from_millis(150),
+                rollback: std::time::Duration::from_millis(450),
+            };
+            let conn = add_postgres_probe_connection(state);
+            state.connect(conn);
+            assert!(
+                pump_until(state, |s| {
+                    s.connections().iter().any(|c| {
+                        c.id == conn && matches!(c.state(), ConnectionState::Connected { .. })
+                    })
+                }),
+                "connects to live Postgres"
+            );
+            let tab = state.new_tab(conn);
+            live_run(state, tab, "DROP TABLE IF EXISTS cde_idle_probe");
+            live_run(state, tab, "CREATE TABLE cde_idle_probe (id INT PRIMARY KEY)");
+
+            live_autocommit(state, tab, conn, false);
+            live_run(state, tab, "INSERT INTO cde_idle_probe VALUES (1)");
+            assert!(transaction_open(state, conn), "the insert is inside the transaction");
+
+            let warned = pump_until(state, |s| {
+                s.tab(tab)
+                    .and_then(|t| t.export_notice())
+                    .is_some_and(|notice| notice.contains("idle for 9 minutes"))
+            });
+            assert!(warned, "the warning notice lands");
+            let rolled = pump_until(state, |s| {
+                !transaction_open(s, conn)
+                    && s.tab(tab)
+                        .and_then(|t| t.export_notice())
+                        .is_some_and(|notice| notice.contains("Rolled back the idle transaction"))
+            });
+            assert!(rolled, "the idle rollback lands with its notice");
+
+            live_run(state, tab, "SELECT COUNT(*) FROM cde_idle_probe");
+            assert_eq!(integer_cell(state, tab), 0, "the idle rollback discarded the insert");
+            live_transaction(state, tab, TransactionAction::Rollback);
+            live_autocommit(state, tab, conn, true);
+            live_run(state, tab, "DROP TABLE cde_idle_probe");
+        });
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    #[ignore = "needs a live MySQL; set MYSQLHOST/MYSQLPORT/MYSQLDATABASE/MYSQLUSER/MYSQLPASSWORD"]
+    fn mysql_live_idle_rollback_fires_and_surfaces_the_notice() {
+        with_isolated_state("mysql-idle-live", |state| {
+            state.tx_idle = TxIdle {
+                warn: std::time::Duration::from_millis(150),
+                rollback: std::time::Duration::from_millis(450),
+            };
+            let conn = add_mysql_probe_connection(state);
+            state.connect(conn);
+            assert!(
+                pump_until(state, |s| {
+                    s.connections().iter().any(|c| {
+                        c.id == conn && matches!(c.state(), ConnectionState::Connected { .. })
+                    })
+                }),
+                "connects to live MySQL"
+            );
+            let tab = state.new_tab(conn);
+            live_run(state, tab, "DROP TABLE IF EXISTS cde_idle_probe");
+            live_run(state, tab, "CREATE TABLE cde_idle_probe (id INT PRIMARY KEY)");
+
+            live_autocommit(state, tab, conn, false);
+            live_run(state, tab, "INSERT INTO cde_idle_probe VALUES (1)");
+            assert!(transaction_open(state, conn), "the insert is inside the transaction");
+
+            let warned = pump_until(state, |s| {
+                s.tab(tab)
+                    .and_then(|t| t.export_notice())
+                    .is_some_and(|notice| notice.contains("idle for 9 minutes"))
+            });
+            assert!(warned, "the warning notice lands");
+            let rolled = pump_until(state, |s| {
+                !transaction_open(s, conn)
+                    && s.tab(tab)
+                        .and_then(|t| t.export_notice())
+                        .is_some_and(|notice| notice.contains("Rolled back the idle transaction"))
+            });
+            assert!(rolled, "the idle rollback lands with its notice");
+
+            live_run(state, tab, "SELECT COUNT(*) FROM cde_idle_probe");
+            assert_eq!(integer_cell(state, tab), 0, "the idle rollback discarded the insert");
+            live_transaction(state, tab, TransactionAction::Rollback);
+            live_autocommit(state, tab, conn, true);
+            live_run(state, tab, "DROP TABLE cde_idle_probe");
         });
     }
 }
