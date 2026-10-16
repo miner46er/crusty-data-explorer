@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use eframe::egui;
 
 use crate::app::{AppState, ConnectionState, Environment};
-use crate::db::{ConnectionConfig, ConnectionId, PostgresSslMode};
+use crate::db::{ConnectionConfig, ConnectionId, PostgresSslMode, parse_connection_url};
 use crate::ssh::{SshAuth, SshConfig};
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(58, 110, 165);
@@ -409,6 +409,57 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
     egui::Window::new(title).show(ui.ctx(), |ui| {
         let registry = state.registry();
         let Some(draft) = state.draft_mut() else { return };
+        let draft_scope = draft.editing.map(|id| id.raw());
+        let url_id = egui::Id::new(("connection_url_paste", draft_scope));
+        let note_id = egui::Id::new(("connection_url_note", draft_scope));
+        let mut url_text: String =
+            ui.ctx().memory(|m| m.data.get_temp(url_id)).unwrap_or_default();
+        let mut parse_url = false;
+        ui.horizontal(|ui| {
+            ui.label("URL:");
+            ui.add(
+                egui::TextEdit::singleline(&mut url_text)
+                    .hint_text("postgres://user:pass@host:5432/db"),
+            );
+            parse_url = ui.button("Parse").clicked();
+        });
+        ui.ctx().memory_mut(|m| m.data.insert_temp(url_id, url_text.clone()));
+        if parse_url {
+            match parse_connection_url(&url_text) {
+                Ok(parsed) => {
+                    let kind = parsed.kind;
+                    draft.config = parsed.config;
+                    if let Some(password) = parsed.password {
+                        draft.password = password;
+                    }
+                    ui.ctx().memory_mut(|m| {
+                        m.data.insert_temp(
+                            note_id,
+                            Some((
+                                format!("Filled {} fields from URL.", kind.label()),
+                                false,
+                            )),
+                        )
+                    });
+                }
+                Err(error) => {
+                    ui.ctx().memory_mut(|m| {
+                        m.data.insert_temp(note_id, Some((error.to_string(), true)))
+                    });
+                }
+            }
+        }
+        if let Some((note, is_error)) = ui
+            .ctx()
+            .memory(|m| m.data.get_temp::<Option<(String, bool)>>(note_id))
+            .flatten()
+        {
+            if is_error {
+                ui.colored_label(ui.visuals().error_fg_color, note);
+            } else {
+                ui.label(egui::RichText::new(note).small().weak());
+            }
+        }
         ui.horizontal(|ui| {
             ui.label("Name:");
             ui.text_edit_singleline(&mut draft.name);

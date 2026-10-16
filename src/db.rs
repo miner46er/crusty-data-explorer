@@ -2468,6 +2468,236 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
+/// A pasted connection URL split into its persisted shape and its secret.
+/// `config` never holds the password; `password` carries the URL's userinfo
+/// secret for the draft's transient password row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedConnectionUrl {
+    pub kind: DbKind,
+    pub config: ConnectionConfig,
+    pub password: Option<String>,
+}
+
+/// Pure parser inverting [`postgres_url`] and [`mysql_url`]. `postgresql`
+/// and `postgres` feed the Postgres variant, `mysql` and `mariadb` the Mysql
+/// one, `sqlite` and a bare path the Sqlite one. User, password, and
+/// database are percent-decoded; `sslmode` maps onto [`PostgresSslMode`]
+/// while every other query parameter is ignored. Any malformed input reports
+/// one [`DbError::Config`] message.
+pub fn parse_connection_url(raw: &str) -> Result<ParsedConnectionUrl, DbError> {
+    let input = raw.trim();
+    if input.is_empty() {
+        return Err(invalid_url());
+    }
+    if let Some(scheme_end) = input.find("://") {
+        let scheme = input[..scheme_end].to_ascii_lowercase();
+        let rest = &input[scheme_end + 3..];
+        match scheme.as_str() {
+            "postgres" | "postgresql" => parse_network_url(DbKind::Postgres, rest),
+            "mysql" | "mariadb" => parse_network_url(DbKind::Mysql, rest),
+            "sqlite" => parse_sqlite_rest(rest),
+            _ => Err(invalid_url()),
+        }
+    } else if let Some(colon) = scheme_prefix_len(input) {
+        if input[..colon].eq_ignore_ascii_case("sqlite") {
+            parse_sqlite_path(&input[colon + 1..], true)
+        } else {
+            Err(invalid_url())
+        }
+    } else {
+        parse_sqlite_path(input, false)
+    }
+}
+
+/// Length of the `scheme` in `scheme:rest`, if the input opens with one.
+fn scheme_prefix_len(input: &str) -> Option<usize> {
+    let colon = input.find(':')?;
+    let scheme = &input[..colon];
+    let mut chars = scheme.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() => (),
+        _ => return None,
+    }
+    if chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+        Some(colon)
+    } else {
+        None
+    }
+}
+
+fn invalid_url() -> DbError {
+    DbError::Config("invalid connection URL".to_owned())
+}
+
+/// One `scheme://` authority split: `[user[:password]@]host[:port][/database]`.
+fn parse_network_url(kind: DbKind, rest: &str) -> Result<ParsedConnectionUrl, DbError> {
+    let (authority_path, query) = match rest.find('?') {
+        Some(question) => (&rest[..question], Some(&rest[question + 1..])),
+        None => (rest, None),
+    };
+    let (authority, database_enc) = match authority_path.find('/') {
+        Some(slash) => (&authority_path[..slash], &authority_path[slash + 1..]),
+        None => (authority_path, ""),
+    };
+    if database_enc.contains('/') {
+        return Err(invalid_url());
+    }
+    let database = percent_decode(database_enc)?;
+    let (userinfo, hostport) = match authority.rfind('@') {
+        Some(at) => (&authority[..at], &authority[at + 1..]),
+        None => ("", authority),
+    };
+    let (user_enc, password_enc) = match userinfo.find(':') {
+        Some(colon) => (&userinfo[..colon], Some(&userinfo[colon + 1..])),
+        None => (userinfo, None),
+    };
+    let user = percent_decode(user_enc)?;
+    let password =
+        password_enc.map(percent_decode).transpose()?.filter(|secret| !secret.is_empty());
+    let (host, port) = split_host_port(kind, hostport)?;
+    let mut ssl_mode = PostgresSslMode::Disable;
+    if let Some(query) = query {
+        for param in query.split('&') {
+            if param.is_empty() {
+                continue;
+            }
+            let (key, value) = match param.find('=') {
+                Some(eq) => (&param[..eq], &param[eq + 1..]),
+                None => (param, ""),
+            };
+            if kind == DbKind::Postgres && key.eq_ignore_ascii_case("sslmode") {
+                ssl_mode = match_ssl_mode(value).ok_or_else(invalid_url)?;
+            }
+        }
+    }
+    let config = match kind {
+        DbKind::Postgres => ConnectionConfig::Postgres {
+            host,
+            port,
+            database,
+            user,
+            ssl_mode,
+            ssh: None,
+        },
+        DbKind::Mysql => ConnectionConfig::Mysql { host, port, database, user, ssh: None },
+        DbKind::Sqlite => return Err(invalid_url()),
+    };
+    Ok(ParsedConnectionUrl { kind, config, password })
+}
+
+fn match_ssl_mode(value: &str) -> Option<PostgresSslMode> {
+    if value.eq_ignore_ascii_case("disable") {
+        Some(PostgresSslMode::Disable)
+    } else if value.eq_ignore_ascii_case("prefer") {
+        Some(PostgresSslMode::Prefer)
+    } else if value.eq_ignore_ascii_case("require") {
+        Some(PostgresSslMode::Require)
+    } else if value.eq_ignore_ascii_case("verify-ca") {
+        Some(PostgresSslMode::VerifyCa)
+    } else if value.eq_ignore_ascii_case("verify-full") {
+        Some(PostgresSslMode::VerifyFull)
+    } else {
+        None
+    }
+}
+
+/// Host and port with the kind's default when the port is missing. Bracketed
+/// IPv6 keeps its colons; anything else with a second colon is malformed.
+fn split_host_port(kind: DbKind, hostport: &str) -> Result<(String, u16), DbError> {
+    let default_port = kind.default_port().ok_or_else(invalid_url)?;
+    if let Some(bracketed) = hostport.strip_prefix('[') {
+        let end = bracketed.find(']').ok_or_else(invalid_url)?;
+        let host = &bracketed[..end];
+        if host.is_empty() {
+            return Err(invalid_url());
+        }
+        let port = match &bracketed[end + 1..] {
+            "" => default_port,
+            suffixed => parse_port(suffixed.strip_prefix(':').ok_or_else(invalid_url)?)?,
+        };
+        return Ok((host.to_owned(), port));
+    }
+    match hostport.rfind(':') {
+        Some(colon) => {
+            let host = &hostport[..colon];
+            if host.is_empty() || host.contains(':') || host.bytes().any(|b| b.is_ascii_whitespace()) {
+                return Err(invalid_url());
+            }
+            Ok((host.to_owned(), parse_port(&hostport[colon + 1..])?))
+        }
+        None => {
+            if hostport.is_empty() || hostport.bytes().any(|b| b.is_ascii_whitespace()) {
+                return Err(invalid_url());
+            }
+            Ok((hostport.to_owned(), default_port))
+        }
+    }
+}
+
+fn parse_port(raw: &str) -> Result<u16, DbError> {
+    if raw.is_empty() {
+        return Err(invalid_url());
+    }
+    raw.parse::<u16>().map_err(|_| invalid_url())
+}
+
+/// The path after `sqlite://`, with an empty authority stripped so
+/// `sqlite:///tmp/app.db` keeps its absolute path.
+fn parse_sqlite_rest(rest: &str) -> Result<ParsedConnectionUrl, DbError> {
+    let path_enc = match rest.find('?') {
+        Some(question) => &rest[..question],
+        None => rest,
+    };
+    parse_sqlite_path(path_enc, true)
+}
+
+fn parse_sqlite_path(path: &str, encoded: bool) -> Result<ParsedConnectionUrl, DbError> {
+    let decoded = if encoded { percent_decode(path)? } else { path.to_owned() };
+    if decoded.is_empty() {
+        return Err(invalid_url());
+    }
+    Ok(ParsedConnectionUrl {
+        kind: DbKind::Sqlite,
+        config: ConnectionConfig::Sqlite { path: PathBuf::from(decoded) },
+        password: None,
+    })
+}
+
+/// Percent-decoding without `+`-as-space: a raw `+` in userinfo stays a
+/// plus, since the builders encode a space as `%20` and a plus as `%2B`.
+fn percent_decode(s: &str) -> Result<String, DbError> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let pair = (bytes.get(i + 1).copied(), bytes.get(i + 2).copied());
+            match pair {
+                (Some(hi), Some(lo))
+                    if hi.is_ascii_hexdigit() && lo.is_ascii_hexdigit() =>
+                {
+                    out.push(hex_val(hi) * 16 + hex_val(lo));
+                    i += 3;
+                }
+                _ => return Err(invalid_url()),
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| invalid_url())
+}
+
+fn hex_val(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    }
+}
+
 #[cfg(feature = "postgres")]
 fn map_pg_row(row: &sqlx::postgres::PgRow) -> Result<Vec<Value>, DbError> {
     use sqlx::{Column as _, Row as _, TypeInfo as _};
@@ -3414,6 +3644,301 @@ mod tests {
             mysql_url("localhost", 3306, "cde test", "ad min", Some("p@ss:w/ord?")),
             "mysql://ad%20min:p%40ss%3Aw%2Ford%3F@localhost:3306/cde%20test"
         );
+    }
+
+    #[test]
+    fn parse_postgres_url_covers_user_password_port_database_and_sslmode() {
+        let parsed =
+            parse_connection_url("postgres://owner:s3cret@db.internal:5433/analytics?sslmode=require")
+                .unwrap();
+        assert_eq!(parsed.kind, DbKind::Postgres);
+        assert_eq!(
+            parsed.config,
+            ConnectionConfig::Postgres {
+                host: "db.internal".to_owned(),
+                port: 5433,
+                database: "analytics".to_owned(),
+                user: "owner".to_owned(),
+                ssl_mode: PostgresSslMode::Require,
+                ssh: None,
+            }
+        );
+        assert_eq!(parsed.password, Some("s3cret".to_owned()));
+    }
+
+    #[test]
+    fn parse_postgresql_scheme_alias_parses_like_postgres() {
+        let parsed = parse_connection_url("postgresql://owner@localhost:5432/appdb").unwrap();
+        assert_eq!(parsed.kind, DbKind::Postgres);
+        assert_eq!(
+            parsed.config,
+            ConnectionConfig::Postgres {
+                host: "localhost".to_owned(),
+                port: 5432,
+                database: "appdb".to_owned(),
+                user: "owner".to_owned(),
+                ssl_mode: PostgresSslMode::Disable,
+                ssh: None,
+            }
+        );
+        assert_eq!(parsed.password, None);
+    }
+
+    #[test]
+    fn parse_postgres_url_decodes_user_password_and_database() {
+        let parsed = parse_connection_url(
+            "postgres://ad%20min:p%40ss%3Aw%2Ford%3F@localhost:5432/cde%20test",
+        )
+        .unwrap();
+        assert_eq!(parsed.kind, DbKind::Postgres);
+        let ConnectionConfig::Postgres { host, port, database, user, ssl_mode, ssh } =
+            parsed.config
+        else {
+            panic!("expected a postgres config");
+        };
+        assert_eq!(user, "ad min");
+        assert_eq!(database, "cde test");
+        assert_eq!(
+            (host.as_str(), port, ssl_mode, ssh),
+            ("localhost", 5432, PostgresSslMode::Disable, None)
+        );
+        assert_eq!(parsed.password, Some("p@ss:w/ord?".to_owned()));
+    }
+
+    #[test]
+    fn parse_postgres_url_defaults_a_missing_port() {
+        let parsed = parse_connection_url("postgres://owner@localhost/appdb").unwrap();
+        let ConnectionConfig::Postgres { port, .. } = parsed.config else {
+            panic!("expected a postgres config");
+        };
+        assert_eq!(port, 5432);
+    }
+
+    #[test]
+    fn parse_postgres_url_maps_every_sslmode() {
+        for (wire, mode) in [
+            ("disable", PostgresSslMode::Disable),
+            ("prefer", PostgresSslMode::Prefer),
+            ("require", PostgresSslMode::Require),
+            ("verify-ca", PostgresSslMode::VerifyCa),
+            ("verify-full", PostgresSslMode::VerifyFull),
+        ] {
+            let url = format!("postgres://owner@localhost:5432/appdb?sslmode={wire}");
+            let parsed = parse_connection_url(&url).unwrap();
+            let ConnectionConfig::Postgres { ssl_mode, .. } = parsed.config else {
+                panic!("expected a postgres config");
+            };
+            assert_eq!(ssl_mode, mode, "{url}");
+        }
+    }
+
+    #[test]
+    fn parse_postgres_url_ignores_unknown_query_parameters() {
+        let parsed = parse_connection_url(
+            "postgres://owner@localhost:5432/appdb?connect_timeout=10&sslmode=prefer",
+        )
+        .unwrap();
+        let ConnectionConfig::Postgres { ssl_mode, user, .. } = parsed.config else {
+            panic!("expected a postgres config");
+        };
+        assert_eq!(ssl_mode, PostgresSslMode::Prefer);
+        assert_eq!(user, "owner");
+    }
+
+    #[test]
+    fn parse_mysql_url_covers_user_password_port_and_database() {
+        let parsed =
+            parse_connection_url("mysql://root:cdepass@db.internal:3307/cde_test").unwrap();
+        assert_eq!(parsed.kind, DbKind::Mysql);
+        assert_eq!(
+            parsed.config,
+            ConnectionConfig::Mysql {
+                host: "db.internal".to_owned(),
+                port: 3307,
+                database: "cde_test".to_owned(),
+                user: "root".to_owned(),
+                ssh: None,
+            }
+        );
+        assert_eq!(parsed.password, Some("cdepass".to_owned()));
+    }
+
+    #[test]
+    fn parse_mariadb_scheme_alias_parses_like_mysql() {
+        let parsed = parse_connection_url("mariadb://root@localhost:3306/cde_test").unwrap();
+        assert_eq!(parsed.kind, DbKind::Mysql);
+        assert_eq!(
+            parsed.config,
+            ConnectionConfig::Mysql {
+                host: "localhost".to_owned(),
+                port: 3306,
+                database: "cde_test".to_owned(),
+                user: "root".to_owned(),
+                ssh: None,
+            }
+        );
+        assert_eq!(parsed.password, None);
+    }
+
+    #[test]
+    fn parse_mysql_url_decodes_parts_defaults_port_and_ignores_query() {
+        let parsed = parse_connection_url(
+            "mysql://ad%20min:p%40ss%3Aw%2Ford%3F@localhost/cde%20test?charset=utf8mb4",
+        )
+        .unwrap();
+        assert_eq!(parsed.kind, DbKind::Mysql);
+        assert_eq!(
+            parsed.config,
+            ConnectionConfig::Mysql {
+                host: "localhost".to_owned(),
+                port: 3306,
+                database: "cde test".to_owned(),
+                user: "ad min".to_owned(),
+                ssh: None,
+            }
+        );
+        assert_eq!(parsed.password, Some("p@ss:w/ord?".to_owned()));
+    }
+
+    #[test]
+    fn parse_sqlite_url_and_bare_paths_share_one_shape() {
+        for raw in [
+            "sqlite:///tmp/app.db",
+            "sqlite:/tmp/app.db",
+            "sqlite:tmp/app.db",
+            "/tmp/app.db",
+            "tmp/app.db",
+            ":memory:",
+        ] {
+            let parsed = parse_connection_url(raw).unwrap();
+            assert_eq!(parsed.kind, DbKind::Sqlite, "{raw}");
+            assert_eq!(parsed.password, None, "{raw}");
+        }
+        assert_eq!(
+            parse_connection_url("sqlite:///tmp/app.db").unwrap().config,
+            ConnectionConfig::Sqlite { path: PathBuf::from("/tmp/app.db") }
+        );
+        assert_eq!(
+            parse_connection_url("/tmp/app.db").unwrap().config,
+            ConnectionConfig::Sqlite { path: PathBuf::from("/tmp/app.db") }
+        );
+        assert_eq!(
+            parse_connection_url(":memory:").unwrap().config,
+            ConnectionConfig::Sqlite { path: PathBuf::from(":memory:") }
+        );
+    }
+
+    #[test]
+    fn parse_rejects_a_bad_scheme() {
+        assert_eq!(
+            parse_connection_url("redis://localhost:6379/0"),
+            Err(DbError::Config("invalid connection URL".to_owned()))
+        );
+    }
+
+    #[test]
+    fn parse_rejects_a_malformed_host() {
+        assert_eq!(
+            parse_connection_url("postgres://owner:secret@/appdb"),
+            Err(DbError::Config("invalid connection URL".to_owned()))
+        );
+    }
+
+    #[test]
+    fn parse_rejects_a_percent_decoding_error() {
+        assert_eq!(
+            parse_connection_url("postgres://%ZZ@localhost:5432/appdb"),
+            Err(DbError::Config("invalid connection URL".to_owned()))
+        );
+    }
+
+    #[test]
+    fn postgres_url_roundtrips_through_parse() {
+        let config = ConnectionConfig::Postgres {
+            host: "db.internal".to_owned(),
+            port: 5433,
+            database: "analytics".to_owned(),
+            user: "reader".to_owned(),
+            ssl_mode: PostgresSslMode::Require,
+            ssh: None,
+        };
+        let url = postgres_url(
+            "db.internal",
+            5433,
+            "analytics",
+            "reader",
+            Some("s3cret"),
+            PostgresSslMode::Require,
+        );
+        let parsed = parse_connection_url(&url).unwrap();
+        assert_eq!(parsed.kind, DbKind::Postgres);
+        assert_eq!(parsed.config, config);
+        assert_eq!(parsed.password, Some("s3cret".to_owned()));
+        let encoded = postgres_url(
+            "localhost",
+            5432,
+            "cde test",
+            "ad min",
+            Some("p@ss:w/ord?"),
+            PostgresSslMode::VerifyFull,
+        );
+        let parsed = parse_connection_url(&encoded).unwrap();
+        let ConnectionConfig::Postgres { host, port, database, user, ssl_mode, ssh } =
+            parsed.config
+        else {
+            panic!("expected a postgres config");
+        };
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 5432);
+        assert_eq!(database, "cde test");
+        assert_eq!(user, "ad min");
+        assert_eq!(ssl_mode, PostgresSslMode::VerifyFull);
+        assert_eq!(ssh, None);
+        assert_eq!(parsed.password, Some("p@ss:w/ord?".to_owned()));
+        let bare =
+            postgres_url("localhost", 5432, "appdb", "owner", None, PostgresSslMode::Disable);
+        let parsed = parse_connection_url(&bare).unwrap();
+        assert_eq!(parsed.password, None);
+        assert_eq!(
+            parsed.config,
+            ConnectionConfig::Postgres {
+                host: "localhost".to_owned(),
+                port: 5432,
+                database: "appdb".to_owned(),
+                user: "owner".to_owned(),
+                ssl_mode: PostgresSslMode::Disable,
+                ssh: None,
+            }
+        );
+    }
+
+    #[test]
+    fn mysql_url_roundtrips_through_parse() {
+        let config = ConnectionConfig::Mysql {
+            host: "db.internal".to_owned(),
+            port: 3307,
+            database: "cde_test".to_owned(),
+            user: "root".to_owned(),
+            ssh: None,
+        };
+        let url = mysql_url("db.internal", 3307, "cde_test", "root", Some("cdepass"));
+        let parsed = parse_connection_url(&url).unwrap();
+        assert_eq!(parsed.kind, DbKind::Mysql);
+        assert_eq!(parsed.config, config);
+        assert_eq!(parsed.password, Some("cdepass".to_owned()));
+        let encoded = mysql_url("localhost", 3306, "cde test", "ad min", Some("p@ss:w/ord?"));
+        let parsed = parse_connection_url(&encoded).unwrap();
+        assert_eq!(
+            parsed.config,
+            ConnectionConfig::Mysql {
+                host: "localhost".to_owned(),
+                port: 3306,
+                database: "cde test".to_owned(),
+                user: "ad min".to_owned(),
+                ssh: None,
+            }
+        );
+        assert_eq!(parsed.password, Some("p@ss:w/ord?".to_owned()));
     }
 
     #[cfg(not(feature = "mysql"))]
