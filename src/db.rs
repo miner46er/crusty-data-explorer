@@ -1257,7 +1257,6 @@ pub fn test_handle() -> (DbHandle, mpsc::Receiver<DbCommand>) {
 
 #[derive(Debug)]
 pub enum DbCommand {
-    Query { run: RunId, sql: String },
     QueryBatch { run: RunId, statements: Vec<String> },
     LoadSchema,
 }
@@ -3445,23 +3444,6 @@ fn worker_loop(
 
     while let Ok(cmd) = cmds.recv() {
         match cmd {
-            DbCommand::Query { run, sql } => {
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    session.query(&sql)
-                }));
-                let event = match outcome {
-                    Ok(Ok(result)) => DbEvent::QueryOk { run, result },
-                    Ok(Err(error)) => DbEvent::QueryErr { run, error },
-                    Err(_) => DbEvent::QueryErr {
-                        run,
-                        error: DbError::Query("driver panicked while running".to_owned()),
-                    },
-                };
-                if events.send(event).is_err() {
-                    break;
-                }
-                ui.request_repaint();
-            }
             DbCommand::QueryBatch { run, statements } => {
                 let event = match run_statements(&mut session, &statements) {
                     Ok(results) => DbEvent::BatchOk { run, results },
