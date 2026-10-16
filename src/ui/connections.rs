@@ -25,6 +25,7 @@ enum SidebarAction {
     Delete(ConnectionId),
     RefreshSchema(ConnectionId),
     PreviewTable(ConnectionId, String, String),
+    RevealTable(ConnectionId, String, String),
     TableCount(ConnectionId, String, String),
     OpenHistory(ConnectionId, String),
     ClearHistory,
@@ -271,6 +272,11 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                                                 id, schema, table,
                                             ));
                                         }
+                                        super::schema::SchemaAction::Reveal(id, schema, table) => {
+                                            actions.push(SidebarAction::RevealTable(
+                                                id, schema, table,
+                                            ));
+                                        }
                                         super::schema::SchemaAction::Count(id, schema, table) => {
                                             actions.push(SidebarAction::TableCount(
                                                 id, schema, table,
@@ -376,6 +382,9 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                         SidebarAction::RefreshSchema(id) => state.refresh_schema(id),
                         SidebarAction::PreviewTable(id, schema, table) => {
                             state.preview_table(id, &schema, &table)
+                        }
+                        SidebarAction::RevealTable(id, schema, table) => {
+                            state.reveal_table(id, &schema, &table)
                         }
                         SidebarAction::TableCount(id, schema, table) => {
                             state.request_row_count(id, &schema, &table)

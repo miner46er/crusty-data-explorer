@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use crate::db::{
     CancelHandle, ConnectionConfig, ConnectionId, DbCommand, DbEvent, DbHandle, DbKind,
-    DriverRegistry, Ids, QueryResult, RowCount, RunId, SchemaInfo, TabId, TableInfo, TxIdle,
-    Value, explain_sql, spawn_session,
+    DriverRegistry, ForeignKeyInfo, Ids, QueryResult, RowCount, RunId, SchemaInfo, TabId,
+    TableInfo, TxIdle, Value, explain_sql, spawn_session,
     TX_IDLE_ROLLBACK_MINUTES,
 };
 use crate::edit::{
@@ -939,6 +939,162 @@ fn table_select(schema: &str, table: &str) -> String {
         schema.replace('"', "\"\""),
         table.replace('"', "\"\"")
     )
+}
+
+/// One foreign key jump: the referenced schema and table plus the filtered
+/// SELECT that lands on the referenced row. Pure, so tests assert literals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FkJump {
+    pub schema: String,
+    pub table: String,
+    pub sql: String,
+}
+
+/// The single-column foreign key on `child_column`, if exactly one exists.
+/// None for no key, several keys, or a multi-column key, so ambiguous cells
+/// stay put rather than guessing.
+fn single_fk<'a>(info: &'a TableInfo, child_column: &str) -> Option<&'a ForeignKeyInfo> {
+    let mut found = None;
+    for fk in info.foreign_keys() {
+        if fk.columns().len() != 1 || fk.ref_columns().len() != 1 {
+            continue;
+        }
+        if !fk.columns()[0].eq_ignore_ascii_case(child_column) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(fk);
+    }
+    found
+}
+
+/// The schema node and table behind a child name, tables only. Foreign keys
+/// live on tables, so a view or a missing name resolves nothing.
+fn fk_child<'a>(schema: &'a SchemaInfo, child_schema: &str, child_table: &str) -> Option<&'a TableInfo> {
+    for database in schema.databases() {
+        for node in database.schemas() {
+            if !node.name().eq_ignore_ascii_case(child_schema) {
+                continue;
+            }
+            for info in node.tables() {
+                if info.name().eq_ignore_ascii_case(child_table) {
+                    return Some(info);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The referenced table behind `ref_table`: a qualified name resolves under
+/// its own schema, a bare name under the child's schema only. No fallback
+/// search, so an unresolvable name stays rather than guessing.
+fn fk_parent<'a>(
+    schema: &'a SchemaInfo,
+    child_schema: &str,
+    ref_table: &str,
+) -> Option<(String, &'a TableInfo)> {
+    let parts = qualified_parts(ref_table);
+    let (wanted_schema, wanted_table) = match parts.as_slice() {
+        [table] => (child_schema, table.as_str()),
+        [first, second] => (first.as_str(), second.as_str()),
+        _ => return None,
+    };
+    for database in schema.databases() {
+        for node in database.schemas() {
+            if !node.name().eq_ignore_ascii_case(wanted_schema) {
+                continue;
+            }
+            for info in node.tables() {
+                if info.name().eq_ignore_ascii_case(wanted_table) {
+                    return Some((node.name().to_owned(), info));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The filtered SELECT landing on one referenced row. None for a NULL value,
+/// a NULL literal, a missing child or parent, a missing referenced column,
+/// or anything but one single-column key, so those cells stay put.
+pub fn fk_jump(
+    schema: &SchemaInfo,
+    child_schema: &str,
+    child_table: &str,
+    child_column: &str,
+    value: &str,
+    was_null: bool,
+) -> Option<FkJump> {
+    if was_null {
+        return None;
+    }
+    let child = fk_child(schema, child_schema, child_table)?;
+    let fk = single_fk(child, child_column)?;
+    let ref_col = fk.ref_columns().first()?;
+    let (parent_schema, parent) = fk_parent(schema, child_schema, fk.ref_table())?;
+    if !parent.columns().iter().any(|c| c.name().eq_ignore_ascii_case(ref_col)) {
+        return None;
+    }
+    let text_key = parent
+        .columns()
+        .iter()
+        .find(|c| c.name().eq_ignore_ascii_case(ref_col))
+        .map(|c| is_text_type(c.type_name()))
+        .unwrap_or(false);
+    let literal = key_literal(value, was_null, text_key);
+    if literal == "NULL" {
+        return None;
+    }
+    let sql = format!(
+        "SELECT * FROM \"{}\".\"{}\" WHERE {} = {} LIMIT 100",
+        parent_schema.replace('"', "\"\""),
+        parent.name().replace('"', "\"\""),
+        ident(ref_col),
+        literal
+    );
+    Some(FkJump { schema: parent_schema, table: parent.name().to_owned(), sql })
+}
+
+/// The referenced table a schema link reveals: Some only for one
+/// single-column key whose table and column resolve, so multi-column and
+/// unresolvable links render as plain text and stay put.
+pub fn fk_reveal_target(
+    schema: &SchemaInfo,
+    child_schema: &str,
+    _child_table: &str,
+    fk: &ForeignKeyInfo,
+) -> Option<(String, String)> {
+    if fk.columns().len() != 1 || fk.ref_columns().len() != 1 {
+        return None;
+    }
+    let ref_col = fk.ref_columns().first()?;
+    let (parent_schema, parent) = fk_parent(schema, child_schema, fk.ref_table())?;
+    if !parent.columns().iter().any(|c| c.name().eq_ignore_ascii_case(ref_col)) {
+        return None;
+    }
+    Some((parent_schema, parent.name().to_owned()))
+}
+
+/// The child table a References entry reveals: the entry carries the parent
+/// columns with `ref_table` set to the child, so the same single-column and
+/// resolvability gates hold with the roles swapped.
+pub fn fk_incoming_target(
+    schema: &SchemaInfo,
+    parent_schema: &str,
+    fk: &ForeignKeyInfo,
+) -> Option<(String, String)> {
+    if fk.columns().len() != 1 || fk.ref_columns().len() != 1 {
+        return None;
+    }
+    let child_col = fk.ref_columns().first()?;
+    let (child_schema, child) = fk_parent(schema, parent_schema, fk.ref_table())?;
+    if !child.columns().iter().any(|c| c.name().eq_ignore_ascii_case(child_col)) {
+        return None;
+    }
+    Some((child_schema, child.name().to_owned()))
 }
 
 /// Primary key columns in key order with their declared types, from the
@@ -2697,6 +2853,95 @@ impl AppState {
                 self.start_run(id, &sql, sql.len(), None);
             }
         }
+    }
+
+    /// Follow the single-column foreign key behind one grid cell to its
+    /// referenced row: the referenced table opens with a filtered SELECT and
+    /// the navigator reveals its entry through [`AppState::reveal_table`].
+    /// False when the cell is NULL, the tab names no single table, or the key
+    /// is multi-column or unresolvable, which stays on the current view.
+    pub fn follow_foreign_key(&mut self, tab: TabId, row: usize, col: usize) -> bool {
+        let (conn, child_schema, child_table, column, text, was_null) = match self.tabs
+            .iter()
+            .find(|t| t.id == tab)
+        {
+            Some(current) => {
+                let Some(conn) = current.conn else { return false };
+                let Some(schema) = self.schemas.get(&conn) else { return false };
+                let Some(result) = current.active_query_result() else { return false };
+                if col >= result.columns().len() || row >= result.row_count() {
+                    return false;
+                }
+                let table_name = match editable_table(&current.sql) {
+                    Some(name) => name,
+                    None => return false,
+                };
+                let (resolved_schema, resolved_table) = match qualified_parts(&table_name)
+                    .as_slice()
+                {
+                    [table] => {
+                        let mut found = None;
+                        for database in schema.databases() {
+                            for node in database.schemas() {
+                                for info in node.tables() {
+                                    if info.name().eq_ignore_ascii_case(table) {
+                                        found = Some((node.name().to_owned(), info.name().to_owned()));
+                                        break;
+                                    }
+                                }
+                                if found.is_some() {
+                                    break;
+                                }
+                            }
+                            if found.is_some() {
+                                break;
+                            }
+                        }
+                        match found {
+                            Some(found) => found,
+                            None => return false,
+                        }
+                    }
+                    [first, second] => (first.clone(), second.clone()),
+                    _ => return false,
+                };
+                let column = result.columns()[col].name().to_owned();
+                let cell = result.cell(row, col);
+                let was_null = matches!(cell, Some(Value::Null) | None);
+                let text = cell
+                    .map(|v| v.display(usize::MAX).into_owned())
+                    .unwrap_or_default();
+                (conn, resolved_schema, resolved_table, column, text, was_null)
+            }
+            None => return false,
+        };
+        let schema = match self.schemas.get(&conn) {
+            Some(schema) => schema.clone(),
+            None => return false,
+        };
+        let jump = match fk_jump(&schema, &child_schema, &child_table, &column, &text, was_null) {
+            Some(jump) => jump,
+            None => return false,
+        };
+        let sql = jump.sql.clone();
+        let existing =
+            self.tabs.iter().find(|t| t.conn == Some(conn) && t.sql == sql).map(|t| t.id);
+        match existing {
+            Some(id) => {
+                self.activate(id);
+                self.start_run(id, &sql.clone(), sql.len(), None);
+            }
+            None => {
+                let id = self.new_tab(conn);
+                if let Some(slot) = self.tab_sql_mut(id) {
+                    *slot = sql.clone();
+                }
+                self.activate(id);
+                self.start_run(id, &sql, sql.len(), None);
+            }
+        }
+        self.reveal_table(conn, &jump.schema, &jump.table);
+        true
     }
 
     pub fn history(&self) -> &[HistoryEntry] {
@@ -6082,6 +6327,356 @@ mod tests {
                 })
             );
             assert_eq!(state.tabs().len(), 2, "the column row opened no tab");
+        });
+    }
+
+    /// One parent with an integer key and one child with a single-column key
+    /// to it, for foreign key jump cases.
+    fn fk_schema() -> SchemaInfo {
+        let parent = TableInfo::new(
+            "parent".to_owned(),
+            TableKind::Table,
+            vec![
+                ColumnInfo::new("id".to_owned(), "INTEGER".to_owned(), false, Some(1)).unwrap(),
+                ColumnInfo::new("name".to_owned(), "TEXT".to_owned(), true, None).unwrap(),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let child = TableInfo::new(
+            "child".to_owned(),
+            TableKind::Table,
+            vec![
+                ColumnInfo::new("id".to_owned(), "INTEGER".to_owned(), false, Some(1)).unwrap(),
+                ColumnInfo::new("parent_id".to_owned(), "INTEGER".to_owned(), true, None)
+                    .unwrap(),
+            ],
+            Vec::new(),
+            vec![
+                crate::db::ForeignKeyInfo::new(
+                    vec!["parent_id".to_owned()],
+                    "parent".to_owned(),
+                    vec!["id".to_owned()],
+                    None,
+                )
+                .unwrap(),
+            ],
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let node = SchemaNode::new(
+            "main".to_owned(),
+            vec![parent, child],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let database = DatabaseNode::new(":memory:".to_owned(), vec![node]).unwrap();
+        SchemaInfo::new(vec![database], false, false)
+    }
+
+    /// The child rows behind [`fk_schema`]: two links into the parent.
+    fn fk_child_result() -> QueryResult {
+        QueryResult::from_columns(
+            vec![
+                crate::db::Column::new(
+                    "id".to_owned(),
+                    "INTEGER".to_owned(),
+                    vec![crate::db::Value::Integer(10), crate::db::Value::Integer(20)],
+                ),
+                crate::db::Column::new(
+                    "parent_id".to_owned(),
+                    "INTEGER".to_owned(),
+                    vec![crate::db::Value::Integer(1), crate::db::Value::Integer(2)],
+                ),
+            ],
+            false,
+            None,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fk_jump_builds_a_filtered_select_for_a_single_column_key() {
+        let schema = fk_schema();
+        assert_eq!(
+            fk_jump(&schema, "main", "child", "parent_id", "1", false),
+            Some(FkJump {
+                schema: "main".to_owned(),
+                table: "parent".to_owned(),
+                sql: "SELECT * FROM \"main\".\"parent\" WHERE \"id\" = 1 LIMIT 100".to_owned(),
+            })
+        );
+        assert_eq!(
+            fk_reveal_target(
+                &schema,
+                "main",
+                "child",
+                &crate::db::ForeignKeyInfo::new(
+                    vec!["parent_id".to_owned()],
+                    "parent".to_owned(),
+                    vec!["id".to_owned()],
+                    None,
+                )
+                .unwrap(),
+            ),
+            Some(("main".to_owned(), "parent".to_owned()))
+        );
+    }
+
+    #[test]
+    fn fk_jump_quotes_a_text_key_that_prints_as_a_number() {
+        let parent = TableInfo::new(
+            "parent".to_owned(),
+            TableKind::Table,
+            vec![
+                ColumnInfo::new("code".to_owned(), "TEXT".to_owned(), false, Some(1)).unwrap(),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let child = TableInfo::new(
+            "child".to_owned(),
+            TableKind::Table,
+            vec![
+                ColumnInfo::new("id".to_owned(), "INTEGER".to_owned(), false, Some(1)).unwrap(),
+                ColumnInfo::new("code".to_owned(), "TEXT".to_owned(), true, None).unwrap(),
+            ],
+            Vec::new(),
+            vec![
+                crate::db::ForeignKeyInfo::new(
+                    vec!["code".to_owned()],
+                    "parent".to_owned(),
+                    vec!["code".to_owned()],
+                    None,
+                )
+                .unwrap(),
+            ],
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let node = SchemaNode::new(
+            "main".to_owned(),
+            vec![parent, child],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let schema =
+            SchemaInfo::new(vec![DatabaseNode::new(":memory:".to_owned(), vec![node]).unwrap()], false, false);
+        assert_eq!(
+            fk_jump(&schema, "main", "child", "code", "010", false),
+            Some(FkJump {
+                schema: "main".to_owned(),
+                table: "parent".to_owned(),
+                sql: "SELECT * FROM \"main\".\"parent\" WHERE \"code\" = '010' LIMIT 100"
+                    .to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn fk_jump_stays_for_null_multi_column_and_missing_targets() {
+        let schema = fk_schema();
+        assert_eq!(fk_jump(&schema, "main", "child", "parent_id", "1", true), None);
+        assert_eq!(fk_jump(&schema, "main", "child", "id", "10", false), None);
+        assert_eq!(fk_jump(&schema, "main", "child", "PARENT_ID", "2", false).map(|j| j.sql),
+            Some("SELECT * FROM \"main\".\"parent\" WHERE \"id\" = 2 LIMIT 100".to_owned()));
+        assert_eq!(fk_jump(&schema, "main", "child", "nope", "1", false), None);
+        assert_eq!(fk_jump(&schema, "main", "gone", "parent_id", "1", false), None);
+        assert_eq!(fk_jump(&schema, "main", "child", "parent_id", "", false), None);
+        let multi = crate::db::ForeignKeyInfo::new(
+            vec!["a".to_owned(), "b".to_owned()],
+            "parent".to_owned(),
+            vec!["a".to_owned(), "b".to_owned()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(fk_reveal_target(&schema, "main", "child", &multi), None);
+        let missing = crate::db::ForeignKeyInfo::new(
+            vec!["parent_id".to_owned()],
+            "gone".to_owned(),
+            vec!["id".to_owned()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(fk_reveal_target(&schema, "main", "child", &missing), None);
+        let bad_col = crate::db::ForeignKeyInfo::new(
+            vec!["parent_id".to_owned()],
+            "parent".to_owned(),
+            vec!["gone".to_owned()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(fk_reveal_target(&schema, "main", "child", &bad_col), None);
+    }
+
+    #[test]
+    fn follow_foreign_key_opens_the_filtered_parent_and_reveals_it() {
+        with_isolated_state("fk-follow", |state| {
+            let conn = add_sqlite_connection(state, "mem-fk");
+            let commands = attach_test_session(state, conn);
+            state.apply(DbEvent::SchemaOk { conn, schema: fk_schema() });
+            let tab = state.new_tab(conn);
+            let sql = "SELECT * FROM \"main\".\"child\"";
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = sql.to_owned();
+            }
+            let run = state.ids.run();
+            state.set_outcome(
+                tab,
+                RunOutcome::Running {
+                    run,
+                    started: Instant::now(),
+                    statements: vec![sql.to_owned()],
+                },
+            );
+            state.apply(DbEvent::BatchOk { run, results: vec![fk_child_result()] });
+            assert!(state.follow_foreign_key(tab, 0, 1), "the single key jumps");
+            assert_eq!(
+                state.navigator_reveal(),
+                Some(&NavigatorReveal {
+                    conn,
+                    schema: "main".to_owned(),
+                    table: "parent".to_owned(),
+                })
+            );
+            let opened = state.active().and_then(|id| state.tab(id)).expect("jumped tab");
+            assert_eq!(
+                opened.sql,
+                "SELECT * FROM \"main\".\"parent\" WHERE \"id\" = 1 LIMIT 100"
+            );
+            match commands.try_recv().expect("the filtered SELECT sends") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(
+                        statements,
+                        vec!["SELECT * FROM \"main\".\"parent\" WHERE \"id\" = 1 LIMIT 100"]
+                    );
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+            let tabs = state.tabs().len();
+            assert!(!state.follow_foreign_key(tab, 0, 0), "a plain column stays");
+            assert!(!state.follow_foreign_key(tab, 9, 1), "a missing row stays");
+            assert_eq!(state.tabs().len(), tabs, "a stay opens no tab");
+            assert!(commands.try_recv().is_err(), "a stay sends nothing");
+        });
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_fk_jump_from_a_scratch_child_row_to_its_parent() {
+        with_isolated_state("pg-fk-jump-live", |state| {
+            let conn = add_postgres_probe_connection(state);
+            state.connect(conn);
+            assert!(
+                pump_until(state, |s| {
+                    s.connections().iter().any(|c| {
+                        c.id == conn && matches!(c.state(), ConnectionState::Connected { .. })
+                    })
+                }),
+                "connects to live Postgres"
+            );
+            let tab = state.new_tab(conn);
+            live_run(state, tab, "DROP TABLE IF EXISTS cde_fk_child");
+            live_run(state, tab, "DROP TABLE IF EXISTS cde_fk_parent");
+            live_run(
+                state,
+                tab,
+                "CREATE TABLE cde_fk_parent (id INT PRIMARY KEY, name TEXT NOT NULL)",
+            );
+            live_run(
+                state,
+                tab,
+                "CREATE TABLE cde_fk_child (id INT PRIMARY KEY, parent_id INT REFERENCES cde_fk_parent(id))",
+            );
+            live_run(
+                state,
+                tab,
+                "INSERT INTO cde_fk_parent (id, name) VALUES (1, 'ada'), (2, 'grace')",
+            );
+            live_run(state, tab, "INSERT INTO cde_fk_child (id, parent_id) VALUES (10, 1)");
+            state.refresh_schema(conn);
+            assert!(
+                pump_until(state, |s| {
+                    s.schema(conn).is_some_and(|schema| {
+                        schema.databases().iter().any(|db| {
+                            db.schemas().iter().any(|node| {
+                                node.tables().iter().any(|t| {
+                                    t.name() == "cde_fk_child" && !t.foreign_keys().is_empty()
+                                })
+                            })
+                        })
+                    })
+                }),
+                "the schema loads the scratch foreign key"
+            );
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT * FROM cde_fk_child".to_owned();
+            }
+            live_run(state, tab, "SELECT * FROM cde_fk_child");
+            let result =
+                state.tab(tab).expect("tab").active_query_result().expect("child rows");
+            let col = result
+                .columns()
+                .iter()
+                .position(|c| c.name().eq_ignore_ascii_case("parent_id"))
+                .expect("the child names its link column");
+            assert!(state.follow_foreign_key(tab, 0, col), "the child row jumps");
+            let jumped = state.active().expect("the jump opens a tab");
+            assert_ne!(jumped, tab, "the parent opens beside the child");
+            assert!(
+                pump_until(state, |s| {
+                    !matches!(
+                        s.tab(jumped).map(|t| t.outcome()),
+                        Some(RunOutcome::Running { .. })
+                    )
+                }),
+                "the filtered parent SELECT lands"
+            );
+            let result =
+                state.tab(jumped).expect("tab").active_query_result().expect("parent rows");
+            assert_eq!(result.row_count(), 1, "only the linked parent survives");
+            let name_col = result
+                .columns()
+                .iter()
+                .position(|c| c.name().eq_ignore_ascii_case("name"))
+                .expect("the parent names its text column");
+            assert_eq!(
+                result.cell(0, name_col),
+                Some(&Value::Text("ada".to_owned())),
+                "the jump lands on ada"
+            );
+            live_run(state, tab, "DROP TABLE cde_fk_child");
+            live_run(state, tab, "DROP TABLE cde_fk_parent");
         });
     }
 

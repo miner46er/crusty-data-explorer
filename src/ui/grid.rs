@@ -519,6 +519,7 @@ enum EditAction {
     SaveTableFilter { name: String },
     RecallTableFilter { name: String },
     DeleteTableFilter { name: String },
+    JumpFk { row: usize, col: usize },
 }
 
 fn apply_edit_actions(state: &mut AppState, tab: TabId, actions: Vec<EditAction>) {
@@ -543,6 +544,9 @@ fn apply_edit_actions(state: &mut AppState, tab: TabId, actions: Vec<EditAction>
             }
             EditAction::DeleteTableFilter { name } => {
                 state.delete_filter(&name);
+            }
+            EditAction::JumpFk { row, col } => {
+                state.follow_foreign_key(tab, row, col);
             }
         }
     }
@@ -1609,6 +1613,11 @@ fn results_grid(
                             if editable {
                                 let label = if deleted { "Restore row" } else { "Delete row" };
                                 response.context_menu(|ui| {
+                                    if !deleted && ui.button("Jump to referenced row").clicked()
+                                    {
+                                        actions.push(EditAction::JumpFk { row: r, col: c });
+                                        ui.close();
+                                    }
                                     if !deleted
                                         && !editor_open
                                         && ui.button("Edit cell…").clicked()
@@ -1622,6 +1631,13 @@ fn results_grid(
                                     }
                                     if ui.button(label).clicked() {
                                         actions.push(EditAction::ToggleDelete(r));
+                                        ui.close();
+                                    }
+                                });
+                            } else if !deleted {
+                                response.context_menu(|ui| {
+                                    if ui.button("Jump to referenced row").clicked() {
+                                        actions.push(EditAction::JumpFk { row: r, col: c });
                                         ui.close();
                                     }
                                 });

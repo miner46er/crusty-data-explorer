@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use crate::app::{AppState, NavigatorReveal, RowCountState};
+use crate::app::{AppState, NavigatorReveal, RowCountState, fk_incoming_target, fk_reveal_target};
 use crate::db::{ConnectionId, DbKind, TableInfo, TableKind};
 
 use super::ddl;
@@ -11,6 +11,8 @@ use super::ddl;
 pub enum SchemaAction {
     Refresh(ConnectionId),
     Preview(ConnectionId, String, String),
+    /// Reveal one referenced table entry in the navigator without opening it.
+    Reveal(ConnectionId, String, String),
     /// Ask the worker for one table's row count.
     Count(ConnectionId, String, String),
     /// The palette-requested table entry was opened and scrolled to.
@@ -400,15 +402,24 @@ fn show_table(
                             egui::RichText::new(fk.columns().join(", ")).monospace().small(),
                         );
                         ui.label(egui::RichText::new("→").small().weak());
-                        if ui
-                            .link(egui::RichText::new(fk.ref_table()).monospace().small())
-                            .clicked()
-                        {
-                            actions.push(SchemaAction::Preview(
-                                conn,
-                                schema_owned.clone(),
-                                fk.ref_table().to_owned(),
-                            ));
+                        let target = state
+                            .schema(conn)
+                            .and_then(|schema| fk_reveal_target(schema, schema_owned.as_str(), &name, fk));
+                        match target {
+                            Some((ref_schema, ref_table)) => {
+                                if ui
+                                    .link(egui::RichText::new(ref_table.clone()).monospace().small())
+                                    .on_hover_text("Reveal the referenced table entry")
+                                    .clicked()
+                                {
+                                    actions.push(SchemaAction::Reveal(conn, ref_schema, ref_table));
+                                }
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new(fk.ref_table()).monospace().small(),
+                                );
+                            }
                         }
                         ui.label(
                             egui::RichText::new(format!("({})", fk.ref_columns().join(", ")))
@@ -438,15 +449,30 @@ fn show_table(
             .show(ui, |ui| {
                 for fk in table.referenced_by() {
                     ui.horizontal(|ui| {
-                        if ui
-                            .link(egui::RichText::new(fk.ref_table()).monospace().small())
-                            .clicked()
-                        {
-                            actions.push(SchemaAction::Preview(
-                                conn,
-                                schema_owned.clone(),
-                                fk.ref_table().to_owned(),
-                            ));
+                        let target = state
+                            .schema(conn)
+                            .and_then(|schema| fk_incoming_target(schema, schema_owned.as_str(), fk));
+                        match target {
+                            Some((child_schema, child_table)) => {
+                                if ui
+                                    .link(
+                                        egui::RichText::new(child_table.clone()).monospace().small(),
+                                    )
+                                    .on_hover_text("Reveal the referencing table entry")
+                                    .clicked()
+                                {
+                                    actions.push(SchemaAction::Reveal(
+                                        conn,
+                                        child_schema,
+                                        child_table,
+                                    ));
+                                }
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new(fk.ref_table()).monospace().small(),
+                                );
+                            }
                         }
                         ui.label(
                             egui::RichText::new(format!("({})", fk.ref_columns().join(", ")))
