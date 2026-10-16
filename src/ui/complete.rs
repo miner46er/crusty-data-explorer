@@ -1,9 +1,11 @@
 //! SQL autocomplete and syntax colors for the query editor.
 //!
-//! Pure helpers ([`current_token`], [`suggest`], [`apply_completion`]) know
-//! nothing about egui. [`editor_with_completion`] renders the editor plus its
-//! popup, painting [`super::editor::highlight_kinds`] spans with the theme
-//! palette. Popup state lives in the egui context temp data, so `AppState` is
+//! Pure helpers ([`current_token`], [`suggest`], [`apply_completion`],
+//! [`expand_star`]) know nothing about egui. [`editor_with_completion`]
+//! renders the editor plus its popup, painting [`super::editor::highlight_kinds`]
+//! spans with the theme palette and a translucent tint on the
+//! [`super::editor::active_line`] line. Popup state and the per-source
+//! [`CompletionToggles`] live in the egui context temp data, so `AppState` is
 //! untouched.
 
 use std::collections::HashMap;
@@ -43,14 +45,86 @@ pub enum CompleteKind {
     Table,
     Column,
     Keyword,
+    Template,
+    Star,
 }
 
-/// One popup row.
+/// One popup row. `label` is the display text; `insert` is the text placed in
+/// the buffer, which differs from the label for templates and star
+/// expansions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
     pub label: String,
+    pub insert: String,
     pub kind: CompleteKind,
     pub detail: String,
+}
+
+impl Completion {
+    fn new(label: String, kind: CompleteKind, detail: String) -> Self {
+        Self {
+            insert: label.clone(),
+            label,
+            kind,
+            detail,
+        }
+    }
+}
+
+/// One SQL template: a popup label plus the plain text it inserts. Template
+/// text carries no tab stops or placeholders; the user edits plain text.
+pub struct Template {
+    pub label: &'static str,
+    pub text: &'static str,
+}
+
+/// Common query shapes offered through the completion popup.
+pub const TEMPLATES: [Template; 6] = [
+    Template {
+        label: "SELECT FROM WHERE",
+        text: "SELECT *\nFROM \nWHERE ",
+    },
+    Template {
+        label: "SELECT JOIN",
+        text: "SELECT *\nFROM \nJOIN  ON \nWHERE ",
+    },
+    Template {
+        label: "INSERT INTO VALUES",
+        text: "INSERT INTO  ()\nVALUES ()",
+    },
+    Template {
+        label: "UPDATE SET WHERE",
+        text: "UPDATE  SET  = \nWHERE ",
+    },
+    Template {
+        label: "DELETE FROM WHERE",
+        text: "DELETE FROM \nWHERE ",
+    },
+    Template {
+        label: "CREATE TABLE",
+        text: "CREATE TABLE  (\n    id INTEGER PRIMARY KEY\n)",
+    },
+];
+
+/// Independent switches for each completion source, rendered as checkboxes
+/// beside the editor. All on by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionToggles {
+    pub keywords: bool,
+    pub tables: bool,
+    pub columns: bool,
+    pub templates: bool,
+}
+
+impl Default for CompletionToggles {
+    fn default() -> Self {
+        Self {
+            keywords: true,
+            tables: true,
+            columns: true,
+            templates: true,
+        }
+    }
 }
 
 fn is_word_char(c: char) -> bool {
@@ -123,18 +197,18 @@ fn all_tables(schema: &SchemaInfo) -> Vec<Completion> {
     for db in schema.databases() {
         for node in db.schemas() {
             for table in node.tables() {
-                out.push(Completion {
-                    label: table.name().to_owned(),
-                    kind: CompleteKind::Table,
-                    detail: "table".to_owned(),
-                });
+                out.push(Completion::new(
+                    table.name().to_owned(),
+                    CompleteKind::Table,
+                    "table".to_owned(),
+                ));
             }
             for view in node.views() {
-                out.push(Completion {
-                    label: view.name().to_owned(),
-                    kind: CompleteKind::Table,
-                    detail: "view".to_owned(),
-                });
+                out.push(Completion::new(
+                    view.name().to_owned(),
+                    CompleteKind::Table,
+                    "view".to_owned(),
+                ));
             }
         }
     }
@@ -185,13 +259,120 @@ fn starts_with_insensitive(label: &str, prefix: &str) -> bool {
     label.to_lowercase().starts_with(&prefix.to_lowercase())
 }
 
-/// Up to 50 completions: tables after `FROM`/`JOIN`, columns after a known
-/// table or alias plus dot, else keywords and tables matching the prefix. An
-/// empty prefix outside `FROM`/`JOIN` yields nothing.
+/// Byte index of the SELECT-list `*` at `cursor`: on the star itself or just
+/// after it over spaces or tabs.
+fn star_at(sql: &str, cursor: usize) -> Option<usize> {
+    let cursor = clamp_cursor(sql, cursor);
+    let bytes = sql.as_bytes();
+    if cursor < bytes.len() && bytes[cursor] == b'*' {
+        return Some(cursor);
+    }
+    let mut i = cursor;
+    while i > 0 && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
+        i -= 1;
+    }
+    if i > 0 && bytes[i - 1] == b'*' {
+        Some(i - 1)
+    } else {
+        None
+    }
+}
+
+/// Whether the `*` at `star` sits in a SELECT list: right after SELECT,
+/// DISTINCT, ALL, or a comma. Anything else, such as `a * b`, stays literal.
+fn is_select_star(sql: &str, star: usize) -> bool {
+    let before = sql[..star].trim_end();
+    if before.ends_with(',') {
+        return true;
+    }
+    let last = before
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .next_back()
+        .unwrap_or("");
+    last.eq_ignore_ascii_case("select")
+        || last.eq_ignore_ascii_case("distinct")
+        || last.eq_ignore_ascii_case("all")
+}
+
+/// Table name after the first `FROM` past `star`, without a schema prefix.
+fn from_table_after(sql: &str, star: usize) -> Option<String> {
+    let words: Vec<&str> = sql[star + 1..]
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    for pair in words.windows(2) {
+        if pair[0].eq_ignore_ascii_case("from") {
+            let bare = pair[1].rsplit('.').next().unwrap_or(pair[1]).trim_matches('"');
+            if !bare.is_empty() {
+                return Some(bare.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// The star-expansion completion for the cursor: one row whose label is the
+/// resolved table's literal column list. None when the cursor is not on a
+/// SELECT-list star or the table is unknown.
+fn star_expansion(schema: &SchemaInfo, sql: &str, cursor: usize) -> Option<Completion> {
+    let star = star_at(sql, cursor)?;
+    if !is_select_star(sql, star) {
+        return None;
+    }
+    let table = from_table_after(sql, star)?;
+    let columns = find_table(schema, &table)?.columns();
+    if columns.is_empty() {
+        return None;
+    }
+    let list = columns.iter().map(|c| c.name()).collect::<Vec<_>>().join(", ");
+    Some(Completion {
+        label: list.clone(),
+        insert: list,
+        kind: CompleteKind::Star,
+        detail: "expand * to columns".to_owned(),
+    })
+}
+
+/// Replace the SELECT-list `*` under `cursor` with the resolved table's
+/// column list. None leaves an unresolvable star literal.
+pub fn expand_star(schema: &SchemaInfo, sql: &str, cursor: usize) -> Option<(String, usize)> {
+    let star = star_at(sql, cursor)?;
+    let expansion = star_expansion(schema, sql, cursor)?;
+    let mut next = String::with_capacity(sql.len() + expansion.insert.len());
+    next.push_str(&sql[..star]);
+    next.push_str(&expansion.insert);
+    next.push_str(&sql[star + 1..]);
+    Some((next, star + expansion.insert.len()))
+}
+
+/// Up to 50 completions with every source on: the column list on a
+/// SELECT-list star, tables after `FROM`/`JOIN`, columns after a known table
+/// or alias plus dot, else keywords, tables, and templates matching the
+/// prefix. An empty prefix outside `FROM`/`JOIN` yields nothing.
 pub fn suggest(schema: &SchemaInfo, sql: &str, cursor: usize) -> Vec<Completion> {
+    suggest_with_toggles(schema, sql, cursor, &CompletionToggles::default())
+}
+
+/// [`suggest`] with per-source [`CompletionToggles`]. A switched-off source
+/// contributes nothing, so its popup section stays empty.
+pub fn suggest_with_toggles(
+    schema: &SchemaInfo,
+    sql: &str,
+    cursor: usize,
+    toggles: &CompletionToggles,
+) -> Vec<Completion> {
     let cursor = clamp_cursor(sql, cursor);
     let prefix = &sql[..cursor];
+    if toggles.columns {
+        if let Some(expansion) = star_expansion(schema, sql, cursor) {
+            return vec![expansion];
+        }
+    }
     if let Some((qual, partial)) = dot_qualifier(prefix) {
+        if !toggles.columns {
+            return Vec::new();
+        }
         let aliases = alias_map(sql);
         let key = qual.to_lowercase();
         let real = aliases.get(&key).cloned().unwrap_or(key);
@@ -200,14 +381,13 @@ pub fn suggest(schema: &SchemaInfo, sql: &str, cursor: usize) -> Vec<Completion>
                 .columns()
                 .iter()
                 .filter(|c| starts_with_insensitive(c.name(), &partial))
-                .map(|c| Completion {
-                    label: c.name().to_owned(),
-                    kind: CompleteKind::Column,
-                    detail: if c.type_name().is_empty() {
+                .map(|c| {
+                    let detail = if c.type_name().is_empty() {
                         "column".to_owned()
                     } else {
                         c.type_name().to_owned()
-                    },
+                    };
+                    Completion::new(c.name().to_owned(), CompleteKind::Column, detail)
                 })
                 .collect();
             out.truncate(SUGGEST_CAP);
@@ -219,6 +399,9 @@ pub fn suggest(schema: &SchemaInfo, sql: &str, cursor: usize) -> Vec<Completion>
     if prev.as_deref().is_some_and(|p| {
         p.eq_ignore_ascii_case("from") || p.eq_ignore_ascii_case("join")
     }) {
+        if !toggles.tables {
+            return Vec::new();
+        }
         return tables
             .into_iter()
             .filter(|t| starts_with_insensitive(&t.label, &word))
@@ -228,28 +411,47 @@ pub fn suggest(schema: &SchemaInfo, sql: &str, cursor: usize) -> Vec<Completion>
     if word.is_empty() {
         return Vec::new();
     }
-    let mut out: Vec<Completion> = KEYWORDS
-        .iter()
-        .filter(|k| starts_with_insensitive(k, &word))
-        .map(|k| Completion {
-            label: k.to_string(),
-            kind: CompleteKind::Keyword,
-            detail: "keyword".to_owned(),
-        })
-        .collect();
-    out.extend(tables.into_iter().filter(|t| starts_with_insensitive(&t.label, &word)));
+    let mut out = Vec::new();
+    if toggles.keywords {
+        out.extend(KEYWORDS.iter().filter(|k| starts_with_insensitive(k, &word)).map(|k| {
+            Completion::new(k.to_string(), CompleteKind::Keyword, "keyword".to_owned())
+        }));
+    }
+    if toggles.tables {
+        out.extend(tables.into_iter().filter(|t| starts_with_insensitive(&t.label, &word)));
+    }
+    if toggles.templates {
+        out.extend(TEMPLATES.iter().filter(|t| starts_with_insensitive(t.label, &word)).map(
+            |t| Completion {
+                label: t.label.to_owned(),
+                insert: t.text.to_owned(),
+                kind: CompleteKind::Template,
+                detail: "template".to_owned(),
+            },
+        ));
+    }
     out.truncate(SUGGEST_CAP);
     out
 }
 
-/// Replace the word under `cursor` (or the partial after a dot) with the
-/// completion label. Returns the new SQL and the new byte cursor.
+/// Replace the word under `cursor` (the partial after a dot, or a
+/// SELECT-list star) with the completion's insert text. Returns the new SQL
+/// and the new byte cursor.
 pub fn apply_completion(
     sql: &str,
     cursor: usize,
     completion: &Completion,
 ) -> (String, usize) {
     let cursor = clamp_cursor(sql, cursor);
+    if completion.kind == CompleteKind::Star {
+        if let Some(star) = star_at(sql, cursor) {
+            let mut next = String::with_capacity(sql.len() + completion.insert.len());
+            next.push_str(&sql[..star]);
+            next.push_str(&completion.insert);
+            next.push_str(&sql[star + 1..]);
+            return (next, star + completion.insert.len());
+        }
+    }
     let prefix = &sql[..cursor];
     let suffix = &sql[cursor..];
     let start = if let Some((_, partial)) = dot_qualifier(prefix) {
@@ -258,11 +460,11 @@ pub fn apply_completion(
         let (word, _) = current_token(sql, cursor);
         cursor - word.len()
     };
-    let mut next = String::with_capacity(sql.len() + completion.label.len());
+    let mut next = String::with_capacity(sql.len() + completion.insert.len());
     next.push_str(&sql[..start]);
-    next.push_str(&completion.label);
+    next.push_str(&completion.insert);
     next.push_str(suffix);
-    let next_cursor = start + completion.label.len();
+    let next_cursor = start + completion.insert.len();
     (next, next_cursor)
 }
 
@@ -326,7 +528,8 @@ struct CompleteState {
 }
 
 /// SQL editor with autocomplete. Ctrl+Space opens the popup, Enter applies
-/// the selected row, Esc closes it.
+/// the selected row, Esc closes it. The checkboxes above the editor switch
+/// each completion source independently.
 pub fn editor_with_completion(
     tab: TabId,
     schema: Option<&SchemaInfo>,
@@ -338,6 +541,16 @@ pub fn editor_with_completion(
     let id = egui::Id::new("crusty_complete");
     let mut state: CompleteState =
         ui.ctx().data_mut(|data| data.get_temp(id).unwrap_or_default());
+    let toggles_id = egui::Id::new("crusty_complete_toggles");
+    let mut toggles: CompletionToggles =
+        ui.ctx().data_mut(|data| data.get_temp(toggles_id).unwrap_or_default());
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Complete").small().weak());
+        ui.checkbox(&mut toggles.keywords, "Keywords");
+        ui.checkbox(&mut toggles.tables, "Tables");
+        ui.checkbox(&mut toggles.columns, "Columns");
+        ui.checkbox(&mut toggles.templates, "Templates");
+    });
 
     if ui.input_mut(|input| input.consume_shortcut(&completion_shortcut())) {
         state.open = true;
@@ -375,8 +588,22 @@ pub fn editor_with_completion(
         .unwrap_or_else(|| egui::FontId::monospace(12.5));
     let plain = ui.visuals().text_color();
     let palette = Palette::of(ui.ctx().theme());
+    let accent = palette.accent;
+    let active_bg =
+        egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 36);
+    let active = previous_cursor_line(ui.ctx(), tab, sql);
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-        ui.fonts_mut(|f| f.layout_job(syntax_job(buf.as_str(), &font, plain, &palette, wrap_width)))
+        ui.fonts_mut(|f| {
+            f.layout_job(syntax_job(
+                buf.as_str(),
+                &font,
+                plain,
+                &palette,
+                active.clone(),
+                active_bg,
+                wrap_width,
+            ))
+        })
     };
     let out = egui::TextEdit::multiline(sql)
         .code_editor()
@@ -391,7 +618,7 @@ pub fn editor_with_completion(
         .unwrap_or_else(|| sql.len());
 
     if apply_enter && state.open {
-        let items = suggest(schema, sql, byte_cursor);
+        let items = suggest_with_toggles(schema, sql, byte_cursor, &toggles);
         if items.is_empty() {
             sql.insert(byte_cursor, '\n');
         } else if let Some(pick) = items.get(state.selected.min(items.len() - 1)) {
@@ -402,7 +629,7 @@ pub fn editor_with_completion(
     }
 
     if state.open {
-        let items = suggest(schema, sql, byte_cursor);
+        let items = suggest_with_toggles(schema, sql, byte_cursor, &toggles);
         if items.is_empty() {
             state.open = false;
         } else {
@@ -437,7 +664,21 @@ pub fn editor_with_completion(
         }
     }
 
-    ui.ctx().data_mut(|data| data.insert_temp(id, state));
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(id, state);
+        data.insert_temp(toggles_id, toggles);
+    });
+}
+
+/// Byte range of the line holding the editor's last rendered cursor, for the
+/// active-line tint. One frame behind the live cursor; a tab whose editor has
+/// not rendered yet reads as the final line.
+fn previous_cursor_line(ctx: &egui::Context, tab: TabId, sql: &str) -> Range<usize> {
+    let byte = egui::widgets::text_edit::TextEditState::load(ctx, editor_id(tab))
+        .and_then(|state| state.cursor.char_range())
+        .map(|range| char_to_byte(sql, range.primary.index.0))
+        .unwrap_or_else(|| sql.len());
+    editor::active_line(sql, byte)
 }
 
 fn span_color(palette: &Palette, kind: editor::Kind) -> egui::Color32 {
@@ -449,21 +690,29 @@ fn span_color(palette: &Palette, kind: editor::Kind) -> egui::Color32 {
     }
 }
 
-fn text_format(font: &egui::FontId, color: egui::Color32) -> egui::TextFormat {
+fn text_format(
+    font: &egui::FontId,
+    color: egui::Color32,
+    background: egui::Color32,
+) -> egui::TextFormat {
     egui::TextFormat {
         font_id: font.clone(),
         color,
+        background,
         ..Default::default()
     }
 }
 
 /// `LayoutJob` for the whole buffer. [`editor::highlight_kinds`] is the only
-/// source of spans, so painted colors and tested span logic stay one.
+/// source of spans, so painted colors and tested span logic stay one. Every
+/// section on the `active` line range paints `active_bg` behind its text.
 fn syntax_job(
     text: &str,
     font: &egui::FontId,
     plain: egui::Color32,
     palette: &Palette,
+    active: Range<usize>,
+    active_bg: egui::Color32,
     wrap_width: f32,
 ) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
@@ -472,23 +721,28 @@ fn syntax_job(
     while pos < text.len() {
         let end = text[pos..].find('\n').map_or(text.len(), |i| pos + i);
         let line = &text[pos..end];
+        let bg = if pos == active.start {
+            active_bg
+        } else {
+            egui::Color32::TRANSPARENT
+        };
         let mut last = 0;
         for span in editor::highlight_kinds(line) {
             if span.start > last {
-                job.append(&line[last..span.start], 0.0, text_format(font, plain));
+                job.append(&line[last..span.start], 0.0, text_format(font, plain, bg));
             }
             job.append(
                 &line[span.start..span.end],
                 0.0,
-                text_format(font, span_color(palette, span.kind)),
+                text_format(font, span_color(palette, span.kind), bg),
             );
             last = span.end;
         }
         if last < line.len() {
-            job.append(&line[last..], 0.0, text_format(font, plain));
+            job.append(&line[last..], 0.0, text_format(font, plain, bg));
         }
         if end < text.len() {
-            job.append("\n", 0.0, text_format(font, plain));
+            job.append("\n", 0.0, text_format(font, plain, egui::Color32::TRANSPARENT));
             pos = end + 1;
         } else {
             pos = end;
@@ -642,11 +896,14 @@ mod tests {
     fn syntax_job_preserves_text_and_colors_spans() {
         let text = "select 'a' from t";
         let palette = Palette::dark();
+        let bg = egui::Color32::from_rgb(10, 20, 30);
         let job = syntax_job(
             text,
             &egui::FontId::monospace(12.0),
             egui::Color32::WHITE,
             &palette,
+            0..text.len(),
+            bg,
             400.0,
         );
         let rebuilt: String = job
@@ -666,5 +923,86 @@ mod tests {
         assert_eq!(color(0..6), Some(palette.keyword));
         assert_eq!(color(6..7), Some(egui::Color32::WHITE));
         assert_eq!(color(7..10), Some(palette.string));
+        assert!(job.sections.iter().all(|s| s.format.background == bg));
+    }
+
+    #[test]
+    fn templates_match_prefix_and_insert_plain_text() {
+        let schema = test_schema();
+        let sql = "SEL";
+        let items = suggest(&schema, sql, sql.len());
+        let template = items
+            .iter()
+            .find(|c| c.kind == CompleteKind::Template)
+            .expect("template offered");
+        assert_eq!(template.label, "SELECT FROM WHERE");
+        assert_eq!(template.insert, "SELECT *\nFROM \nWHERE ");
+        assert!(!template.insert.contains('\t') && !template.insert.contains("${"));
+        let (next, cursor) = apply_completion(sql, sql.len(), template);
+        assert_eq!(next, "SELECT *\nFROM \nWHERE ");
+        assert_eq!(cursor, next.len());
+    }
+
+    #[test]
+    fn star_expands_to_literal_column_list() {
+        let schema = test_schema();
+        let sql = "SELECT * FROM users";
+        let cursor = "SELECT *".len();
+        let items = suggest(&schema, sql, cursor);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, CompleteKind::Star);
+        assert_eq!(items[0].label, "id, name, email");
+        let (next, _) = expand_star(&schema, sql, cursor).expect("star expands");
+        assert_eq!(next, "SELECT id, name, email FROM users");
+    }
+
+    #[test]
+    fn unresolvable_star_stays_literal() {
+        let schema = test_schema();
+        let missing = "SELECT * FROM missing";
+        assert!(expand_star(&schema, missing, "SELECT *".len()).is_none());
+        assert!(suggest(&schema, missing, "SELECT *".len()).is_empty());
+        let math = "SELECT a * b FROM users";
+        assert!(expand_star(&schema, math, "SELECT a *".len()).is_none());
+    }
+
+    #[test]
+    fn toggle_defaults_are_all_on() {
+        let toggles = CompletionToggles::default();
+        assert!(toggles.keywords && toggles.tables && toggles.columns && toggles.templates);
+    }
+
+    #[test]
+    fn toggles_switch_each_source_off() {
+        let schema = test_schema();
+        let sql = "SEL";
+        let no_keywords = CompletionToggles {
+            keywords: false,
+            ..CompletionToggles::default()
+        };
+        let items = suggest_with_toggles(&schema, sql, sql.len(), &no_keywords);
+        assert!(!items.iter().any(|c| c.kind == CompleteKind::Keyword));
+        assert!(items.iter().any(|c| c.kind == CompleteKind::Template));
+        let no_templates = CompletionToggles {
+            templates: false,
+            ..CompletionToggles::default()
+        };
+        let items = suggest_with_toggles(&schema, sql, sql.len(), &no_templates);
+        assert!(!items.iter().any(|c| c.kind == CompleteKind::Template));
+        assert!(items.iter().any(|c| c.kind == CompleteKind::Keyword));
+        let from_sql = "SELECT * FROM us";
+        let no_tables = CompletionToggles {
+            tables: false,
+            ..CompletionToggles::default()
+        };
+        assert!(suggest_with_toggles(&schema, from_sql, from_sql.len(), &no_tables).is_empty());
+        let dot_sql = "SELECT u. FROM users u";
+        let no_columns = CompletionToggles {
+            columns: false,
+            ..CompletionToggles::default()
+        };
+        assert!(suggest_with_toggles(&schema, dot_sql, "SELECT u.".len(), &no_columns).is_empty());
+        let star_sql = "SELECT * FROM users";
+        assert!(suggest_with_toggles(&schema, star_sql, "SELECT *".len(), &no_columns).is_empty());
     }
 }

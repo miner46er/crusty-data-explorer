@@ -169,6 +169,20 @@ pub fn char_range(text: &str, bytes: &Range<usize>) -> Range<usize> {
     start..end
 }
 
+/// Byte range of the line holding `cursor`, without the newline.
+///
+/// `cursor` clamps onto a char boundary at the end of `text`. A cursor on a
+/// newline reads as the line it ends. Empty text yields `0..0`.
+pub fn active_line(text: &str, cursor: usize) -> Range<usize> {
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    let start = text[..cursor].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[cursor..].find('\n').map_or(text.len(), |i| cursor + i);
+    start..end
+}
+
 /// Highlight kind for one tagged span. Gaps between spans are plain text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -557,5 +571,24 @@ mod tests {
             end: 19,
             kind: Kind::Comment,
         }));
+    }
+
+    #[test]
+    fn active_line_covers_the_cursor_line() {
+        let text = "SELECT 1\nFROM users\nWHERE x = 1";
+        assert_eq!(active_line(text, 0), 0..8);
+        assert_eq!(active_line(text, 8), 0..8);
+        assert_eq!(active_line(text, 9), 9..19);
+        assert_eq!(active_line(text, 19), 9..19);
+        assert_eq!(active_line(text, 20), 20..31);
+        assert_eq!(active_line(text, 999), 20..31);
+        assert_eq!(active_line("", 0), 0..0);
+    }
+
+    #[test]
+    fn active_line_clamps_split_chars() {
+        let text = "héllo\nworld";
+        assert_eq!(active_line(text, 2), 0..6);
+        assert_eq!(active_line(text, 8), 7..12);
     }
 }

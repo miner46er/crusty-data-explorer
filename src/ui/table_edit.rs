@@ -356,6 +356,8 @@ mod tests {
         create_table_statements, validate_table_form,
     };
     use crate::db::{ConnectionConfig, DbKind, PostgresSslMode, Session};
+    #[cfg(feature = "mysql")]
+    use crate::db::MysqlSslMode;
 
     fn probe_form(table: &str) -> TableForm {
         TableForm {
