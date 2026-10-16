@@ -91,3 +91,34 @@ Considered and deferred: vim mode (large with low daily friction for our users),
 Risks: sqlx sessions pool connections, so T16c must pin one connection for the life of a transaction instead of acquiring per statement, and that decision touches the cancel path. Named parameters risk recording substituted SQL in history unless the raw text is threaded through T15. The units in waves 5 and 6 all touch `src/app.rs`, so they run one at a time with a green gate between.
 
 Per-unit verify: `cargo check`, `cargo check --all-features`, `cargo test`, `cargo test --features postgres`, plus `--features mysql` and `--features ssh` where a unit touches them, and live ignored probes against cde-postgres, cde-mysql, and cde-ssh where an engine or the tunnel is involved.
+
+## Next features plan (researched 2026-10-16, waves 8 to 10)
+
+Ranked from three fallback-model reports: app inventory, Beekeeper 6.0 to 6.1.6 gap, DBeaver 26.x gap. Friction rankings are the researchers' judgment, sizes are estimates. No new database types. One unit at a time, the parent verifies and commits between units. Backup wizards, ERD, AI chat, cloud sync stay out of scope.
+
+Wave 8: grid depth, serial on `src/ui/grid.rs` and `src/app.rs`.
+- [ ] T23 Structured row filters. Per-column operators plus a raw SQL WHERE box plus saved filter history, composed into table SELECTs through the existing batch path. Owns `src/ui/grid.rs` and `src/app.rs`. Tests: clause builder, history roundtrip. Beekeeper first, DBeaver first. Size M.
+- [ ] T24 Spreadsheet-grade grid bundle. Type to start editing, Backspace sets NULL, column hide and resize, range fill marking cells edited, keyboard paste. Owns `src/ui/grid.rs`. Tests: staged-edit cases per primitive. Beekeeper second. Size M, after T23.
+- [ ] T25 Dedicated cell editor. Modal editor with explicit set NULL and set default plus large and blob value handling. Owns `src/ui/grid.rs`. Tests: NULL and default actions, large value roundtrip. DBeaver fourth, Beekeeper third. Size M, after T24.
+- [ ] T26 Pending edit SQL preview. Render the already built staged statements in a confirm-shaped modal before apply. Owns `src/ui/query.rs` and `src/app.rs`. Tests: preview matches applied statements. DBeaver fifth. Size S, after T25.
+- [ ] T27 Multi-table SELECT editing. Widen the single-table resolver so joined results map columns back to source tables, reusing staged apply and refresh. Owns `src/edit.rs` and `src/app.rs`. Tests: resolver cases, live join edit. Beekeeper fifth. Size M, after T26.
+- [ ] T28 Row detail view. JSON viewer plus transposed record form plus large text viewer beside the grid over the same result. Owns `src/ui/grid.rs`. Tests: rendering cases. Beekeeper third, DBeaver sixth. Size M, after T27.
+
+Wave 9: discovery surface, serial where files overlap.
+- [ ] T29 Foreign key jump navigation. Follow references from grid cells and schema links through the navigator reveal path. Owns `src/ui/schema.rs` and `src/app.rs`. Tests: reveal cases. DBeaver third. Size S.
+- [ ] T30 Navigator bookmarks and object filters. Bookmark set beside saved groups plus tree filter text. Owns `src/app.rs` and `src/ui/connections.rs`. Tests: bookmark roundtrip, filter cases. DBeaver eleventh. Size S, after T29.
+- [ ] T31 Nested folders with drag and drop. Folder paths for saved queries and connections, folder context creation. Owns `src/app.rs` and `src/ui/connections.rs`. Tests: path grouping, move cases. Beekeeper eighth. Size M, after T30.
+- [ ] T32 Execution log panel with per-connection scope. Query manager view over HistoryEntry with timing, plus the existing per-connection filter at the call site. Owns `src/ui/connections.rs` and `src/app.rs`. Tests: scope toggle, stats rendering. Beekeeper sixth, DBeaver tenth. Size S, after T31.
+- [ ] T33 Saved-query version history with restore. Version the saved-query persist file on each save. Owns `src/app.rs`. Tests: version list, restore roundtrip. Beekeeper seventh. Size S, independent inside wave 9.
+- [ ] T34 Import breadth. SQL file and directory import into saved-query folders, pasted connection JSON beside the URL parser, and JSONL routed through the import modal by extension. Owns `src/ui/connections.rs`, `src/app.rs`, and the modal in `src/ui/grid.rs`. Tests: loader cases, parser cases. Beekeeper eleventh and twelfth. Size S, closes the JSONL modal follow-up.
+- [ ] T35 Session and lock viewer for Postgres and MySQL. Read-only introspection behind feature flags with terminate actions. Owns `src/db.rs` and `src/ui/schema.rs`. Tests: live per engine. DBeaver twelfth. Size M.
+
+Wave 10: breadth, individually optional after wave 9.
+- [ ] T36 Streamed full export with paged fetching past the row cap. Streaming worker arm under the export writers plus on-demand total count. Owns `src/db.rs`, `src/export.rs`, and `src/ui/grid.rs`. Tests: chunked output, live paging. Beekeeper ninth, DBeaver second. Size L, closes the streamed-export follow-up.
+- [ ] T37 Visual table creator and structure editor. Form model over the pure DDL builders with Copy to SQL before apply, sent through the batch path. Owns new `src/ui/table_edit.rs`, `src/ui/ddl.rs`, and `src/app.rs`. Tests: builder cases, live create and alter. Beekeeper fourth. Size L.
+- [ ] T38 Graphical execution plan. Costed plan nodes with heavy-path emphasis over the existing explain batch. Owns new `src/ui/plan.rs` and `src/app.rs`. Tests: layout cases, live per engine. DBeaver eighth. Size M.
+- [ ] T39 Result charts. Read-only plots over QueryResult. Owns new `src/ui/charts.rs`. Tests: series mapping cases. DBeaver seventh. Size M.
+- [ ] T40 SQL templates with star expansion plus editor polish. Template insertion, SELECT star expands to columns, active-line highlight, completion toggles. Owns `src/ui/complete.rs` and `src/ui/editor.rs`. Tests: expansion cases, template cases. DBeaver ninth, Beekeeper thirteenth. Size S.
+- [ ] T41 Table data compare. Two read-only batches diffed in a new view for migration checks. Owns new `src/ui/compare.rs` and `src/app.rs`. Tests: diff cases, live per engine. DBeaver thirteenth. Size L.
+
+Plan status: research complete 2026-10-16 on the fallback model after round 1 rate limits. Carried-over maintenance: migrate to `zip` 9 when the xlsx crates accept it.
