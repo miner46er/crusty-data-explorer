@@ -377,6 +377,8 @@ fn sidebar_modal_open(state: &AppState) -> bool {
         || state.pending_write().is_some()
         || state.pending_params().is_some()
         || state.pending_edit_preview().is_some()
+        || state.table_editor().is_some()
+        || state.pending_table_ddl().is_some()
         || state.palette_open()
 }
 

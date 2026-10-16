@@ -13,6 +13,7 @@ pub mod grid;
 pub mod query;
 pub mod schema;
 pub mod search;
+pub mod table_edit;
 
 pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     // First, so the palette's keys win over the editor's completion popup.
@@ -28,6 +29,8 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     egui::CentralPanel::default().show(ui, |ui| grid::results(state, ui));
     connections::draft_window(state, ui);
     connections::password_window(state, ui);
+    table_edit::table_editor_window(state, ui);
+    table_edit::table_prod_confirm_window(state, ui);
 }
 
 fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
@@ -86,6 +89,7 @@ fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
             if ui.button(label).on_hover_text("Flip the app theme").clicked() {
                 state.toggle_theme();
             }
+            table_edit::status_entry(state, ui);
             let backend = state
                 .active()
                 .and_then(|id| state.tab(id))

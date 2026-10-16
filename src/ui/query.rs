@@ -20,6 +20,8 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
         || state.pending_write().is_some()
         || state.pending_params().is_some()
         || state.pending_edit_preview().is_some()
+        || state.table_editor().is_some()
+        || state.pending_table_ddl().is_some()
         || state.palette_open();
     let (new_tab_shortcut_pressed, close_tab_shortcut_pressed, find_shortcut_pressed) = ui
         .input_mut(|i| {

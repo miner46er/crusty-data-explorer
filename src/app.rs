@@ -426,6 +426,9 @@ pub struct Tab {
     pending_import: Option<(RunId, String)>,
     /// The silent post-apply refresh in flight. It adds no history entry.
     silent_run: Option<RunId>,
+    /// The table DDL batch in flight. Its Ok landing refreshes the schema
+    /// so the new or altered table appears in the navigator.
+    pending_table: Option<RunId>,
 }
 
 impl Tab {
@@ -602,6 +605,9 @@ enum BatchPurpose {
     Import(String),
     /// The silent re-read after an apply; it adds no history entry.
     Refresh,
+    /// The table DDL batch; its Ok landing refreshes the schema instead
+    /// of re-running the tab.
+    TableDdl,
 }
 
 /// One finished run. Newest first in [`AppState::history`]. Holds the SQL
@@ -1579,6 +1585,24 @@ pub struct PendingWriteConfirm {
     pub table: String,
 }
 
+/// A table DDL batch held for its prod confirmation: the connection and
+/// tab it would run on plus the exact statements Confirm would send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTableDdl {
+    pub conn: ConnectionId,
+    pub tab: TabId,
+    pub statements: Vec<String>,
+}
+
+/// The open visual table editor: the connection it builds for, the loaded
+/// table it edits (None for a create), and the live form the preview reads.
+#[derive(Debug, Clone)]
+pub struct TableEditorState {
+    pub conn: ConnectionId,
+    pub original: Option<TableInfo>,
+    pub form: crate::ui::ddl::TableForm,
+}
+
 /// A session terminate held for its prod confirmation: the connection and
 /// backend Confirm would kill.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1632,6 +1656,10 @@ pub struct AppState {
     sessions_errors: HashMap<ConnectionId, String>,
     /// The terminate awaiting its prod confirmation, if any.
     pending_terminate: Option<PendingTerminate>,
+    /// The open visual table editor, if any. Not persisted.
+    table_editor: Option<TableEditorState>,
+    /// The table DDL batch awaiting its prod confirmation, if any.
+    pending_table_confirm: Option<PendingTableDdl>,
     history: Vec<HistoryEntry>,
     /// True narrows the execution log to the current connection. False shows
     /// every connection. Never persisted, so a relaunch starts at all.
@@ -1686,6 +1714,8 @@ impl AppState {
             sessions_loading: HashSet::new(),
             sessions_errors: HashMap::new(),
             pending_terminate: None,
+            table_editor: None,
+            pending_table_confirm: None,
             history: load_history(),
             history_current_only: false,
             saved,
@@ -1855,6 +1885,7 @@ impl AppState {
             pending_apply: None,
             pending_import: None,
             silent_run: None,
+            pending_table: None,
         });
         if self.active.is_none() {
             self.active = Some(id);
@@ -1872,6 +1903,9 @@ impl AppState {
         }
         if self.pending_edit_preview == Some(tab) {
             self.pending_edit_preview = None;
+        }
+        if self.pending_table_confirm.as_ref().is_some_and(|pending| pending.tab == tab) {
+            self.pending_table_confirm = None;
         }
         self.repair_active();
     }
@@ -2180,6 +2214,7 @@ impl AppState {
                                     t.pending_import = Some((run, notice));
                                 }
                                 BatchPurpose::Refresh => t.silent_run = Some(run),
+                                BatchPurpose::TableDdl => t.pending_table = Some(run),
                             }
                         }
                         self.set_outcome(
@@ -2230,6 +2265,9 @@ impl AppState {
             }
             if t.silent_run == Some(run) {
                 t.silent_run = None;
+            }
+            if t.pending_table == Some(run) {
+                t.pending_table = None;
             }
         }
         if let Some(conn_id) = conn_id {
@@ -2603,6 +2641,168 @@ impl AppState {
     /// Drop the SQL preview without sending anything. Staged edits stay.
     pub fn cancel_pending_edits(&mut self) {
         self.pending_edit_preview = None;
+    }
+
+    /// Open a blank create-table form for the connection. No-op for an
+    /// unknown connection.
+    pub fn open_table_create(&mut self, conn: ConnectionId) {
+        if self.connections.iter().find(|c| c.id == conn).is_none() {
+            return;
+        }
+        self.table_editor = Some(TableEditorState {
+            conn,
+            original: None,
+            form: crate::ui::ddl::TableForm::blank(),
+        });
+        self.pending_table_confirm = None;
+    }
+
+    /// Open the alter-table form prefilled from the loaded schema. No-op
+    /// when the connection or the table is unknown.
+    pub fn open_table_alter(&mut self, conn: ConnectionId, schema: &str, table: &str) {
+        let info = self.schemas.get(&conn).and_then(|info| {
+            info.databases().iter().flat_map(|db| db.schemas()).find_map(|node| {
+                if !node.name().eq_ignore_ascii_case(schema) {
+                    return None;
+                }
+                node.tables()
+                    .iter()
+                    .find(|t| t.name().eq_ignore_ascii_case(table))
+                    .cloned()
+            })
+        });
+        let Some(info) = info else { return };
+        if self.connections.iter().find(|c| c.id == conn).is_none() {
+            return;
+        }
+        let form = crate::ui::ddl::TableForm::from_table(schema, &info);
+        self.table_editor = Some(TableEditorState { conn, original: Some(info), form });
+        self.pending_table_confirm = None;
+    }
+
+    /// Close the table editor without sending anything. A held prod
+    /// confirmation goes with it.
+    pub fn close_table_editor(&mut self) {
+        self.table_editor = None;
+        self.pending_table_confirm = None;
+    }
+
+    /// The open table editor, if any.
+    pub fn table_editor(&self) -> Option<&TableEditorState> {
+        self.table_editor.as_ref()
+    }
+
+    /// The open table editor for editing.
+    pub fn table_editor_mut(&mut self) -> Option<&mut TableEditorState> {
+        self.table_editor.as_mut()
+    }
+
+    /// The editor's SQL preview: the create statements for a new table,
+    /// the alter diff for a loaded one. None without an editor or a
+    /// connection whose dialect is known.
+    pub fn table_ddl_statements(&self) -> Option<Vec<String>> {
+        let editor = self.table_editor.as_ref()?;
+        let kind = self.connections.iter().find(|c| c.id == editor.conn)?.config.kind();
+        match &editor.original {
+            Some(original) => Some(crate::ui::ddl::alter_table_statements(
+                original, &editor.form, kind,
+            )),
+            None => Some(crate::ui::ddl::create_table_statements(&editor.form, kind)),
+        }
+    }
+
+    /// The editor's validation errors. Empty means the preview can apply.
+    pub fn table_ddl_errors(&self) -> Vec<String> {
+        match self.table_editor.as_ref() {
+            Some(editor) => crate::ui::ddl::validate_table_form(&editor.form),
+            None => vec!["no table editor open".to_owned()],
+        }
+    }
+
+    /// Send the editor's preview through the batch path. Validation failures
+    /// and an empty diff land as the tab error; a read-only connection
+    /// refuses the write kind like every other write path; a prod connection
+    /// holds the batch for confirmation instead of sending. The tab must be
+    /// bound to the editor's connection.
+    pub fn apply_table_ddl(&mut self, tab: TabId) {
+        let errors = self.table_ddl_errors();
+        if !errors.is_empty() {
+            self.set_outcome(tab, RunOutcome::Err(errors.join("; ")));
+            return;
+        }
+        let (conn_id, statements) = match self.table_editor.as_ref() {
+            Some(editor) => match self.table_ddl_statements() {
+                Some(statements) if !statements.is_empty() => (editor.conn, statements),
+                _ => {
+                    self.set_outcome(
+                        tab,
+                        RunOutcome::Err(
+                            "nothing to apply: the form matches the table".to_owned(),
+                        ),
+                    );
+                    return;
+                }
+            },
+            None => return,
+        };
+        let bound = self.tabs.iter().find(|t| t.id == tab).and_then(|t| t.conn);
+        if bound != Some(conn_id) {
+            self.set_outcome(tab, RunOutcome::Err("table editor connection does not match the tab".to_owned()));
+            return;
+        }
+        let (handle, read_only, prod) =
+            match self.connections.iter().find(|c| c.id == conn_id) {
+                Some(c) => (c.handle(), c.config.is_read_only(), c.env == Environment::Prod),
+                None => return,
+            };
+        if read_only {
+            let kind = statements
+                .iter()
+                .find_map(|statement| crate::db::write_statement_kind(statement))
+                .unwrap_or("write");
+            self.set_outcome(
+                tab,
+                RunOutcome::Err(
+                    crate::db::DbError::Config(format!("read-only connection refused {kind}"))
+                        .to_string(),
+                ),
+            );
+            return;
+        }
+        if prod {
+            self.pending_table_confirm =
+                Some(PendingTableDdl { conn: conn_id, tab, statements });
+            return;
+        }
+        self.send_batch(tab, conn_id, handle, statements, BatchPurpose::TableDdl, None);
+    }
+
+    /// Send the held prod table DDL exactly as previewed.
+    pub fn confirm_table_ddl(&mut self) {
+        let Some(pending) = self.pending_table_confirm.take() else { return };
+        let handle = self
+            .connections
+            .iter()
+            .find(|c| c.id == pending.conn)
+            .and_then(|c| c.handle());
+        self.send_batch(
+            pending.tab,
+            pending.conn,
+            handle,
+            pending.statements,
+            BatchPurpose::TableDdl,
+            None,
+        );
+    }
+
+    /// Drop the held prod table DDL without sending anything.
+    pub fn cancel_table_ddl(&mut self) {
+        self.pending_table_confirm = None;
+    }
+
+    /// The table DDL batch held for its prod confirmation, if any.
+    pub fn pending_table_ddl(&self) -> Option<&PendingTableDdl> {
+        self.pending_table_confirm.as_ref()
     }
 
     /// Read and parse a CSV or JSONL file for one tab and stage it for
@@ -4328,6 +4528,11 @@ impl AppState {
                 if t.silent_run == Some(run) {
                     t.silent_run = None;
                 }
+                let table_ddl = t.pending_table == Some(run);
+                if table_ddl {
+                    t.pending_table = None;
+                }
+                let table_schema_refresh = table_ddl && ok;
                 if ok {
                     t.edits.clear();
                     t.deleted_rows.clear();
@@ -4386,11 +4591,13 @@ impl AppState {
                 // Only an Ok landing moves the transaction flag, so a failed
                 // BEGIN, COMMIT, or ROLLBACK leaves it as it was.
                 let transaction = if ok { transaction_action(&statements) } else { None };
-                Some((tab_id, conn, entries, refresh, import_notice, transaction))
+                Some((tab_id, conn, entries, refresh, import_notice, transaction, table_schema_refresh))
             }
             None => None,
         };
-        let Some((tab_id, conn, entries, refresh, import_notice, transaction)) = matched else {
+        let Some((tab_id, conn, entries, refresh, import_notice, transaction, table_schema_refresh)) =
+            matched
+        else {
             return;
         };
         if !entries.is_empty() {
@@ -4424,6 +4631,9 @@ impl AppState {
         }
         if refresh {
             self.start_refresh(tab_id);
+        }
+        if table_schema_refresh {
+            self.refresh_schema(conn);
         }
         // After the refresh send: its set_outcome clears the notice, so the
         // import notice must land last to survive.
@@ -9030,6 +9240,192 @@ mod tests {
             assert_eq!(view.staged_count(), 2);
             assert_eq!(view.edit_text(0, 2), Some("Ada"));
             assert!(view.is_row_deleted(1));
+        });
+    }
+
+    #[test]
+    fn table_create_sends_exact_statements_and_refreshes_schema_on_ok() {
+        with_isolated_state("table-create-send", |state| {
+            let conn = add_sqlite_connection(state, "mem-table");
+            let commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+            state.open_table_create(conn);
+            {
+                let editor = state.table_editor_mut().expect("editor open");
+                editor.form.table = "users".to_owned();
+                editor.form.columns = vec![
+                    crate::ui::ddl::TableColumnDraft {
+                        name: "id".to_owned(),
+                        data_type: "INTEGER".to_owned(),
+                        nullable: false,
+                        default: String::new(),
+                        pk: true,
+                    },
+                    crate::ui::ddl::TableColumnDraft {
+                        name: "name".to_owned(),
+                        data_type: "TEXT".to_owned(),
+                        nullable: true,
+                        default: String::new(),
+                        pk: false,
+                    },
+                ];
+                editor.form.indexes = vec![crate::ui::ddl::TableIndexDraft {
+                    name: "idx_users_name".to_owned(),
+                    columns: "name".to_owned(),
+                    unique: false,
+                }];
+            }
+            assert!(state.table_ddl_errors().is_empty());
+            assert_eq!(
+                state.table_ddl_statements(),
+                Some(vec![
+                    "CREATE TABLE \"users\" (\n  \"id\" INTEGER NOT NULL,\n  \"name\" TEXT,\n  PRIMARY KEY (\"id\")\n);"
+                        .to_owned(),
+                    "CREATE INDEX \"idx_users_name\" ON \"users\" (\"name\");".to_owned(),
+                ])
+            );
+            state.apply_table_ddl(tab);
+            let run = match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { run, statements } => {
+                    assert_eq!(
+                        statements,
+                        vec![
+                            "CREATE TABLE \"users\" (\n  \"id\" INTEGER NOT NULL,\n  \"name\" TEXT,\n  PRIMARY KEY (\"id\")\n);",
+                            "CREATE INDEX \"idx_users_name\" ON \"users\" (\"name\");",
+                        ]
+                    );
+                    run
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            state.apply(DbEvent::BatchOk { run, results: vec![affected_result(0)] });
+            match commands.try_recv().expect("the schema refresh was sent") {
+                DbCommand::LoadSchema => {}
+                other => panic!("expected LoadSchema, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn table_create_read_only_refuses_and_sends_nothing() {
+        with_isolated_state("table-create-readonly", |state| {
+            let conn = add_sqlite_connection(state, "mem-table-ro");
+            let commands = attach_test_session(state, conn);
+            state
+                .connections
+                .iter_mut()
+                .find(|c| c.id == conn)
+                .expect("connection")
+                .config
+                .set_read_only(true);
+            let tab = state.new_tab(conn);
+            state.open_table_create(conn);
+            {
+                let editor = state.table_editor_mut().expect("editor open");
+                editor.form.table = "users".to_owned();
+                editor.form.columns = vec![crate::ui::ddl::TableColumnDraft {
+                    name: "id".to_owned(),
+                    data_type: "INTEGER".to_owned(),
+                    nullable: false,
+                    default: String::new(),
+                    pk: true,
+                }];
+            }
+            state.apply_table_ddl(tab);
+            assert!(commands.try_recv().is_err(), "read-only sends nothing");
+            match state.tab(tab).expect("tab").outcome() {
+                RunOutcome::Err(message) => assert!(message.contains("read-only"), "{message}"),
+                other => panic!("expected a read-only error, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn table_create_prod_holds_for_confirm_then_sends() {
+        with_isolated_state("table-create-prod", |state| {
+            let conn = add_sqlite_connection_env(state, "mem-table-prod", Environment::Prod);
+            let commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+            state.open_table_create(conn);
+            {
+                let editor = state.table_editor_mut().expect("editor open");
+                editor.form.table = "users".to_owned();
+                editor.form.columns = vec![crate::ui::ddl::TableColumnDraft {
+                    name: "id".to_owned(),
+                    data_type: "INTEGER".to_owned(),
+                    nullable: false,
+                    default: String::new(),
+                    pk: true,
+                }];
+            }
+            state.apply_table_ddl(tab);
+            assert!(commands.try_recv().is_err(), "prod holds the batch");
+            assert!(state.pending_table_ddl().is_some(), "held for confirmation");
+            state.cancel_table_ddl();
+            assert!(state.pending_table_ddl().is_none());
+            assert!(commands.try_recv().is_err(), "cancel sends nothing");
+            state.apply_table_ddl(tab);
+            assert!(state.pending_table_ddl().is_some());
+            state.confirm_table_ddl();
+            assert!(state.pending_table_ddl().is_none());
+            match commands.try_recv().expect("confirm sends the batch") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert!(statements[0].contains("CREATE TABLE \"users\""), "{statements:?}");
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn table_create_validation_failure_lands_error_and_sends_nothing() {
+        with_isolated_state("table-create-invalid", |state| {
+            let conn = add_sqlite_connection(state, "mem-table-bad");
+            let commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+            state.open_table_create(conn);
+            assert!(!state.table_ddl_errors().is_empty(), "blank name fails");
+            state.apply_table_ddl(tab);
+            assert!(commands.try_recv().is_err(), "invalid sends nothing");
+            match state.tab(tab).expect("tab").outcome() {
+                RunOutcome::Err(message) => assert!(message.contains("table name"), "{message}"),
+                other => panic!("expected a validation error, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn table_alter_sends_add_column_and_index() {
+        with_isolated_state("table-alter-send", |state| {
+            let (tab, conn, commands) = editable_tab(state);
+            state.open_table_alter(conn, "main", "items");
+            {
+                let editor = state.table_editor_mut().expect("editor open");
+                editor.form.columns.push(crate::ui::ddl::TableColumnDraft {
+                    name: "email".to_owned(),
+                    data_type: "TEXT".to_owned(),
+                    nullable: true,
+                    default: String::new(),
+                    pk: false,
+                });
+                editor.form.indexes.push(crate::ui::ddl::TableIndexDraft {
+                    name: "idx_items_email".to_owned(),
+                    columns: "email".to_owned(),
+                    unique: false,
+                });
+            }
+            assert!(state.table_ddl_errors().is_empty());
+            state.apply_table_ddl(tab);
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => assert_eq!(
+                    statements,
+                    vec![
+                        "ALTER TABLE \"main\".\"items\" ADD COLUMN \"email\" TEXT;",
+                        "CREATE INDEX \"idx_items_email\" ON \"main\".\"items\" (\"email\");",
+                    ]
+                ),
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
         });
     }
 
