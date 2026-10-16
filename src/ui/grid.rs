@@ -1549,6 +1549,7 @@ fn results_grid(
     result_tabs(tab, ui);
     let palette = Palette::of(ui.ctx().theme());
     super::charts::chart_side_panel(tab, ui);
+    super::plan::plan_section(tab, ui);
     poll_export_job(tab, ui);
     let (cols, total) = {
         let Some(result) = tab.active_query_result() else { return actions };

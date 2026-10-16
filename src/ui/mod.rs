@@ -11,6 +11,7 @@ pub mod connections;
 pub mod ddl;
 pub mod editor;
 pub mod grid;
+pub mod plan;
 pub mod query;
 pub mod schema;
 pub mod search;
