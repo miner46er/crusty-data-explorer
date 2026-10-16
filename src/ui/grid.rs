@@ -559,10 +559,14 @@ fn tab_notice(state: &mut AppState, tab: TabId, notice: String, failed: bool) {
     }
 }
 
-/// Ask for a CSV file and stage it on the tab. A dismissed dialog changes
-/// nothing.
+/// Ask for a CSV or JSONL file and stage it on the tab through the import
+/// modal. [`AppState::begin_import`] names the parser by extension. A
+/// dismissed dialog changes nothing.
 fn pick_import_file(state: &mut AppState, tab: TabId) {
-    let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).pick_file() else {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("CSV or JSONL", &["csv", "jsonl"])
+        .pick_file()
+    else {
         return;
     };
     state.begin_import(tab, &path);
@@ -692,7 +696,7 @@ pub fn import_window(state: &mut AppState, ui: &mut egui::Ui) {
         let Some(draft) = state.import_draft() else { return };
         ui.label(format!("{} rows", draft.rows.len()));
         egui::Grid::new("import_columns").striped(true).show(ui, |ui| {
-            ui.label(egui::RichText::new("CSV column").small().weak());
+            ui.label(egui::RichText::new(draft.column_title()).small().weak());
             ui.label(egui::RichText::new("Table column").small().weak());
             ui.end_row();
             for (header, column) in &draft.map.pairs {
@@ -1296,8 +1300,8 @@ fn results_grid(
                     actions.push(EditAction::Apply);
                 }
                 if ui
-                    .button("Import CSV")
-                    .on_hover_text("Load a CSV file into this table")
+                    .button("Import file")
+                    .on_hover_text("Load a CSV or JSONL file into this table")
                     .clicked()
                 {
                     actions.push(EditAction::ImportCsv);

@@ -20,7 +20,9 @@ use crate::edit::{
     delete_statement, editable_table, ident, insert_statement, is_text_type, parse_join,
     qualified_parts, quote_qualified, to_literal, update_statement,
 };
-use crate::import::{ColumnMap, ROW_CAP, dropped_rows, insert_batches, map_headers, parse_csv};
+use crate::import::{
+    ColumnMap, ROW_CAP, dropped_rows, insert_batches, map_headers, parse_csv, parse_jsonl,
+};
 use crate::sql::{collect_params, current_statement, split_statements, statement_ranges, substitute};
 
 /// Everything that changes about one connection's lifecycle, in five states.
@@ -687,6 +689,51 @@ impl SavedQuery {
         self.versions.insert(0, SavedQueryVersion { at, sql: sql.to_owned() });
         self.versions.truncate(SAVED_VERSION_CAP);
     }
+}
+
+/// One `.sql` file batch import: how many files became saved queries and
+/// which file names were skipped (unreadable or blank), in file order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlImportOutcome {
+    pub imported: usize,
+    pub skipped: Vec<String>,
+}
+
+/// The saved-query name for a `.sql` path: its file stem, else its file
+/// name, else `query`. `reports/daily.sql` becomes `daily`.
+pub fn sql_import_name_for_path(path: &std::path::Path) -> String {
+    let stem =
+        path.file_stem().and_then(|s| s.to_str()).map(str::trim).filter(|s| !s.is_empty());
+    let name =
+        path.file_name().and_then(|s| s.to_str()).map(str::trim).filter(|s| !s.is_empty());
+    stem.or(name).unwrap_or("query").to_owned()
+}
+
+/// The file name shown for a skipped import: the file name, else the whole
+/// path, so temp files still identify themselves.
+fn sql_import_display_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// The `.sql` files directly inside `dir`, sorted by path. Missing or
+/// unreadable directories read as empty, so a cancelled picker imports
+/// nothing instead of erroring.
+pub fn collect_sql_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.is_file()
+                    && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("sql"))
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    files.sort();
+    files
 }
 
 /// Normalize a raw folder path into slash-separated segments: trims each
@@ -1468,8 +1515,38 @@ pub struct SavePrompt {
     pub error: Option<String>,
 }
 
-/// A parsed CSV awaiting its confirmation: the tab it imports into, the
-/// file's headers and rows, the resolved header map, and the target table.
+/// Which file shape staged the pending import: a CSV header row or one JSON
+/// object per line. The file extension names it, so the modal and its errors
+/// speak the file the user picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportSource {
+    Csv,
+    Jsonl,
+}
+
+impl ImportSource {
+    /// `.jsonl` in any case stages as JSONL; every other extension stages as
+    /// CSV, so the existing `.csv` paths and extensionless temp files keep
+    /// the old behavior.
+    pub fn of_path(path: &std::path::Path) -> Self {
+        if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl")) {
+            ImportSource::Jsonl
+        } else {
+            ImportSource::Csv
+        }
+    }
+    /// The modal's column header noun: `CSV` or `JSONL`.
+    pub fn label(self) -> &'static str {
+        match self {
+            ImportSource::Csv => "CSV",
+            ImportSource::Jsonl => "JSONL",
+        }
+    }
+}
+
+/// A parsed file awaiting its confirmation: the tab it imports into, the
+/// file's headers and rows, the resolved header map, the target table, and
+/// the shape it parsed as.
 #[derive(Debug)]
 pub struct ImportDraft {
     pub tab: TabId,
@@ -1477,6 +1554,17 @@ pub struct ImportDraft {
     pub rows: Vec<Vec<String>>,
     pub map: ColumnMap,
     pub table: String,
+    pub source: ImportSource,
+}
+
+impl ImportDraft {
+    /// The modal's first column header: `CSV column` or `JSONL key`.
+    pub fn column_title(&self) -> &'static str {
+        match self.source {
+            ImportSource::Csv => "CSV column",
+            ImportSource::Jsonl => "JSONL key",
+        }
+    }
 }
 
 /// A run held for its write guard: the tab and connection it would run on,
@@ -2483,10 +2571,13 @@ impl AppState {
         self.pending_edit_preview = None;
     }
 
-    /// Read and parse a CSV file for one tab and stage it for confirmation.
-    /// Failure lands in the tab's notice: an unreadable file, a file that is
-    /// not a CSV of one column count, or a tab the edit path cannot resolve.
-    /// Joined results never import, since the row spans tables.
+    /// Read and parse a CSV or JSONL file for one tab and stage it for
+    /// confirmation. The extension names the parser: `.jsonl` reads through
+    /// the JSONL parser, anything else through the CSV one. Failure lands in
+    /// the tab's notice: an unreadable file, a file that is not one column
+    /// count (CSV) or one JSON object per line (JSONL), or a tab the edit
+    /// path cannot resolve. Joined results never import, since the row spans
+    /// tables.
     pub fn begin_import(&mut self, tab: TabId, path: &std::path::Path) {
         let Some(target) = self.edit_target(tab) else {
             self.set_tab_notice(tab, "Import failed: the table is not editable".to_owned(), true);
@@ -2526,12 +2617,21 @@ impl AppState {
                 return;
             }
         };
-        let Some(parsed) = parse_csv(&text) else {
-            self.set_tab_notice(
-                tab,
-                "Import failed: the file needs a header and rows of one column count".to_owned(),
-                true,
-            );
+        let source = ImportSource::of_path(path);
+        let parsed = match source {
+            ImportSource::Csv => parse_csv(&text),
+            ImportSource::Jsonl => parse_jsonl(&text),
+        };
+        let Some(parsed) = parsed else {
+            let message = match source {
+                ImportSource::Csv => {
+                    "Import failed: the file needs a header and rows of one column count"
+                }
+                ImportSource::Jsonl => {
+                    "Import failed: the file needs one JSON object per line"
+                }
+            };
+            self.set_tab_notice(tab, message.to_owned(), true);
             return;
         };
         let map = map_headers(&parsed.headers, &columns);
@@ -2541,6 +2641,7 @@ impl AppState {
             rows: parsed.rows,
             map,
             table: target.table,
+            source,
         });
         if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
             t.clear_export_notice();
@@ -2562,9 +2663,13 @@ impl AppState {
         }
         let statements = insert_batches(&draft.table, &draft.map, &draft.rows);
         if statements.is_empty() {
+            let noun = match draft.source {
+                ImportSource::Csv => "CSV header",
+                ImportSource::Jsonl => "JSONL key",
+            };
             self.set_tab_notice(
                 draft.tab,
-                format!("Import failed: no CSV header matches {}", draft.table),
+                format!("Import failed: no {noun} matches {}", draft.table),
                 true,
             );
             return;
@@ -3323,6 +3428,68 @@ impl AppState {
         }
         self.persist_saved();
         true
+    }
+
+    /// Create one saved query per `.sql` file in `folder`: the file stem
+    /// names it, the file text is its SQL. A name already saved in the
+    /// folder is replaced in place with a new version, the way
+    /// [`AppState::save_active_tab`] replaces; anything else inserts
+    /// newest-first in file order. Unreadable or blank files are skipped by
+    /// file name. Persists once. None when no connection exists to attribute
+    /// the queries to.
+    pub fn import_sql_files(
+        &mut self,
+        paths: &[std::path::PathBuf],
+        folder: Option<&str>,
+    ) -> Option<SqlImportOutcome> {
+        let conn = self
+            .active
+            .and_then(|id| self.tab(id))
+            .and_then(|tab| tab.conn)
+            .or_else(|| self.connections.first().map(|c| c.id))?;
+        let folder = normalize_folder_path(folder);
+        let mut imported = 0;
+        let mut skipped = Vec::new();
+        for path in paths.iter().rev() {
+            let name = sql_import_name_for_path(path);
+            let sql = match std::fs::read_to_string(path) {
+                Ok(text) if !text.trim().is_empty() => text,
+                _ => {
+                    skipped.push(sql_import_display_name(path));
+                    continue;
+                }
+            };
+            if let Some(existing) = self
+                .saved
+                .iter_mut()
+                .find(|q| q.name == name && q.folder.as_deref() == folder.as_deref())
+            {
+                existing.sql = sql.clone();
+                existing.conn = conn;
+                existing.push_version(&sql, now_unix_secs());
+                imported += 1;
+                continue;
+            }
+            match SavedQuery::new(
+                self.ids.saved(),
+                name,
+                sql.clone(),
+                conn,
+                folder.clone(),
+                false,
+            ) {
+                Ok(mut query) => {
+                    query.push_version(&sql, now_unix_secs());
+                    self.saved.insert(0, query);
+                    imported += 1;
+                }
+                Err(_) => skipped.push(sql_import_display_name(path)),
+            }
+        }
+        self.saved.truncate(SAVED_CAP);
+        self.persist_saved();
+        skipped.reverse();
+        Some(SqlImportOutcome { imported, skipped })
     }
 
     /// Every retained version for one saved query, newest first. Empty for
@@ -9528,6 +9695,259 @@ mod tests {
         });
     }
 
+    /// Write a JSONL file for a test and return its path. The caller removes it.
+    fn write_jsonl(tag: &str, text: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("cde-jsonl-{tag}-{}.jsonl", std::process::id()));
+        std::fs::write(&path, text).expect("write jsonl");
+        path
+    }
+
+    #[test]
+    fn import_source_names_the_parser_by_extension() {
+        assert_eq!(
+            ImportSource::of_path(std::path::Path::new("rows.jsonl")),
+            ImportSource::Jsonl
+        );
+        assert_eq!(
+            ImportSource::of_path(std::path::Path::new("ROWS.JSONL")),
+            ImportSource::Jsonl
+        );
+        assert_eq!(
+            ImportSource::of_path(std::path::Path::new("rows.csv")),
+            ImportSource::Csv
+        );
+        assert_eq!(
+            ImportSource::of_path(std::path::Path::new("rows")),
+            ImportSource::Csv
+        );
+        assert_eq!(ImportSource::Csv.label(), "CSV");
+        assert_eq!(ImportSource::Jsonl.label(), "JSONL");
+    }
+
+    #[test]
+    fn jsonl_by_extension_stages_through_the_modal_and_sends_the_exact_inserts() {
+        with_isolated_state("import-jsonl-modal", |state| {
+            let (tab, _conn, commands) = editable_tab(state);
+            let path = write_jsonl(
+                "modal",
+                "{\"tenant\": \"acme\", \"id\": 1, \"note\": \"x\"}\n\
+                 {\"tenant\": \"globex\", \"id\": 2}\n",
+            );
+            state.begin_import(tab, &path);
+            let draft = state.import_draft().expect("draft");
+            assert_eq!(draft.source, ImportSource::Jsonl);
+            assert_eq!(draft.column_title(), "JSONL key");
+            assert_eq!(draft.table, "items");
+            // serde_json maps sort keys, so the union reads sorted per
+            // object: the values still land on the right table columns.
+            assert_eq!(draft.headers, vec!["id", "note", "tenant"]);
+            assert_eq!(draft.map.pairs, vec![(2, 0), (0, 1)]);
+            assert_eq!(draft.map.skipped, vec!["note"]);
+
+            state.commit_import();
+            assert!(state.import_draft().is_none());
+            let run = match commands.try_recv().expect("insert batch") {
+                DbCommand::QueryBatch { run, statements } => {
+                    assert_eq!(
+                        statements,
+                        vec![
+                            "INSERT INTO \"items\" (\"tenant\", \"id\") \
+                             VALUES ('acme', 1), ('globex', 2)"
+                        ]
+                    );
+                    run
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            let notice = "Imported 2 rows into items (1 skipped, 0 dropped)";
+            let before = state.history().len();
+            state.apply(DbEvent::BatchOk { run, results: vec![affected_result(2)] });
+            assert_eq!(state.history().len(), before);
+            let view = state.tab(tab).expect("tab");
+            assert_eq!(view.export_notice(), Some(notice));
+            assert!(!view.export_failed());
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn jsonl_modal_rejects_non_objects_and_unmatched_keys() {
+        with_isolated_state("import-jsonl-bad", |state| {
+            let (tab, _conn, commands) = editable_tab(state);
+            let bad = write_jsonl("bad", "{\"tenant\": \"acme\"}\ntrailing\n");
+            state.begin_import(tab, &bad);
+            assert!(state.import_draft().is_none());
+            let view = state.tab(tab).expect("tab");
+            assert!(view.export_failed());
+            assert_eq!(
+                view.export_notice(),
+                Some("Import failed: the file needs one JSON object per line")
+            );
+
+            let unmatched = write_jsonl("unmatched", "{\"zzz\": 1}\n");
+            state.begin_import(tab, &unmatched);
+            assert_eq!(
+                state.import_draft().expect("draft").map.skipped,
+                vec!["zzz"]
+            );
+            state.commit_import();
+            assert_eq!(
+                state.tab(tab).expect("tab").export_notice(),
+                Some("Import failed: no JSONL key matches items")
+            );
+            assert!(state.tab(tab).expect("tab").export_failed());
+            assert!(commands.try_recv().is_err());
+            let _ = std::fs::remove_file(&bad);
+            let _ = std::fs::remove_file(&unmatched);
+        });
+    }
+
+    #[test]
+    fn jsonl_modal_renders_the_key_mapping() {
+        with_isolated_state("import-jsonl-render", |state| {
+            let (tab, _conn, _commands) = editable_tab(state);
+            state.activate(tab);
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let path = write_jsonl("render", "{\"tenant\": \"acme\", \"extra\": 1}\n");
+            state.begin_import(tab, &path);
+            assert!(state.import_draft().is_some(), "draft staged");
+            let render = |state: &mut AppState| {
+                let mut output = ctx.run_ui(input.clone(), |ui| {
+                    crate::ui::grid::results(state, ui);
+                });
+                output.textures_delta.clear();
+                output
+            };
+            render(state);
+            let output = render(state);
+            let text = rendered_text(&output);
+            assert!(text.iter().any(|t| t == "Import into items"), "{text:?}");
+            assert!(text.iter().any(|t| t == "JSONL key"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Skipped headers: extra"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Import"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Cancel"), "{text:?}");
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn sql_import_names_come_from_file_stems() {
+        assert_eq!(
+            sql_import_name_for_path(std::path::Path::new("reports/daily.sql")),
+            "daily"
+        );
+        assert_eq!(
+            sql_import_name_for_path(std::path::Path::new("MONTHLY.SQL")),
+            "MONTHLY"
+        );
+        assert_eq!(
+            sql_import_name_for_path(std::path::Path::new("query")),
+            "query"
+        );
+        assert_eq!(sql_import_name_for_path(std::path::Path::new(".sql")), ".sql");
+    }
+
+    /// Write one `.sql` file under `dir` and return its path.
+    fn write_sql_file(dir: &std::path::Path, name: &str, sql: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, sql).expect("write sql");
+        path
+    }
+
+    #[test]
+    fn sql_import_directory_creates_one_query_per_file_in_folder() {
+        with_isolated_state("sql-import-dir", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let dir = std::env::temp_dir()
+                .join(format!("cde-sql-import-dir-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            write_sql_file(&dir, "b.sql", "SELECT 2");
+            write_sql_file(&dir, "a.sql", "SELECT 1");
+            write_sql_file(&dir, "notes.txt", "SELECT 3");
+
+            let files = collect_sql_files(&dir);
+            assert_eq!(
+                files,
+                vec![dir.join("a.sql"), dir.join("b.sql")],
+                "only .sql files, sorted"
+            );
+            // A missing directory reads as empty instead of erroring.
+            assert!(collect_sql_files(&dir.join("gone")).is_empty());
+
+            let outcome =
+                state.import_sql_files(&files, Some(" //ops// db/ ")).expect("imports");
+            assert_eq!(outcome, SqlImportOutcome { imported: 2, skipped: vec![] });
+            let saved = state.saved_queries();
+            assert_eq!(saved.len(), 2);
+            assert_eq!(saved[0].name, "a");
+            assert_eq!(saved[0].sql, "SELECT 1");
+            assert_eq!(saved[1].name, "b");
+            assert_eq!(saved[1].sql, "SELECT 2");
+            for query in saved {
+                assert_eq!(query.folder.as_deref(), Some("ops/db"));
+                assert_eq!(query.conn, conn);
+                assert_eq!(query.versions.len(), 1);
+                assert_eq!(query.versions[0].sql, query.sql);
+            }
+
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.saved_queries().len(), 2);
+            assert_eq!(reloaded.saved_queries()[0].name, "a");
+            assert_eq!(
+                reloaded.saved_queries()[0].folder.as_deref(),
+                Some("ops/db")
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn sql_import_replaces_same_name_skips_blank_and_needs_a_connection() {
+        with_isolated_state("sql-import-replace", |state| {
+            // No connections yet: nothing to attribute the queries to.
+            let dir = std::env::temp_dir()
+                .join(format!("cde-sql-import-replace-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let fresh = write_sql_file(&dir, "daily.sql", "SELECT 1");
+            assert!(state.import_sql_files(&[fresh.clone()], None).is_none());
+
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 0".to_owned();
+            }
+            let first = state.save_active_tab("daily", None, false).expect("saved");
+            let blank = write_sql_file(&dir, "blank.sql", "  \n ");
+            let outcome =
+                state.import_sql_files(&[fresh, blank.clone()], None).expect("imports");
+            assert_eq!(
+                outcome,
+                SqlImportOutcome { imported: 1, skipped: vec!["blank.sql".to_owned()] }
+            );
+            // The same name in the same folder replaces in place, keeping its
+            // id and recording a version, instead of saving beside it.
+            let saved = state.saved_queries();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].id, first);
+            assert_eq!(saved[0].sql, "SELECT 1");
+            assert_eq!(saved[0].conn, conn);
+            assert_eq!(
+                state.saved_versions(first).iter().map(|v| v.sql.clone()).collect::<Vec<_>>(),
+                vec!["SELECT 1", "SELECT 0"]
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
     #[test]
     fn grid_import_button_and_modal_render_the_mapping_and_skipped_headers() {
         with_isolated_state("import-render", |state| {
@@ -9546,7 +9966,7 @@ mod tests {
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
-            assert!(text.iter().any(|t| t == "Import CSV"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Import file"), "{text:?}");
 
             let path = write_csv("render", "tenant,id,extra\nacme,1,x\n");
             state.begin_import(tab, &path);
@@ -9578,7 +9998,7 @@ mod tests {
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
-            assert!(!text.iter().any(|t| t == "Import CSV"), "{text:?}");
+            assert!(!text.iter().any(|t| t == "Import file"), "{text:?}");
             let _ = std::fs::remove_file(&path);
         });
     }

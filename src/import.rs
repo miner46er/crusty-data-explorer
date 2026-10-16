@@ -130,7 +130,8 @@ fn parse_records(text: &str) -> Vec<Vec<String>> {
 
 /// Parse JSON Lines: one JSON object per line, blank lines skipped, a leading
 /// UTF-8 BOM dropped, CRLF or LF terminators, and an optional trailing
-/// newline. The union of keys in first-seen order is the header; each object
+/// newline. The union of keys across objects is the header, in sorted order
+/// because the JSON map does not preserve document order; each object
 /// is one record. None when a line is not an object or no line carries one,
 /// so a JSON array document or a non-JSON line is rejected whole, the way a
 /// ragged CSV is. Values render as the text a cell holds: strings bare,
