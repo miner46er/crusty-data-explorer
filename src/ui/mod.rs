@@ -12,8 +12,11 @@ pub mod editor;
 pub mod grid;
 pub mod query;
 pub mod schema;
+pub mod search;
 
 pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
+    // First, so the palette's keys win over the editor's completion popup.
+    search::palette(state, ui);
     egui::Panel::left("connections")
         .resizable(true)
         .default_size(240.0)

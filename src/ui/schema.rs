@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use crate::app::{AppState, RowCountState};
+use crate::app::{AppState, NavigatorReveal, RowCountState};
 use crate::db::{ConnectionId, DbKind, TableInfo, TableKind};
 
 use super::ddl;
@@ -13,6 +13,8 @@ pub enum SchemaAction {
     Preview(ConnectionId, String, String),
     /// Ask the worker for one table's row count.
     Count(ConnectionId, String, String),
+    /// The palette-requested table entry was opened and scrolled to.
+    RevealHandled,
 }
 
 pub fn connection_schema(
@@ -62,6 +64,7 @@ pub fn connection_schema(
                 .find(|c| c.id == conn)
                 .map(|c| c.config.kind())
                 .unwrap_or(DbKind::Sqlite);
+            let reveal = state.navigator_reveal().filter(|reveal| reveal.conn == conn);
             egui::CollapsingHeader::new(egui::RichText::new("Databases").small().strong())
                 .default_open(true)
                 .show(ui, |ui| {
@@ -84,6 +87,7 @@ pub fn connection_schema(
                                         schema_node,
                                         dialect,
                                         &mut actions,
+                                        reveal,
                                     );
                                 }
                             });
@@ -101,6 +105,7 @@ fn show_schema(
     schema_node: &crate::db::SchemaNode,
     dialect: DbKind,
     actions: &mut Vec<SchemaAction>,
+    reveal: Option<&NavigatorReveal>,
 ) {
     egui::CollapsingHeader::new(
         egui::RichText::new(schema_node.name()).monospace().small(),
@@ -119,7 +124,9 @@ fn show_schema(
                     if i > 0 {
                         ui.separator();
                     }
-                    show_table(state, ui, conn, schema_node.name(), table, dialect, actions);
+                    show_table(
+                        state, ui, conn, schema_node.name(), table, dialect, actions, reveal,
+                    );
                 }
             });
             ui.add_space(4.0);
@@ -136,7 +143,9 @@ fn show_schema(
                     if i > 0 {
                         ui.separator();
                     }
-                    show_table(state, ui, conn, schema_node.name(), view, dialect, actions);
+                    show_table(
+                        state, ui, conn, schema_node.name(), view, dialect, actions, reveal,
+                    );
                 }
             });
             ui.add_space(4.0);
@@ -305,13 +314,20 @@ fn show_table(
     table: &TableInfo,
     dialect: DbKind,
     actions: &mut Vec<SchemaAction>,
+    reveal: Option<&NavigatorReveal>,
 ) {
     let name = table.name().to_owned();
     let schema_owned = schema.to_owned();
     let columns = table.columns();
+    let reveal_here = reveal
+        .is_some_and(|reveal| reveal.schema == schema && reveal.table == name);
     let header =
         egui::RichText::new(format!("{name} ({})", columns.len())).monospace().small();
-    let resp = egui::CollapsingHeader::new(header).default_open(false).show(ui, |ui| {
+    let mut collapsing = egui::CollapsingHeader::new(header).default_open(false);
+    if reveal_here {
+        collapsing = collapsing.open(Some(true));
+    }
+    let resp = collapsing.show(ui, |ui| {
         count_affordance(state, ui, conn, schema, table, actions);
         if !table.columns().is_empty() {
             egui::CollapsingHeader::new(
@@ -491,6 +507,10 @@ fn show_table(
             ddl::show_table_ddl(ui, table, dialect);
         }
     });
+    if reveal_here {
+        resp.header_response.scroll_to_me(Some(egui::Align::Center));
+        actions.push(SchemaAction::RevealHandled);
+    }
     if resp.header_response.clicked() {
         actions.push(SchemaAction::Preview(conn, schema_owned, name));
     }

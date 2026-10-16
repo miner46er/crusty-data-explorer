@@ -276,6 +276,9 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                                                 id, schema, table,
                                             ));
                                         }
+                                        super::schema::SchemaAction::RevealHandled => {
+                                            state.clear_navigator_reveal();
+                                        }
                                     }
                                 }
                             }

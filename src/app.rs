@@ -465,12 +465,182 @@ pub fn saved_groups(saved: &[SavedQuery]) -> Vec<SavedGroup<'_>> {
     groups
 }
 
+/// One entity the Ctrl+K palette can open. The variant carries what opening
+/// it needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchResult {
+    Connection(ConnectionId),
+    Saved(u64),
+    Table { conn: ConnectionId, schema: String, table: String },
+    Column { conn: ConnectionId, schema: String, table: String, column: String },
+}
+
+impl SearchResult {
+    /// The tie-break order across kinds: connections, saved queries, tables,
+    /// columns.
+    fn kind_rank(&self) -> u8 {
+        match self {
+            SearchResult::Connection(_) => 0,
+            SearchResult::Saved(_) => 1,
+            SearchResult::Table { .. } => 2,
+            SearchResult::Column { .. } => 3,
+        }
+    }
+}
+
+/// The open palette: filter text, the selected row, and the ranked rows.
+/// `None` in [`AppState`] is closed, so a closed palette holds no stale list.
+#[derive(Debug)]
+pub struct SearchPalette {
+    pub query: String,
+    pub selected: usize,
+    pub results: Vec<SearchResult>,
+}
+
+/// One palette entry before filtering: what opening it does, its display
+/// name, and the second text its kind matches on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchCandidate {
+    pub result: SearchResult,
+    pub name: String,
+    /// A connection's kind or a saved query's folder; `None` for tables and
+    /// columns, which match on their names only.
+    pub extra: Option<String>,
+}
+
+/// A table entry the palette asked the navigator to open and scroll to,
+/// consumed by the next schema render.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavigatorReveal {
+    pub conn: ConnectionId,
+    pub schema: String,
+    pub table: String,
+}
+
 /// Cap on retained history entries, newest first.
 const HISTORY_CAP: usize = 200;
 /// Cap on history rows rendered in the sidebar.
 pub const HISTORY_SHOWN: usize = 30;
 /// Cap on retained saved queries, newest first.
 const SAVED_CAP: usize = 200;
+/// Cap on palette rows for one query, best-ranked first.
+const SEARCH_CAP: usize = 50;
+
+/// How one candidate matched the query, best first: the field starts with
+/// it, a word inside it starts with it, or its characters appear in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchTier {
+    Prefix,
+    WordStart,
+    Subsequence,
+}
+
+/// The best tier the lowercased `query` reaches inside `field`.
+fn match_tier(query: &str, field: &str) -> Option<MatchTier> {
+    let field = field.to_lowercase();
+    if field.starts_with(query) {
+        return Some(MatchTier::Prefix);
+    }
+    let mut after_word = false;
+    for (index, ch) in field.char_indices() {
+        if after_word && field[index..].starts_with(query) {
+            return Some(MatchTier::WordStart);
+        }
+        after_word = !ch.is_alphanumeric();
+    }
+    is_subsequence(&field, query).then_some(MatchTier::Subsequence)
+}
+
+/// Whether every char of `query` appears in `field` in order.
+fn is_subsequence(field: &str, query: &str) -> bool {
+    let mut field_chars = field.chars();
+    query.chars().all(|wanted| field_chars.any(|c| c == wanted))
+}
+
+/// Rank candidates against `query`: prefix matches above word starts above
+/// plain subsequences, ties by kind then name, capped at [`SEARCH_CAP`]. The
+/// empty query matches nothing, so a fresh palette opens empty.
+fn rank_candidates(query: &str, candidates: &[SearchCandidate]) -> Vec<SearchResult> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut ranked: Vec<(MatchTier, u8, String, &SearchResult)> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let tier = match_tier(&query, &candidate.name)
+                .into_iter()
+                .chain(candidate.extra.as_deref().and_then(|extra| match_tier(&query, extra)))
+                .min()?;
+            Some((
+                tier,
+                candidate.result.kind_rank(),
+                candidate.name.to_lowercase(),
+                &candidate.result,
+            ))
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2))
+    });
+    ranked
+        .into_iter()
+        .take(SEARCH_CAP)
+        .map(|(_, _, _, result)| result.clone())
+        .collect()
+}
+
+/// Every entity the palette can open: all connections and saved queries,
+/// plus the loaded tables and columns behind the default connection.
+fn search_candidates(state: &AppState) -> Vec<SearchCandidate> {
+    let mut candidates: Vec<SearchCandidate> = Vec::new();
+    for conn in state.connections() {
+        candidates.push(SearchCandidate {
+            result: SearchResult::Connection(conn.id),
+            name: conn.name.clone(),
+            extra: Some(conn.config.kind().label().to_owned()),
+        });
+    }
+    for query in state.saved_queries() {
+        candidates.push(SearchCandidate {
+            result: SearchResult::Saved(query.id),
+            name: query.name.clone(),
+            extra: query.folder.clone(),
+        });
+    }
+    if let Some(conn) = state.default_connection() {
+        if let Some(schema) = state.schema(conn) {
+            for database in schema.databases() {
+                for node in database.schemas() {
+                    for table in node.tables().iter().chain(node.views()) {
+                        candidates.push(SearchCandidate {
+                            result: SearchResult::Table {
+                                conn,
+                                schema: node.name().to_owned(),
+                                table: table.name().to_owned(),
+                            },
+                            name: table.name().to_owned(),
+                            extra: None,
+                        });
+                        for column in table.columns() {
+                            candidates.push(SearchCandidate {
+                                result: SearchResult::Column {
+                                    conn,
+                                    schema: node.name().to_owned(),
+                                    table: table.name().to_owned(),
+                                    column: column.name().to_owned(),
+                                },
+                                name: column.name().to_owned(),
+                                extra: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    candidates
+}
 
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
@@ -544,6 +714,16 @@ fn find_table<'a>(schema: &'a SchemaInfo, table: &str) -> Option<&'a TableInfo> 
         }
     }
     None
+}
+
+/// The SELECT a table entry loads: every column, capped, with the schema
+/// qualifier quoted.
+fn table_select(schema: &str, table: &str) -> String {
+    format!(
+        "SELECT * FROM \"{}\".\"{}\" LIMIT 100",
+        schema.replace('"', "\"\""),
+        table.replace('"', "\"\"")
+    )
 }
 
 /// Primary key columns in key order with their declared types, from the
@@ -713,6 +893,10 @@ pub struct AppState {
     row_counts: HashMap<(ConnectionId, String, String), RowCountState>,
     history: Vec<HistoryEntry>,
     saved: Vec<SavedQuery>,
+    search: Option<SearchPalette>,
+    /// The table the palette asked the navigator to reveal; the schema tree
+    /// consumes it on its next render.
+    navigator_reveal: Option<NavigatorReveal>,
     save_prompt: Option<SavePrompt>,
     imports: Option<ImportDraft>,
     theme: crate::ui::Theme,
@@ -752,6 +936,8 @@ impl AppState {
             row_counts: HashMap::new(),
             history: load_history(),
             saved,
+            search: None,
+            navigator_reveal: None,
             save_prompt: None,
             imports: None,
             theme: settings.theme,
@@ -1841,11 +2027,7 @@ impl AppState {
         if self.connections.iter().find(|c| c.id == conn).is_none() {
             return;
         }
-        let sql = format!(
-            "SELECT * FROM \"{}\".\"{}\" LIMIT 100",
-            schema.replace('"', "\"\""),
-            table.replace('"', "\"\"")
-        );
+        let sql = table_select(schema, table);
         let existing = self.tabs.iter().find(|t| t.conn == Some(conn) && t.sql == sql).map(|t| t.id);
         match existing {
             Some(id) => {
@@ -1982,6 +2164,158 @@ impl AppState {
         }
         self.persist_saved();
         true
+    }
+
+    /// Whether the palette is open.
+    pub fn palette_open(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// The open palette.
+    pub fn palette(&self) -> Option<&SearchPalette> {
+        self.search.as_ref()
+    }
+
+    /// The open palette's filter box and rows.
+    pub fn palette_mut(&mut self) -> Option<&mut SearchPalette> {
+        self.search.as_mut()
+    }
+
+    /// Open the palette fresh: empty query, first row selected, no rows
+    /// until the query says something.
+    pub fn open_palette(&mut self) {
+        self.search = Some(SearchPalette {
+            query: String::new(),
+            selected: 0,
+            results: Vec::new(),
+        });
+    }
+
+    pub fn close_palette(&mut self) {
+        self.search = None;
+    }
+
+    pub fn toggle_palette(&mut self) {
+        if self.palette_open() {
+            self.close_palette();
+        } else {
+            self.open_palette();
+        }
+    }
+
+    /// Replace the filter text and re-rank. The selection clamps to the
+    /// smaller list.
+    pub fn set_palette_query(&mut self, query: &str) {
+        if let Some(palette) = self.search.as_mut() {
+            palette.query = query.to_owned();
+        }
+        self.refilter_palette();
+    }
+
+    /// Re-run the matcher for the current query.
+    fn refilter_palette(&mut self) {
+        let Some(query) = self.search.as_ref().map(|palette| palette.query.clone()) else {
+            return;
+        };
+        let results = rank_candidates(&query, &search_candidates(self));
+        if let Some(palette) = self.search.as_mut() {
+            palette.results = results;
+            palette.selected = palette.selected.min(palette.results.len().saturating_sub(1));
+        }
+    }
+
+    /// Move the selection by `delta` rows, wrapping around the ends. A no-op
+    /// with no rows.
+    pub fn move_palette_selection(&mut self, delta: isize) {
+        let Some(palette) = self.search.as_mut() else { return };
+        let len = palette.results.len();
+        if len == 0 {
+            return;
+        }
+        palette.selected =
+            (palette.selected as isize + delta).rem_euclid(len as isize) as usize;
+    }
+
+    /// The row Enter would open.
+    pub fn palette_selection(&self) -> Option<&SearchResult> {
+        let palette = self.search.as_ref()?;
+        palette.results.get(palette.selected)
+    }
+
+    /// Open the selected row and close the palette. False with no selection,
+    /// which leaves the palette open.
+    pub fn activate_palette_selection(&mut self) -> bool {
+        let Some(result) = self.palette_selection().cloned() else { return false };
+        self.open_search_result(&result);
+        self.close_palette();
+        true
+    }
+
+    /// Open one palette row: a connection activates (opening a tab when it
+    /// has none), a saved query opens like the sidebar, a table loads its
+    /// SELECT into a fresh tab, and a column reveals its table in the
+    /// navigator.
+    pub fn open_search_result(&mut self, result: &SearchResult) {
+        match result {
+            SearchResult::Connection(conn) => self.select_connection(*conn),
+            SearchResult::Saved(id) => self.open_saved(*id),
+            SearchResult::Table { conn, schema, table } => {
+                self.open_table_query(*conn, schema, table)
+            }
+            SearchResult::Column { conn, schema, table, .. } => {
+                self.reveal_table(*conn, schema, table)
+            }
+        }
+    }
+
+    /// Make a connection the sidebar's selection. The sidebar highlights the
+    /// active tab's connection, so this activates the connection's first tab
+    /// or opens a fresh one when it has none.
+    fn select_connection(&mut self, conn: ConnectionId) {
+        if !self.connections.iter().any(|c| c.id == conn) {
+            return;
+        }
+        match self.tabs.iter().find(|tab| tab.conn == Some(conn)) {
+            Some(tab) => self.activate(tab.id),
+            None => {
+                let tab = self.new_tab(conn);
+                self.activate(tab);
+            }
+        }
+    }
+
+    /// Load `schema.table`'s SELECT into a fresh tab on its connection,
+    /// unrun, so the user runs it.
+    pub fn open_table_query(&mut self, conn: ConnectionId, schema: &str, table: &str) {
+        if !self.connections.iter().any(|c| c.id == conn) {
+            return;
+        }
+        let sql = table_select(schema, table);
+        let tab = self.new_tab(conn);
+        if let Some(slot) = self.tab_sql_mut(tab) {
+            *slot = sql;
+        }
+        self.activate(tab);
+    }
+
+    /// Ask the navigator to open and show one table's entry, by exact schema
+    /// and table name.
+    pub fn reveal_table(&mut self, conn: ConnectionId, schema: &str, table: &str) {
+        self.navigator_reveal = Some(NavigatorReveal {
+            conn,
+            schema: schema.to_owned(),
+            table: table.to_owned(),
+        });
+    }
+
+    /// The table the navigator should reveal, while one is pending.
+    pub fn navigator_reveal(&self) -> Option<&NavigatorReveal> {
+        self.navigator_reveal.as_ref()
+    }
+
+    /// Clear the pending reveal once the schema tree showed it.
+    pub fn clear_navigator_reveal(&mut self) {
+        self.navigator_reveal = None;
     }
 
     pub fn save_prompt(&self) -> Option<&SavePrompt> {
@@ -4094,6 +4428,453 @@ mod tests {
                 (Some("zeta"), vec!["zeta-pinned", "zeta-plain"]),
             ]
         );
+    }
+
+    fn search_candidate(
+        result: SearchResult,
+        name: &str,
+        extra: Option<&str>,
+    ) -> SearchCandidate {
+        SearchCandidate { result, name: name.to_owned(), extra: extra.map(str::to_owned) }
+    }
+
+    fn key_event(
+        key: eframe::egui::Key,
+        modifiers: eframe::egui::Modifiers,
+    ) -> eframe::egui::Event {
+        eframe::egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn palette_matcher_ranks_prefix_word_start_and_subsequence() {
+        let conn = ConnectionId::from_raw(1);
+        let table = |name: &str| SearchResult::Table {
+            conn,
+            schema: "main".to_owned(),
+            table: name.to_owned(),
+        };
+        let column = |name: &str| SearchResult::Column {
+            conn,
+            schema: "main".to_owned(),
+            table: "items".to_owned(),
+            column: name.to_owned(),
+        };
+        let candidates = vec![
+            search_candidate(
+                SearchResult::Connection(conn),
+                "big time machine",
+                Some("SQLite"),
+            ),
+            search_candidate(
+                SearchResult::Connection(ConnectionId::from_raw(2)),
+                "prod items",
+                Some("Postgres"),
+            ),
+            search_candidate(SearchResult::Saved(7), "Item Report", Some("reports")),
+            search_candidate(table("items"), "items", None),
+            search_candidate(column("item_id"), "item_id", None),
+            search_candidate(table("metrics"), "metrics", None),
+        ];
+        assert_eq!(
+            rank_candidates("item", &candidates),
+            vec![
+                SearchResult::Saved(7),
+                table("items"),
+                column("item_id"),
+                SearchResult::Connection(ConnectionId::from_raw(2)),
+                SearchResult::Connection(conn),
+            ]
+        );
+    }
+
+    #[test]
+    fn palette_matcher_reads_saved_folders_and_connection_kinds() {
+        let conn = ConnectionId::from_raw(1);
+        let candidates = vec![
+            search_candidate(SearchResult::Connection(conn), "analytics", Some("Postgres")),
+            search_candidate(SearchResult::Saved(4), "daily rollup", Some("reports")),
+        ];
+        assert_eq!(
+            rank_candidates("postgres", &candidates),
+            vec![SearchResult::Connection(conn)]
+        );
+        assert_eq!(rank_candidates("reports", &candidates), vec![SearchResult::Saved(4)]);
+    }
+
+    #[test]
+    fn palette_matcher_caps_rows_at_fifty() {
+        let conn = ConnectionId::from_raw(1);
+        let candidates: Vec<SearchCandidate> = (0..60)
+            .map(|i| {
+                let name = format!("item_{i:02}");
+                search_candidate(
+                    SearchResult::Table {
+                        conn,
+                        schema: "main".to_owned(),
+                        table: name.clone(),
+                    },
+                    &name,
+                    None,
+                )
+            })
+            .collect();
+        let ranked = rank_candidates("item", &candidates);
+        assert_eq!(ranked.len(), SEARCH_CAP);
+        assert_eq!(ranked.len(), 50);
+        assert_eq!(
+            ranked.first(),
+            Some(&SearchResult::Table {
+                conn,
+                schema: "main".to_owned(),
+                table: "item_00".to_owned(),
+            })
+        );
+        assert_eq!(
+            ranked.last(),
+            Some(&SearchResult::Table {
+                conn,
+                schema: "main".to_owned(),
+                table: "item_49".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn palette_matcher_empty_query_matches_nothing() {
+        let candidates = vec![search_candidate(
+            SearchResult::Connection(ConnectionId::from_raw(1)),
+            "prod",
+            Some("Postgres"),
+        )];
+        assert!(rank_candidates("", &candidates).is_empty());
+        assert!(rank_candidates("   ", &candidates).is_empty());
+    }
+
+    #[test]
+    fn palette_opens_fresh_and_clears_on_reopen() {
+        with_isolated_state("palette-toggle", |state| {
+            add_sqlite_connection(state, "prod db");
+            state.toggle_palette();
+            assert!(state.palette_open());
+            let palette = state.palette().expect("palette");
+            assert_eq!(palette.query, "");
+            assert_eq!(palette.selected, 0);
+            assert!(palette.results.is_empty(), "a fresh palette lists nothing");
+            state.set_palette_query("it");
+            assert!(!state.palette().expect("palette").results.is_empty());
+            state.toggle_palette();
+            assert!(!state.palette_open());
+            state.open_palette();
+            let palette = state.palette().expect("palette");
+            assert_eq!(palette.query, "");
+            assert!(palette.results.is_empty(), "reopening clears query and rows");
+        });
+    }
+
+    #[test]
+    fn palette_query_filters_connections_saved_and_schema() {
+        with_isolated_state("palette-filter", |state| {
+            let conn = add_sqlite_connection(state, "prod db");
+            let other = add_sqlite_connection(state, "warehouse");
+            let _commands = attach_test_session(state, conn);
+            state.apply(DbEvent::SchemaOk { conn, schema: items_schema() });
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 1".to_owned();
+            }
+            let saved = state.save_active_tab("item report", Some("reports"), false).expect("saved");
+            state.open_palette();
+            state.set_palette_query("item");
+            assert_eq!(
+                state.palette().expect("palette").results,
+                vec![
+                    SearchResult::Saved(saved),
+                    SearchResult::Table {
+                        conn,
+                        schema: "main".to_owned(),
+                        table: "items".to_owned(),
+                    },
+                ]
+            );
+            state.set_palette_query("reports");
+            assert_eq!(
+                state.palette().expect("palette").results,
+                vec![SearchResult::Saved(saved)]
+            );
+            state.set_palette_query("warehouse");
+            assert_eq!(
+                state.palette().expect("palette").results,
+                vec![SearchResult::Connection(other)]
+            );
+            state.set_palette_query("name");
+            assert_eq!(
+                state.palette().expect("palette").results,
+                vec![SearchResult::Column {
+                    conn,
+                    schema: "main".to_owned(),
+                    table: "items".to_owned(),
+                    column: "name".to_owned(),
+                }]
+            );
+        });
+    }
+
+    #[test]
+    fn palette_selection_moves_and_wraps() {
+        with_isolated_state("palette-select", |state| {
+            let conn = add_sqlite_connection(state, "prod");
+            let _commands = attach_test_session(state, conn);
+            state.apply(DbEvent::SchemaOk { conn, schema: items_schema() });
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 1".to_owned();
+            }
+            state.save_active_tab("item report", None, false).expect("saved");
+            state.open_palette();
+            state.set_palette_query("item");
+            assert_eq!(state.palette().expect("palette").results.len(), 2);
+            assert_eq!(state.palette().expect("palette").selected, 0);
+            state.move_palette_selection(1);
+            assert_eq!(state.palette().expect("palette").selected, 1, "down moves");
+            state.move_palette_selection(1);
+            assert_eq!(state.palette().expect("palette").selected, 0, "down wraps");
+            state.move_palette_selection(-1);
+            assert_eq!(state.palette().expect("palette").selected, 1, "up wraps");
+            state.set_palette_query("prod");
+            assert_eq!(state.palette().expect("palette").results.len(), 1);
+            assert_eq!(state.palette().expect("palette").selected, 0, "a shorter list clamps");
+        });
+    }
+
+    #[test]
+    fn palette_connection_row_opens_and_selects_its_tab() {
+        with_isolated_state("palette-open-conn", |state| {
+            let first = add_sqlite_connection(state, "first");
+            let second = add_sqlite_connection(state, "second");
+            let tab = state.new_tab(first);
+            state.activate(tab);
+            state.open_palette();
+            state.set_palette_query("second");
+            assert_eq!(
+                state.palette().expect("palette").results,
+                vec![SearchResult::Connection(second)]
+            );
+            assert!(state.activate_palette_selection(), "the row opens");
+            assert!(!state.palette_open(), "opening closes the palette");
+            let opened = state.active().expect("active tab");
+            assert_ne!(opened, tab);
+            assert_eq!(state.tab(opened).expect("tab").conn, Some(second));
+            assert!(matches!(
+                state.tab(opened).expect("tab").outcome(),
+                RunOutcome::Never
+            ));
+            state.open_palette();
+            state.set_palette_query("second");
+            assert!(state.activate_palette_selection());
+            assert_eq!(state.active(), Some(opened), "an existing tab activates");
+            assert_eq!(state.tabs().len(), 2);
+        });
+    }
+
+    #[test]
+    fn palette_saved_row_opens_its_tab() {
+        with_isolated_state("palette-open-saved", |state| {
+            let conn = add_sqlite_connection(state, "prod");
+            let tab = state.new_tab(conn);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 42".to_owned();
+            }
+            state.activate(tab);
+            state
+                .save_active_tab("daily rollup", Some("reports"), false)
+                .expect("saved");
+            state.open_palette();
+            state.set_palette_query("rollup");
+            assert!(state.activate_palette_selection(), "the row opens");
+            let opened = state.active().and_then(|id| state.tab(id)).expect("active tab");
+            assert_ne!(opened.id, tab);
+            assert_eq!(opened.sql, "SELECT 42");
+            assert_eq!(opened.conn, Some(conn));
+            assert!(matches!(opened.outcome(), RunOutcome::Never));
+        });
+    }
+
+    #[test]
+    fn palette_table_row_opens_an_unrun_select() {
+        with_isolated_state("palette-open-table", |state| {
+            let conn = add_sqlite_connection(state, "prod");
+            let commands = attach_test_session(state, conn);
+            state.apply(DbEvent::SchemaOk { conn, schema: items_schema() });
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            state.open_palette();
+            state.set_palette_query("items");
+            assert!(state.activate_palette_selection(), "the row opens");
+            let opened = state.active().and_then(|id| state.tab(id)).expect("active tab");
+            assert_ne!(opened.id, tab);
+            assert_eq!(opened.sql, "SELECT * FROM \"main\".\"items\" LIMIT 100");
+            assert_eq!(opened.conn, Some(conn));
+            assert!(matches!(opened.outcome(), RunOutcome::Never), "the SELECT waits");
+            assert!(commands.try_recv().is_err(), "opening a table sends nothing");
+        });
+    }
+
+    #[test]
+    fn palette_column_row_reveals_its_table_in_the_navigator() {
+        with_isolated_state("palette-open-column", |state| {
+            let conn = add_sqlite_connection(state, "prod");
+            let _commands = attach_test_session(state, conn);
+            state.apply(DbEvent::SchemaOk { conn, schema: items_schema() });
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            state.open_palette();
+            state.set_palette_query("name");
+            assert!(state.activate_palette_selection(), "the row opens");
+            assert_eq!(
+                state.navigator_reveal(),
+                Some(&NavigatorReveal {
+                    conn,
+                    schema: "main".to_owned(),
+                    table: "items".to_owned(),
+                })
+            );
+            assert_eq!(state.active(), Some(tab), "a column opens no tab");
+            assert_eq!(state.tabs().len(), 1);
+            assert!(!state.palette_open());
+            state.clear_navigator_reveal();
+            assert!(state.navigator_reveal().is_none());
+        });
+    }
+
+    #[test]
+    fn palette_window_renders_over_the_root_with_rows() {
+        with_isolated_state("palette-render", |state| {
+            let conn = add_sqlite_connection(state, "prod");
+            let _commands = attach_test_session(state, conn);
+            state.apply(DbEvent::SchemaOk { conn, schema: items_schema() });
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            state.open_palette();
+            state.set_palette_query("item");
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            // A fresh egui window paints from its second frame on.
+            let mut first = ctx.run_ui(input.clone(), |ui| crate::ui::root(state, ui));
+            first.textures_delta.clear();
+            let mut output = ctx.run_ui(input, |ui| crate::ui::root(state, ui));
+            output.textures_delta.clear();
+            let text = rendered_text(&output);
+            assert!(text.iter().any(|t| t == "Search"), "{text:?}");
+            assert!(text.iter().any(|t| t == "items  ·  main"), "{text:?}");
+        });
+    }
+
+    #[test]
+    fn palette_keyboard_flow_filters_moves_and_opens() {
+        with_isolated_state("palette-keys", |state| {
+            let conn = add_sqlite_connection(state, "prod");
+            let _commands = attach_test_session(state, conn);
+            state.apply(DbEvent::SchemaOk { conn, schema: items_schema() });
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let frame = |state: &mut AppState, events: Vec<eframe::egui::Event>| {
+                let mut raw = input.clone();
+                raw.events = events;
+                let mut output = ctx.run_ui(raw, |ui| {
+                    crate::ui::search::palette(state, ui);
+                });
+                output.textures_delta.clear();
+                output
+            };
+            frame(
+                state,
+                vec![key_event(eframe::egui::Key::K, eframe::egui::Modifiers::CTRL)],
+            );
+            assert!(state.palette_open(), "Ctrl+K opens");
+            frame(state, vec![eframe::egui::Event::Text("item".to_owned())]);
+            assert_eq!(state.palette().expect("palette").query, "item");
+            assert_eq!(
+                state.palette().expect("palette").results,
+                vec![SearchResult::Table {
+                    conn,
+                    schema: "main".to_owned(),
+                    table: "items".to_owned(),
+                }]
+            );
+            frame(
+                state,
+                vec![key_event(eframe::egui::Key::Enter, eframe::egui::Modifiers::NONE)],
+            );
+            assert!(!state.palette_open(), "Enter closes the palette");
+            let opened = state.active().and_then(|id| state.tab(id)).expect("active tab");
+            assert_eq!(opened.sql, "SELECT * FROM \"main\".\"items\" LIMIT 100");
+            assert_eq!(state.tabs().len(), 2);
+
+            frame(
+                state,
+                vec![key_event(eframe::egui::Key::K, eframe::egui::Modifiers::CTRL)],
+            );
+            frame(state, vec![eframe::egui::Event::Text("e".to_owned())]);
+            assert_eq!(state.palette().expect("palette").results.len(), 4);
+            frame(
+                state,
+                vec![key_event(eframe::egui::Key::ArrowDown, eframe::egui::Modifiers::NONE)],
+            );
+            assert_eq!(state.palette().expect("palette").selected, 1);
+            frame(
+                state,
+                vec![key_event(eframe::egui::Key::Escape, eframe::egui::Modifiers::NONE)],
+            );
+            assert!(!state.palette_open(), "Escape closes");
+            assert_eq!(state.tabs().len(), 2, "Escape opened nothing");
+
+            frame(
+                state,
+                vec![key_event(eframe::egui::Key::K, eframe::egui::Modifiers::CTRL)],
+            );
+            frame(state, vec![eframe::egui::Event::Text("e".to_owned())]);
+            frame(
+                state,
+                vec![key_event(eframe::egui::Key::ArrowUp, eframe::egui::Modifiers::NONE)],
+            );
+            assert_eq!(state.palette().expect("palette").selected, 3, "up wraps");
+            frame(
+                state,
+                vec![key_event(eframe::egui::Key::Enter, eframe::egui::Modifiers::NONE)],
+            );
+            assert!(!state.palette_open());
+            assert_eq!(
+                state.navigator_reveal(),
+                Some(&NavigatorReveal {
+                    conn,
+                    schema: "main".to_owned(),
+                    table: "items".to_owned(),
+                })
+            );
+            assert_eq!(state.tabs().len(), 2, "the column row opened no tab");
+        });
     }
 
     #[test]

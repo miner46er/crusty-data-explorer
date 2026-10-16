@@ -18,7 +18,8 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
         || state.password_prompt().is_some()
         || state.import_draft().is_some()
         || state.pending_write().is_some()
-        || state.pending_params().is_some();
+        || state.pending_params().is_some()
+        || state.palette_open();
     let (new_tab_shortcut_pressed, close_tab_shortcut_pressed, find_shortcut_pressed) = ui
         .input_mut(|i| {
             (
