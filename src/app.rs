@@ -4250,6 +4250,47 @@ impl AppState {
                     false,
                 );
             }
+            DbEvent::PageOk { run: _, tab, offset, result } => {
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    let active = t.active_result();
+                    let target: Option<&mut QueryResult> = match &mut t.outcome {
+                        RunOutcome::Ok { results, .. } => results.get_mut(active),
+                        _ => t.results.get_mut(active),
+                    };
+                    if let Some(current) = target {
+                        if current.row_count() as u64 == offset {
+                            if let Err(error) = current.append_page(result) {
+                                t.set_export_notice(
+                                    format!("Page failed: {error}"),
+                                    true,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            DbEvent::PageErr { run: _, tab, error } => {
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    t.set_export_notice(format!("Page failed: {error}"), true);
+                }
+            }
+            DbEvent::CountOk { run: _, tab, total } => {
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    let active = t.active_result();
+                    let target: Option<&mut QueryResult> = match &mut t.outcome {
+                        RunOutcome::Ok { results, .. } => results.get_mut(active),
+                        _ => t.results.get_mut(active),
+                    };
+                    if let Some(current) = target {
+                        current.set_total(total);
+                    }
+                }
+            }
+            DbEvent::CountErr { run: _, tab, error } => {
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    t.set_export_notice(format!("Count failed: {error}"), true);
+                }
+            }
         }
     }
 

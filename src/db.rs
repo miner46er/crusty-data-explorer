@@ -9,15 +9,55 @@
 
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::{Arc, mpsc};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::{Duration, Instant};
 
 use crate::ssh::SshConfig;
 
 /// Cap on materialized rows per statement. The result reports truncation.
 pub const ROW_CAP: usize = 10_000;
+/// Rows per streaming page. Paging and streamed export fetch this many rows
+/// per roundtrip, so a large result never materializes at once.
+pub const STREAM_PAGE_SIZE: usize = 5_000;
 /// Cap on displayed characters per text cell in the grid.
 pub const CELL_CAP: usize = 256;
+
+/// One statement trimmed of trailing whitespace and semicolons, so a page
+/// or count wrapper never nests a second terminator inside the subselect.
+fn trim_statement(sql: &str) -> &str {
+    let mut inner = sql.trim();
+    while let Some(stripped) = inner.strip_suffix(';') {
+        inner = stripped.trim_end();
+        if inner.is_empty() {
+            break;
+        }
+    }
+    inner
+}
+
+/// One page of `sql` as a subselect. `LIMIT` plus `OFFSET` reads on SQLite,
+/// Postgres, and MySQL 8, so one wrapper covers every engine.
+pub fn paged_sql(sql: &str, limit: u64, offset: u64) -> String {
+    let inner = trim_statement(sql);
+    format!("SELECT * FROM ({inner}) AS __cde_page LIMIT {limit} OFFSET {offset}")
+}
+
+/// The total row count behind `sql` as one scalar row.
+pub fn count_sql(sql: &str) -> String {
+    let inner = trim_statement(sql);
+    format!("SELECT COUNT(*) FROM ({inner}) AS __cde_count")
+}
+
+/// True when `sql` holds one statement with no inner terminator. Paging and
+/// streamed export wrap the whole text as a subselect, so a batch falls back
+/// to the visible grid instead.
+pub fn is_single_statement(sql: &str) -> bool {
+    !trim_statement(sql).contains(';')
+}
 
 /// Branded id so a tab id cannot stand in for a connection id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -28,6 +68,14 @@ pub struct TabId(u64);
 /// Caller-allocated request id, echoed back on completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RunId(u64);
+
+impl RunId {
+    /// Mint one id from a caller counter, for grid paging runs the app
+    /// never tracks as running.
+    pub fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+}
 
 impl ConnectionId {
     pub fn raw(self) -> u64 {
@@ -732,10 +780,20 @@ impl Column {
     pub fn values(&self) -> &[Value] {
         &self.values
     }
+    /// Split one page column into its parts for [`QueryResult::append_page`].
+    fn into_parts(self) -> (String, String, Vec<Value>) {
+        (self.name, self.type_name, self.values)
+    }
+    /// Append page values onto the loaded column.
+    fn append_values(&mut self, values: &mut Vec<Value>) {
+        self.values.append(values);
+    }
 }
 
 /// A materialized result set in column-major order. `affected` is Some only
 /// for statements without result columns. `truncated` says the row cap hit.
+/// `total` carries an on-demand exact count beside the flag when one was
+/// fetched, so the grid can name the full size without loading it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryResult {
     columns: Vec<Column>,
@@ -743,6 +801,7 @@ pub struct QueryResult {
     truncated: bool,
     affected: Option<u64>,
     took: Duration,
+    total: Option<u64>,
 }
 
 impl QueryResult {
@@ -757,7 +816,7 @@ impl QueryResult {
         if columns.iter().any(|c| c.values.len() != row_count) {
             return Err(ShapeError::Ragged { expected: row_count });
         }
-        Ok(Self { columns, row_count, truncated, affected, took })
+        Ok(Self { columns, row_count, truncated, affected, took, total: None })
     }
     pub fn columns(&self) -> &[Column] {
         &self.columns
@@ -773,6 +832,36 @@ impl QueryResult {
     }
     pub fn took(&self) -> Duration {
         self.took
+    }
+    /// The on-demand total behind the truncation flag, if one was counted.
+    pub fn total(&self) -> Option<u64> {
+        self.total
+    }
+    /// Record the on-demand total beside the flag.
+    pub fn set_total(&mut self, total: u64) {
+        self.total = Some(total);
+    }
+    /// Append one page onto the loaded rows. Column counts and names must
+    /// match positionally; the page's flag becomes the combined flag and a
+    /// page total never carries over. Returns the page's flag, which says
+    /// whether another page remains.
+    pub fn append_page(&mut self, page: QueryResult) -> Result<bool, ShapeError> {
+        if page.columns.len() != self.columns.len() {
+            return Err(ShapeError::Ragged { expected: self.row_count });
+        }
+        for (own, next) in self.columns.iter().zip(page.columns.iter()) {
+            if own.name() != next.name() {
+                return Err(ShapeError::Ragged { expected: self.row_count });
+            }
+        }
+        let has_more = page.truncated;
+        for (own, next) in self.columns.iter_mut().zip(page.columns.into_iter()) {
+            let (_, _, mut values) = next.into_parts();
+            own.append_values(&mut values);
+        }
+        self.row_count = self.columns.first().map(|c| c.values.len()).unwrap_or(0);
+        self.truncated = has_more;
+        Ok(has_more)
     }
     /// Bounds-checked: the grid's visible range comes from the previous frame
     /// and the result can be replaced between frames.
@@ -1668,7 +1757,7 @@ impl ResultBuilder {
         let truncated = self.truncated;
         debug_assert!(cols.iter().all(|c| c.values.len() == row_count));
         let _ = &mut cols;
-        QueryResult { columns: cols, row_count, truncated, affected: None, took }
+        QueryResult { columns: cols, row_count, truncated, affected: None, took, total: None }
     }
 }
 
@@ -1778,6 +1867,11 @@ pub enum DbCommand {
     TerminateSession { backend: String },
     /// Flip the worker's autocommit for this session.
     SetAutocommit { on: bool },
+    /// One page of a grid query past the row cap. `tab` routes the landing
+    /// back to the grid without touching the tab's running run.
+    QueryPage { run: RunId, tab: TabId, sql: String, offset: u64, limit: u64 },
+    /// The exact total behind a grid query, on the count button's request.
+    CountFor { run: RunId, tab: TabId, sql: String },
 }
 
 #[derive(Debug)]
@@ -1809,6 +1903,16 @@ pub enum DbEvent {
     TxIdleWarning { conn: ConnectionId },
     /// The worker rolled an idle manual transaction back.
     TxIdleRollback { conn: ConnectionId },
+    /// One grid page landed. `tab` is the grid that asked; `offset` is the
+    /// page's first row in the full order. The tab appends it onto the
+    /// loaded rows instead of replacing the run.
+    PageOk { run: RunId, tab: TabId, offset: u64, result: QueryResult },
+    /// One grid page failed. The loaded rows stay as they were.
+    PageErr { run: RunId, tab: TabId, error: DbError },
+    /// The exact total behind a grid query landed beside the flag.
+    CountOk { run: RunId, tab: TabId, total: u64 },
+    /// The count failed. The flag stays without a total.
+    CountErr { run: RunId, tab: TabId, error: DbError },
 }
 
 /// Owned by one worker thread for its whole life. Not Sync, and that is the
@@ -1919,6 +2023,38 @@ impl Session {
             Session::Postgres(pg) => pg.query(sql),
             #[cfg(feature = "mysql")]
             Session::Mysql(my) => my.query(sql),
+        }
+    }
+
+    /// One page of `sql` at `offset` with at most `limit` rows. The page
+    /// carries the flag when another page may remain: the row count hitting
+    /// the limit exactly. A total that divides the limit evenly costs one
+    /// extra empty page, which the stream loop treats as the end.
+    pub fn query_page(
+        &mut self,
+        sql: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<QueryResult, DbError> {
+        if limit == 0 {
+            return Err(DbError::Query("page size is zero".to_owned()));
+        }
+        let mut page = self.query(&paged_sql(sql, limit, offset))?;
+        page.truncated = page.row_count() == limit as usize;
+        Ok(page)
+    }
+
+    /// The exact total behind `sql` for the truncation flag. Runs the count
+    /// wrapper through the same query path as any SELECT.
+    pub fn count_for(&mut self, sql: &str) -> Result<u64, DbError> {
+        let result = self.query(&count_sql(sql))?;
+        match result.cell(0, 0) {
+            Some(Value::Integer(n)) if *n >= 0 => Ok(*n as u64),
+            Some(Value::Text(text)) => text
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| DbError::Query("count did not return a row".to_owned())),
+            _ => Err(DbError::Query("count did not return a row".to_owned())),
         }
     }
 
@@ -2085,6 +2221,45 @@ fn count_cell(result: &QueryResult, schema: &str, table: &str) -> Result<u64, Db
         Some(Value::Integer(n)) if *n >= 0 => Ok(*n as u64),
         _ => Err(DbError::Query(format!("no row count for \"{schema}\".\"{table}\""))),
     }
+}
+
+/// Page `sql` in chunks without materializing the full result. Each page
+/// reaches `on_page` with its offset before the next fetch; the loop ends on
+/// a short page. `cancel` is checked before every fetch and after every
+/// page, so a cancelled stream stops with a `cancelled` query error and the
+/// rows already fed stay written. Returns the total rows fed.
+pub fn stream_pages(
+    session: &mut Session,
+    sql: &str,
+    page_size: usize,
+    cancel: &AtomicBool,
+    mut on_page: impl FnMut(&QueryResult, u64),
+) -> Result<u64, DbError> {
+    if page_size == 0 {
+        return Err(DbError::Query("page size is zero".to_owned()));
+    }
+    let mut offset: u64 = 0;
+    let mut rows: u64 = 0;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(DbError::Query("cancelled".to_owned()));
+        }
+        let page = session.query_page(sql, offset, page_size as u64)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(DbError::Query("cancelled".to_owned()));
+        }
+        let count = page.row_count() as u64;
+        if count == 0 {
+            break;
+        }
+        on_page(&page, offset);
+        rows += count;
+        offset += count;
+        if count < page_size as u64 {
+            break;
+        }
+    }
+    Ok(rows)
 }
 
 /// Autocommit state for one engine session, a sum type so "autocommit with
@@ -5254,6 +5429,36 @@ fn worker_loop(
                     },
                 );
             }
+            DbCommand::QueryPage { run, tab, sql, offset, limit } => {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    session.query_page(&sql, offset, limit)
+                }));
+                let event = match outcome {
+                    Ok(Ok(result)) => DbEvent::PageOk { run, tab, offset, result },
+                    Ok(Err(error)) => DbEvent::PageErr { run, tab, error },
+                    Err(_) => DbEvent::PageErr {
+                        run,
+                        tab,
+                        error: DbError::Query("driver panicked while paging".to_owned()),
+                    },
+                };
+                emit(&events, &ui, event);
+            }
+            DbCommand::CountFor { run, tab, sql } => {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    session.count_for(&sql)
+                }));
+                let event = match outcome {
+                    Ok(Ok(total)) => DbEvent::CountOk { run, tab, total },
+                    Ok(Err(error)) => DbEvent::CountErr { run, tab, error },
+                    Err(_) => DbEvent::CountErr {
+                        run,
+                        tab,
+                        error: DbError::Query("driver panicked while counting".to_owned()),
+                    },
+                };
+                emit(&events, &ui, event);
+            }
         }
     }
 }
@@ -5305,6 +5510,159 @@ mod tests {
             Column::new("b".into(), "".into(), vec![]),
         ];
         assert!(QueryResult::from_columns(cols, false, None, Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn paged_sql_wraps_with_limit_and_offset() {
+        assert_eq!(
+            paged_sql("SELECT id FROM users ORDER BY id", 5000, 10000),
+            "SELECT * FROM (SELECT id FROM users ORDER BY id) AS __cde_page LIMIT 5000 OFFSET 10000"
+        );
+    }
+
+    #[test]
+    fn paged_sql_strips_trailing_semicolons_and_whitespace() {
+        assert_eq!(
+            paged_sql("SELECT 1;  \n;", 10, 0),
+            "SELECT * FROM (SELECT 1) AS __cde_page LIMIT 10 OFFSET 0"
+        );
+    }
+
+    #[test]
+    fn count_sql_wraps_the_statement() {
+        assert_eq!(
+            count_sql("SELECT id FROM users WHERE id > 3;"),
+            "SELECT COUNT(*) FROM (SELECT id FROM users WHERE id > 3) AS __cde_count"
+        );
+    }
+
+    #[test]
+    fn single_statement_rejects_batches() {
+        assert!(is_single_statement("SELECT * FROM users"));
+        assert!(is_single_statement("SELECT 1;  "));
+        assert!(!is_single_statement("SELECT 1; SELECT 2"));
+    }
+
+    fn two_rows(first: Vec<Value>, second: Vec<Value>) -> QueryResult {
+        QueryResult::from_columns(
+            vec![
+                Column::new("a".to_owned(), "INT".to_owned(), first),
+                Column::new("b".to_owned(), "TEXT".to_owned(), second),
+            ],
+            false,
+            None,
+            Duration::ZERO,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn append_page_extends_rows_and_takes_the_flag() {
+        let mut loaded = two_rows(vec![Value::Integer(1)], vec![Value::Text("a".to_owned())]);
+        let mut next = two_rows(vec![Value::Integer(2)], vec![Value::Text("b".to_owned())]);
+        next.truncated = true;
+        assert!(loaded.append_page(next).unwrap());
+        assert_eq!(loaded.row_count(), 2);
+        assert!(loaded.is_truncated());
+        assert_eq!(loaded.cell(1, 0), Some(&Value::Integer(2)));
+    }
+
+    #[test]
+    fn append_page_rejects_mismatched_columns() {
+        let mut loaded = two_rows(vec![Value::Integer(1)], vec![Value::Text("a".to_owned())]);
+        let other = QueryResult::from_columns(
+            vec![Column::new("a".to_owned(), "INT".to_owned(), vec![Value::Integer(2)])],
+            false,
+            None,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(loaded.append_page(other).is_err());
+    }
+
+    #[test]
+    fn total_defaults_to_none_and_sets() {
+        let mut result =
+            two_rows(vec![Value::Integer(1)], vec![Value::Text("a".to_owned())]);
+        assert_eq!(result.total(), None);
+        result.set_total(42);
+        assert_eq!(result.total(), Some(42));
+    }
+
+    #[test]
+    fn stream_pages_feeds_chunks_in_order() {
+        let mut session = Session::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        session.query("CREATE TABLE cde_pages (id INTEGER)").unwrap();
+        session.query("INSERT INTO cde_pages VALUES (1), (2), (3), (4), (5)").unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut seen: Vec<(u64, Vec<i64>)> = Vec::new();
+        let rows = stream_pages(
+            &mut session,
+            "SELECT id FROM cde_pages ORDER BY id",
+            2,
+            &cancel,
+            |page, offset| {
+                let ids: Vec<i64> = (0..page.row_count())
+                    .map(|r| match page.cell(r, 0) {
+                        Some(Value::Integer(n)) => *n,
+                        other => panic!("expected integer, got {other:?}"),
+                    })
+                    .collect();
+                seen.push((offset, ids));
+            },
+        )
+        .unwrap();
+        assert_eq!(rows, 5);
+        assert_eq!(
+            seen,
+            vec![
+                (0, vec![1, 2]),
+                (2, vec![3, 4]),
+                (4, vec![5]),
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_pages_counts_exactly_through_the_wrapper() {
+        let mut session = Session::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        session.query("CREATE TABLE cde_count (id INTEGER)").unwrap();
+        session.query("INSERT INTO cde_count VALUES (1), (2), (3)").unwrap();
+        assert_eq!(session.count_for("SELECT id FROM cde_count WHERE id > 1").unwrap(), 2);
+    }
+
+    #[test]
+    fn stream_pages_stops_when_cancelled() {
+        let mut session = Session::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        session.query("CREATE TABLE cde_cancel (id INTEGER)").unwrap();
+        session.query("INSERT INTO cde_cancel VALUES (1), (2), (3), (4)").unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut pages = 0;
+        let outcome = stream_pages(
+            &mut session,
+            "SELECT id FROM cde_cancel ORDER BY id",
+            2,
+            &cancel,
+            |_, _| {
+                pages += 1;
+                cancel.store(true, Ordering::Relaxed);
+            },
+        );
+        assert!(matches!(outcome, Err(DbError::Query(message)) if message == "cancelled"));
+        assert_eq!(pages, 1);
+    }
+
+    #[test]
+    fn query_page_marks_a_full_page_as_more() {
+        let mut session = Session::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        session.query("CREATE TABLE cde_flag (id INTEGER)").unwrap();
+        session.query("INSERT INTO cde_flag VALUES (1), (2), (3)").unwrap();
+        let full = session.query_page("SELECT id FROM cde_flag ORDER BY id", 0, 2).unwrap();
+        assert_eq!(full.row_count(), 2);
+        assert!(full.is_truncated());
+        let last = session.query_page("SELECT id FROM cde_flag ORDER BY id", 2, 2).unwrap();
+        assert_eq!(last.row_count(), 1);
+        assert!(!last.is_truncated());
     }
 
     #[test]

@@ -8,12 +8,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::app::{AppState, EditTarget, FilterClause, FilterOp, RunOutcome, SavedFilter, SortDir, Tab};
-use crate::db::{CELL_CAP, QueryResult, TabId, Value};
-use crate::edit::{STAGED_DEFAULT, editable_table};
-use crate::export::{
-    to_csv, to_in_list, to_inserts, to_json, to_jsonl, to_markdown, to_tsv, to_xlsx,
+use std::sync::{
+    Arc, Mutex,
+    atomic::AtomicBool,
 };
+
+use crate::app::{
+    AppState, EditTarget, FilterClause, FilterOp, RunOutcome, SavedFilter, SortDir, Tab,
+};
+use crate::db::{
+    CELL_CAP, CancelHandle, ConnectionConfig, DbCommand, DbHandle, QueryResult, RunId,
+    STREAM_PAGE_SIZE, TabId, Value, is_single_statement,
+};
+use crate::export::{
+    StreamFormat, stream_session_to_file, to_csv, to_in_list, to_inserts, to_json, to_jsonl,
+    to_markdown, to_tsv, to_xlsx,
+};
+use crate::edit::{STAGED_DEFAULT, editable_table};
 use crate::import::{ParsedCsv, parse_csv, parse_jsonl, parse_xlsx};
 
 use super::Palette;
@@ -207,6 +218,344 @@ fn prune_grid_views(state: &AppState, ctx: &egui::Context) {
     if known != live {
         ctx.data_mut(|data| data.insert_temp(id, live));
     }
+}
+
+/// The worker and connection pieces the grid needs past the tab borrow: a
+/// handle to ask for pages, a cancel for the in-flight page, and the config
+/// plus secrets to open a background export session.
+#[derive(Clone)]
+struct GridConn {
+    config: ConnectionConfig,
+    password: String,
+    ssh_password: String,
+    handle: Option<DbHandle>,
+}
+
+/// One background streamed export. The file writes on its own thread through
+/// paged [`stream_session_to_file`]; the grid polls `state` every frame for
+/// progress and completion. `cancel` stops between pages.
+#[derive(Clone)]
+struct ExportJob {
+    format: StreamFormat,
+    path: std::path::PathBuf,
+    state: std::sync::Arc<std::sync::Mutex<JobProgress>>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Debug, Clone)]
+struct JobProgress {
+    rows: u64,
+    total: Option<u64>,
+    done: bool,
+    error: Option<String>,
+    cancelled: bool,
+    cancel_handle: Option<CancelHandle>,
+}
+
+fn export_job_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_export_job", tab))
+}
+
+fn export_job_of(ctx: &egui::Context, tab: TabId) -> Option<ExportJob> {
+    ctx.data(|data| data.get_temp(export_job_id(tab)))
+}
+
+fn store_export_job(ctx: &egui::Context, tab: TabId, job: Option<ExportJob>) {
+    ctx.data_mut(|data| match job {
+        Some(job) => {
+            data.insert_temp(export_job_id(tab), job);
+        }
+        None => {
+            data.remove::<ExportJob>(export_job_id(tab));
+        }
+    });
+}
+
+/// The next paging run id for one tab, so page and count runs never share an
+/// id with a run the app tracks.
+fn paging_run_id(ctx: &egui::Context, tab: TabId) -> RunId {
+    let id = egui::Id::new(("crusty_paging_run", tab));
+    let next: u64 = ctx.data(|data| data.get_temp(id)).unwrap_or(1);
+    ctx.data_mut(|data| data.insert_temp(id, next + 1));
+    RunId::from_raw(next)
+}
+
+/// The truncation flag text. Names the on-demand total when one was counted.
+fn truncate_label(total: Option<u64>) -> String {
+    match total {
+        Some(n) => format!("truncated at 10,000 · {n} total"),
+        None => "truncated at 10,000".to_owned(),
+    }
+}
+
+/// One paging row under a truncated grid: the on-demand count beside the
+/// flag and the next page on demand. Pages append onto the loaded rows
+/// through [`DbEvent::PageOk`]; a stale page whose offset misses the loaded
+/// length is ignored, so a new run never gains old rows.
+fn paging_row(
+    tab: &mut Tab,
+    conn: &Option<GridConn>,
+    known_total: Option<u64>,
+    loaded: usize,
+    ui: &mut egui::Ui,
+) {
+    ui.horizontal(|ui| {
+        if known_total.is_none()
+            && ui
+                .button("Count total")
+                .on_hover_text("Count every row behind the truncation flag")
+                .clicked()
+        {
+            match conn.as_ref().and_then(|c| c.handle.clone()) {
+                Some(handle) => {
+                    if is_single_statement(&tab.sql) {
+                        let run = paging_run_id(ui.ctx(), tab.id);
+                        let sql = tab.sql.clone();
+                        if handle
+                            .send(DbCommand::CountFor { run, tab: tab.id, sql })
+                            .is_err()
+                        {
+                            tab.set_export_notice(
+                                "Count failed: connection is gone".to_owned(),
+                                true,
+                            );
+                        }
+                    } else {
+                        tab.set_export_notice(
+                            "Counting needs a single SELECT".to_owned(),
+                            true,
+                        );
+                    }
+                }
+                None => tab.set_export_notice(
+                    "Counting needs a live connection".to_owned(),
+                    true,
+                ),
+            }
+        }
+        if ui
+            .button(format!("Load more ({loaded} loaded)"))
+            .on_hover_text("Fetch the next page past the row cap")
+            .clicked()
+        {
+            match conn.as_ref().and_then(|c| c.handle.clone()) {
+                Some(handle) => {
+                    if is_single_statement(&tab.sql) {
+                        let run = paging_run_id(ui.ctx(), tab.id);
+                        let sql = tab.sql.clone();
+                        if handle
+                            .send(DbCommand::QueryPage {
+                                run,
+                                tab: tab.id,
+                                sql,
+                                offset: loaded as u64,
+                                limit: STREAM_PAGE_SIZE as u64,
+                            })
+                            .is_err()
+                        {
+                            tab.set_export_notice(
+                                "Page failed: connection is gone".to_owned(),
+                                true,
+                            );
+                        }
+                    } else {
+                        tab.set_export_notice(
+                            "Paging needs a single SELECT".to_owned(),
+                            true,
+                        );
+                    }
+                }
+                None => tab.set_export_notice(
+                    "Paging needs a live connection".to_owned(),
+                    true,
+                ),
+            }
+        }
+    });
+}
+
+/// Poll one background streamed export: show its progress with a Cancel
+/// button while it runs, and record its notice when it lands.
+fn poll_export_job(tab: &mut Tab, ui: &mut egui::Ui) {
+    let Some(job) = export_job_of(ui.ctx(), tab.id) else { return };
+    let snapshot = job.state.lock().map(|s| s.clone()).unwrap_or(JobProgress {
+        rows: 0,
+        total: None,
+        done: false,
+        error: Some("export state is gone".to_owned()),
+        cancelled: false,
+        cancel_handle: None,
+    });
+    if snapshot.done {
+        let name = job.path.display().to_string();
+        tab.set_export_notice(format!("Exported {} rows to {name}", snapshot.rows), false);
+        store_export_job(ui.ctx(), tab.id, None);
+        return;
+    }
+    if let Some(error) = snapshot.error {
+        tab.set_export_notice(format!("Export failed: {error}"), true);
+        store_export_job(ui.ctx(), tab.id, None);
+        return;
+    }
+    if snapshot.cancelled {
+        tab.set_export_notice("Export cancelled".to_owned(), true);
+        store_export_job(ui.ctx(), tab.id, None);
+        return;
+    }
+    let progress = match snapshot.total {
+        Some(total) => format!("Exporting {} ({} of {total} rows)…", job.format.label(), snapshot.rows),
+        None => format!("Exporting {} ({} rows)…", job.format.label(), snapshot.rows),
+    };
+    ui.horizontal(|ui| {
+        ui.spinner();
+        ui.label(progress);
+        if ui.button("Cancel export").clicked() {
+            job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(cancel) = snapshot.cancel_handle {
+                cancel.cancel();
+            }
+        }
+    });
+}
+
+/// Start one background streamed export of the tab's whole query past the
+/// cap. Falls back to the visible grid when the tab holds a batch, has no
+/// live connection pieces, or already runs an export.
+fn start_stream_export(
+    tab: &mut Tab,
+    conn: &Option<GridConn>,
+    format: StreamFormat,
+    visible: fn(&mut Tab),
+    ui: &mut egui::Ui,
+) {
+    if export_job_of(ui.ctx(), tab.id).is_some() {
+        tab.set_export_notice("An export is already running".to_owned(), true);
+        return;
+    }
+    let Some(conn) = conn.clone() else {
+        visible(tab);
+        return;
+    };
+    if !is_single_statement(&tab.sql) {
+        visible(tab);
+        return;
+    }
+    let truncated = tab.active_query_result().is_some_and(|r| r.is_truncated());
+    if !truncated {
+        visible(tab);
+        return;
+    }
+    let (filter, extension) = match format {
+        StreamFormat::Csv => ("CSV", "csv"),
+        StreamFormat::Json => ("JSON", "json"),
+        StreamFormat::Jsonl => ("JSONL", "jsonl"),
+        StreamFormat::Xlsx => ("XLSX", "xlsx"),
+        StreamFormat::Tsv => ("TSV", "tsv"),
+        StreamFormat::Markdown => ("Markdown", "md"),
+        StreamFormat::Inserts => ("SQL", "sql"),
+    };
+    let default_name =
+        format!("{}.{extension}", super::query::tab_title(tab.sql.clone()));
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter(filter, &[extension])
+        .set_file_name(&default_name)
+        .save_file()
+    else {
+        return;
+    };
+    let sql = tab.sql.clone();
+    let state = Arc::new(Mutex::new(JobProgress {
+        rows: 0,
+        total: None,
+        done: false,
+        error: None,
+        cancelled: false,
+        cancel_handle: None,
+    }));
+    let cancel = Arc::new(AtomicBool::new(false));
+    store_export_job(
+        ui.ctx(),
+        tab.id,
+        Some(ExportJob { format, path: path.clone(), state: state.clone(), cancel: cancel.clone() }),
+    );
+    std::thread::spawn(move || {
+        let outcome = run_stream_export(
+            &conn.config,
+            &conn.password,
+            &conn.ssh_password,
+            &sql,
+            format,
+            &path,
+            &state,
+            &cancel,
+        );
+        let mut guard = state.lock().expect("export state locks");
+        match outcome {
+            Ok(rows) => {
+                guard.rows = rows;
+                guard.done = true;
+            }
+            Err(error) if error == "cancelled" => {
+                guard.cancelled = true;
+            }
+            Err(error) => {
+                guard.error = Some(error);
+            }
+        }
+    });
+}
+
+/// Open a background session and stream `sql` to `path` in pages. Records
+/// the count for progress when one is available and the engine handle so
+/// Cancel stops the in-flight page as well as the loop.
+fn run_stream_export(
+    config: &ConnectionConfig,
+    password: &str,
+    ssh_password: &str,
+    sql: &str,
+    format: StreamFormat,
+    path: &std::path::Path,
+    state: &Arc<Mutex<JobProgress>>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<u64, String> {
+    let password = (!password.is_empty()).then_some(password);
+    let ssh_password = (!ssh_password.is_empty()).then_some(ssh_password);
+    let mut session = crate::db::Session::open(config, password, ssh_password)
+        .map_err(|e| e.to_string())?;
+    if let Ok(handle) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session.cancel_handle()
+    })) {
+        if let Ok(mut guard) = state.lock() {
+            guard.cancel_handle = Some(handle);
+        }
+    }
+    if let Ok(total) = session.count_for(sql) {
+        if let Ok(mut guard) = state.lock() {
+            guard.total = Some(total);
+        }
+    }
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("cancelled".to_owned());
+    }
+    let state_rows = state.clone();
+    stream_session_to_file(
+        &mut session,
+        sql,
+        format,
+        "result",
+        path,
+        crate::db::STREAM_PAGE_SIZE,
+        cancel,
+        &mut |rows| {
+            if let Ok(mut guard) = state_rows.lock() {
+                guard.rows = rows;
+            }
+        },
+    )
+    .map_err(|e| match e {
+        crate::export::StreamError::Db(crate::db::DbError::Query(message)) => message,
+        other => other.to_string(),
+    })
 }
 
 fn result_id_of(tab: &Tab) -> Option<ResultId> {
@@ -498,8 +847,20 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
     }
     let target = state.edit_target(tab_id);
     let filter_history = state.filter_history().to_vec();
+    let grid_conn = state
+        .tab(tab_id)
+        .and_then(|t| t.conn)
+        .and_then(|cid| state.connections().iter().find(|c| c.id == cid))
+        .map(|c| {
+            GridConn {
+                config: c.config.clone(),
+                password: c.password.clone(),
+                ssh_password: c.ssh_password.clone(),
+                handle: c.handle(),
+            }
+        });
     let Some(tab) = state.tab_mut(tab_id) else { return };
-    let actions = results_grid(tab, target.as_ref(), &filter_history, modal_open, ui);
+    let actions = results_grid(tab, target.as_ref(), &filter_history, modal_open, grid_conn, ui);
     apply_edit_actions(state, tab_id, actions);
 }
 
@@ -1181,11 +1542,13 @@ fn results_grid(
     target: Option<&EditTarget>,
     filter_history: &[SavedFilter],
     modal_open: bool,
+    grid_conn: Option<GridConn>,
     ui: &mut egui::Ui,
 ) -> Vec<EditAction> {
     let mut actions = Vec::new();
     result_tabs(tab, ui);
     let palette = Palette::of(ui.ctx().theme());
+    poll_export_job(tab, ui);
     let (cols, total) = {
         let Some(result) = tab.active_query_result() else { return actions };
         if result.columns().is_empty() {
@@ -1209,6 +1572,8 @@ fn results_grid(
             .map(|c| (c.name().to_owned(), c.type_name().to_owned()))
             .collect();
         let ms = result.took().as_secs_f64() * 1000.0;
+        let truncated = result.is_truncated();
+        let known_total = result.total();
         ui.horizontal(|ui| {
             egui::Frame::group(ui.style())
                 .inner_margin(egui::Margin::symmetric(8, 4))
@@ -1220,13 +1585,16 @@ fn results_grid(
                             .strong(),
                     );
                 });
-            if result.is_truncated() {
+            if truncated {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
-                    egui::RichText::new("truncated at 10,000").small().strong(),
+                    egui::RichText::new(truncate_label(known_total)).small().strong(),
                 );
             }
         });
+        if truncated {
+            paging_row(tab, &grid_conn, known_total, total, ui);
+        }
         if total == 0 && tab.added_rows().is_empty() {
             ui.label(egui::RichText::new("No rows returned.").weak());
             return actions;
@@ -1258,26 +1626,26 @@ fn results_grid(
             .add_enabled(can_export, egui::Button::new("Export CSV"))
             .clicked()
         {
-            export_current_view(tab);
+            export_csv_streaming(tab, &grid_conn, ui);
         }
         if ui
             .add_enabled(can_export, egui::Button::new("Export JSON"))
             .clicked()
         {
-            export_json_view(tab);
+            export_json_streaming(tab, &grid_conn, ui);
         }
         if ui
             .add_enabled(can_export, egui::Button::new("Export JSONL"))
             .clicked()
         {
-            export_jsonl_view(tab);
+            export_jsonl_streaming(tab, &grid_conn, ui);
         }
         if ui
             .add_enabled(can_export, egui::Button::new("Export XLSX"))
             .on_hover_text("Export this view as a spreadsheet workbook")
             .clicked()
         {
-            export_xlsx_view(tab);
+            export_xlsx_streaming(tab, &grid_conn, ui);
         }
         if ui
             .add_enabled(can_export_all, egui::Button::new("Export all"))
@@ -1804,6 +2172,22 @@ fn structured_filter_panel(
         }
     });
     actions
+}
+
+fn export_csv_streaming(tab: &mut Tab, conn: &Option<GridConn>, ui: &mut egui::Ui) {
+    start_stream_export(tab, conn, StreamFormat::Csv, export_current_view, ui);
+}
+
+fn export_json_streaming(tab: &mut Tab, conn: &Option<GridConn>, ui: &mut egui::Ui) {
+    start_stream_export(tab, conn, StreamFormat::Json, export_json_view, ui);
+}
+
+fn export_jsonl_streaming(tab: &mut Tab, conn: &Option<GridConn>, ui: &mut egui::Ui) {
+    start_stream_export(tab, conn, StreamFormat::Jsonl, export_jsonl_view, ui);
+}
+
+fn export_xlsx_streaming(tab: &mut Tab, conn: &Option<GridConn>, ui: &mut egui::Ui) {
+    start_stream_export(tab, conn, StreamFormat::Xlsx, export_xlsx_view, ui);
 }
 
 fn export_current_view(tab: &mut Tab) {
@@ -2623,6 +3007,12 @@ mod tests {
         assert!(selection.is_empty());
         assert_eq!(selection.active(), None);
         assert_eq!(selection.resolve(&[0, 1]), vec![0, 1]);
+    }
+
+    #[test]
+    fn truncate_label_names_the_count_beside_the_flag() {
+        assert_eq!(truncate_label(None), "truncated at 10,000");
+        assert_eq!(truncate_label(Some(12_500)), "truncated at 10,000 · 12500 total");
     }
 
     fn paste_columns() -> Vec<String> {
