@@ -704,6 +704,10 @@ pub const SCHEMA_SCHEMA_CAP: usize = 64;
 pub const SCHEMA_SEQUENCE_CAP: usize = 200;
 /// Cap on aggregated schema indexes materialized per schema.
 pub const SCHEMA_SCHEMA_INDEX_CAP: usize = 200;
+/// Cap on triggers materialized per schema. Each schema reports truncation.
+pub const SCHEMA_TRIGGER_CAP: usize = 200;
+/// Cap on routines materialized per schema. Each schema reports truncation.
+pub const SCHEMA_ROUTINE_CAP: usize = 200;
 
 /// Table or view. The variant is the kind; no stringly matching above this file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -963,6 +967,105 @@ impl IndexRef {
     }
 }
 
+/// One trigger in a schema. `table` is the bound table where the engine
+/// reports one, `kind` the engine's own event words where it reports them
+/// (for example `BEFORE INSERT`), and `definition` the statement text where
+/// the engine exposes one. Fields are private; construction checks happen in
+/// [`TriggerInfo::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerInfo {
+    name: String,
+    table: Option<String>,
+    kind: Option<String>,
+    definition: Option<String>,
+}
+
+impl TriggerInfo {
+    /// Checked constructor. Rejects a blank name, and a blank table, kind, or
+    /// definition when one is present.
+    pub fn new(
+        name: String,
+        table: Option<String>,
+        kind: Option<String>,
+        definition: Option<String>,
+    ) -> Result<Self, SchemaError> {
+        if name.trim().is_empty() {
+            return Err(SchemaError::EmptyName("trigger"));
+        }
+        if table.as_ref().is_some_and(|t| t.trim().is_empty()) {
+            return Err(SchemaError::EmptyName("trigger table"));
+        }
+        if kind.as_ref().is_some_and(|k| k.trim().is_empty()) {
+            return Err(SchemaError::EmptyName("trigger kind"));
+        }
+        if definition.as_ref().is_some_and(|d| d.trim().is_empty()) {
+            return Err(SchemaError::EmptyName("trigger definition"));
+        }
+        Ok(Self { name, table, kind, definition })
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn table(&self) -> Option<&str> {
+        self.table.as_deref()
+    }
+    pub fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+    pub fn definition(&self) -> Option<&str> {
+        self.definition.as_deref()
+    }
+}
+
+/// One stored routine in a schema. `kind` is the engine's own word (FUNCTION
+/// or PROCEDURE), `language` the body language where the engine reports one,
+/// and `definition` the body text where the engine exposes one. Fields are
+/// private; construction checks happen in [`RoutineInfo::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutineInfo {
+    name: String,
+    kind: Option<String>,
+    language: Option<String>,
+    definition: Option<String>,
+}
+
+impl RoutineInfo {
+    /// Checked constructor. Rejects a blank name, and a blank kind, language,
+    /// or definition when one is present.
+    pub fn new(
+        name: String,
+        kind: Option<String>,
+        language: Option<String>,
+        definition: Option<String>,
+    ) -> Result<Self, SchemaError> {
+        if name.trim().is_empty() {
+            return Err(SchemaError::EmptyName("routine"));
+        }
+        if kind.as_ref().is_some_and(|k| k.trim().is_empty()) {
+            return Err(SchemaError::EmptyName("routine kind"));
+        }
+        if language.as_ref().is_some_and(|l| l.trim().is_empty()) {
+            return Err(SchemaError::EmptyName("routine language"));
+        }
+        if definition.as_ref().is_some_and(|d| d.trim().is_empty()) {
+            return Err(SchemaError::EmptyName("routine definition"));
+        }
+        Ok(Self { name, kind, language, definition })
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+    pub fn language(&self) -> Option<&str> {
+        self.language.as_deref()
+    }
+    pub fn definition(&self) -> Option<&str> {
+        self.definition.as_deref()
+    }
+}
+
 /// One table or view in a schema tree. Fields are private; construction checks
 /// happen in [`TableInfo::new`]. `referenced_by` holds incoming foreign keys:
 /// each entry copies the child key with `columns` set to the parent columns
@@ -1038,8 +1141,8 @@ impl TableInfo {
     }
 }
 
-/// One schema in a database: split tables and views plus sequences and the
-/// aggregated per-schema index folder.
+/// One schema in a database: split tables and views plus sequences, the
+/// aggregated per-schema index folder, triggers, and routines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaNode {
     name: String,
@@ -1047,6 +1150,10 @@ pub struct SchemaNode {
     views: Vec<TableInfo>,
     sequences: Vec<SequenceInfo>,
     schema_indexes: Vec<IndexRef>,
+    triggers: Vec<TriggerInfo>,
+    routines: Vec<RoutineInfo>,
+    triggers_truncated: bool,
+    routines_truncated: bool,
 }
 
 impl SchemaNode {
@@ -1056,11 +1163,25 @@ impl SchemaNode {
         views: Vec<TableInfo>,
         sequences: Vec<SequenceInfo>,
         schema_indexes: Vec<IndexRef>,
+        triggers: Vec<TriggerInfo>,
+        routines: Vec<RoutineInfo>,
+        triggers_truncated: bool,
+        routines_truncated: bool,
     ) -> Result<Self, SchemaError> {
         if name.trim().is_empty() {
             return Err(SchemaError::EmptyName("schema"));
         }
-        Ok(Self { name, tables, views, sequences, schema_indexes })
+        Ok(Self {
+            name,
+            tables,
+            views,
+            sequences,
+            schema_indexes,
+            triggers,
+            routines,
+            triggers_truncated,
+            routines_truncated,
+        })
     }
     pub fn name(&self) -> &str {
         &self.name
@@ -1077,11 +1198,25 @@ impl SchemaNode {
     pub fn schema_indexes(&self) -> &[IndexRef] {
         &self.schema_indexes
     }
+    pub fn triggers(&self) -> &[TriggerInfo] {
+        &self.triggers
+    }
+    pub fn routines(&self) -> &[RoutineInfo] {
+        &self.routines
+    }
+    pub fn triggers_truncated(&self) -> bool {
+        self.triggers_truncated
+    }
+    pub fn routines_truncated(&self) -> bool {
+        self.routines_truncated
+    }
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
             && self.views.is_empty()
             && self.sequences.is_empty()
             && self.schema_indexes.is_empty()
+            && self.triggers.is_empty()
+            && self.routines.is_empty()
     }
 }
 
@@ -1565,6 +1700,10 @@ impl PgSession {
             idx_truncated_by_table: std::collections::HashMap<String, bool>,
             sequences: Vec<SequenceInfo>,
             schema_indexes: Vec<IndexRef>,
+            triggers: Vec<TriggerInfo>,
+            routines: Vec<RoutineInfo>,
+            triggers_truncated: bool,
+            routines_truncated: bool,
         }
         struct FkEdge {
             child_table: String,
@@ -1908,6 +2047,95 @@ impl PgSession {
                     SequenceInfo::new(name).map_err(|e| DbError::Query(e.to_string()))?,
                 );
             }
+            let trigger_rows: Vec<(String, String, i16, String)> = self
+                .rt
+                .block_on(
+                    sqlx::query(
+                        "SELECT t.tgname, c.relname, t.tgtype, pg_get_triggerdef(t.oid) \
+                         FROM pg_trigger t \
+                         JOIN pg_class c ON c.oid = t.tgrelid \
+                         JOIN pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE NOT t.tgisinternal AND n.nspname = $1 \
+                         ORDER BY c.relname, t.tgname",
+                    )
+                    .bind(schema_name)
+                    .fetch_all(&self.pool),
+                )
+                .map_err(|e| DbError::Query(e.to_string()))?
+                .iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get::<String, _>(0)
+                            .map_err(|e| DbError::Query(e.to_string()))?,
+                        row.try_get::<String, _>(1)
+                            .map_err(|e| DbError::Query(e.to_string()))?,
+                        row.try_get::<i16, _>(2)
+                            .map_err(|e| DbError::Query(e.to_string()))?,
+                        row.try_get::<String, _>(3)
+                            .map_err(|e| DbError::Query(e.to_string()))?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, DbError>>()?;
+            let triggers_truncated = trigger_rows.len() > SCHEMA_TRIGGER_CAP;
+            let mut triggers = Vec::new();
+            for (name, table, tgtype, definition) in
+                trigger_rows.into_iter().take(SCHEMA_TRIGGER_CAP)
+            {
+                triggers.push(
+                    TriggerInfo::new(
+                        name,
+                        Some(table),
+                        Some(pg_trigger_kind(tgtype)),
+                        Some(definition).filter(|d| !d.trim().is_empty()),
+                    )
+                    .map_err(|e| DbError::Query(e.to_string()))?,
+                );
+            }
+            let routine_rows: Vec<(String, String, String, String)> = self
+                .rt
+                .block_on(
+                    sqlx::query(
+                        "SELECT p.proname, p.prokind::text, l.lanname, p.prosrc \
+                         FROM pg_proc p \
+                         JOIN pg_namespace n ON n.oid = p.pronamespace \
+                         JOIN pg_language l ON l.oid = p.prolang \
+                         WHERE n.nspname = $1 AND p.prokind IN ('f', 'p') \
+                         ORDER BY p.proname",
+                    )
+                    .bind(schema_name)
+                    .fetch_all(&self.pool),
+                )
+                .map_err(|e| DbError::Query(e.to_string()))?
+                .iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get::<String, _>(0)
+                            .map_err(|e| DbError::Query(e.to_string()))?,
+                        row.try_get::<String, _>(1)
+                            .map_err(|e| DbError::Query(e.to_string()))?,
+                        row.try_get::<String, _>(2)
+                            .map_err(|e| DbError::Query(e.to_string()))?,
+                        row.try_get::<String, _>(3)
+                            .map_err(|e| DbError::Query(e.to_string()))?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, DbError>>()?;
+            let routines_truncated = routine_rows.len() > SCHEMA_ROUTINE_CAP;
+            let mut routines = Vec::new();
+            for (name, prokind, language, definition) in
+                routine_rows.into_iter().take(SCHEMA_ROUTINE_CAP)
+            {
+                let kind = if prokind == "p" { "PROCEDURE" } else { "FUNCTION" };
+                routines.push(
+                    RoutineInfo::new(
+                        name,
+                        Some(kind.to_owned()),
+                        Some(language),
+                        Some(definition).filter(|d| !d.trim().is_empty()),
+                    )
+                    .map_err(|e| DbError::Query(e.to_string()))?,
+                );
+            }
             raw_schemas.push(RawSchema {
                 name: schema_name.clone(),
                 order,
@@ -1920,6 +2148,10 @@ impl PgSession {
                 idx_truncated_by_table,
                 sequences,
                 schema_indexes,
+                triggers,
+                routines,
+                triggers_truncated,
+                routines_truncated,
             });
         }
         let mut incoming: std::collections::HashMap<(String, String), Vec<ForeignKeyInfo>> =
@@ -1999,6 +2231,10 @@ impl PgSession {
                     views,
                     raw.sequences.clone(),
                     raw.schema_indexes.clone(),
+                    raw.triggers.clone(),
+                    raw.routines.clone(),
+                    raw.triggers_truncated,
+                    raw.routines_truncated,
                 )
                 .map_err(|e| DbError::Query(e.to_string()))?,
             );
@@ -2007,6 +2243,34 @@ impl PgSession {
             .map_err(|e| DbError::Query(e.to_string()))?;
         Ok(SchemaInfo::new(vec![db_node], tables_truncated, columns_truncated))
     }
+}
+
+/// Renders a `pg_trigger.tgtype` bitmask as the timing plus event words the
+/// definition prints, for example `BEFORE INSERT`. Bit assignments come from
+/// PostgreSQL's `TRIGGER_TYPE_*` constants.
+#[cfg(feature = "postgres")]
+fn pg_trigger_kind(tgtype: i16) -> String {
+    let mut parts = Vec::new();
+    if tgtype & 2 != 0 {
+        parts.push("BEFORE");
+    } else if tgtype & 64 != 0 {
+        parts.push("INSTEAD OF");
+    } else {
+        parts.push("AFTER");
+    }
+    if tgtype & 4 != 0 {
+        parts.push("INSERT");
+    }
+    if tgtype & 16 != 0 {
+        parts.push("UPDATE");
+    }
+    if tgtype & 8 != 0 {
+        parts.push("DELETE");
+    }
+    if tgtype & 32 != 0 {
+        parts.push("TRUNCATE");
+    }
+    parts.join(" ")
 }
 
 /// Behind the `mysql` feature. Owns a current-thread tokio runtime so the
@@ -2325,6 +2589,85 @@ impl MySession {
             }
             schema_indexes.sort_by(|a, b| (a.table(), a.index()).cmp(&(b.table(), b.index())));
             schema_indexes.truncate(SCHEMA_SCHEMA_INDEX_CAP);
+            let trigger_rows: Vec<(String, String, String, String, String)> = self
+                .rt
+                .block_on(
+                    sqlx::query(
+                        "SELECT trigger_name, event_object_table, action_timing, \
+                         event_manipulation, action_statement \
+                         FROM information_schema.triggers \
+                         WHERE trigger_schema = ? \
+                         ORDER BY event_object_table, trigger_name",
+                    )
+                    .bind(database)
+                    .fetch_all(&self.pool),
+                )
+                .map_err(|e| DbError::Query(e.to_string()))?
+                .iter()
+                .map(|row| {
+                    Ok((
+                        my_string(row, 0)?,
+                        my_string(row, 1)?,
+                        my_string(row, 2)?,
+                        my_string(row, 3)?,
+                        my_string(row, 4)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, DbError>>()?;
+            let triggers_truncated = trigger_rows.len() > SCHEMA_TRIGGER_CAP;
+            let mut triggers = Vec::new();
+            for (name, table, timing, event, statement) in
+                trigger_rows.into_iter().take(SCHEMA_TRIGGER_CAP)
+            {
+                triggers.push(
+                    TriggerInfo::new(
+                        name,
+                        Some(table),
+                        Some(format!("{timing} {event}")),
+                        Some(statement).filter(|s| !s.trim().is_empty()),
+                    )
+                    .map_err(|e| DbError::Query(e.to_string()))?,
+                );
+            }
+            let routine_rows: Vec<(String, String, String, Option<String>)> = self
+                .rt
+                .block_on(
+                    sqlx::query(
+                        "SELECT routine_name, routine_type, external_language, \
+                         routine_definition \
+                         FROM information_schema.routines \
+                         WHERE routine_schema = ? \
+                         ORDER BY routine_name",
+                    )
+                    .bind(database)
+                    .fetch_all(&self.pool),
+                )
+                .map_err(|e| DbError::Query(e.to_string()))?
+                .iter()
+                .map(|row| {
+                    use sqlx::Row as _;
+                    // NULL when the connected user cannot see the body.
+                    let definition = row
+                        .try_get_unchecked::<Option<String>, _>(3)
+                        .map_err(|e| DbError::Query(e.to_string()))?;
+                    Ok((
+                        my_string(row, 0)?,
+                        my_string(row, 1)?,
+                        my_string(row, 2)?,
+                        definition.map(|d| d.trim().to_owned()).filter(|d| !d.is_empty()),
+                    ))
+                })
+                .collect::<Result<Vec<_>, DbError>>()?;
+            let routines_truncated = routine_rows.len() > SCHEMA_ROUTINE_CAP;
+            let mut routines = Vec::new();
+            for (name, kind, language, definition) in
+                routine_rows.into_iter().take(SCHEMA_ROUTINE_CAP)
+            {
+                routines.push(
+                    RoutineInfo::new(name, Some(kind), Some(language), definition)
+                        .map_err(|e| DbError::Query(e.to_string()))?,
+                );
+            }
             let mut tables = Vec::new();
             let mut views = Vec::new();
             for (name, kind) in &order {
@@ -2376,6 +2719,10 @@ impl MySession {
                 views,
                 Vec::new(),
                 schema_indexes,
+                triggers,
+                routines,
+                triggers_truncated,
+                routines_truncated,
             )
             .map_err(|e| DbError::Query(e.to_string()))?;
             databases.push(
@@ -3375,10 +3722,50 @@ fn sqlite_schema(conn: &rusqlite::Connection) -> Result<SchemaInfo, DbError> {
             TableKind::View => views_out.push(rebuilt),
         }
     }
+    let mut trigger_stmt = conn
+        .prepare(
+            "SELECT name, tbl_name, sql FROM sqlite_master \
+             WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%' \
+             ORDER BY name",
+        )
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    let trigger_rows: Vec<(String, String, Option<String>)> = trigger_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|e| DbError::Query(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    let triggers_truncated = trigger_rows.len() > SCHEMA_TRIGGER_CAP;
+    let mut triggers = Vec::new();
+    for (name, table, definition) in trigger_rows.into_iter().take(SCHEMA_TRIGGER_CAP) {
+        triggers.push(
+            TriggerInfo::new(
+                name,
+                Some(table).filter(|t| !t.trim().is_empty()),
+                None,
+                definition.filter(|d| !d.trim().is_empty()),
+            )
+            .map_err(|e| DbError::Query(e.to_string()))?,
+        );
+    }
     let db_name = sqlite_database_name(conn);
-    let schema_node =
-        SchemaNode::new("main".to_owned(), tables_out, views_out, Vec::new(), schema_indexes)
-            .map_err(|e| DbError::Query(e.to_string()))?;
+    let schema_node = SchemaNode::new(
+        "main".to_owned(),
+        tables_out,
+        views_out,
+        Vec::new(),
+        schema_indexes,
+        triggers,
+        Vec::new(),
+        triggers_truncated,
+        false,
+    )
+    .map_err(|e| DbError::Query(e.to_string()))?;
     let db_node =
         DatabaseNode::new(db_name, vec![schema_node]).map_err(|e| DbError::Query(e.to_string()))?;
     Ok(SchemaInfo::new(vec![db_node], tables_truncated, columns_truncated))
@@ -4289,6 +4676,17 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
+    fn pg_trigger_kind_covers_timing_and_events() {
+        assert_eq!(pg_trigger_kind(7), "BEFORE INSERT");
+        assert_eq!(pg_trigger_kind(17), "AFTER UPDATE");
+        assert_eq!(pg_trigger_kind(22), "BEFORE INSERT UPDATE");
+        assert_eq!(pg_trigger_kind(9), "AFTER DELETE");
+        assert_eq!(pg_trigger_kind(80), "INSTEAD OF UPDATE");
+        assert_eq!(pg_trigger_kind(32), "AFTER TRUNCATE");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
     fn pg_cancel_handle_double_fire_is_safe_without_server() {
         let unknown =
             pg_cancel_handle("postgres://owner@localhost:5432/appdb".to_owned(), -1);
@@ -4537,6 +4935,141 @@ mod tests {
         assert_eq!(result.cell(1, 1), Some(&Value::Text("Lin".to_owned())));
     }
 
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_schema_lists_triggers_and_routines() {
+        let config = ConnectionConfig::Postgres { read_only: false,
+            host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
+            port: std::env::var("PGPORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
+            user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+            ssl_mode: PostgresSslMode::Disable,
+            ssh: None,
+        };
+        let password = std::env::var("PGPASSWORD").ok();
+        let mut session = Session::open(&config, password.as_deref(), None).expect("open");
+        session
+            .query("DROP TABLE IF EXISTS cde_schema_probe CASCADE")
+            .expect("drop table");
+        session
+            .query("DROP FUNCTION IF EXISTS cde_schema_trg_fn()")
+            .expect("drop trigger function");
+        session
+            .query("DROP FUNCTION IF EXISTS cde_schema_fn(INT)")
+            .expect("drop function");
+        session
+            .query("CREATE TABLE cde_schema_probe (id INT PRIMARY KEY, note TEXT)")
+            .expect("create table");
+        session
+            .query(
+                "CREATE FUNCTION cde_schema_trg_fn() RETURNS trigger LANGUAGE plpgsql \
+                 AS $$ BEGIN RETURN NEW; END $$",
+            )
+            .expect("create trigger function");
+        session
+            .query(
+                "CREATE TRIGGER cde_schema_trg BEFORE INSERT ON cde_schema_probe \
+                 FOR EACH ROW EXECUTE FUNCTION cde_schema_trg_fn()",
+            )
+            .expect("create trigger");
+        session
+            .query(
+                "CREATE FUNCTION cde_schema_fn(a INT) RETURNS INT LANGUAGE sql \
+                 AS $$ SELECT a + 1 $$",
+            )
+            .expect("create function");
+        let schema = session.schema().expect("schema loads");
+        session
+            .query("DROP TABLE IF EXISTS cde_schema_probe CASCADE")
+            .expect("cleanup table");
+        session
+            .query("DROP FUNCTION IF EXISTS cde_schema_trg_fn()")
+            .expect("cleanup trigger function");
+        session
+            .query("DROP FUNCTION IF EXISTS cde_schema_fn(INT)")
+            .expect("cleanup function");
+        let node = schema
+            .databases()
+            .iter()
+            .flat_map(|db| db.schemas())
+            .find(|s| s.triggers().iter().any(|t| t.name() == "cde_schema_trg"))
+            .expect("schema with the probe trigger");
+        let trigger = node
+            .triggers()
+            .iter()
+            .find(|t| t.name() == "cde_schema_trg")
+            .expect("probe trigger");
+        assert_eq!(trigger.table(), Some("cde_schema_probe"));
+        assert_eq!(trigger.kind(), Some("BEFORE INSERT"));
+        assert!(
+            trigger.definition().is_some_and(|d| d.contains("cde_schema_trg_fn")),
+            "{:?}",
+            trigger.definition()
+        );
+        let routine = node
+            .routines()
+            .iter()
+            .find(|r| r.name() == "cde_schema_fn")
+            .expect("probe routine");
+        assert_eq!(routine.kind(), Some("FUNCTION"));
+        assert_eq!(routine.language(), Some("sql"));
+        assert!(
+            routine.definition().is_some_and(|d| d.contains("a + 1")),
+            "{:?}",
+            routine.definition()
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_schema_caps_routines_and_flags_truncation() {
+        let config = ConnectionConfig::Postgres { read_only: false,
+            host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
+            port: std::env::var("PGPORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
+            user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+            ssl_mode: PostgresSslMode::Disable,
+            ssh: None,
+        };
+        let password = std::env::var("PGPASSWORD").ok();
+        let mut session = Session::open(&config, password.as_deref(), None).expect("open");
+        session
+            .query("DROP SCHEMA IF EXISTS cde_routine_cap CASCADE")
+            .expect("drop schema");
+        session.query("CREATE SCHEMA cde_routine_cap").expect("create schema");
+        let over_cap = SCHEMA_ROUTINE_CAP + 1;
+        let seed = format!(
+            "DO $$ BEGIN \
+             FOR i IN 1..{over_cap} LOOP \
+             EXECUTE format('CREATE FUNCTION cde_routine_cap.f_%s() RETURNS int \
+             LANGUAGE sql AS ''SELECT %s''', i, i); \
+             END LOOP; \
+             END $$"
+        );
+        session.query(&seed).expect("seed routines");
+        let schema = session.schema().expect("schema loads");
+        session
+            .query("DROP SCHEMA IF EXISTS cde_routine_cap CASCADE")
+            .expect("cleanup schema");
+        let node = schema
+            .databases()
+            .iter()
+            .flat_map(|db| db.schemas())
+            .find(|s| s.name() == "cde_routine_cap")
+            .expect("cap schema");
+        assert_eq!(node.routines().len(), SCHEMA_ROUTINE_CAP);
+        assert!(node.routines_truncated());
+        assert!(!node.triggers_truncated());
+    }
+
     #[cfg(feature = "mysql")]
     #[test]
     fn my_cell_kind_covers_listed_type_names() {
@@ -4662,6 +5195,18 @@ mod tests {
         Session::open(&config, password.as_deref(), None).expect("open MySQL")
     }
 
+    /// Runs DDL that the prepared-statement protocol refuses, such as
+    /// CREATE TRIGGER and DROP FUNCTION, over the simple protocol.
+    #[cfg(feature = "mysql")]
+    fn mysql_live_raw(session: &Session, sql: &str) {
+        let Session::Mysql(my) = session else {
+            panic!("expected a mysql session");
+        };
+        my.rt
+            .block_on(sqlx::raw_sql(sql).execute(&my.pool))
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
     #[cfg(feature = "mysql")]
     #[test]
     #[ignore = "needs a live MySQL; set MYSQLHOST/MYSQLPORT/MYSQLDATABASE/MYSQLUSER/MYSQLPASSWORD"]
@@ -4726,6 +5271,10 @@ mod tests {
             panic!("expected a mysql config");
         };
         let mut session = mysql_live_open();
+        // MySQL rejects trigger and routine DDL on the prepared-statement
+        // protocol the query path uses, so the scratch objects run on the
+        // simple protocol. Dropping the table drops its trigger.
+        mysql_live_raw(&session, "DROP FUNCTION IF EXISTS cde_schema_fn");
         session.query("DROP VIEW IF EXISTS cde_schema_view").expect("drop view");
         session.query("DROP TABLE IF EXISTS cde_schema_probe").expect("drop table");
         session
@@ -4739,9 +5288,20 @@ mod tests {
         session
             .query("CREATE VIEW cde_schema_view AS SELECT id FROM cde_schema_probe")
             .expect("create view");
+        mysql_live_raw(
+            &session,
+            "CREATE TRIGGER cde_schema_trg BEFORE INSERT ON cde_schema_probe \
+             FOR EACH ROW SET NEW.amount = NEW.amount",
+        );
+        mysql_live_raw(
+            &session,
+            "CREATE FUNCTION cde_schema_fn(a INT) RETURNS INT DETERMINISTIC \
+             RETURN a + 1",
+        );
         let schema = session.schema();
         session.query("DROP VIEW IF EXISTS cde_schema_view").expect("cleanup view");
         session.query("DROP TABLE IF EXISTS cde_schema_probe").expect("cleanup table");
+        mysql_live_raw(&session, "DROP FUNCTION IF EXISTS cde_schema_fn");
         let schema = schema.expect("schema loads");
         assert!(!schema.is_empty());
         let node = schema
@@ -4786,6 +5346,32 @@ mod tests {
         assert_eq!(pk[0].columns(), &["id".to_owned()]);
         let view_names: Vec<&str> = main.views().iter().map(|t| t.name()).collect();
         assert!(view_names.contains(&"cde_schema_view"), "{view_names:?}");
+        assert!(!main.triggers_truncated());
+        let trigger = main
+            .triggers()
+            .iter()
+            .find(|t| t.name() == "cde_schema_trg")
+            .expect("probe trigger");
+        assert_eq!(trigger.table(), Some("cde_schema_probe"));
+        assert_eq!(trigger.kind(), Some("BEFORE INSERT"));
+        assert!(
+            trigger.definition().is_some_and(|d| d.contains("SET NEW.amount")),
+            "{:?}",
+            trigger.definition()
+        );
+        assert!(!main.routines_truncated());
+        let routine = main
+            .routines()
+            .iter()
+            .find(|r| r.name() == "cde_schema_fn")
+            .expect("probe routine");
+        assert_eq!(routine.kind(), Some("FUNCTION"));
+        assert_eq!(routine.language(), Some("SQL"));
+        assert!(
+            routine.definition().is_some_and(|d| d.contains("a + 1")),
+            "{:?}",
+            routine.definition()
+        );
     }
 
     #[cfg(feature = "mysql")]
@@ -4903,8 +5489,30 @@ mod tests {
         assert!(SequenceInfo::new("  ".into()).is_err());
         assert!(IndexRef::new(String::new(), "idx_a".into()).is_err());
         assert!(IndexRef::new("users".into(), "  ".into()).is_err());
-        assert!(SchemaNode::new(String::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
-            .is_err());
+        assert!(TriggerInfo::new(String::new(), None, None, None).is_err());
+        assert!(TriggerInfo::new("  ".into(), None, None, None).is_err());
+        assert!(TriggerInfo::new("trg_a".into(), Some(" ".into()), None, None).is_err());
+        assert!(TriggerInfo::new("trg_a".into(), None, Some(" ".into()), None).is_err());
+        assert!(TriggerInfo::new("trg_a".into(), None, None, Some(" ".into())).is_err());
+        assert!(RoutineInfo::new(String::new(), None, None, None).is_err());
+        assert!(RoutineInfo::new("  ".into(), None, None, None).is_err());
+        assert!(RoutineInfo::new("fn_a".into(), Some(" ".into()), None, None).is_err());
+        assert!(RoutineInfo::new("fn_a".into(), None, Some(" ".into()), None).is_err());
+        assert!(RoutineInfo::new("fn_a".into(), None, None, Some(" ".into())).is_err());
+        assert!(
+            SchemaNode::new(
+                String::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                false,
+                false
+            )
+            .is_err()
+        );
         assert!(DatabaseNode::new(String::new(), Vec::new()).is_err());
         assert!(ColumnInfo::new("id".into(), "INTEGER".into(), false, Some(1)).is_ok());
         assert!(
@@ -4930,6 +5538,24 @@ mod tests {
         );
         assert!(SequenceInfo::new("seq_a".into()).is_ok());
         assert!(IndexRef::new("users".into(), "idx_a".into()).is_ok());
+        assert!(
+            TriggerInfo::new(
+                "trg_a".into(),
+                Some("users".into()),
+                Some("BEFORE INSERT".into()),
+                Some("CREATE TRIGGER trg_a BEFORE INSERT ON users".into())
+            )
+            .is_ok()
+        );
+        assert!(
+            RoutineInfo::new(
+                "fn_a".into(),
+                Some("FUNCTION".into()),
+                Some("plpgsql".into()),
+                Some("BEGIN RETURN NEW; END".into())
+            )
+            .is_ok()
+        );
         assert!(
             TableInfo::new(
                 "users".into(),
@@ -4970,6 +5596,11 @@ mod tests {
         conn.execute("CREATE UNIQUE INDEX idx_child_parent_unique ON child(parent_id)", [])
             .unwrap();
         conn.execute("CREATE INDEX idx_child_id_plain ON child(id)", []).unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_users_note AFTER INSERT ON users BEGIN SELECT 1; END",
+            [],
+        )
+        .unwrap();
         let session = Session::Sqlite(conn);
         let schema = session.schema().unwrap();
         assert!(!schema.tables_truncated());
@@ -4981,6 +5612,19 @@ mod tests {
         let main = &db.schemas()[0];
         assert_eq!(main.name(), "main");
         assert!(main.sequences().is_empty());
+        assert!(!main.triggers_truncated());
+        assert_eq!(main.triggers().len(), 1);
+        let trigger = &main.triggers()[0];
+        assert_eq!(trigger.name(), "trg_users_note");
+        assert_eq!(trigger.table(), Some("users"));
+        assert_eq!(trigger.kind(), None);
+        assert!(
+            trigger.definition().is_some_and(|d| d.contains("AFTER INSERT ON users")),
+            "{:?}",
+            trigger.definition()
+        );
+        assert!(main.routines().is_empty());
+        assert!(!main.routines_truncated());
         let table_names: Vec<&str> =
             main.tables().iter().map(|t| t.name()).collect();
         assert_eq!(table_names, vec!["child", "parent", "posts", "users"]);
@@ -5063,6 +5707,27 @@ mod tests {
             .collect();
         assert!(agg.contains(&("child", "idx_child_parent_unique")));
         assert!(agg.contains(&("child", "idx_child_id_plain")));
+    }
+
+    #[test]
+    fn sqlite_schema_caps_triggers_and_flags_truncation() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", []).unwrap();
+        for i in 0..SCHEMA_TRIGGER_CAP + 1 {
+            conn.execute(
+                &format!("CREATE TRIGGER trg_{i:03} AFTER INSERT ON users BEGIN SELECT 1; END"),
+                [],
+            )
+            .unwrap();
+        }
+        let session = Session::Sqlite(conn);
+        let schema = session.schema().unwrap();
+        let main = &schema.databases()[0].schemas()[0];
+        assert_eq!(main.triggers().len(), SCHEMA_TRIGGER_CAP);
+        assert!(main.triggers_truncated());
+        assert_eq!(main.triggers()[0].name(), "trg_000");
+        assert!(main.routines().is_empty());
+        assert!(!main.routines_truncated());
     }
 
     #[test]

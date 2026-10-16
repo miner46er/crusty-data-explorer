@@ -2525,9 +2525,18 @@ mod tests {
             false,
         )
         .unwrap();
-        let node =
-            SchemaNode::new("main".to_owned(), vec![table], Vec::new(), Vec::new(), Vec::new())
-                .unwrap();
+        let node = SchemaNode::new(
+            "main".to_owned(),
+            vec![table],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
         let database = DatabaseNode::new(":memory:".to_owned(), vec![node]).unwrap();
         SchemaInfo::new(vec![database], false, false)
     }

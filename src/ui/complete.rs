@@ -534,6 +534,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
         )
         .unwrap();
         let db = DatabaseNode::new("db".to_owned(), vec![schema]).unwrap();
@@ -543,9 +547,18 @@ mod tests {
     fn many_schema(n: usize) -> SchemaInfo {
         let tables =
             (0..n).map(|i| table(&format!("t{i:02}"), &[("id", "INTEGER")])).collect();
-        let schema =
-            SchemaNode::new("main".to_owned(), tables, Vec::new(), Vec::new(), Vec::new())
-                .unwrap();
+        let schema = SchemaNode::new(
+            "main".to_owned(),
+            tables,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
         let db = DatabaseNode::new("db".to_owned(), vec![schema]).unwrap();
         SchemaInfo::new(vec![db], false, false)
     }

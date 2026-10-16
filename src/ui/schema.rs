@@ -171,6 +171,72 @@ fn show_schema(
             });
             ui.add_space(4.0);
         }
+        if !schema_node.triggers().is_empty() {
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("Triggers ({})", schema_node.triggers().len()))
+                    .small()
+                    .strong(),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                for trigger in schema_node.triggers() {
+                    ui.horizontal(|ui| {
+                        let name = ui.label(
+                            egui::RichText::new(trigger.name()).monospace().small(),
+                        );
+                        if let Some(definition) = trigger.definition() {
+                            name.on_hover_text(definition);
+                        }
+                        if let Some(table) = trigger.table() {
+                            ui.label(
+                                egui::RichText::new(format!("({table})")).small().weak(),
+                            );
+                        }
+                        if let Some(kind) = trigger.kind() {
+                            ui.label(egui::RichText::new(kind).small().weak());
+                        }
+                    });
+                }
+                if schema_node.triggers_truncated() {
+                    ui.label(
+                        egui::RichText::new("Showing first 200 triggers.").small().weak(),
+                    );
+                }
+            });
+            ui.add_space(4.0);
+        }
+        if !schema_node.routines().is_empty() {
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("Routines ({})", schema_node.routines().len()))
+                    .small()
+                    .strong(),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                for routine in schema_node.routines() {
+                    ui.horizontal(|ui| {
+                        let name = ui.label(
+                            egui::RichText::new(routine.name()).monospace().small(),
+                        );
+                        if let Some(definition) = routine.definition() {
+                            name.on_hover_text(definition);
+                        }
+                        if let Some(kind) = routine.kind() {
+                            ui.label(egui::RichText::new(kind).small().weak());
+                        }
+                        if let Some(language) = routine.language() {
+                            ui.label(egui::RichText::new(language).small().weak());
+                        }
+                    });
+                }
+                if schema_node.routines_truncated() {
+                    ui.label(
+                        egui::RichText::new("Showing first 200 routines.").small().weak(),
+                    );
+                }
+            });
+            ui.add_space(4.0);
+        }
     });
 }
 
