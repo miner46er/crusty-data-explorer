@@ -52,13 +52,13 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     if let Some(id) = state.active() {
         let hint = state
             .tab(id)
-            .and_then(|tab| state.connections().iter().find(|c| c.id == tab.conn))
+            .and_then(|tab| state.connections().iter().find(|c| Some(c.id) == tab.conn))
             .map(|c| format!("{} · {}", c.name, c.config.kind().label()))
             .unwrap_or_else(|| "no connection".to_owned());
         ui.label(egui::RichText::new(hint).small().weak());
         let schema = state
             .tab(id)
-            .map(|tab| tab.conn)
+            .and_then(|tab| tab.conn)
             .and_then(|conn| state.schema(conn))
             .cloned();
         find_bar(state, ui, find_opened);

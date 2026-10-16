@@ -130,7 +130,7 @@ pub struct EditTarget {
 #[derive(Debug)]
 pub struct Tab {
     pub id: TabId,
-    pub conn: ConnectionId,
+    pub conn: Option<ConnectionId>,
     pub sql: String,
     outcome: RunOutcome,
     run_scope: RunScope,
@@ -549,7 +549,7 @@ impl AppState {
         let saved = load_saved_queries();
         ids.resume_after_saved(&saved.iter().map(|q| q.id).collect::<Vec<_>>());
         let (events_tx, events_rx) = mpsc::channel();
-        Self {
+        let mut state = Self {
             connections: profiles,
             tabs: Vec::new(),
             active: None,
@@ -569,6 +569,23 @@ impl AppState {
             saved,
             save_prompt: None,
             imports: None,
+        };
+        state.restore_tabs();
+        state
+    }
+
+    /// Reload the saved tabs as fresh tabs in file order. A row bound to a
+    /// connection that no longer exists is pruned; an unbound row is kept.
+    /// Ids are minted, never resumed, so a saved row cannot collide.
+    fn restore_tabs(&mut self) {
+        let live: HashSet<ConnectionId> = self.connections.iter().map(|c| c.id).collect();
+        for saved in load_tabs() {
+            let conn = match saved.conn {
+                Some(id) if live.contains(&id) => Some(id),
+                Some(_) => continue,
+                None => None,
+            };
+            self.push_tab(conn, saved.sql);
         }
     }
 
@@ -613,7 +630,7 @@ impl AppState {
     pub fn default_connection(&self) -> Option<ConnectionId> {
         if let Some(active) = self.active {
             if let Some(tab) = self.tab(active) {
-                return Some(tab.conn);
+                return tab.conn;
             }
         }
         self.connections
@@ -628,11 +645,17 @@ impl AppState {
     }
 
     pub fn new_tab(&mut self, conn: ConnectionId) -> TabId {
+        self.push_tab(Some(conn), String::new())
+    }
+
+    /// The one tab constructor. Restore reuses it so a reloaded tab starts
+    /// exactly like a fresh one: fresh id, `Never` outcome, empty display.
+    fn push_tab(&mut self, conn: Option<ConnectionId>, sql: String) -> TabId {
         let id = self.ids.tab();
         self.tabs.push(Tab {
             id,
             conn,
-            sql: String::new(),
+            sql,
             outcome: RunOutcome::Never,
             run_scope: RunScope::All,
             results: Vec::new(),
@@ -706,13 +729,15 @@ impl AppState {
         prepare: impl Fn(DbKind, String) -> String,
     ) {
         let (conn_id, kind, handle, scope) = match self.tabs.iter().find(|t| t.id == tab) {
-            Some(t) => match self.connections.iter().find(|c| c.id == t.conn) {
-                Some(c) => (t.conn, c.config.kind(), c.handle(), t.run_scope),
-                None => {
-                    self.set_outcome(tab, RunOutcome::Err("connection not found".to_owned()));
-                    return;
+            Some(t) => {
+                match t.conn.and_then(|id| self.connections.iter().find(|c| c.id == id)) {
+                    Some(c) => (c.id, c.config.kind(), c.handle(), t.run_scope),
+                    None => {
+                        self.set_outcome(tab, RunOutcome::Err("connection not found".to_owned()));
+                        return;
+                    }
                 }
-            },
+            }
             None => return,
         };
         let statements = effective_statements(sql, scope, cursor, selection);
@@ -799,12 +824,14 @@ impl AppState {
                 t.silent_run = None;
             }
         }
-        if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn_id) {
-            if let ConnectionState::QueryRunning { session, run: current, .. } = &c.state {
-                if *current == run {
-                    let session = session.clone();
-                    session.cancel.cancel();
-                    c.state = ConnectionState::Connected { session };
+        if let Some(conn_id) = conn_id {
+            if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn_id) {
+                if let ConnectionState::QueryRunning { session, run: current, .. } = &c.state {
+                    if *current == run {
+                        let session = session.clone();
+                        session.cancel.cancel();
+                        c.state = ConnectionState::Connected { session };
+                    }
                 }
             }
         }
@@ -816,15 +843,16 @@ impl AppState {
     /// appears in the active result.
     pub fn edit_target(&self, tab: TabId) -> Option<EditTarget> {
         let tab = self.tabs.iter().find(|t| t.id == tab)?;
+        let conn = tab.conn?;
         let idle = matches!(
-            self.connections.iter().find(|c| c.id == tab.conn)?.state(),
+            self.connections.iter().find(|c| c.id == conn)?.state(),
             ConnectionState::Connected { .. }
         );
         if !idle {
             return None;
         }
         let table = editable_table(&tab.sql)?;
-        let pk = primary_key(self.schemas.get(&tab.conn)?, &table)?;
+        let pk = primary_key(self.schemas.get(&conn)?, &table)?;
         let result = tab.active_query_result()?;
         let mut pk_cols = Vec::with_capacity(pk.len());
         let mut pk_types = Vec::with_capacity(pk.len());
@@ -915,10 +943,12 @@ impl AppState {
             return;
         }
         let (conn_id, handle) = match self.tabs.iter().find(|t| t.id == tab) {
-            Some(t) => match self.connections.iter().find(|c| c.id == t.conn) {
-                Some(c) => (t.conn, c.handle()),
-                None => return,
-            },
+            Some(t) => {
+                match t.conn.and_then(|id| self.connections.iter().find(|c| c.id == id)) {
+                    Some(c) => (c.id, c.handle()),
+                    None => return,
+                }
+            }
             None => return,
         };
         self.send_batch(tab, conn_id, handle, statements, BatchPurpose::ApplyEdits);
@@ -933,7 +963,10 @@ impl AppState {
             return;
         };
         let conn = match self.tabs.iter().find(|t| t.id == tab) {
-            Some(t) => t.conn,
+            Some(t) => match t.conn {
+                Some(conn) => conn,
+                None => return,
+            },
             None => return,
         };
         let Some(columns) = self
@@ -1003,10 +1036,12 @@ impl AppState {
             return;
         }
         let (conn_id, handle) = match self.tabs.iter().find(|t| t.id == draft.tab) {
-            Some(t) => match self.connections.iter().find(|c| c.id == t.conn) {
-                Some(c) => (t.conn, c.handle()),
-                None => return,
-            },
+            Some(t) => {
+                match t.conn.and_then(|id| self.connections.iter().find(|c| c.id == id)) {
+                    Some(c) => (c.id, c.handle()),
+                    None => return,
+                }
+            }
             None => return,
         };
         let inserted = draft.rows.len().min(ROW_CAP);
@@ -1095,10 +1130,12 @@ impl AppState {
             return;
         }
         let (conn_id, handle) = match self.tabs.iter().find(|t| t.id == tab) {
-            Some(t) => match self.connections.iter().find(|c| c.id == t.conn) {
-                Some(c) => (t.conn, c.handle()),
-                None => return,
-            },
+            Some(t) => {
+                match t.conn.and_then(|id| self.connections.iter().find(|c| c.id == id)) {
+                    Some(c) => (c.id, c.handle()),
+                    None => return,
+                }
+            }
             None => return,
         };
         self.send_batch(tab, conn_id, handle, statements, BatchPurpose::Refresh);
@@ -1257,7 +1294,7 @@ impl AppState {
 
     pub fn delete_connection(&mut self, id: ConnectionId) {
         self.disconnect(id);
-        self.tabs.retain(|t| t.conn != id);
+        self.tabs.retain(|t| t.conn != Some(id));
         self.connections.retain(|c| c.id != id);
         self.schemas.remove(&id);
         self.schema_loading.remove(&id);
@@ -1292,7 +1329,7 @@ impl AppState {
             schema.replace('"', "\"\""),
             table.replace('"', "\"\"")
         );
-        let existing = self.tabs.iter().find(|t| t.conn == conn && t.sql == sql).map(|t| t.id);
+        let existing = self.tabs.iter().find(|t| t.conn == Some(conn) && t.sql == sql).map(|t| t.id);
         match existing {
             Some(id) => {
                 self.activate(id);
@@ -1334,7 +1371,10 @@ impl AppState {
             return None;
         }
         let (conn, sql) = match self.active.and_then(|id| self.tab(id)) {
-            Some(tab) => (tab.conn, tab.sql.clone()),
+            Some(tab) => match tab.conn {
+                Some(conn) => (conn, tab.sql.clone()),
+                None => return None,
+            },
             None => return None,
         };
         if let Some(existing) = self.saved.iter_mut().find(|q| q.name == trimmed) {
@@ -1608,7 +1648,7 @@ impl AppState {
                     .tabs
                     .iter()
                     .find(|t| matches!(&t.outcome, RunOutcome::Running { run: r, .. } if *r == run))
-                    .map(|t| t.conn);
+                    .and_then(|t| t.conn);
                 self.finish_run(run, RunOutcome::Err(message.clone()));
                 if fatal {
                     if let Some(id) = conn_id {
@@ -1639,6 +1679,12 @@ impl AppState {
             .find(|t| matches!(&t.outcome, RunOutcome::Running { run: r, .. } if *r == run))
         {
             Some(t) => {
+                // A running tab always carries a connection; only a directly
+                // minted test run can land here without one.
+                let Some(conn) = t.conn else {
+                    t.outcome = outcome;
+                    return;
+                };
                 let ok = matches!(&outcome, RunOutcome::Ok { .. });
                 // An import landing behaves like an apply that adds no
                 // history entry and records its send-time notice.
@@ -1666,7 +1712,6 @@ impl AppState {
                     }
                     _ => (Instant::now(), Vec::new()),
                 };
-                let conn = t.conn;
                 let sql = t.sql.clone();
                 let entries: Vec<HistoryEntry> = if silent {
                     Vec::new()
@@ -1721,7 +1766,7 @@ impl AppState {
         let still_running = self
             .tabs
             .iter()
-            .any(|t| t.conn == conn && matches!(t.outcome, RunOutcome::Running { .. }));
+            .any(|t| t.conn == Some(conn) && matches!(t.outcome, RunOutcome::Running { .. }));
         if !still_running {
             if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn) {
                 if let ConnectionState::QueryRunning { session, .. } = &c.state {
@@ -1763,6 +1808,12 @@ impl AppState {
             log::warn!("persist saved queries: {e}");
         }
     }
+
+    fn persist_tabs(&self) {
+        if let Err(e) = save_tabs(&self.tabs) {
+            log::warn!("persist tabs: {e}");
+        }
+    }
 }
 
 impl eframe::App for AppState {
@@ -1771,6 +1822,9 @@ impl eframe::App for AppState {
     }
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
         crate::ui::root(self, ui);
+    }
+    fn on_exit(&mut self) {
+        self.persist_tabs();
     }
 }
 
@@ -1902,6 +1956,61 @@ fn save_saved_queries(saved: &[SavedQuery]) -> std::io::Result<()> {
     }
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(saved).unwrap_or_default())?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// One persisted tab row: the connection and the SQL, nothing else. Both
+/// fields default so a partial row still loads instead of failing the file.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedTab {
+    #[serde(default)]
+    conn: Option<ConnectionId>,
+    #[serde(default)]
+    sql: String,
+}
+
+fn tabs_path() -> std::path::PathBuf {
+    profiles_path().with_file_name("tabs.json")
+}
+
+/// Every parseable row in file order. A corrupt file loads as empty; a row
+/// that does not parse is skipped, so one bad row keeps the rest.
+fn load_tabs() -> Vec<PersistedTab> {
+    let path = tabs_path();
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
+        Ok(rows) => rows,
+        Err(e) => {
+            log::warn!("parse {}: {e}", path.display());
+            return Vec::new();
+        }
+    };
+    rows.into_iter()
+        .filter_map(|row| match serde_json::from_value::<PersistedTab>(row) {
+            Ok(tab) => Some(tab),
+            Err(e) => {
+                log::warn!("skip tab row in {}: {e}", path.display());
+                None
+            }
+        })
+        .collect()
+}
+
+fn save_tabs(tabs: &[Tab]) -> std::io::Result<()> {
+    let path = tabs_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let persisted: Vec<PersistedTab> = tabs
+        .iter()
+        .map(|t| PersistedTab { conn: t.conn, sql: t.sql.clone() })
+        .collect();
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&persisted).unwrap_or_default())?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
@@ -2954,6 +3063,118 @@ mod tests {
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tabs_roundtrip_saves_conn_and_sql_in_order() {
+        with_isolated_state("tabs-roundtrip", |state| {
+            let a = add_sqlite_connection(state, "a");
+            let b = add_sqlite_connection(state, "b");
+            let first = state.new_tab(a);
+            if let Some(slot) = state.tab_sql_mut(first) {
+                *slot = "SELECT 1".to_owned();
+            }
+            let second = state.new_tab(b);
+            if let Some(slot) = state.tab_sql_mut(second) {
+                *slot = "SELECT 2".to_owned();
+            }
+            state.tab_mut(first).expect("tab").set_sort(0);
+            state.tab_mut(first).expect("tab").set_filter("leak".to_owned());
+            eframe::App::on_exit(state);
+            let raw = std::fs::read_to_string(tabs_path()).expect("tabs file");
+            let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(json[0]["sql"], serde_json::json!("SELECT 1"));
+            assert_eq!(json[1]["sql"], serde_json::json!("SELECT 2"));
+            for row in json.as_array().expect("rows") {
+                let keys: Vec<&str> = row
+                    .as_object()
+                    .expect("row")
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                assert_eq!(keys.len(), 2);
+                assert!(keys.contains(&"conn"));
+                assert!(keys.contains(&"sql"));
+            }
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.tabs().len(), 2);
+            assert_eq!(reloaded.tabs()[0].conn, Some(a));
+            assert_eq!(reloaded.tabs()[0].sql, "SELECT 1");
+            assert_eq!(reloaded.tabs()[1].conn, Some(b));
+            assert_eq!(reloaded.tabs()[1].sql, "SELECT 2");
+            assert_ne!(reloaded.tabs()[0].id, reloaded.tabs()[1].id);
+            assert_eq!(reloaded.active(), Some(reloaded.tabs()[0].id));
+            for tab in reloaded.tabs() {
+                assert!(matches!(tab.outcome(), RunOutcome::Never));
+                assert!(tab.results().is_empty());
+                assert_eq!(tab.sort_col(), None);
+                assert_eq!(tab.filter(), "");
+            }
+        });
+    }
+
+    #[test]
+    fn tabs_prune_drops_missing_connections_and_keeps_unbound() {
+        with_isolated_state("tabs-prune", |state| {
+            let live = add_sqlite_connection(state, "live");
+            let rows = vec![
+                PersistedTab {
+                    conn: Some(ConnectionId::from_raw(999_999)),
+                    sql: "SELECT gone".to_owned(),
+                },
+                PersistedTab { conn: None, sql: "SELECT free".to_owned() },
+                PersistedTab { conn: Some(live), sql: "SELECT kept".to_owned() },
+            ];
+            std::fs::write(tabs_path(), serde_json::to_vec(&rows).unwrap()).unwrap();
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.tabs().len(), 2);
+            assert_eq!(reloaded.tabs()[0].conn, None);
+            assert_eq!(reloaded.tabs()[0].sql, "SELECT free");
+            assert_eq!(reloaded.tabs()[1].conn, Some(live));
+            assert_eq!(reloaded.tabs()[1].sql, "SELECT kept");
+            assert!(matches!(reloaded.tabs()[1].outcome(), RunOutcome::Never));
+            assert_eq!(reloaded.active(), Some(reloaded.tabs()[0].id));
+        });
+    }
+
+    #[test]
+    fn tabs_empty_state_matches_fresh_start() {
+        with_isolated_state("tabs-empty", |state| {
+            assert!(!tabs_path().exists());
+            assert!(state.tabs().is_empty());
+            assert_eq!(state.active(), None);
+            std::fs::write(tabs_path(), b"").unwrap();
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert!(reloaded.tabs().is_empty());
+            assert_eq!(reloaded.active(), None);
+        });
+    }
+
+    #[test]
+    fn tabs_corrupt_file_loads_what_it_can() {
+        with_isolated_state("tabs-corrupt", |state| {
+            let live = add_sqlite_connection(state, "live");
+            std::fs::write(tabs_path(), b"{oops").unwrap();
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert!(reloaded.tabs().is_empty());
+            assert_eq!(reloaded.active(), None);
+            let mixed = serde_json::json!([
+                {"conn": live.raw(), "sql": "SELECT kept"},
+                {"conn": "oops", "sql": "SELECT bad"},
+                {"sql": "SELECT unbound"},
+                {},
+            ]);
+            std::fs::write(tabs_path(), serde_json::to_vec(&mixed).unwrap()).unwrap();
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.tabs().len(), 3);
+            assert_eq!(reloaded.tabs()[0].conn, Some(live));
+            assert_eq!(reloaded.tabs()[0].sql, "SELECT kept");
+            assert_eq!(reloaded.tabs()[1].conn, None);
+            assert_eq!(reloaded.tabs()[1].sql, "SELECT unbound");
+            assert_eq!(reloaded.tabs()[2].conn, None);
+            assert_eq!(reloaded.tabs()[2].sql, "");
+            assert_eq!(reloaded.active(), Some(reloaded.tabs()[0].id));
+        });
     }
 
     #[test]

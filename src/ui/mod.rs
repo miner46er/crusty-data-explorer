@@ -79,7 +79,7 @@ fn status_bar(state: &AppState, ui: &mut egui::Ui) {
             let backend = state
                 .active()
                 .and_then(|id| state.tab(id))
-                .and_then(|tab| state.connections().iter().find(|c| c.id == tab.conn))
+                .and_then(|tab| state.connections().iter().find(|c| Some(c.id) == tab.conn))
                 .map(|c| c.config.kind().label())
                 .unwrap_or("no backend");
             ui.label(egui::RichText::new(backend).small().weak());

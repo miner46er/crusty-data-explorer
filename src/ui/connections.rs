@@ -81,7 +81,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                 let active_conn = state
                     .active()
                     .and_then(|id| state.tab(id))
-                    .map(|tab| tab.conn);
+                    .and_then(|tab| tab.conn);
 
                 let mut actions: Vec<SidebarAction> = Vec::new();
                 let snapshot: Vec<(ConnectionId, String, Environment, String, bool)> = state
