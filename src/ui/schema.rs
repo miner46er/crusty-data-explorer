@@ -2,7 +2,10 @@
 
 use eframe::egui;
 
-use crate::app::{AppState, NavigatorReveal, RowCountState, fk_incoming_target, fk_reveal_target};
+use crate::app::{
+    AppState, NavigatorReveal, RowCountState, fk_incoming_target, fk_reveal_target,
+    table_matches_navigator_filter,
+};
 use crate::db::{ConnectionId, DbKind, TableInfo, TableKind};
 
 use super::ddl;
@@ -15,6 +18,8 @@ pub enum SchemaAction {
     Reveal(ConnectionId, String, String),
     /// Ask the worker for one table's row count.
     Count(ConnectionId, String, String),
+    /// Toggle one table bookmark.
+    Bookmark(ConnectionId, String, String),
     /// The palette-requested table entry was opened and scrolled to.
     RevealHandled,
 }
@@ -114,6 +119,7 @@ fn show_schema(
     )
     .default_open(true)
     .show(ui, |ui| {
+        let filter = state.navigator_filter().to_owned();
         if !schema_node.tables().is_empty() {
             egui::CollapsingHeader::new(
                 egui::RichText::new(format!("Tables ({})", schema_node.tables().len()))
@@ -122,13 +128,20 @@ fn show_schema(
             )
             .default_open(true)
             .show(ui, |ui| {
-                for (i, table) in schema_node.tables().iter().enumerate() {
-                    if i > 0 {
+                let mut shown = 0;
+                for table in schema_node.tables().iter().filter(|t| {
+                    table_matches_navigator_filter(t.name(), filter.trim())
+                }) {
+                    if shown > 0 {
                         ui.separator();
                     }
+                    shown += 1;
                     show_table(
                         state, ui, conn, schema_node.name(), table, dialect, actions, reveal,
                     );
+                }
+                if shown == 0 {
+                    ui.label(egui::RichText::new("No tables match.").small().weak());
                 }
             });
             ui.add_space(4.0);
@@ -141,13 +154,20 @@ fn show_schema(
             )
             .default_open(true)
             .show(ui, |ui| {
-                for (i, view) in schema_node.views().iter().enumerate() {
-                    if i > 0 {
+                let mut shown = 0;
+                for view in schema_node.views().iter().filter(|v| {
+                    table_matches_navigator_filter(v.name(), filter.trim())
+                }) {
+                    if shown > 0 {
                         ui.separator();
                     }
+                    shown += 1;
                     show_table(
                         state, ui, conn, schema_node.name(), view, dialect, actions, reveal,
                     );
+                }
+                if shown == 0 {
+                    ui.label(egui::RichText::new("No views match.").small().weak());
                 }
             });
             ui.add_space(4.0);
@@ -330,6 +350,17 @@ fn show_table(
         collapsing = collapsing.open(Some(true));
     }
     let resp = collapsing.show(ui, |ui| {
+        let bookmarked = state.is_bookmarked(conn, schema, &name);
+        ui.horizontal(|ui| {
+            let label = if bookmarked { "★ Remove bookmark" } else { "☆ Bookmark" };
+            if ui.small_button(label).clicked() {
+                actions.push(SchemaAction::Bookmark(
+                    conn,
+                    schema_owned.clone(),
+                    name.clone(),
+                ));
+            }
+        });
         count_affordance(state, ui, conn, schema, table, actions);
         if !table.columns().is_empty() {
             egui::CollapsingHeader::new(

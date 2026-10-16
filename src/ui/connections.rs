@@ -27,6 +27,7 @@ enum SidebarAction {
     PreviewTable(ConnectionId, String, String),
     RevealTable(ConnectionId, String, String),
     TableCount(ConnectionId, String, String),
+    ToggleBookmark(ConnectionId, String, String),
     OpenHistory(ConnectionId, String),
     ClearHistory,
     OpenSaved(u64),
@@ -96,6 +97,21 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                 ui.label(egui::RichText::new("CONNECTIONS").small().weak());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Filter tables:").small().weak());
+                    let mut filter = state.navigator_filter().to_owned();
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut filter)
+                                .hint_text("narrow tables by name")
+                                .desired_width(120.0),
+                        )
+                        .changed()
+                    {
+                        state.set_navigator_filter(filter);
+                    }
+                });
                 ui.add_space(4.0);
 
                 if state.connections().is_empty() {
@@ -282,6 +298,11 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                                                 id, schema, table,
                                             ));
                                         }
+                                        super::schema::SchemaAction::Bookmark(id, schema, table) => {
+                                            actions.push(SidebarAction::ToggleBookmark(
+                                                id, schema, table,
+                                            ));
+                                        }
                                         super::schema::SchemaAction::RevealHandled => {
                                             state.clear_navigator_reveal();
                                         }
@@ -356,6 +377,44 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                 }
                 ui.add_space(8.0);
 
+                ui.label(egui::RichText::new("BOOKMARKS").small().weak());
+                ui.add_space(4.0);
+                if state.bookmarks().is_empty() {
+                    ui.label(egui::RichText::new("No bookmarks.").small().weak());
+                } else {
+                    let conn_names: HashMap<ConnectionId, String> = state
+                        .connections()
+                        .iter()
+                        .map(|c| (c.id, c.name.clone()))
+                        .collect();
+                    for bookmark in state.bookmarks().to_vec() {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("★").small().color(palette.accent));
+                            let title = format!("{}.{}", bookmark.schema, bookmark.table);
+                            if ui.small_button(&title).clicked() {
+                                actions.push(SidebarAction::PreviewTable(
+                                    bookmark.conn,
+                                    bookmark.schema.clone(),
+                                    bookmark.table.clone(),
+                                ));
+                            }
+                            let conn_name = conn_names
+                                .get(&bookmark.conn)
+                                .map(String::as_str)
+                                .unwrap_or("deleted");
+                            ui.label(egui::RichText::new(conn_name).small().weak());
+                            if ui.small_button("Remove").clicked() {
+                                actions.push(SidebarAction::ToggleBookmark(
+                                    bookmark.conn,
+                                    bookmark.schema.clone(),
+                                    bookmark.table.clone(),
+                                ));
+                            }
+                        });
+                    }
+                }
+                ui.add_space(8.0);
+
                 for action in actions {
                     match action {
                         SidebarAction::Connect(id) => {
@@ -388,6 +447,9 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                         }
                         SidebarAction::TableCount(id, schema, table) => {
                             state.request_row_count(id, &schema, &table)
+                        }
+                        SidebarAction::ToggleBookmark(id, schema, table) => {
+                            state.toggle_bookmark(id, &schema, &table);
                         }
                         SidebarAction::OpenHistory(conn, sql) => state.open_history(conn, &sql),
                         SidebarAction::ClearHistory => state.clear_history(),

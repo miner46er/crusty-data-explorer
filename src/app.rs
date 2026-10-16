@@ -680,6 +680,31 @@ pub fn saved_groups(saved: &[SavedQuery]) -> Vec<SavedGroup<'_>> {
     groups
 }
 
+/// One bookmarked table: the connection plus schema and table names the
+/// sidebar section pins. Every field defaults so files written before a
+/// field existed still load.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TableBookmark {
+    pub conn: ConnectionId,
+    #[serde(default)]
+    pub schema: String,
+    #[serde(default)]
+    pub table: String,
+}
+
+/// Cap on retained bookmarks, newest first.
+const BOOKMARKS_CAP: usize = 200;
+
+/// Whether a table name survives the navigator filter. Empty filter matches
+/// everything, else a case-insensitive substring on the table name.
+pub fn table_matches_navigator_filter(table: &str, filter: &str) -> bool {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return true;
+    }
+    table.to_lowercase().contains(&filter.to_lowercase())
+}
+
 /// One entity the Ctrl+K palette can open. The variant carries what opening
 /// it needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1335,6 +1360,8 @@ pub struct AppState {
     history: Vec<HistoryEntry>,
     saved: Vec<SavedQuery>,
     filter_history: Vec<SavedFilter>,
+    bookmarks: Vec<TableBookmark>,
+    navigator_filter: String,
     search: Option<SearchPalette>,
     /// The table the palette asked the navigator to reveal; the schema tree
     /// consumes it on its next render.
@@ -1380,6 +1407,8 @@ impl AppState {
             history: load_history(),
             saved,
             filter_history: load_saved_filters(),
+            bookmarks: load_bookmarks(),
+            navigator_filter: String::new(),
             search: None,
             navigator_reveal: None,
             save_prompt: None,
@@ -2700,6 +2729,10 @@ impl AppState {
         self.schemas.remove(&id);
         self.schema_loading.remove(&id);
         self.schema_errors.remove(&id);
+        if self.bookmarks.iter().any(|b| b.conn == id) {
+            self.bookmarks.retain(|b| b.conn != id);
+            self.persist_bookmarks();
+        }
         self.repair_active();
         self.persist();
     }
@@ -3063,6 +3096,61 @@ impl AppState {
         }
         self.persist_saved();
         true
+    }
+
+    /// Every bookmarked table, newest first.
+    pub fn bookmarks(&self) -> &[TableBookmark] {
+        &self.bookmarks
+    }
+
+    /// Whether the connection schema table is bookmarked. Exact match on
+    /// all three fields, so a renamed table leaves its old entry behind.
+    pub fn is_bookmarked(&self, conn: ConnectionId, schema: &str, table: &str) -> bool {
+        self.bookmarks
+            .iter()
+            .any(|b| b.conn == conn && b.schema == schema && b.table == table)
+    }
+
+    /// Toggle one bookmark. True when the entry is bookmarked after the
+    /// call. Blank schema or table names toggle nothing.
+    pub fn toggle_bookmark(&mut self, conn: ConnectionId, schema: &str, table: &str) -> bool {
+        if schema.trim().is_empty() || table.trim().is_empty() {
+            return false;
+        }
+        match self
+            .bookmarks
+            .iter()
+            .position(|b| b.conn == conn && b.schema == schema && b.table == table)
+        {
+            Some(index) => {
+                self.bookmarks.remove(index);
+                self.persist_bookmarks();
+                false
+            }
+            None => {
+                self.bookmarks.insert(
+                    0,
+                    TableBookmark {
+                        conn,
+                        schema: schema.to_owned(),
+                        table: table.to_owned(),
+                    },
+                );
+                self.bookmarks.truncate(BOOKMARKS_CAP);
+                self.persist_bookmarks();
+                true
+            }
+        }
+    }
+
+    /// The navigator tree filter text.
+    pub fn navigator_filter(&self) -> &str {
+        &self.navigator_filter
+    }
+
+    /// Replace the navigator tree filter text.
+    pub fn set_navigator_filter(&mut self, filter: String) {
+        self.navigator_filter = filter;
     }
 
     /// Whether the palette is open.
@@ -3716,6 +3804,12 @@ impl AppState {
         }
     }
 
+    fn persist_bookmarks(&self) {
+        if let Err(e) = save_bookmarks(&self.bookmarks) {
+            log::warn!("persist bookmarks: {e}");
+        }
+    }
+
     fn persist_tabs(&self) {
         if let Err(e) = save_tabs(&self.tabs) {
             log::warn!("persist tabs: {e}");
@@ -3920,6 +4014,44 @@ fn save_saved_filters(filters: &[SavedFilter]) -> std::io::Result<()> {
     }
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(filters).unwrap_or_default())?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// The bookmarked tables beside the saved queries, newest first. One file
+/// per store, so a corrupt bookmarks file cannot take the queries down.
+fn bookmarks_path() -> std::path::PathBuf {
+    profiles_path().with_file_name("bookmarks.json")
+}
+
+/// Every retained bookmark in file order. A missing or corrupt file loads
+/// as empty, and rows with blank schema or table names are pruned.
+fn load_bookmarks() -> Vec<TableBookmark> {
+    let path = bookmarks_path();
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    match serde_json::from_slice::<Vec<TableBookmark>>(&bytes) {
+        Ok(mut bookmarks) => {
+            bookmarks.retain(|b| !b.schema.trim().is_empty() && !b.table.trim().is_empty());
+            bookmarks.truncate(BOOKMARKS_CAP);
+            bookmarks
+        }
+        Err(e) => {
+            log::warn!("parse {}: {e}", path.display());
+            Vec::new()
+        }
+    }
+}
+
+fn save_bookmarks(bookmarks: &[TableBookmark]) -> std::io::Result<()> {
+    let path = bookmarks_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(bookmarks).unwrap_or_default())?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
@@ -9691,6 +9823,101 @@ mod tests {
             );
             live_run(state, tab, "DROP TABLE cde_join_orders");
             live_run(state, tab, "DROP TABLE cde_join_users");
+        });
+    }
+
+    #[test]
+    fn bookmark_toggle_adds_and_removes() {
+        with_isolated_state("bookmark-toggle", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            assert!(state.bookmarks().is_empty());
+            assert!(!state.is_bookmarked(conn, "main", "users"));
+            assert!(state.toggle_bookmark(conn, "main", "users"));
+            assert!(state.is_bookmarked(conn, "main", "users"));
+            assert_eq!(state.bookmarks().len(), 1);
+            assert_eq!(state.bookmarks()[0].schema, "main");
+            assert_eq!(state.bookmarks()[0].table, "users");
+            assert!(!state.toggle_bookmark(conn, "main", "users"));
+            assert!(state.bookmarks().is_empty());
+            assert!(!state.is_bookmarked(conn, "main", "users"));
+            assert!(!state.toggle_bookmark(conn, "", "users"));
+            assert!(!state.toggle_bookmark(conn, "main", "  "));
+            assert!(state.bookmarks().is_empty());
+        });
+    }
+
+    #[test]
+    fn bookmark_save_and_reload_roundtrip() {
+        with_isolated_state("bookmark-persist", |state| {
+            assert!(state.bookmarks().is_empty());
+            let conn = add_sqlite_connection(state, "mem");
+            assert!(state.toggle_bookmark(conn, "main", "users"));
+            assert!(state.toggle_bookmark(conn, "main", "orders"));
+            assert_eq!(state.bookmarks().len(), 2);
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.bookmarks().len(), 2);
+            assert_eq!(reloaded.bookmarks()[0].table, "orders");
+            assert_eq!(reloaded.bookmarks()[1].table, "users");
+            assert!(reloaded.is_bookmarked(conn, "main", "orders"));
+        });
+    }
+
+    #[test]
+    fn bookmark_delete_connection_prunes_entries() {
+        with_isolated_state("bookmark-prune", |state| {
+            let first = add_sqlite_connection(state, "one");
+            let second = add_sqlite_connection(state, "two");
+            assert!(state.toggle_bookmark(first, "main", "users"));
+            assert!(state.toggle_bookmark(second, "main", "orders"));
+            state.delete_connection(first);
+            assert_eq!(state.bookmarks().len(), 1);
+            assert_eq!(state.bookmarks()[0].conn, second);
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.bookmarks().len(), 1);
+            assert_eq!(reloaded.bookmarks()[0].table, "orders");
+        });
+    }
+
+    #[test]
+    fn old_bookmark_file_without_fields_loads_empty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("cde-bookmark-old-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crusty-data-explorer")).unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        std::fs::write(
+            dir.join("crusty-data-explorer").join("bookmarks.json"),
+            br#"[{"conn":1},{"conn":1,"schema":"main"},{"conn":2,"schema":"main","table":"users"}]"#,
+        )
+        .unwrap();
+        let state = AppState::new(&eframe::egui::Context::default());
+        assert_eq!(state.bookmarks().len(), 1);
+        assert_eq!(state.bookmarks()[0].conn, ConnectionId::from_raw(2));
+        assert_eq!(state.bookmarks()[0].schema, "main");
+        assert_eq!(state.bookmarks()[0].table, "users");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn navigator_filter_narrows_table_names() {
+        assert!(table_matches_navigator_filter("users", ""));
+        assert!(table_matches_navigator_filter("users", "   "));
+        assert!(table_matches_navigator_filter("users", "user"));
+        assert!(table_matches_navigator_filter("users", "USERS"));
+        assert!(table_matches_navigator_filter("order_items", "Order"));
+        assert!(table_matches_navigator_filter("users", "  use  "));
+        assert!(!table_matches_navigator_filter("users", "order"));
+        assert!(!table_matches_navigator_filter("users", "xyz"));
+        with_isolated_state("nav-filter", |state| {
+            assert_eq!(state.navigator_filter(), "");
+            state.set_navigator_filter("use".to_owned());
+            assert_eq!(state.navigator_filter(), "use");
+            assert!(table_matches_navigator_filter("users", state.navigator_filter()));
+            assert!(!table_matches_navigator_filter("orders", state.navigator_filter()));
         });
     }
 }
