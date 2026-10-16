@@ -355,7 +355,7 @@ mod tests {
         TableColumnDraft, TableForm, TableIndexDraft, alter_table_statements,
         create_table_statements, validate_table_form,
     };
-    use crate::db::{ConnectionConfig, DbKind, MysqlSslMode, PostgresSslMode, Session};
+    use crate::db::{ConnectionConfig, DbKind, PostgresSslMode, Session};
 
     fn probe_form(table: &str) -> TableForm {
         TableForm {

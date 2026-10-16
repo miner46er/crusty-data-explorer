@@ -1548,6 +1548,7 @@ fn results_grid(
     let mut actions = Vec::new();
     result_tabs(tab, ui);
     let palette = Palette::of(ui.ctx().theme());
+    super::charts::chart_side_panel(tab, ui);
     poll_export_job(tab, ui);
     let (cols, total) = {
         let Some(result) = tab.active_query_result() else { return actions };

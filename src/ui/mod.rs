@@ -5,6 +5,7 @@ use eframe::egui;
 
 use crate::app::{AppState, ConnectionState};
 
+pub mod charts;
 pub mod complete;
 pub mod connections;
 pub mod ddl;
