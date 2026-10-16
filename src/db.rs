@@ -205,6 +205,14 @@ fn first_keyword(sql: &str) -> Option<String> {
     keyword_span(sql).map(|(keyword, _)| keyword)
 }
 
+/// A BEGIN, COMMIT, or ROLLBACK statement. MySQL refuses BEGIN in the
+/// prepared statement protocol, so [`MySession::query`] runs these on the
+/// text protocol instead of probing them with `describe` first.
+#[cfg(feature = "mysql")]
+fn is_transaction_control(sql: &str) -> bool {
+    matches!(first_keyword(sql).as_deref(), Some("BEGIN" | "COMMIT" | "ROLLBACK"))
+}
+
 fn keyword_span(sql: &str) -> Option<(String, usize)> {
     let bytes = sql.as_bytes();
     let mut i = 0;
@@ -2356,6 +2364,22 @@ impl MySession {
     /// so a data-changing statement runs exactly once on the `execute` path.
     fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
         let started = Instant::now();
+        // MySQL refuses BEGIN in the prepared statement protocol, and even an
+        // empty bind set prepares, so a transaction control skips `describe`
+        // and runs through `raw_sql` on the text protocol.
+        if is_transaction_control(sql) {
+            let done = self
+                .rt
+                .block_on(sqlx::raw_sql(sql).execute(&self.pool))
+                .map_err(|e| DbError::Query(e.to_string()))?;
+            return QueryResult::from_columns(
+                Vec::new(),
+                false,
+                Some(done.rows_affected()),
+                started.elapsed(),
+            )
+            .map_err(|e| DbError::Query(e.to_string()));
+        }
         let columns = self.describe_columns(sql)?;
         if columns.is_empty() {
             let done = self

@@ -34,6 +34,62 @@ pub enum ConnectionState {
     Error { message: String },
 }
 
+/// The per-connection transaction flag, open or closed. A flag, not a
+/// protocol mirror: it changes only when a transaction control batch lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Transaction {
+    #[default]
+    Closed,
+    Open,
+}
+
+impl Transaction {
+    pub fn is_open(self) -> bool {
+        matches!(self, Transaction::Open)
+    }
+}
+
+/// One explicit transaction control the toolbar offers. Label, statement,
+/// and the flag its Ok landing leaves are one table, so the button the user
+/// presses and the observer in [`AppState::finish_run`] cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionAction {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+impl TransactionAction {
+    pub const ALL: [TransactionAction; 3] =
+        [TransactionAction::Begin, TransactionAction::Commit, TransactionAction::Rollback];
+
+    /// The toolbar button text.
+    pub fn label(self) -> &'static str {
+        match self {
+            TransactionAction::Begin => "Begin",
+            TransactionAction::Commit => "Commit",
+            TransactionAction::Rollback => "Rollback",
+        }
+    }
+
+    /// The one statement this control sends.
+    pub fn statement(self) -> &'static str {
+        match self {
+            TransactionAction::Begin => "BEGIN",
+            TransactionAction::Commit => "COMMIT",
+            TransactionAction::Rollback => "ROLLBACK",
+        }
+    }
+
+    /// The flag this control's Ok landing leaves behind.
+    pub fn on_ok(self) -> Transaction {
+        match self {
+            TransactionAction::Begin => Transaction::Open,
+            TransactionAction::Commit | TransactionAction::Rollback => Transaction::Closed,
+        }
+    }
+}
+
 /// Handles the UI may use from the egui thread while a worker runs.
 #[derive(Debug, Clone)]
 pub struct LiveSession {
@@ -52,11 +108,20 @@ pub struct Connection {
     /// SSH secret (a password or key passphrase), never persisted.
     pub ssh_password: String,
     state: ConnectionState,
+    /// The observed transaction flag. A BEGIN batch landing Ok opens it; a
+    /// COMMIT or ROLLBACK batch landing Ok closes it, and a fatal worker
+    /// error or disconnect closes it too. Cancel leaves it as it was, since
+    /// stopping a statement says nothing about the server's transaction.
+    transaction: Transaction,
 }
 
 impl Connection {
     pub fn state(&self) -> &ConnectionState {
         &self.state
+    }
+    /// The observed transaction flag, for the tab and card indicators.
+    pub fn transaction(&self) -> Transaction {
+        self.transaction
     }
     /// Some only while a worker exists to queue commands to.
     pub fn handle(&self) -> Option<DbHandle> {
@@ -378,6 +443,18 @@ fn effective_statements(
     }
 }
 
+/// The transaction control a landed batch carries: Some only when the batch
+/// is exactly one statement spelling BEGIN, COMMIT, or ROLLBACK, so a script
+/// that mixes statements, an explain form, and every other batch leave the
+/// flag untouched. The spelling comes from [`TransactionAction`], so a typed
+/// `begin` matches the button's `BEGIN`.
+fn transaction_action(statements: &[String]) -> Option<TransactionAction> {
+    let [statement] = statements else { return None };
+    TransactionAction::ALL
+        .into_iter()
+        .find(|action| statement.eq_ignore_ascii_case(action.statement()))
+}
+
 /// The loaded table a possibly qualified name resolves to: under its schema
 /// when qualified, else the first case-insensitive match across databases and
 /// schemas. An unqualified name takes the first match; a deeper qualifier
@@ -696,6 +773,16 @@ impl AppState {
             .map(|c| c.id)
     }
 
+    /// Whether the tab's connection is live and idle, the condition for the
+    /// transaction controls. No connection, a connecting or failed
+    /// connection, and a run in flight all read false.
+    pub fn transaction_ready(&self, tab: TabId) -> bool {
+        self.tab(tab)
+            .and_then(|t| t.conn)
+            .and_then(|id| self.connections.iter().find(|c| c.id == id))
+            .is_some_and(|c| matches!(c.state, ConnectionState::Connected { .. }))
+    }
+
     pub fn new_tab(&mut self, conn: ConnectionId) -> TabId {
         self.push_tab(Some(conn), String::new())
     }
@@ -830,6 +917,41 @@ impl AppState {
             Ok(_) => {}
         }
         self.continue_batch(tab, conn_id, kind, handle, read_only, &statements, explain, None);
+    }
+
+    /// Send one transaction control as a plain single-statement batch through
+    /// [`AppState::continue_batch`], so the read-only guard, the write
+    /// confirm, and history behave exactly as a run's. The flag opens or
+    /// closes only when the batch lands Ok.
+    pub fn start_transaction(&mut self, tab: TabId, action: TransactionAction) {
+        let (conn_id, kind, handle, read_only) =
+            match self.tabs.iter().find(|t| t.id == tab) {
+                Some(t) => {
+                    match t.conn.and_then(|id| self.connections.iter().find(|c| c.id == id)) {
+                        Some(c) => {
+                            (c.id, c.config.kind(), c.handle(), c.config.is_read_only())
+                        }
+                        None => {
+                            self.set_outcome(
+                                tab,
+                                RunOutcome::Err("connection not found".to_owned()),
+                            );
+                            return;
+                        }
+                    }
+                }
+                None => return,
+            };
+        self.continue_batch(
+            tab,
+            conn_id,
+            kind,
+            handle,
+            read_only,
+            &[action.statement().to_owned()],
+            false,
+            None,
+        );
     }
 
     /// The prepared tail of [`AppState::start_batch`]: map each statement
@@ -1528,6 +1650,7 @@ impl AppState {
     pub fn disconnect(&mut self, id: ConnectionId) {
         if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
             c.state = ConnectionState::Disconnected;
+            c.transaction = Transaction::Closed;
         }
         self.schemas.remove(&id);
         self.schema_loading.remove(&id);
@@ -1802,6 +1925,7 @@ impl AppState {
                     password: draft.password,
                     ssh_password: draft.ssh_password,
                     state: ConnectionState::Disconnected,
+                    transaction: Transaction::Closed,
                 });
             }
         }
@@ -1901,6 +2025,7 @@ impl AppState {
                                     | ConnectionState::QueryRunning { .. }
                             ) {
                                 c.state = ConnectionState::Error { message };
+                                c.transaction = Transaction::Closed;
                             }
                         }
                     }
@@ -1995,11 +2120,16 @@ impl AppState {
                 if !silent || !ok {
                     t.clear_export_notice();
                 }
-                Some((tab_id, conn, entries, refresh, import_notice))
+                // Only an Ok landing moves the transaction flag, so a failed
+                // BEGIN, COMMIT, or ROLLBACK leaves it as it was.
+                let transaction = if ok { transaction_action(&statements) } else { None };
+                Some((tab_id, conn, entries, refresh, import_notice, transaction))
             }
             None => None,
         };
-        let Some((tab_id, conn, entries, refresh, import_notice)) = matched else { return };
+        let Some((tab_id, conn, entries, refresh, import_notice, transaction)) = matched else {
+            return;
+        };
         if !entries.is_empty() {
             self.history.splice(0..0, entries);
             self.history.truncate(HISTORY_CAP);
@@ -2014,6 +2144,18 @@ impl AppState {
                 if let ConnectionState::QueryRunning { session, .. } = &c.state {
                     let session = session.clone();
                     c.state = ConnectionState::Connected { session };
+                }
+            }
+        }
+        if let Some(action) = transaction {
+            if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn) {
+                // A landing that arrives after a disconnect must not reopen
+                // the flag, so only a live connection moves it.
+                if matches!(
+                    c.state,
+                    ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
+                ) {
+                    c.transaction = action.on_ok();
                 }
             }
         }
@@ -2113,6 +2255,7 @@ fn load_connections() -> Vec<Connection> {
                 password: String::new(),
                 ssh_password: String::new(),
                 state: ConnectionState::Disconnected,
+                transaction: Transaction::Closed,
             })
             .collect(),
         Err(e) => {
@@ -2504,6 +2647,150 @@ mod tests {
             },
         };
         commands
+    }
+
+    /// The transaction flag for one connection.
+    fn transaction_open(state: &AppState, conn: ConnectionId) -> bool {
+        state
+            .connections()
+            .iter()
+            .find(|c| c.id == conn)
+            .expect("connection")
+            .transaction()
+            .is_open()
+    }
+
+    /// Send one transaction control through the button path, asserting the
+    /// exact statement reached the worker, and hand back its run id.
+    fn send_transaction(
+        state: &mut AppState,
+        commands: &mpsc::Receiver<DbCommand>,
+        tab: TabId,
+        action: TransactionAction,
+    ) -> RunId {
+        state.start_transaction(tab, action);
+        match commands.try_recv().expect("a command was sent") {
+            DbCommand::QueryBatch { run, statements } => {
+                assert_eq!(statements, vec![action.statement()]);
+                run
+            }
+            other => panic!("expected QueryBatch, got {other:?}"),
+        }
+    }
+
+    /// Send a Begin, land its Ok, and assert the flag opened.
+    fn begin_and_land(
+        state: &mut AppState,
+        commands: &mpsc::Receiver<DbCommand>,
+        tab: TabId,
+        conn: ConnectionId,
+    ) {
+        let run = send_transaction(state, commands, tab, TransactionAction::Begin);
+        state.apply(DbEvent::BatchOk { run, results: vec![affected_result(0)] });
+        assert!(transaction_open(state, conn), "BEGIN Ok opens the flag");
+    }
+
+    /// Drain worker events into the fold until `done` holds or the deadline
+    /// passes. Live tests only.
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    fn pump_until(state: &mut AppState, done: impl Fn(&AppState) -> bool) -> bool {
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if done(state) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            if let Ok(event) =
+                state.events_rx.recv_timeout(std::time::Duration::from_millis(100))
+            {
+                state.apply(event);
+            }
+        }
+    }
+
+    /// Wait for the tab's run to land, then panic on a failed outcome.
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    fn settle(state: &mut AppState, tab: TabId, what: &str) {
+        let landed =
+            pump_until(state, |s| {
+                !matches!(s.tab(tab).map(|t| t.outcome()), Some(RunOutcome::Running { .. }))
+            });
+        assert!(landed, "no landing for {what}");
+        if let RunOutcome::Err(message) = state.tab(tab).expect("tab").outcome() {
+            panic!("{what} failed: {message}");
+        }
+    }
+
+    /// Run one statement through the app and wait for its landing.
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    fn live_run(state: &mut AppState, tab: TabId, sql: &str) {
+        state.start_run(tab, sql, 0, None);
+        settle(state, tab, sql);
+    }
+
+    /// Send one transaction control through the button path and wait for its
+    /// landing.
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    fn live_transaction(state: &mut AppState, tab: TabId, action: TransactionAction) {
+        state.start_transaction(tab, action);
+        settle(state, tab, action.statement());
+    }
+
+    /// The tab's first result cell as an integer.
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    fn integer_cell(state: &AppState, tab: TabId) -> i64 {
+        match state.tab(tab).and_then(|t| t.active_query_result()).and_then(|r| r.cell(0, 0)) {
+            Some(Value::Integer(n)) => *n,
+            other => panic!("expected an integer cell, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    fn add_postgres_probe_connection(state: &mut AppState) -> ConnectionId {
+        state.open_draft(None);
+        {
+            let draft = state.draft_mut().expect("new draft");
+            draft.name = "pg-probe".to_owned();
+            draft.config = ConnectionConfig::Postgres { read_only: false,
+                host: std::env::var("PGHOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+                port: std::env::var("PGPORT")
+                    .ok()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(5432),
+                database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
+                user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+                ssl_mode: PostgresSslMode::Disable,
+                ssh: None,
+            };
+            draft.password = std::env::var("PGPASSWORD").unwrap_or_default();
+        }
+        state.save_draft();
+        state.connections().last().map(|c| c.id).expect("saved connection")
+    }
+
+    #[cfg(feature = "mysql")]
+    fn add_mysql_probe_connection(state: &mut AppState) -> ConnectionId {
+        state.open_draft(None);
+        {
+            let draft = state.draft_mut().expect("new draft");
+            draft.name = "mysql-probe".to_owned();
+            draft.config = ConnectionConfig::Mysql { read_only: false,
+                host: std::env::var("MYSQLHOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+                port: std::env::var("MYSQLPORT")
+                    .ok()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(3306),
+                database: std::env::var("MYSQLDATABASE")
+                    .unwrap_or_else(|_| "mysql".to_owned()),
+                user: std::env::var("MYSQLUSER").unwrap_or_else(|_| "root".to_owned()),
+                ssh: None,
+            };
+            draft.password = std::env::var("MYSQLPASSWORD").unwrap_or_default();
+        }
+        state.save_draft();
+        state.connections().last().map(|c| c.id).expect("saved connection")
     }
 
     /// One table with a composite key and one editable column.
@@ -3515,6 +3802,7 @@ mod tests {
             password: "transient-only".to_owned(),
             ssh_password: "ssh-transient-only".to_owned(),
             state: ConnectionState::Disconnected,
+            transaction: Transaction::Closed,
         }];
         let result = save_connections(&conns);
         let raw = std::fs::read_to_string(dir.join("crusty-data-explorer").join("connections.json"))
@@ -5185,6 +5473,210 @@ mod tests {
                 state.tab(tab).expect("tab").outcome(),
                 RunOutcome::Running { .. }
             ));
+        });
+    }
+
+    #[test]
+    fn transaction_controls_enable_only_for_an_idle_live_connection() {
+        with_isolated_state("tx-ready", |state| {
+            let conn = add_sqlite_connection(state, "mem-tx");
+            let tab = state.new_tab(conn);
+            let unbound = state.push_tab(None, String::new());
+            assert!(!state.transaction_ready(unbound), "no connection");
+            assert!(!state.transaction_ready(tab), "disconnected");
+            let _ = attach_test_handle(state, conn);
+            assert!(!state.transaction_ready(tab), "connecting");
+
+            let commands = attach_test_session(state, conn);
+            assert!(state.transaction_ready(tab), "connected and idle");
+
+            state.start_run(tab, "SELECT 1", 0, None);
+            assert!(!state.transaction_ready(tab), "run in flight");
+            let run = match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { run, .. } => run,
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            state.apply(DbEvent::BatchOk { run, results: vec![rows_result(1)] });
+            assert!(state.transaction_ready(tab), "idle again");
+
+            state.disconnect(conn);
+            assert!(!state.transaction_ready(tab), "disconnected again");
+        });
+    }
+
+    #[test]
+    fn begin_sends_exactly_begin_and_opens_the_flag_on_ok() {
+        with_isolated_state("tx-begin", |state| {
+            let conn = add_sqlite_connection(state, "mem-tx");
+            let commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+            let run = send_transaction(state, &commands, tab, TransactionAction::Begin);
+            assert!(!transaction_open(state, conn), "opens only on the Ok landing");
+
+            state.apply(DbEvent::BatchOk { run, results: vec![affected_result(0)] });
+            assert!(transaction_open(state, conn));
+        });
+    }
+
+    #[test]
+    fn commit_and_rollback_send_their_statement_and_close_the_flag_on_ok() {
+        with_isolated_state("tx-controls", |state| {
+            let conn = add_sqlite_connection(state, "mem-tx");
+            let commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+            for action in [TransactionAction::Commit, TransactionAction::Rollback] {
+                begin_and_land(state, &commands, tab, conn);
+                let run = send_transaction(state, &commands, tab, action);
+                state.apply(DbEvent::BatchOk { run, results: vec![affected_result(0)] });
+                assert!(!transaction_open(state, conn), "{:?} Ok closes", action);
+            }
+        });
+    }
+
+    #[test]
+    fn failed_begin_leaves_the_flag_closed() {
+        with_isolated_state("tx-failed-begin", |state| {
+            let conn = add_sqlite_connection(state, "mem-tx");
+            let commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+            let run = send_transaction(state, &commands, tab, TransactionAction::Begin);
+            state.apply(DbEvent::QueryErr {
+                run,
+                error: crate::db::DbError::Query("cannot begin".to_owned()),
+            });
+            assert!(!transaction_open(state, conn));
+        });
+    }
+
+    #[test]
+    fn cancel_leaves_the_flag_as_it_was() {
+        with_isolated_state("tx-cancel", |state| {
+            let conn = add_sqlite_connection(state, "mem-tx");
+            let commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+            begin_and_land(state, &commands, tab, conn);
+
+            state.start_run(tab, "SELECT 1", 0, None);
+            let run = match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { run, .. } => run,
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            state.cancel_run(tab);
+            assert!(transaction_open(state, conn), "cancel keeps the open transaction");
+            state.apply(DbEvent::BatchOk { run, results: vec![rows_result(1)] });
+            assert!(transaction_open(state, conn), "a cancelled run's landing is dropped");
+        });
+    }
+
+    #[test]
+    fn fatal_error_and_disconnect_close_an_open_transaction() {
+        with_isolated_state("tx-closed", |state| {
+            let conn = add_sqlite_connection(state, "mem-tx");
+            let commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+            begin_and_land(state, &commands, tab, conn);
+
+            state.start_run(tab, "SELECT 1", 0, None);
+            let run = match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { run, .. } => run,
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            state.apply(DbEvent::QueryErr { run, error: crate::db::DbError::Gone });
+            assert!(!transaction_open(state, conn), "fatal error closes");
+            assert!(matches!(
+                state.connections()[0].state(),
+                ConnectionState::Error { .. }
+            ));
+
+            let commands = attach_test_session(state, conn);
+            begin_and_land(state, &commands, tab, conn);
+            state.disconnect(conn);
+            assert!(!transaction_open(state, conn), "disconnect closes");
+
+            // A BEGIN that lands after the disconnect must not reopen it.
+            let commands = attach_test_session(state, conn);
+            let run = send_transaction(state, &commands, tab, TransactionAction::Begin);
+            state.disconnect(conn);
+            state.apply(DbEvent::BatchOk { run, results: vec![affected_result(0)] });
+            assert!(!transaction_open(state, conn), "late BEGIN Ok after disconnect");
+        });
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_begin_commit_and_rollback_track_the_flag() {
+        with_isolated_state("pg-tx-live", |state| {
+            let conn = add_postgres_probe_connection(state);
+            state.connect(conn);
+            assert!(
+                pump_until(state, |s| {
+                    s.connections().iter().any(|c| {
+                        c.id == conn && matches!(c.state(), ConnectionState::Connected { .. })
+                    })
+                }),
+                "connects to live Postgres"
+            );
+            let tab = state.new_tab(conn);
+            live_run(state, tab, "DROP TABLE IF EXISTS cde_tx_probe");
+            live_run(state, tab, "CREATE TABLE cde_tx_probe (id INT PRIMARY KEY)");
+
+            live_transaction(state, tab, TransactionAction::Begin);
+            assert!(transaction_open(state, conn), "BEGIN Ok opens the flag");
+            live_run(state, tab, "INSERT INTO cde_tx_probe VALUES (1)");
+            live_transaction(state, tab, TransactionAction::Rollback);
+            assert!(!transaction_open(state, conn), "ROLLBACK Ok closes the flag");
+            live_run(state, tab, "SELECT COUNT(*) FROM cde_tx_probe");
+            assert_eq!(integer_cell(state, tab), 0, "ROLLBACK dropped the insert");
+
+            live_transaction(state, tab, TransactionAction::Begin);
+            assert!(transaction_open(state, conn), "BEGIN Ok opens the flag");
+            live_run(state, tab, "INSERT INTO cde_tx_probe VALUES (2)");
+            live_transaction(state, tab, TransactionAction::Commit);
+            assert!(!transaction_open(state, conn), "COMMIT Ok closes the flag");
+            live_run(state, tab, "SELECT COUNT(*) FROM cde_tx_probe");
+            assert_eq!(integer_cell(state, tab), 1, "COMMIT kept the insert");
+
+            live_run(state, tab, "DROP TABLE cde_tx_probe");
+        });
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    #[ignore = "needs a live MySQL; set MYSQLHOST/MYSQLPORT/MYSQLDATABASE/MYSQLUSER/MYSQLPASSWORD"]
+    fn mysql_live_begin_commit_and_rollback_track_the_flag() {
+        with_isolated_state("mysql-tx-live", |state| {
+            let conn = add_mysql_probe_connection(state);
+            state.connect(conn);
+            assert!(
+                pump_until(state, |s| {
+                    s.connections().iter().any(|c| {
+                        c.id == conn && matches!(c.state(), ConnectionState::Connected { .. })
+                    })
+                }),
+                "connects to live MySQL"
+            );
+            let tab = state.new_tab(conn);
+            live_run(state, tab, "DROP TABLE IF EXISTS cde_tx_probe");
+            live_run(state, tab, "CREATE TABLE cde_tx_probe (id INT PRIMARY KEY)");
+
+            live_transaction(state, tab, TransactionAction::Begin);
+            assert!(transaction_open(state, conn), "BEGIN Ok opens the flag");
+            live_run(state, tab, "INSERT INTO cde_tx_probe VALUES (1)");
+            live_transaction(state, tab, TransactionAction::Rollback);
+            assert!(!transaction_open(state, conn), "ROLLBACK Ok closes the flag");
+            live_run(state, tab, "SELECT COUNT(*) FROM cde_tx_probe");
+            assert_eq!(integer_cell(state, tab), 0, "ROLLBACK dropped the insert");
+
+            live_transaction(state, tab, TransactionAction::Begin);
+            assert!(transaction_open(state, conn), "BEGIN Ok opens the flag");
+            live_run(state, tab, "INSERT INTO cde_tx_probe VALUES (2)");
+            live_transaction(state, tab, TransactionAction::Commit);
+            assert!(!transaction_open(state, conn), "COMMIT Ok closes the flag");
+            live_run(state, tab, "SELECT COUNT(*) FROM cde_tx_probe");
+            assert_eq!(integer_cell(state, tab), 1, "COMMIT kept the insert");
+
+            live_run(state, tab, "DROP TABLE cde_tx_probe");
         });
     }
 }

@@ -6,7 +6,7 @@
 use eframe::egui;
 
 use super::editor::{char_range, format_sql, FindState};
-use crate::app::{AppState, RunOutcome, RunScope};
+use crate::app::{AppState, RunOutcome, RunScope, TransactionAction};
 use crate::db::TabId;
 
 use super::Palette;
@@ -102,6 +102,15 @@ fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
             if ui.selectable_value(&mut active, Some(tab.id), label).clicked() {
                 activate = Some(tab.id);
             }
+            let transaction_open = state
+                .connections()
+                .iter()
+                .find(|c| Some(c.id) == tab.conn)
+                .is_some_and(|c| c.transaction().is_open());
+            if transaction_open {
+                ui.label(egui::RichText::new("tx").small().strong())
+                    .on_hover_text("Open transaction: commit or roll back to close it");
+            }
             if ui.small_button("×").clicked() {
                 close.push(tab.id);
             }
@@ -139,12 +148,14 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
     let (mut run_clicked, mut explain_clicked, mut cancel_clicked, mut save_clicked) =
         (false, false, false, false);
     let (mut format_clicked, mut find_clicked) = (false, false);
+    let mut transaction_clicked: Option<TransactionAction> = None;
     let mut scope = state.tab(tab_id).map(|t| t.run_scope()).unwrap_or_default();
     if state.tab(tab_id).is_some() {
         let running = matches!(
             state.tab(tab_id).map(|t| t.outcome()),
             Some(RunOutcome::Running { .. })
         );
+        let transaction_ready = state.transaction_ready(tab_id);
         ui.horizontal(|ui| {
             if running {
                 cancel_clicked = ui.button("Cancel").clicked();
@@ -172,6 +183,15 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                         .weak(),
                 );
                 save_clicked = ui.button("Save").clicked();
+            }
+            for action in TransactionAction::ALL {
+                if ui
+                    .add_enabled(transaction_ready, egui::Button::new(action.label()))
+                    .on_hover_text(format!("Send {}", action.statement()))
+                    .clicked()
+                {
+                    transaction_clicked = Some(action);
+                }
             }
             format_clicked = ui.button("Format").clicked();
             find_clicked = ui
@@ -208,6 +228,9 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
     run_clicked |= ui.input_mut(|i| i.consume_shortcut(&run_shortcut()));
     if cancel_clicked {
         state.cancel_run(tab_id);
+    }
+    if let Some(action) = transaction_clicked {
+        state.start_transaction(tab_id, action);
     }
     if save_clicked {
         state.open_save_prompt();

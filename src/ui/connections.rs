@@ -158,6 +158,11 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                             .unwrap_or(ConnectionStateKind::Offline);
                         conn
                     };
+                    let transaction_open = state
+                        .connections()
+                        .iter()
+                        .find(|c| c.id == conn_id)
+                        .is_some_and(|c| c.transaction().is_open());
                     egui::Frame::group(ui.style())
                         .fill(frame_fill)
                         .stroke(frame_stroke)
@@ -175,6 +180,13 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                                     ui.label(
                                         egui::RichText::new(&state_text).small().weak(),
                                     );
+                                    if transaction_open {
+                                        ui.label(
+                                            egui::RichText::new("transaction open")
+                                                .small()
+                                                .color(palette.success),
+                                        );
+                                    }
                                 });
                             });
                             ui.add_space(4.0);
