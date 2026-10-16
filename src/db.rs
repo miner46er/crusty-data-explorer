@@ -5783,9 +5783,14 @@ mod tests {
     }
 
     #[cfg(feature = "postgres")]
+    static LIVE_SCHEMA_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(feature = "postgres")]
     #[test]
     #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+
     fn pg_live_schema_lists_triggers_and_routines() {
+        let _guard = LIVE_SCHEMA_LOCK.lock().expect("schema live lock");
         let config = ConnectionConfig::Postgres { read_only: false,
             host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
             port: std::env::var("PGPORT")
@@ -5875,6 +5880,7 @@ mod tests {
     #[test]
     #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
     fn pg_live_schema_caps_routines_and_flags_truncation() {
+        let _guard = LIVE_SCHEMA_LOCK.lock().expect("schema live lock");
         let config = ConnectionConfig::Postgres { read_only: false,
             host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
             port: std::env::var("PGPORT")
