@@ -78,6 +78,329 @@ fn is_trailing_clause(word: &str) -> bool {
         .any(|keyword| word.eq_ignore_ascii_case(keyword))
 }
 
+/// One source table behind a SELECT: its canonical name and its optional
+/// alias as written. The alias is the qualifier result columns use when the
+/// query aliases its tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinSource {
+    pub table: String,
+    pub alias: Option<String>,
+}
+
+/// One SELECT list item as a column mapping: an optional qualifier and the
+/// source column. None column is an unresolvable item: `*`, `table.*`, a
+/// function, an expression, or anything but `[qualifier.]column` with an
+/// optional `AS` alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinSelect {
+    pub qualifier: Option<String>,
+    pub column: Option<String>,
+}
+
+/// The parsed shape a joined SELECT edits: every source table and every
+/// SELECT item in order, so a result column maps positionally to its item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinPlan {
+    pub sources: Vec<JoinSource>,
+    pub selects: Vec<JoinSelect>,
+}
+
+/// Parse a SELECT into its source tables and SELECT items. Some for a plain
+/// SELECT with at least one source and one item; None for anything else:
+/// unions, subquery sources, deeper qualifiers, or multiple statements. Each
+/// item parses on its own, so one expression marks only its own column
+/// unresolvable. Pure text, no engine calls.
+pub fn parse_join(sql: &str) -> Option<JoinPlan> {
+    let tokens = lex(sql);
+    if !matches!(tokens.first(), Some(Token::Word(w)) if w.eq_ignore_ascii_case("select")) {
+        return None;
+    }
+    let from = top_level_from(&tokens)?;
+    let selects = parse_select_list(&tokens[1..from])?;
+    if selects.is_empty() {
+        return None;
+    }
+    let sources = parse_sources(&tokens[from + 1..])?;
+    if sources.is_empty() {
+        return None;
+    }
+    Some(JoinPlan { sources, selects })
+}
+
+/// Index of the top-level FROM, so a subquery's FROM never reads as the
+/// outer one.
+fn top_level_from(tokens: &[Token]) -> Option<usize> {
+    let mut depth: usize = 0;
+    for (index, token) in tokens.iter().enumerate().skip(1) {
+        match token {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Word(w) if depth == 0 && w.eq_ignore_ascii_case("from") => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Every SELECT item in order. None when a comma split is empty.
+fn parse_select_list(tokens: &[Token]) -> Option<Vec<JoinSelect>> {
+    let mut rest = tokens;
+    if matches!(rest.first(), Some(Token::Word(w)) if w.eq_ignore_ascii_case("distinct") || w.eq_ignore_ascii_case("all"))
+    {
+        rest = &rest[1..];
+    }
+    let mut items = Vec::new();
+    let mut depth: usize = 0;
+    let mut start = 0;
+    let mut index = 0;
+    while index <= rest.len() {
+        let boundary = index == rest.len()
+            || (depth == 0 && matches!(rest.get(index), Some(Token::Punct(','))));
+        match rest.get(index) {
+            Some(Token::Punct('(')) => depth += 1,
+            Some(Token::Punct(')')) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if boundary {
+            if index > start {
+                items.push(parse_select_item(&rest[start..index]));
+            } else if index == rest.len() && items.is_empty() {
+                return None;
+            } else {
+                return None;
+            }
+            start = index + 1;
+        }
+        index += 1;
+    }
+    Some(items)
+}
+
+/// One SELECT item as an optional qualifier plus an optional column. Only
+/// `[qualifier.]column` with an optional `AS` alias resolves; everything
+/// else keeps None so its result column stays read-only.
+fn parse_select_item(chunk: &[Token]) -> JoinSelect {
+    let unresolvable = JoinSelect { qualifier: None, column: None };
+    if chunk.is_empty() {
+        return unresolvable;
+    }
+    if chunk.len() == 1 && matches!(chunk[0], Token::Punct('*')) {
+        return unresolvable;
+    }
+    let (first, after_first) = match identifier_at(chunk, 0) {
+        Some(pair) => pair,
+        None => return unresolvable,
+    };
+    let (qualifier, column, after_col) = match chunk.get(after_first) {
+        Some(Token::Punct('.')) => match chunk.get(after_first + 1) {
+            Some(Token::Punct('*')) => return JoinSelect {
+                qualifier: Some(first),
+                column: None,
+            },
+            Some(_) => match identifier_at(chunk, after_first + 1) {
+                Some((second, after_second)) => {
+                    if matches!(chunk.get(after_second), Some(Token::Punct('.'))) {
+                        return unresolvable;
+                    }
+                    (Some(first), Some(second), after_second)
+                }
+                None => return unresolvable,
+            },
+            None => return unresolvable,
+        },
+        _ => (None, Some(first), after_first),
+    };
+    match chunk.get(after_col) {
+        None => JoinSelect { qualifier, column },
+        Some(Token::Word(w)) if after_col + 1 == chunk.len() && !is_join_reserved(w) => {
+            JoinSelect { qualifier, column }
+        }
+        Some(Token::Quoted(_)) if after_col + 1 == chunk.len() => JoinSelect { qualifier, column },
+        Some(Token::Word(w))
+            if w.eq_ignore_ascii_case("as")
+                && after_col + 2 == chunk.len()
+                && matches!(chunk.get(after_col + 1), Some(Token::Word(_)) | Some(Token::Quoted(_))) =>
+        {
+            JoinSelect { qualifier, column }
+        }
+        _ => unresolvable,
+    }
+}
+
+/// Whether a word can never be a bare table alias in a FROM clause.
+fn is_join_reserved(word: &str) -> bool {
+    [
+        "where",
+        "group",
+        "order",
+        "having",
+        "limit",
+        "offset",
+        "join",
+        "left",
+        "right",
+        "inner",
+        "outer",
+        "full",
+        "cross",
+        "natural",
+        "straight_join",
+        "on",
+        "using",
+        "union",
+        "except",
+        "intersect",
+        "as",
+        "select",
+        "from",
+    ]
+    .iter()
+    .any(|keyword| word.eq_ignore_ascii_case(keyword))
+}
+
+/// Every source table after FROM in order: comma sources and JOIN chains
+/// with their ON/USING conditions skipped. None for subquery sources,
+/// deeper qualifiers, unions, or trailing statements.
+fn parse_sources(tokens: &[Token]) -> Option<Vec<JoinSource>> {
+    let mut sources = Vec::new();
+    let mut pos = 0;
+    let (first, next) = parse_table_ref(tokens, pos)?;
+    sources.push(first);
+    pos = next;
+    loop {
+        match tokens.get(pos) {
+            None => break,
+            Some(Token::Punct(';')) => {
+                if pos + 1 == tokens.len() {
+                    break;
+                }
+                return None;
+            }
+            Some(Token::Punct(',')) => {
+                let (source, next) = parse_table_ref(tokens, pos + 1)?;
+                sources.push(source);
+                pos = next;
+            }
+            Some(Token::Word(w)) if w.eq_ignore_ascii_case("on") || w.eq_ignore_ascii_case("using") => {
+                pos = skip_condition(tokens, pos + 1);
+            }
+            Some(Token::Word(_)) => {
+                if is_trailing_clause_at(tokens, pos) {
+                    break;
+                }
+                if is_union_at(tokens, pos) {
+                    return None;
+                }
+                match consume_join(tokens, pos) {
+                    Some(after_join) => {
+                        let (source, next) = parse_table_ref(tokens, after_join)?;
+                        sources.push(source);
+                        pos = next;
+                    }
+                    None => return None,
+                }
+            }
+            Some(_) => return None,
+        }
+    }
+    Some(sources)
+}
+
+/// One `[schema.]table [[AS] alias]` at `pos` with the index after it. None
+/// for subqueries, missing names, deeper qualifiers, or a bare AS.
+fn parse_table_ref(tokens: &[Token], pos: usize) -> Option<(JoinSource, usize)> {
+    let (first, after_first) = identifier_at(tokens, pos)?;
+    let (table, after_table) = match tokens.get(after_first) {
+        Some(Token::Punct('.')) => {
+            let (second, after_second) = identifier_at(tokens, after_first + 1)?;
+            if matches!(tokens.get(after_second), Some(Token::Punct('.'))) {
+                return None;
+            }
+            (canonical_name(&first, Some(&second)), after_second)
+        }
+        _ => (canonical_name(&first, None), after_first),
+    };
+    match tokens.get(after_table) {
+        Some(Token::Word(w)) if w.eq_ignore_ascii_case("as") => {
+            let (alias, after_alias) = identifier_at(tokens, after_table + 1)?;
+            Some((JoinSource { table, alias: Some(alias) }, after_alias))
+        }
+        Some(Token::Word(w)) if !is_join_reserved(w) => {
+            let (alias, after_alias) = identifier_at(tokens, after_table)?;
+            Some((JoinSource { table, alias: Some(alias) }, after_alias))
+        }
+        Some(Token::Quoted(_)) => {
+            let (alias, after_alias) = identifier_at(tokens, after_table)?;
+            Some((JoinSource { table, alias: Some(alias) }, after_alias))
+        }
+        _ => Some((JoinSource { table, alias: None }, after_table)),
+    }
+}
+
+/// Index after a JOIN keyword chain (`JOIN`, `LEFT JOIN`, `LEFT OUTER
+/// JOIN`, `STRAIGHT_JOIN`). None when no join starts at `pos`.
+fn consume_join(tokens: &[Token], pos: usize) -> Option<usize> {
+    let mut index = pos;
+    loop {
+        match tokens.get(index) {
+            Some(Token::Word(w)) if w.eq_ignore_ascii_case("straight_join") => return Some(index + 1),
+            Some(Token::Word(w))
+                if ["left", "right", "inner", "outer", "full", "cross", "natural"]
+                    .iter()
+                    .any(|m| w.eq_ignore_ascii_case(m)) =>
+            {
+                index += 1;
+            }
+            Some(Token::Word(w)) if w.eq_ignore_ascii_case("join") => return Some(index + 1),
+            _ => return None,
+        }
+    }
+}
+
+/// Index where an ON/USING condition ends: the next top-level comma, join,
+/// trailing clause, union, or end.
+fn skip_condition(tokens: &[Token], mut pos: usize) -> usize {
+    let mut depth: usize = 0;
+    while let Some(token) = tokens.get(pos) {
+        match token {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Punct(',') if depth == 0 => break,
+            Token::Word(w)
+                if depth == 0
+                    && (w.eq_ignore_ascii_case("join")
+                        || w.eq_ignore_ascii_case("straight_join")
+                        || ["left", "right", "inner", "outer", "full", "cross", "natural"]
+                            .iter()
+                            .any(|m| w.eq_ignore_ascii_case(m))
+                        || is_trailing_clause(w)
+                        || ["union", "except", "intersect"].iter().any(|k| w.eq_ignore_ascii_case(k))) =>
+            {
+                break;
+            }
+            Token::Punct(';') if depth == 0 => break,
+            _ => {}
+        }
+        pos += 1;
+    }
+    pos
+}
+
+/// True at a trailing single-table clause or a statement end.
+fn is_trailing_clause_at(tokens: &[Token], pos: usize) -> bool {
+    match tokens.get(pos) {
+        Some(Token::Word(w)) if is_trailing_clause(w) => true,
+        Some(Token::Punct(';')) => true,
+        None => true,
+        _ => false,
+    }
+}
+
+/// True at a set operator, which keeps the whole SELECT read-only.
+fn is_union_at(tokens: &[Token], pos: usize) -> bool {
+    matches!(tokens.get(pos), Some(Token::Word(w)) if ["union", "except", "intersect"].iter().any(|k| w.eq_ignore_ascii_case(k)))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Token {
     /// An unquoted word: identifier or keyword.
@@ -532,5 +855,149 @@ mod tests {
             delete_statement("\"a.b\"", &[("id".to_owned(), "1".to_owned())]),
             "DELETE FROM \"a.b\" WHERE \"id\" = 1"
         );
+    }
+
+    fn join_of(sql: &str) -> Option<JoinPlan> {
+        parse_join(sql)
+    }
+
+    #[test]
+    fn two_table_join_maps_each_column_to_its_source() {
+        assert_eq!(
+            join_of("SELECT u.id, u.name, o.total FROM users AS u JOIN orders AS o ON o.user_id = u.id"),
+            Some(JoinPlan {
+                sources: vec![
+                    JoinSource { table: "users".to_owned(), alias: Some("u".to_owned()) },
+                    JoinSource { table: "orders".to_owned(), alias: Some("o".to_owned()) },
+                ],
+                selects: vec![
+                    JoinSelect { qualifier: Some("u".to_owned()), column: Some("id".to_owned()) },
+                    JoinSelect { qualifier: Some("u".to_owned()), column: Some("name".to_owned()) },
+                    JoinSelect { qualifier: Some("o".to_owned()), column: Some("total".to_owned()) },
+                ],
+            })
+        );
+        assert_eq!(
+            join_of("SELECT users.id, orders.total FROM users JOIN orders ON orders.user_id = users.id WHERE users.id > 1 ORDER BY users.id LIMIT 10"),
+            Some(JoinPlan {
+                sources: vec![
+                    JoinSource { table: "users".to_owned(), alias: None },
+                    JoinSource { table: "orders".to_owned(), alias: None },
+                ],
+                selects: vec![
+                    JoinSelect { qualifier: Some("users".to_owned()), column: Some("id".to_owned()) },
+                    JoinSelect { qualifier: Some("orders".to_owned()), column: Some("total".to_owned()) },
+                ],
+            })
+        );
+        assert_eq!(
+            join_of("SELECT u.id AS user_id, o.total AS order_total FROM users u LEFT OUTER JOIN orders o ON o.user_id = u.id"),
+            Some(JoinPlan {
+                sources: vec![
+                    JoinSource { table: "users".to_owned(), alias: Some("u".to_owned()) },
+                    JoinSource { table: "orders".to_owned(), alias: Some("o".to_owned()) },
+                ],
+                selects: vec![
+                    JoinSelect { qualifier: Some("u".to_owned()), column: Some("id".to_owned()) },
+                    JoinSelect { qualifier: Some("o".to_owned()), column: Some("total".to_owned()) },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn aliased_tables_keep_their_canonical_names() {
+        assert_eq!(
+            join_of("SELECT u.id, u.name FROM users u"),
+            Some(JoinPlan {
+                sources: vec![JoinSource { table: "users".to_owned(), alias: Some("u".to_owned()) }],
+                selects: vec![
+                    JoinSelect { qualifier: Some("u".to_owned()), column: Some("id".to_owned()) },
+                    JoinSelect { qualifier: Some("u".to_owned()), column: Some("name".to_owned()) },
+                ],
+            })
+        );
+        assert_eq!(
+            join_of("SELECT \"u\".\"id\" FROM \"public\".\"users\" AS \"u\" JOIN \"orders\" \"o\" ON \"o\".\"user_id\" = \"u\".\"id\""),
+            Some(JoinPlan {
+                sources: vec![
+                    JoinSource { table: "public.users".to_owned(), alias: Some("u".to_owned()) },
+                    JoinSource { table: "orders".to_owned(), alias: Some("o".to_owned()) },
+                ],
+                selects: vec![JoinSelect {
+                    qualifier: Some("u".to_owned()),
+                    column: Some("id".to_owned())
+                }],
+            })
+        );
+        assert_eq!(
+            join_of("SELECT a.id, b.total FROM users, orders a JOIN orders b ON b.user_id = a.id"),
+            Some(JoinPlan {
+                sources: vec![
+                    JoinSource { table: "users".to_owned(), alias: None },
+                    JoinSource { table: "orders".to_owned(), alias: Some("a".to_owned()) },
+                    JoinSource { table: "orders".to_owned(), alias: Some("b".to_owned()) },
+                ],
+                selects: vec![
+                    JoinSelect { qualifier: Some("a".to_owned()), column: Some("id".to_owned()) },
+                    JoinSelect { qualifier: Some("b".to_owned()), column: Some("total".to_owned()) },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn expressions_stars_and_bad_shapes_leave_only_their_own_column_unresolvable() {
+        assert_eq!(
+            join_of("SELECT count(*), u.id + 1, *, o.* FROM users u JOIN orders o ON o.user_id = u.id"),
+            Some(JoinPlan {
+                sources: vec![
+                    JoinSource { table: "users".to_owned(), alias: Some("u".to_owned()) },
+                    JoinSource { table: "orders".to_owned(), alias: Some("o".to_owned()) },
+                ],
+                selects: vec![
+                    JoinSelect { qualifier: None, column: None },
+                    JoinSelect { qualifier: None, column: None },
+                    JoinSelect { qualifier: None, column: None },
+                    JoinSelect { qualifier: Some("o".to_owned()), column: None },
+                ],
+            })
+        );
+        assert_eq!(
+            join_of("SELECT u.id, 'from', 42 FROM users u JOIN orders o ON o.user_id = u.id"),
+            Some(JoinPlan {
+                sources: vec![
+                    JoinSource { table: "users".to_owned(), alias: Some("u".to_owned()) },
+                    JoinSource { table: "orders".to_owned(), alias: Some("o".to_owned()) },
+                ],
+                selects: vec![
+                    JoinSelect { qualifier: Some("u".to_owned()), column: Some("id".to_owned()) },
+                    JoinSelect { qualifier: None, column: None },
+                    JoinSelect { qualifier: None, column: Some("42".to_owned()) },
+                ],
+            })
+        );
+        assert_eq!(
+            join_of("SELECT a.b.c, u.id FROM users u JOIN orders o ON o.user_id = u.id"),
+            Some(JoinPlan {
+                sources: vec![
+                    JoinSource { table: "users".to_owned(), alias: Some("u".to_owned()) },
+                    JoinSource { table: "orders".to_owned(), alias: Some("o".to_owned()) },
+                ],
+                selects: vec![
+                    JoinSelect { qualifier: None, column: None },
+                    JoinSelect { qualifier: Some("u".to_owned()), column: Some("id".to_owned()) },
+                ],
+            })
+        );
+        for sql in [
+            "SELECT u.id FROM (SELECT 1 AS id) u JOIN orders o ON o.user_id = u.id",
+            "SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id UNION SELECT id FROM users",
+            "SELECT u.id FROM a.b.c u JOIN orders o ON o.user_id = u.id",
+            "SELECT * FROM users JOIN orders ON orders.user_id = users.id; SELECT 1",
+            "UPDATE users SET name = 'ada'",
+        ] {
+            assert_eq!(join_of(sql), None, "{sql}");
+        }
     }
 }

@@ -17,8 +17,8 @@ use crate::db::{
     TX_IDLE_ROLLBACK_MINUTES,
 };
 use crate::edit::{
-    delete_statement, editable_table, ident, insert_statement, is_text_type, qualified_parts,
-    quote_qualified, to_literal, update_statement,
+    delete_statement, editable_table, ident, insert_statement, is_text_type, parse_join,
+    qualified_parts, quote_qualified, to_literal, update_statement,
 };
 use crate::import::{ColumnMap, ROW_CAP, dropped_rows, insert_batches, map_headers, parse_csv};
 use crate::sql::{collect_params, current_statement, split_statements, statement_ranges, substitute};
@@ -336,12 +336,52 @@ pub struct RowEdit {
 
 /// The table one tab's grid edits: its name and every primary key column
 /// with the result column index its value shows in and whether its type is
-/// text, so a text key can render as a quoted literal.
+/// text, so a text key can render as a quoted literal. A joined SELECT keeps
+/// the single-table fields for its display and fills the join tables plus
+/// one entry per result column: Some for an editable column, None for a
+/// read-only one. A single-table SELECT leaves the join fields empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditTarget {
     pub table: String,
     pub pk_cols: Vec<(String, usize)>,
     pub pk_types: Vec<bool>,
+    pub join_tables: Vec<JoinTableTarget>,
+    pub join_columns: Vec<Option<JoinColumnTarget>>,
+}
+
+/// One source table behind a joined edit: its name and every primary key
+/// column with the result column index its value shows in and whether its
+/// type is text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinTableTarget {
+    pub table: String,
+    pub pk_cols: Vec<(String, usize)>,
+    pub pk_types: Vec<bool>,
+}
+
+/// One editable result column behind a joined edit: which join table it
+/// writes and which source column it sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinColumnTarget {
+    pub table_index: usize,
+    pub column: String,
+}
+
+impl EditTarget {
+    /// True for a joined SELECT; deletes and inserts stay single-table only.
+    pub fn is_join(&self) -> bool {
+        !self.join_tables.is_empty()
+    }
+    /// True when the result column edits through the staged path. Every
+    /// column of a single-table target edits; a joined column edits only
+    /// when its mapping resolved to a keyed table.
+    pub fn is_column_editable(&self, col: usize) -> bool {
+        if self.is_join() {
+            self.join_columns.get(col).is_some_and(|slot| slot.is_some())
+        } else {
+            true
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -922,6 +962,55 @@ fn primary_key(schema: &SchemaInfo, table: &str) -> Option<Vec<(String, String)>
     (!key.is_empty()).then_some(key)
 }
 
+/// The one source a qualifier names: its alias first, else its table's last
+/// part or full name. None when no source or several match, so ambiguous
+/// qualifiers stay read-only rather than guessing.
+fn resolve_qualifier(plan: &crate::edit::JoinPlan, qualifier: &str) -> Option<usize> {
+    let mut found = None;
+    for (index, source) in plan.sources.iter().enumerate() {
+        let matches = source
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
+            || last_part(&source.table).eq_ignore_ascii_case(qualifier)
+            || source.table.eq_ignore_ascii_case(qualifier);
+        if matches {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(index);
+        }
+    }
+    found
+}
+
+/// The one source carrying a bare column name in the loaded schema. None
+/// when no source or several carry it, so ambiguous columns stay read-only.
+fn resolve_bare_column(
+    schema: &SchemaInfo,
+    plan: &crate::edit::JoinPlan,
+    column: &str,
+) -> Option<usize> {
+    let mut found = None;
+    for (index, source) in plan.sources.iter().enumerate() {
+        let carries = find_table(schema, &source.table).is_some_and(|info| {
+            info.columns().iter().any(|c| c.name().eq_ignore_ascii_case(column))
+        });
+        if carries {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(index);
+        }
+    }
+    found
+}
+
+/// The last dot part of a canonical table name, for qualifier matching.
+fn last_part(table: &str) -> String {
+    qualified_parts(table).last().cloned().unwrap_or_else(|| table.to_owned())
+}
+
 /// Column names of a loaded table in schema order, the way [`primary_key`]
 /// resolves the table, so CSV headers map onto all of its columns.
 fn table_columns(schema: &SchemaInfo, table: &str) -> Option<Vec<String>> {
@@ -941,6 +1030,24 @@ fn key_pairs(
         let cell = result.cell(row, *col)?;
         let was_null = matches!(cell, Value::Null);
         let text_key = target.pk_types.get(index).copied().unwrap_or(false);
+        let literal = key_literal(&cell.display(usize::MAX), was_null, text_key);
+        pairs.push((name.clone(), literal));
+    }
+    Some(pairs)
+}
+
+/// Key pairs for one joined table: the same literal mapping as
+/// [`key_pairs`] over that table's result columns.
+fn join_key_pairs(
+    result: &QueryResult,
+    table: &JoinTableTarget,
+    row: usize,
+) -> Option<Vec<(String, String)>> {
+    let mut pairs = Vec::with_capacity(table.pk_cols.len());
+    for (index, (name, col)) in table.pk_cols.iter().enumerate() {
+        let cell = result.cell(row, *col)?;
+        let was_null = matches!(cell, Value::Null);
+        let text_key = table.pk_types.get(index).copied().unwrap_or(false);
         let literal = key_literal(&cell.display(usize::MAX), was_null, text_key);
         pairs.push((name.clone(), literal));
     }
@@ -1656,9 +1763,11 @@ impl AppState {
     }
 
     /// What the tab's grid can edit, if anything. Some only while the
-    /// connection is idle, the tab's SQL is a single-table SELECT, the loaded
-    /// schema carries that table with a primary key, and every key column
-    /// appears in the active result.
+    /// connection is idle, the tab's SQL is a SELECT the loaded schema keys,
+    /// and every key column appears in the active result. A single-table
+    /// SELECT edits every column through one table; a joined SELECT edits
+    /// each mapped column through its own source table while ambiguous or
+    /// keyless columns stay read-only.
     pub fn edit_target(&self, tab: TabId) -> Option<EditTarget> {
         let tab = self.tabs.iter().find(|t| t.id == tab)?;
         let conn = tab.conn?;
@@ -1669,9 +1778,22 @@ impl AppState {
         if !idle {
             return None;
         }
-        let table = editable_table(&tab.sql)?;
+        if let Some(single) = self.single_edit_target(conn, &tab.sql, tab.active_query_result()?) {
+            return Some(single);
+        }
+        self.join_edit_target(conn, &tab.sql, tab.active_query_result()?)
+    }
+
+    /// The single-table target behind `editable_table`, if its table carries
+    /// a primary key with every key column in the result.
+    fn single_edit_target(
+        &self,
+        conn: ConnectionId,
+        sql: &str,
+        result: &QueryResult,
+    ) -> Option<EditTarget> {
+        let table = editable_table(sql)?;
         let pk = primary_key(self.schemas.get(&conn)?, &table)?;
-        let result = tab.active_query_result()?;
         let mut pk_cols = Vec::with_capacity(pk.len());
         let mut pk_types = Vec::with_capacity(pk.len());
         for (column, type_name) in pk {
@@ -1682,22 +1804,152 @@ impl AppState {
             pk_cols.push((column, index));
             pk_types.push(is_text_type(&type_name));
         }
-        Some(EditTarget { table, pk_cols, pk_types })
+        Some(EditTarget { table, pk_cols, pk_types, join_tables: Vec::new(), join_columns: Vec::new() })
+    }
+
+    /// The joined target behind `parse_join`: each result column maps
+    /// positionally to its SELECT item, each qualifier resolves through its
+    /// alias or table name, and each bare column resolves to the one source
+    /// table carrying it. A column stays read-only when its item is an
+    /// expression, its qualifier matches no table or several, its name is in
+    /// no table or several, its source column is unknown, or its table's
+    /// keys are missing from the result. None when no column resolves.
+    fn join_edit_target(
+        &self,
+        conn: ConnectionId,
+        sql: &str,
+        result: &QueryResult,
+    ) -> Option<EditTarget> {
+        let plan = parse_join(sql)?;
+        if plan.selects.len() != result.columns().len() {
+            return None;
+        }
+        let schema = self.schemas.get(&conn)?;
+        let mut resolved: Vec<Option<(usize, String)>> = Vec::with_capacity(plan.selects.len());
+        for select in &plan.selects {
+            let column = match &select.column {
+                Some(column) => column,
+                None => {
+                    resolved.push(None);
+                    continue;
+                }
+            };
+            if let Some(qualifier) = &select.qualifier {
+                match resolve_qualifier(&plan, qualifier) {
+                    Some(index) => resolved.push(Some((index, column.clone()))),
+                    None => resolved.push(None),
+                }
+            } else {
+                match resolve_bare_column(schema, &plan, column) {
+                    Some(index) => resolved.push(Some((index, column.clone()))),
+                    None => resolved.push(None),
+                }
+            }
+        }
+        let mut tables: Vec<JoinTableTarget> = Vec::new();
+        let mut table_index_of_source: Vec<Option<usize>> = vec![None; plan.sources.len()];
+        let mut columns: Vec<Option<JoinColumnTarget>> = Vec::with_capacity(resolved.len());
+        for slot in &resolved {
+            let Some((source_index, column)) = slot else {
+                columns.push(None);
+                continue;
+            };
+            let source_table = &plan.sources[*source_index].table;
+            let Some(info) = find_table(schema, source_table) else {
+                columns.push(None);
+                continue;
+            };
+            if !info.columns().iter().any(|c| c.name().eq_ignore_ascii_case(column)) {
+                columns.push(None);
+                continue;
+            }
+            let Some(pk) = primary_key(schema, source_table) else {
+                columns.push(None);
+                continue;
+            };
+            let mut key_cols = Vec::with_capacity(pk.len());
+            let mut key_types = Vec::with_capacity(pk.len());
+            let mut keyed = true;
+            for (key_name, key_type) in &pk {
+                let mut found = None;
+                for (index, other) in resolved.iter().enumerate() {
+                    if let Some((other_source, other_column)) = other
+                        && *other_source == *source_index
+                        && other_column.eq_ignore_ascii_case(key_name)
+                    {
+                        found = Some(index);
+                        break;
+                    }
+                }
+                match found {
+                    Some(index) => {
+                        key_cols.push((key_name.clone(), index));
+                        key_types.push(is_text_type(key_type));
+                    }
+                    None => {
+                        keyed = false;
+                        break;
+                    }
+                }
+            }
+            if !keyed {
+                columns.push(None);
+                continue;
+            }
+            let table_index = match table_index_of_source[*source_index] {
+                Some(index) => {
+                    tables[index].pk_cols = key_cols.clone();
+                    tables[index].pk_types = key_types.clone();
+                    index
+                }
+                None => {
+                    tables.push(JoinTableTarget {
+                        table: source_table.clone(),
+                        pk_cols: key_cols,
+                        pk_types: key_types,
+                    });
+                    let index = tables.len() - 1;
+                    table_index_of_source[*source_index] = Some(index);
+                    index
+                }
+            };
+            columns.push(Some(JoinColumnTarget { table_index, column: column.clone() }));
+        }
+        if columns.iter().all(|slot| slot.is_none()) {
+            return None;
+        }
+        let display = tables.iter().map(|t| t.table.clone()).collect::<Vec<_>>().join(", ");
+        Some(EditTarget {
+            table: display,
+            pk_cols: Vec::new(),
+            pk_types: Vec::new(),
+            join_tables: tables,
+            join_columns: columns,
+        })
     }
 
     /// Stage one cell edit. `row` counts result rows first, then staged added
     /// rows. No-op unless the target resolves and the cell is in the active
-    /// result or a staged added row. A later stage on the same cell replaces
-    /// its text. No-op while the SQL preview is open, so the previewed
-    /// statements cannot change underneath the modal.
+    /// result or a staged added row. A joined column stages only when its
+    /// mapping resolved; deletes and inserts stay single-table only. A later
+    /// stage on the same cell replaces its text. No-op while the SQL preview
+    /// is open, so the previewed statements cannot change underneath the
+    /// modal.
     pub fn stage_edit(&mut self, tab: TabId, row: usize, col: usize, text: String) {
         if self.pending_edit_preview.is_some() {
             return;
         }
-        if self.edit_target(tab).is_none() {
+        let Some(target) = self.edit_target(tab) else { return };
+        if target.is_join() && !target.is_column_editable(col) {
             return;
         }
         let Some((rows, cols)) = self.result_shape(tab) else { return };
+        if col >= cols {
+            return;
+        }
+        if target.is_join() && row >= rows {
+            return;
+        }
         let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) else { return };
         match row.checked_sub(rows).filter(|index| *index < t.added_rows.len()) {
             Some(index) => {
@@ -1730,10 +1982,14 @@ impl AppState {
     }
 
     /// Stage a DELETE for one result row. Marking the row again restores it.
-    /// No-op unless the target resolves and the row is in the active result.
-    /// No-op while the SQL preview is open, the way staging is.
+    /// Single-table only: a joined target never deletes, since the row spans
+    /// tables. No-op unless the target resolves and the row is in the active
+    /// result. No-op while the SQL preview is open, the way staging is.
     pub fn mark_row_deleted(&mut self, tab: TabId, row: usize) {
         if self.pending_edit_preview.is_some() {
+            return;
+        }
+        if self.edit_target(tab).is_some_and(|target| target.is_join()) {
             return;
         }
         if self.edit_target(tab).is_none() {
@@ -1753,10 +2009,14 @@ impl AppState {
     }
 
     /// Stage one empty row for INSERT, with one cell per result column.
-    /// No-op unless the target resolves. No-op while the SQL preview is
-    /// open, the way staging is.
+    /// Single-table only: a joined result never inserts, since the row spans
+    /// tables. No-op unless the target resolves. No-op while the SQL preview
+    /// is open, the way staging is.
     pub fn add_row(&mut self, tab: TabId) {
         if self.pending_edit_preview.is_some() {
+            return;
+        }
+        if self.edit_target(tab).is_some_and(|target| target.is_join()) {
             return;
         }
         if self.edit_target(tab).is_none() {
@@ -1865,11 +2125,16 @@ impl AppState {
     /// Read and parse a CSV file for one tab and stage it for confirmation.
     /// Failure lands in the tab's notice: an unreadable file, a file that is
     /// not a CSV of one column count, or a tab the edit path cannot resolve.
+    /// Joined results never import, since the row spans tables.
     pub fn begin_import(&mut self, tab: TabId, path: &std::path::Path) {
         let Some(target) = self.edit_target(tab) else {
             self.set_tab_notice(tab, "Import failed: the table is not editable".to_owned(), true);
             return;
         };
+        if target.is_join() {
+            self.set_tab_notice(tab, "Import failed: the table is not editable".to_owned(), true);
+            return;
+        }
         let conn = match self.tabs.iter().find(|t| t.id == tab) {
             Some(t) => match t.conn {
                 Some(conn) => conn,
@@ -1926,7 +2191,7 @@ impl AppState {
     /// Nothing sends without a draft.
     pub fn commit_import(&mut self) {
         let Some(draft) = self.imports.take() else { return };
-        if self.edit_target(draft.tab).is_none() {
+        if self.edit_target(draft.tab).is_none_or(|target| target.is_join()) {
             self.set_tab_notice(
                 draft.tab,
                 "Import failed: the table is not editable".to_owned(),
@@ -2019,8 +2284,14 @@ impl AppState {
     }
 
     /// The statements for the staged changes, in apply order. None when the
-    /// displayed result cannot be read.
+    /// displayed result cannot be read. A single-table target sends one
+    /// UPDATE per dirty row plus deletes and inserts; a joined target sends
+    /// one UPDATE per dirty row per touched source table and never deletes
+    /// or inserts.
     fn edit_statements(&self, tab: TabId, target: &EditTarget) -> Option<Vec<String>> {
+        if target.is_join() {
+            return self.join_edit_statements(tab, target);
+        }
         let t = self.tabs.iter().find(|t| t.id == tab)?;
         let result = t.active_query_result()?;
         let columns: Vec<String> =
@@ -2050,6 +2321,41 @@ impl AppState {
         }
         for added in &t.added_rows {
             statements.push(insert_statement(&target.table, &columns, added));
+        }
+        Some(statements)
+    }
+
+    /// One UPDATE per dirty row per touched source table. A staged edit on a
+    /// read-only column never reaches here, since staging drops it; a row
+    /// with only such edits sends nothing.
+    fn join_edit_statements(&self, tab: TabId, target: &EditTarget) -> Option<Vec<String>> {
+        let t = self.tabs.iter().find(|t| t.id == tab)?;
+        let result = t.active_query_result()?;
+        let mut statements = Vec::new();
+        let mut dirty_rows: Vec<usize> = t.edits.iter().map(|e| e.row).collect();
+        dirty_rows.sort_unstable();
+        dirty_rows.dedup();
+        for row in dirty_rows {
+            if row >= result.row_count() || t.is_row_deleted(row) {
+                continue;
+            }
+            for (table_index, join_table) in target.join_tables.iter().enumerate() {
+                let mut sets: Vec<(String, String)> = Vec::new();
+                for (col, slot) in target.join_columns.iter().enumerate() {
+                    let Some(mapping) = slot else { continue };
+                    if mapping.table_index != table_index {
+                        continue;
+                    }
+                    if let Some(text) = t.edit_text(row, col) {
+                        sets.push((mapping.column.clone(), text.to_owned()));
+                    }
+                }
+                if sets.is_empty() {
+                    continue;
+                }
+                let pk = join_key_pairs(result, join_table, row)?;
+                statements.push(update_statement(&join_table.table, &pk, &sets));
+            }
         }
         Some(statements)
     }
@@ -3949,6 +4255,123 @@ mod tests {
         );
         state.apply(DbEvent::BatchOk { run, results: vec![items_result()] });
         (tab, conn, commands)
+    }
+
+    /// Two keyed tables for join tests: users with one editable column and
+    /// orders with a key, a link, and one editable column.
+    fn join_schema() -> SchemaInfo {
+        let users = TableInfo::new(
+            "users".to_owned(),
+            TableKind::Table,
+            vec![
+                ColumnInfo::new("id".to_owned(), "INTEGER".to_owned(), false, Some(1)).unwrap(),
+                ColumnInfo::new("name".to_owned(), "TEXT".to_owned(), true, None).unwrap(),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let orders = TableInfo::new(
+            "orders".to_owned(),
+            TableKind::Table,
+            vec![
+                ColumnInfo::new("id".to_owned(), "INTEGER".to_owned(), false, Some(1)).unwrap(),
+                ColumnInfo::new("user_id".to_owned(), "INTEGER".to_owned(), true, None).unwrap(),
+                ColumnInfo::new("total".to_owned(), "INTEGER".to_owned(), true, None).unwrap(),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let node = SchemaNode::new(
+            "main".to_owned(),
+            vec![users, orders],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let database = DatabaseNode::new(":memory:".to_owned(), vec![node]).unwrap();
+        SchemaInfo::new(vec![database], false, false)
+    }
+
+    fn join_result() -> QueryResult {
+        QueryResult::from_columns(
+            vec![
+                crate::db::Column::new(
+                    "id".to_owned(),
+                    "INTEGER".to_owned(),
+                    vec![crate::db::Value::Integer(1), crate::db::Value::Integer(2)],
+                ),
+                crate::db::Column::new(
+                    "name".to_owned(),
+                    "TEXT".to_owned(),
+                    vec![
+                        crate::db::Value::Text("ada".to_owned()),
+                        crate::db::Value::Text("grace".to_owned()),
+                    ],
+                ),
+                crate::db::Column::new(
+                    "oid".to_owned(),
+                    "INTEGER".to_owned(),
+                    vec![crate::db::Value::Integer(10), crate::db::Value::Integer(20)],
+                ),
+                crate::db::Column::new(
+                    "total".to_owned(),
+                    "INTEGER".to_owned(),
+                    vec![crate::db::Value::Integer(100), crate::db::Value::Integer(200)],
+                ),
+            ],
+            false,
+            None,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap()
+    }
+
+    /// An idle scripted connection with the join schema loaded and one tab
+    /// showing the two-table join.
+    fn join_tab(state: &mut AppState) -> (TabId, ConnectionId, mpsc::Receiver<DbCommand>) {
+        let conn = add_sqlite_connection(state, "mem-join");
+        let commands = attach_test_session(state, conn);
+        state.apply(DbEvent::SchemaOk { conn, schema: join_schema() });
+        let tab = state.new_tab(conn);
+        let sql = "SELECT u.id, u.name, o.id AS oid, o.total \
+                   FROM users u JOIN orders o ON o.user_id = u.id";
+        if let Some(slot) = state.tab_sql_mut(tab) {
+            *slot = sql.to_owned();
+        }
+        let run = state.ids.run();
+        state.set_outcome(
+            tab,
+            RunOutcome::Running {
+                run,
+                started: Instant::now(),
+                statements: vec![sql.to_owned()],
+            },
+        );
+        state.apply(DbEvent::BatchOk { run, results: vec![join_result()] });
+        (tab, conn, commands)
+    }
+
+    /// Point the tab's SQL at `sql` without touching its result, for
+    /// resolver cases where the shape still lines up.
+    fn set_tab_sql(state: &mut AppState, tab: TabId, sql: &str) {
+        if let Some(slot) = state.tab_sql_mut(tab) {
+            *slot = sql.to_owned();
+        }
     }
 
     /// Every text galley painted in one frame, for render assertions.
@@ -6449,6 +6872,137 @@ mod tests {
     }
 
     #[test]
+    fn join_target_maps_each_column_to_its_source_table() {
+        with_isolated_state("edit-join-target", |state| {
+            let (tab, _conn, _commands) = join_tab(state);
+            let target = state.edit_target(tab).expect("join target");
+            assert!(target.is_join());
+            assert_eq!(target.table, "users, orders");
+            assert_eq!(target.join_tables.len(), 2);
+            assert_eq!(target.join_tables[0].table, "users");
+            assert_eq!(target.join_tables[0].pk_cols, vec![("id".to_owned(), 0)]);
+            assert_eq!(target.join_tables[1].table, "orders");
+            assert_eq!(target.join_tables[1].pk_cols, vec![("id".to_owned(), 2)]);
+            assert_eq!(
+                target.join_columns,
+                vec![
+                    Some(JoinColumnTarget { table_index: 0, column: "id".to_owned() }),
+                    Some(JoinColumnTarget { table_index: 0, column: "name".to_owned() }),
+                    Some(JoinColumnTarget { table_index: 1, column: "id".to_owned() }),
+                    Some(JoinColumnTarget { table_index: 1, column: "total".to_owned() }),
+                ]
+            );
+            for col in 0..4 {
+                assert!(target.is_column_editable(col), "col {col} edits");
+            }
+
+            set_tab_sql(
+                state,
+                tab,
+                "SELECT users.id, users.name, orders.id AS oid, orders.total \
+                 FROM users JOIN orders ON orders.user_id = users.id",
+            );
+            let named = state.edit_target(tab).expect("table names resolve");
+            assert!(named.is_join());
+            assert_eq!(named.join_columns.len(), 4);
+            assert!(named.join_columns.iter().all(|slot| slot.is_some()));
+
+            set_tab_sql(
+                state,
+                tab,
+                "SELECT u.id, u.name, o.id AS oid, o.total FROM users AS u JOIN orders AS o \
+                 ON o.user_id = u.id WHERE u.id > 0 ORDER BY u.id LIMIT 10",
+            );
+            assert!(state.edit_target(tab).expect("clauses resolve").is_join());
+        });
+    }
+
+    #[test]
+    fn join_staging_routes_each_cell_to_its_source_table() {
+        with_isolated_state("edit-join-apply", |state| {
+            let (tab, _conn, commands) = join_tab(state);
+            state.stage_edit(tab, 0, 1, "Ada".to_owned());
+            state.stage_edit(tab, 1, 3, "999".to_owned());
+            assert_eq!(
+                state.preview_edit_statements(tab),
+                Some(vec![
+                    "UPDATE \"users\" SET \"name\" = 'Ada' WHERE \"id\" = 1".to_owned(),
+                    "UPDATE \"orders\" SET \"total\" = 999 WHERE \"id\" = 20".to_owned(),
+                ])
+            );
+            state.apply_edits(tab);
+            assert_eq!(state.pending_edit_preview(), Some(tab));
+            state.confirm_pending_edits();
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => assert_eq!(
+                    statements,
+                    vec![
+                        "UPDATE \"users\" SET \"name\" = 'Ada' WHERE \"id\" = 1",
+                        "UPDATE \"orders\" SET \"total\" = 999 WHERE \"id\" = 20",
+                    ]
+                ),
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn join_unresolvable_ambiguous_and_keyless_columns_stay_read_only() {
+        with_isolated_state("edit-join-readonly", |state| {
+            let (tab, _conn, _commands) = join_tab(state);
+            set_tab_sql(
+                state,
+                tab,
+                "SELECT u.id, u.name, o.id AS oid, count(*) \
+                 FROM users u JOIN orders o ON o.user_id = u.id",
+            );
+            let target = state.edit_target(tab).expect("partial target");
+            assert!(target.is_join());
+            assert_eq!(target.join_columns.len(), 4);
+            assert!(target.join_columns[0].is_some());
+            assert!(target.join_columns[1].is_some());
+            assert!(target.join_columns[2].is_some());
+            assert_eq!(target.join_columns[3], None);
+            assert!(!target.is_column_editable(3));
+            state.stage_edit(tab, 0, 3, "x".to_owned());
+            assert!(state.tab(tab).expect("tab").edits().is_empty());
+            state.stage_edit(tab, 0, 1, "Ada".to_owned());
+            assert_eq!(state.tab(tab).expect("tab").edits().len(), 1);
+            assert_eq!(
+                state.preview_edit_statements(tab),
+                Some(vec!["UPDATE \"users\" SET \"name\" = 'Ada' WHERE \"id\" = 1".to_owned()])
+            );
+
+            set_tab_sql(state, tab, "SELECT id, name, oid, total FROM users u JOIN orders o ON o.user_id = u.id");
+            assert_eq!(state.edit_target(tab), None);
+
+            set_tab_sql(state, tab, "SELECT a.id, a.name, a.oid, a.total FROM users a JOIN orders a ON a.user_id = a.id");
+            assert_eq!(state.edit_target(tab), None);
+
+            set_tab_sql(state, tab, "SELECT u.name, u.name, o.total, o.total FROM users u JOIN orders o ON o.user_id = u.id");
+            assert_eq!(state.edit_target(tab), None);
+        });
+    }
+
+    #[test]
+    fn join_deletes_and_inserts_stay_disabled() {
+        with_isolated_state("edit-join-no-delete", |state| {
+            let (tab, _conn, _commands) = join_tab(state);
+            state.mark_row_deleted(tab, 0);
+            assert!(!state.tab(tab).expect("tab").is_row_deleted(0));
+            state.add_row(tab);
+            assert!(state.tab(tab).expect("tab").added_rows().is_empty());
+            state.stage_edit(tab, 0, 1, "Ada".to_owned());
+            state.apply_edits(tab);
+            assert_eq!(state.pending_edit_preview(), Some(tab));
+            assert_eq!(
+                state.preview_edit_statements(tab),
+                Some(vec!["UPDATE \"users\" SET \"name\" = 'Ada' WHERE \"id\" = 1".to_owned()])
+            );
+        });
+    }
+
+    #[test]
     fn stage_and_discard_roundtrip() {
         with_isolated_state("edit-stage", |state| {
             let (tab, _conn, _commands) = editable_tab(state);
@@ -8374,6 +8928,174 @@ mod tests {
             live_transaction(state, tab, TransactionAction::Rollback);
             live_autocommit(state, tab, conn, true);
             live_run(state, tab, "DROP TABLE cde_idle_probe");
+        });
+    }
+
+    /// The first result cell as text.
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    fn text_cell(state: &AppState, tab: TabId) -> String {
+        match state.tab(tab).and_then(|t| t.active_query_result()).and_then(|r| r.cell(0, 0)) {
+            Some(Value::Text(text)) => text.clone(),
+            other => panic!("expected a text cell, got {other:?}"),
+        }
+    }
+
+    /// True once the loaded schema carries both join scratch tables.
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    fn has_join_tables(state: &AppState, conn: ConnectionId) -> bool {
+        state.schema(conn).is_some_and(|schema| {
+            let mut users = false;
+            let mut orders = false;
+            for database in schema.databases() {
+                for node in database.schemas() {
+                    for table in node.tables() {
+                        if table.name().eq_ignore_ascii_case("cde_join_users") {
+                            users = true;
+                        }
+                        if table.name().eq_ignore_ascii_case("cde_join_orders") {
+                            orders = true;
+                        }
+                    }
+                }
+            }
+            users && orders
+        })
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_join_edit_writes_each_source_table() {
+        with_isolated_state("pg-join-live", |state| {
+            let conn = add_postgres_probe_connection(state);
+            state.connect(conn);
+            assert!(
+                pump_until(state, |s| {
+                    s.connections().iter().any(|c| {
+                        c.id == conn && matches!(c.state(), ConnectionState::Connected { .. })
+                    })
+                }),
+                "connects to live Postgres"
+            );
+            let tab = state.new_tab(conn);
+            live_run(state, tab, "DROP TABLE IF EXISTS cde_join_orders");
+            live_run(state, tab, "DROP TABLE IF EXISTS cde_join_users");
+            live_run(state, tab, "CREATE TABLE cde_join_users (id INT PRIMARY KEY, name TEXT)");
+            live_run(
+                state,
+                tab,
+                "CREATE TABLE cde_join_orders (id INT PRIMARY KEY, user_id INT, total INT)",
+            );
+            live_run(
+                state,
+                tab,
+                "INSERT INTO cde_join_users (id, name) VALUES (1, 'ada'), (2, 'grace')",
+            );
+            live_run(
+                state,
+                tab,
+                "INSERT INTO cde_join_orders (id, user_id, total) VALUES (10, 1, 100), (20, 2, 200)",
+            );
+            state.refresh_schema(conn);
+            assert!(
+                pump_until(state, |s| has_join_tables(s, conn)),
+                "the schema loads the join tables"
+            );
+            let join_sql = "SELECT u.id, u.name, o.id AS oid, o.total FROM cde_join_users u \
+                            JOIN cde_join_orders o ON o.user_id = u.id ORDER BY u.id";
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = join_sql.to_owned();
+            }
+            live_run(state, tab, join_sql);
+            let target = state.edit_target(tab).expect("the join resolves");
+            assert!(target.is_join(), "aliased two-table SELECT edits");
+            state.stage_edit(tab, 0, 1, "Ada".to_owned());
+            state.stage_edit(tab, 1, 3, "999".to_owned());
+            assert_eq!(
+                state.preview_edit_statements(tab),
+                Some(vec![
+                    "UPDATE \"cde_join_users\" SET \"name\" = 'Ada' WHERE \"id\" = 1".to_owned(),
+                    "UPDATE \"cde_join_orders\" SET \"total\" = 999 WHERE \"id\" = 20".to_owned(),
+                ])
+            );
+            state.apply_edits(tab);
+            state.confirm_pending_edits();
+            assert!(
+                pump_until(state, |s| {
+                    !matches!(s.tab(tab).map(|t| t.outcome()), Some(RunOutcome::Running { .. }))
+                }),
+                "the join apply and refresh land"
+            );
+            assert_eq!(state.tab(tab).expect("tab").staged_count(), 0);
+            live_run(state, tab, "SELECT name FROM cde_join_users WHERE id = 1");
+            assert_eq!(text_cell(state, tab), "Ada");
+            live_run(state, tab, "SELECT total FROM cde_join_orders WHERE id = 20");
+            assert_eq!(integer_cell(state, tab), 999);
+            live_run(state, tab, "DROP TABLE cde_join_orders");
+            live_run(state, tab, "DROP TABLE cde_join_users");
+        });
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    #[ignore = "needs a live MySQL; set MYSQLHOST/MYSQLPORT/MYSQLDATABASE/MYSQLUSER/MYSQLPASSWORD"]
+    fn mysql_live_join_mapping_matches_postgres_without_applying() {
+        with_isolated_state("mysql-join-live", |state| {
+            let conn = add_mysql_probe_connection(state);
+            state.connect(conn);
+            assert!(
+                pump_until(state, |s| {
+                    s.connections().iter().any(|c| {
+                        c.id == conn && matches!(c.state(), ConnectionState::Connected { .. })
+                    })
+                }),
+                "connects to live MySQL"
+            );
+            let tab = state.new_tab(conn);
+            live_run(state, tab, "DROP TABLE IF EXISTS cde_join_orders");
+            live_run(state, tab, "DROP TABLE IF EXISTS cde_join_users");
+            live_run(state, tab, "CREATE TABLE cde_join_users (id INT PRIMARY KEY, name TEXT)");
+            live_run(
+                state,
+                tab,
+                "CREATE TABLE cde_join_orders (id INT PRIMARY KEY, user_id INT, total INT)",
+            );
+            live_run(
+                state,
+                tab,
+                "INSERT INTO cde_join_users (id, name) VALUES (1, 'ada'), (2, 'grace')",
+            );
+            live_run(
+                state,
+                tab,
+                "INSERT INTO cde_join_orders (id, user_id, total) VALUES (10, 1, 100), (20, 2, 200)",
+            );
+            state.refresh_schema(conn);
+            assert!(
+                pump_until(state, |s| has_join_tables(s, conn)),
+                "the schema loads the join tables"
+            );
+            let join_sql = "SELECT u.id, u.name, o.id AS oid, o.total FROM cde_join_users u \
+                            JOIN cde_join_orders o ON o.user_id = u.id ORDER BY u.id";
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = join_sql.to_owned();
+            }
+            live_run(state, tab, join_sql);
+            let target = state.edit_target(tab).expect("the join resolves");
+            assert!(target.is_join(), "aliased two-table SELECT edits");
+            state.stage_edit(tab, 0, 1, "Ada".to_owned());
+            state.stage_edit(tab, 1, 3, "999".to_owned());
+            assert_eq!(
+                state.preview_edit_statements(tab),
+                Some(vec![
+                    "UPDATE \"cde_join_users\" SET \"name\" = 'Ada' WHERE \"id\" = 1".to_owned(),
+                    "UPDATE \"cde_join_orders\" SET \"total\" = 999 WHERE \"id\" = 20".to_owned(),
+                ]),
+                "MySQL maps the same UPDATEs as Postgres; the apply stays Postgres-only \
+                 since MySQL rejects double-quoted identifiers"
+            );
+            live_run(state, tab, "DROP TABLE cde_join_orders");
+            live_run(state, tab, "DROP TABLE cde_join_users");
         });
     }
 }
