@@ -2740,7 +2740,7 @@ fn save_settings(settings: &Settings) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::db::PostgresSslMode;
-    use crate::db::{ColumnInfo, DatabaseNode, SchemaNode, TableInfo, TableKind};
+    use crate::db::{ColumnInfo, DatabaseNode, MysqlSslMode, SchemaNode, TableInfo, TableKind};
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -2829,6 +2829,7 @@ mod tests {
                 port: 3307,
                 database: "cde_test".to_owned(),
                 user: "root".to_owned(),
+                ssl_mode: MysqlSslMode::default(),
                 ssh: None,
             };
             draft.password = password.to_owned();
@@ -3096,6 +3097,7 @@ mod tests {
                 database: std::env::var("MYSQLDATABASE")
                     .unwrap_or_else(|_| "mysql".to_owned()),
                 user: std::env::var("MYSQLUSER").unwrap_or_else(|_| "root".to_owned()),
+                ssl_mode: MysqlSslMode::default(),
                 ssh: None,
             };
             draft.password = std::env::var("MYSQLPASSWORD").unwrap_or_default();
@@ -4581,6 +4583,7 @@ mod tests {
                     port: 3307,
                     database: "cde_test".to_owned(),
                     user: "root".to_owned(),
+                    ssl_mode: MysqlSslMode::default(),
                     ssh: None,
                 }
             );

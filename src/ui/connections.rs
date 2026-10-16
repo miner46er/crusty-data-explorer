@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use eframe::egui;
 
 use crate::app::{AppState, ConnectionState, Environment, SavedQuery, saved_groups};
-use crate::db::{ConnectionConfig, ConnectionId, PostgresSslMode, parse_connection_url};
+use crate::db::{ConnectionConfig, ConnectionId, MysqlSslMode, PostgresSslMode, parse_connection_url};
 use crate::ssh::{SshAuth, SshConfig};
 
 use super::{Palette, Theme};
@@ -584,7 +584,7 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
                 });
                 ssh_section(ui, ssh, &mut draft.ssh_password);
             }
-            ConnectionConfig::Mysql { host, port, database, user, ssh, .. } => {
+            ConnectionConfig::Mysql { host, port, database, user, ssl_mode, ssh, .. } => {
                 ui.horizontal(|ui| {
                     ui.label("Host:");
                     ui.text_edit_singleline(host);
@@ -606,7 +606,16 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
                     ui.label("User:");
                     ui.text_edit_singleline(user);
                 });
-                // MySQL TLS options land with their own unit, so no SSL row yet.
+                ui.horizontal(|ui| {
+                    ui.label("SSL:");
+                    egui::ComboBox::from_label("")
+                        .selected_text(ssl_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in MysqlSslMode::ALL {
+                                ui.selectable_value(ssl_mode, mode, mode.label());
+                            }
+                        });
+                });
                 ssh_section(ui, ssh, &mut draft.ssh_password);
             }
         }

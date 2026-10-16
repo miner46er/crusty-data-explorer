@@ -124,6 +124,7 @@ impl DbKind {
                 port: 3306,
                 database: String::new(),
                 user: String::new(),
+                ssl_mode: MysqlSslMode::default(),
                 ssh: None,
                 read_only: false,
             },
@@ -529,6 +530,54 @@ impl PostgresSslMode {
     }
 }
 
+/// MySQL TLS policy. `VerifyIdentity` is MySQL's counterpart of Postgres
+/// `verify-full`; the rest mirror the Postgres set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MysqlSslMode {
+    Disabled,
+    Preferred,
+    Required,
+    VerifyCa,
+    VerifyIdentity,
+}
+
+impl Default for MysqlSslMode {
+    fn default() -> Self {
+        Self::Preferred
+    }
+}
+
+impl MysqlSslMode {
+    pub const ALL: [MysqlSslMode; 5] = [
+        MysqlSslMode::Disabled,
+        MysqlSslMode::Preferred,
+        MysqlSslMode::Required,
+        MysqlSslMode::VerifyCa,
+        MysqlSslMode::VerifyIdentity,
+    ];
+    /// The value sqlx's MySQL URL parser accepts, which is not the Postgres
+    /// spelling. sqlx rejects `prefer`, `verify-ca`, and `verify-full`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MysqlSslMode::Disabled => "disabled",
+            MysqlSslMode::Preferred => "preferred",
+            MysqlSslMode::Required => "required",
+            MysqlSslMode::VerifyCa => "verify_ca",
+            MysqlSslMode::VerifyIdentity => "verify_identity",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            MysqlSslMode::Disabled => "Disabled",
+            MysqlSslMode::Preferred => "Preferred",
+            MysqlSslMode::Required => "Required",
+            MysqlSslMode::VerifyCa => "Verify CA",
+            MysqlSslMode::VerifyIdentity => "Verify Identity",
+        }
+    }
+}
+
 /// Persisted settings, one variant per engine. The variant IS the kind.
 /// Serialized shape (the `kind` tag) is the on-disk contract.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -556,6 +605,8 @@ pub enum ConnectionConfig {
         port: u16,
         database: String,
         user: String,
+        #[serde(default)]
+        ssl_mode: MysqlSslMode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ssh: Option<SshConfig>,
         #[serde(default)]
@@ -2863,7 +2914,8 @@ impl MySession {
         password: Option<&str>,
         ssh_password: Option<&str>,
     ) -> Result<Self, DbError> {
-        let ConnectionConfig::Mysql { host, port, database, user, ssh, .. } = config else {
+        let ConnectionConfig::Mysql { host, port, database, user, ssl_mode, ssh, .. } = config
+        else {
             return Err(DbError::Config("not a mysql connection".to_owned()));
         };
         let (tunnel, dial_host, dial_port) = crate::ssh::forward(
@@ -2872,7 +2924,8 @@ impl MySession {
             host,
             *port,
         )?;
-        let connection_string = mysql_url(&dial_host, dial_port, database, user, password);
+        let connection_string =
+            mysql_url(&dial_host, dial_port, database, user, password, *ssl_mode);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -3684,22 +3737,28 @@ fn my_temporal_text(type_name: &str, bytes: &[u8]) -> String {
 
 /// Pure URL builder for MySQL. User, password, and database are
 /// percent-encoded; an empty or missing password omits the secret part.
-/// TLS parameters land with their own unit, so no query string yet.
+/// `Preferred` leaves the URL untouched; any other mode appends `ssl-mode`.
 pub fn mysql_url(
     host: &str,
     port: u16,
     database: &str,
     user: &str,
     password: Option<&str>,
+    ssl_mode: MysqlSslMode,
 ) -> String {
     let user_enc = percent_encode(user);
     let db_enc = percent_encode(database);
-    match password {
+    let base = match password {
         Some(s) if !s.is_empty() => {
             let enc: String = percent_encode(s);
             format!("mysql://{user_enc}:{enc}@{host}:{port}/{db_enc}")
         }
         _ => format!("mysql://{user_enc}@{host}:{port}/{db_enc}"),
+    };
+    if ssl_mode == MysqlSslMode::Preferred {
+        base
+    } else {
+        format!("{base}?ssl-mode={}", ssl_mode.as_str())
     }
 }
 
@@ -4006,7 +4065,15 @@ fn parse_network_url(kind: DbKind, rest: &str) -> Result<ParsedConnectionUrl, Db
             read_only: false,
         },
         DbKind::Mysql => {
-            ConnectionConfig::Mysql { host, port, database, user, ssh: None, read_only: false }
+            ConnectionConfig::Mysql {
+                host,
+                port,
+                database,
+                user,
+                ssl_mode: MysqlSslMode::default(),
+                ssh: None,
+                read_only: false,
+            }
         }
         DbKind::Sqlite => return Err(invalid_url()),
     };
@@ -4929,6 +4996,54 @@ mod tests {
         assert_eq!(PostgresSslMode::default(), PostgresSslMode::Disable);
     }
 
+    #[test]
+    fn mysql_ssl_mode_roundtrips_through_json() {
+        for (mode, json_name) in [
+            (MysqlSslMode::Disabled, "disabled"),
+            (MysqlSslMode::Preferred, "preferred"),
+            (MysqlSslMode::Required, "required"),
+            (MysqlSslMode::VerifyCa, "verify_ca"),
+            (MysqlSslMode::VerifyIdentity, "verify_identity"),
+        ] {
+            let config = ConnectionConfig::Mysql { read_only: false,
+                host: "localhost".to_owned(),
+                port: 3306,
+                database: "cde_test".to_owned(),
+                user: "root".to_owned(),
+                ssl_mode: mode,
+                ssh: None,
+            };
+            let json = serde_json::to_string(&config).unwrap();
+            assert!(json.contains(&format!("\"ssl_mode\":\"{json_name}\"")), "{json}");
+            let back: ConnectionConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, config);
+        }
+    }
+
+    #[test]
+    fn mysql_ssl_mode_missing_from_old_profiles_defaults_to_preferred() {
+        let old = serde_json::json!({
+            "kind": "mysql",
+            "host": "localhost",
+            "port": 3306,
+            "database": "cde_test",
+            "user": "root",
+        });
+        let back: ConnectionConfig = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            back,
+            ConnectionConfig::Mysql { read_only: false,
+                host: "localhost".to_owned(),
+                port: 3306,
+                database: "cde_test".to_owned(),
+                user: "root".to_owned(),
+                ssl_mode: MysqlSslMode::Preferred,
+                ssh: None,
+            }
+        );
+        assert_eq!(MysqlSslMode::default(), MysqlSslMode::Preferred);
+    }
+
     /// An ssh config shared by the tunnel tests.
     fn ssh_config() -> crate::ssh::SshConfig {
         crate::ssh::SshConfig {
@@ -4957,6 +5072,7 @@ mod tests {
                 port: 3307,
                 database: "cde_test".to_owned(),
                 user: "root".to_owned(),
+                ssl_mode: MysqlSslMode::default(),
                 ssh,
             };
             let json = serde_json::to_string(&mysql).unwrap();
@@ -4991,7 +5107,7 @@ mod tests {
             "postgres://owner:s3cret@127.0.0.1:41234/appdb"
         );
         assert_eq!(
-            mysql_url(&host, port, "cde_test", "root", None),
+            mysql_url(&host, port, "cde_test", "root", None, MysqlSslMode::Preferred),
             "mysql://root@127.0.0.1:41234/cde_test"
         );
     }
@@ -5085,6 +5201,7 @@ mod tests {
                 port: 3306,
                 database: String::new(),
                 user: String::new(),
+                ssl_mode: MysqlSslMode::default(),
                 ssh: None,
             }
         );
@@ -5100,11 +5217,12 @@ mod tests {
             port: 3307,
             database: "cde_test".to_owned(),
             user: "root".to_owned(),
+            ssl_mode: MysqlSslMode::Preferred,
             ssh: None,
         };
         assert_eq!(
             serde_json::to_string(&config).unwrap(),
-            r#"{"kind":"mysql","host":"db.internal","port":3307,"database":"cde_test","user":"root","read_only":false}"#
+            r#"{"kind":"mysql","host":"db.internal","port":3307,"database":"cde_test","user":"root","ssl_mode":"preferred","read_only":false}"#
         );
         let back: ConnectionConfig = serde_json::from_str(&serde_json::to_string(&config).unwrap())
             .unwrap();
@@ -5120,6 +5238,7 @@ mod tests {
             port,
             database: database.to_owned(),
             user: user.to_owned(),
+            ssl_mode: MysqlSslMode::default(),
             ssh: None,
         };
         assert!(
@@ -5144,13 +5263,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_every_mysql_ssl_mode() {
+        for mode in MysqlSslMode::ALL {
+            let config = ConnectionConfig::Mysql { read_only: false,
+                host: "localhost".to_owned(),
+                port: 3307,
+                database: "cde_test".to_owned(),
+                user: "root".to_owned(),
+                ssl_mode: mode,
+                ssh: None,
+            };
+            assert_eq!(config.validate(), Ok(()), "{mode:?}");
+        }
+    }
+
+    #[test]
     fn mysql_url_without_password_omits_secret() {
         assert_eq!(
-            mysql_url("localhost", 3306, "cde_test", "root", None),
+            mysql_url("localhost", 3306, "cde_test", "root", None, MysqlSslMode::Preferred),
             "mysql://root@localhost:3306/cde_test"
         );
         assert_eq!(
-            mysql_url("localhost", 3306, "cde_test", "root", Some("")),
+            mysql_url("localhost", 3306, "cde_test", "root", Some(""), MysqlSslMode::Preferred),
             "mysql://root@localhost:3306/cde_test"
         );
     }
@@ -5158,7 +5292,7 @@ mod tests {
     #[test]
     fn mysql_url_with_password_includes_secret() {
         assert_eq!(
-            mysql_url("db.internal", 3307, "cde_test", "root", Some("cdepass")),
+            mysql_url("db.internal", 3307, "cde_test", "root", Some("cdepass"), MysqlSslMode::Preferred),
             "mysql://root:cdepass@db.internal:3307/cde_test"
         );
     }
@@ -5166,9 +5300,66 @@ mod tests {
     #[test]
     fn mysql_url_encodes_special_chars_in_user_and_password() {
         assert_eq!(
-            mysql_url("localhost", 3306, "cde test", "ad min", Some("p@ss:w/ord?")),
+            mysql_url("localhost", 3306, "cde test", "ad min", Some("p@ss:w/ord?"), MysqlSslMode::Preferred),
             "mysql://ad%20min:p%40ss%3Aw%2Ford%3F@localhost:3306/cde%20test"
         );
+    }
+
+    #[test]
+    fn mysql_url_preferred_default_keeps_old_string() {
+        assert_eq!(
+            mysql_url("localhost", 3306, "cde_test", "root", None, MysqlSslMode::Preferred),
+            "mysql://root@localhost:3306/cde_test"
+        );
+        assert_eq!(
+            mysql_url(
+                "db.internal",
+                3307,
+                "cde_test",
+                "root",
+                Some("cdepass"),
+                MysqlSslMode::Preferred,
+            ),
+            "mysql://root:cdepass@db.internal:3307/cde_test"
+        );
+    }
+
+    #[test]
+    fn mysql_url_appends_ssl_mode_per_variant() {
+        for (mode, wire) in [
+            (MysqlSslMode::Disabled, "disabled"),
+            (MysqlSslMode::Required, "required"),
+            (MysqlSslMode::VerifyCa, "verify_ca"),
+            (MysqlSslMode::VerifyIdentity, "verify_identity"),
+        ] {
+            assert_eq!(
+                mysql_url("localhost", 3306, "cde_test", "root", None, mode),
+                format!("mysql://root@localhost:3306/cde_test?ssl-mode={wire}"),
+            );
+            assert_eq!(
+                mysql_url("db.internal", 3307, "cde_test", "root", Some("cdepass"), mode),
+                format!("mysql://root:cdepass@db.internal:3307/cde_test?ssl-mode={wire}"),
+            );
+        }
+    }
+
+    /// Pins every value to sqlx's own MySQL parser.
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn mysql_ssl_mode_wire_spellings_parse_as_sqlx_options() {
+        for mode in MysqlSslMode::ALL {
+            let url =
+                format!("mysql://root@localhost:3306/cde_test?ssl-mode={}", mode.as_str());
+            let options: sqlx::mysql::MySqlConnectOptions = url.parse().unwrap();
+            assert_eq!(format!("{:?}", options.get_ssl_mode()), format!("{mode:?}"), "{url}");
+        }
+        for url in [
+            "mysql://root@localhost:3306/cde_test?ssl-mode=prefer",
+            "mysql://root@localhost:3306/cde_test?ssl-mode=verify-ca",
+            "mysql://root@localhost:3306/cde_test?ssl-mode=verify-full",
+        ] {
+            assert!(url.parse::<sqlx::mysql::MySqlConnectOptions>().is_err(), "{url}");
+        }
     }
 
     #[test]
@@ -5282,6 +5473,7 @@ mod tests {
                 port: 3307,
                 database: "cde_test".to_owned(),
                 user: "root".to_owned(),
+                ssl_mode: MysqlSslMode::default(),
                 ssh: None,
             }
         );
@@ -5299,6 +5491,7 @@ mod tests {
                 port: 3306,
                 database: "cde_test".to_owned(),
                 user: "root".to_owned(),
+                ssl_mode: MysqlSslMode::default(),
                 ssh: None,
             }
         );
@@ -5319,6 +5512,7 @@ mod tests {
                 port: 3306,
                 database: "cde test".to_owned(),
                 user: "ad min".to_owned(),
+                ssl_mode: MysqlSslMode::default(),
                 ssh: None,
             }
         );
@@ -5444,14 +5638,29 @@ mod tests {
             port: 3307,
             database: "cde_test".to_owned(),
             user: "root".to_owned(),
+            ssl_mode: MysqlSslMode::Preferred,
             ssh: None,
         };
-        let url = mysql_url("db.internal", 3307, "cde_test", "root", Some("cdepass"));
+        let url = mysql_url(
+            "db.internal",
+            3307,
+            "cde_test",
+            "root",
+            Some("cdepass"),
+            MysqlSslMode::Preferred,
+        );
         let parsed = parse_connection_url(&url).unwrap();
         assert_eq!(parsed.kind, DbKind::Mysql);
         assert_eq!(parsed.config, config);
         assert_eq!(parsed.password, Some("cdepass".to_owned()));
-        let encoded = mysql_url("localhost", 3306, "cde test", "ad min", Some("p@ss:w/ord?"));
+        let encoded = mysql_url(
+            "localhost",
+            3306,
+            "cde test",
+            "ad min",
+            Some("p@ss:w/ord?"),
+            MysqlSslMode::Preferred,
+        );
         let parsed = parse_connection_url(&encoded).unwrap();
         assert_eq!(
             parsed.config,
@@ -5460,6 +5669,7 @@ mod tests {
                 port: 3306,
                 database: "cde test".to_owned(),
                 user: "ad min".to_owned(),
+                ssl_mode: MysqlSslMode::default(),
                 ssh: None,
             }
         );
@@ -5474,6 +5684,7 @@ mod tests {
             port: 3306,
             database: "cde_test".to_owned(),
             user: "root".to_owned(),
+            ssl_mode: MysqlSslMode::default(),
             ssh: None,
         };
         match Session::open(&config, Some("cdepass"), None) {
@@ -6091,6 +6302,7 @@ mod tests {
                 .unwrap_or(3306),
             database: std::env::var("MYSQLDATABASE").unwrap_or_else(|_| "cde_test".to_owned()),
             user: std::env::var("MYSQLUSER").unwrap_or_else(|_| "root".to_owned()),
+            ssl_mode: MysqlSslMode::default(),
             ssh: None,
         }
     }
@@ -6332,6 +6544,33 @@ mod tests {
         let (index, error) = outcome.expect_err("cancelled batch fails");
         assert_eq!(index, 1);
         assert!(matches!(error, DbError::Query(_)));
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    #[ignore = "needs a live MySQL; set MYSQLHOST/MYSQLPORT/MYSQLDATABASE/MYSQLUSER/MYSQLPASSWORD"]
+    fn mysql_live_preferred_connects_and_required_reports_missing_tls() {
+        let password = std::env::var("MYSQLPASSWORD").ok();
+        let mut config = mysql_live_config();
+        let session =
+            Session::open(&config, password.as_deref(), None).expect("default mode opens");
+        assert!(!session.server_version().is_empty());
+        drop(session);
+        if let ConnectionConfig::Mysql { ssl_mode, .. } = &mut config {
+            *ssl_mode = MysqlSslMode::Disabled;
+        }
+        let session =
+            Session::open(&config, password.as_deref(), None).expect("disabled mode opens");
+        assert!(!session.server_version().is_empty());
+        drop(session);
+        if let ConnectionConfig::Mysql { ssl_mode, .. } = &mut config {
+            *ssl_mode = MysqlSslMode::Required;
+        }
+        let error = match Session::open(&config, password.as_deref(), None) {
+            Ok(_) => panic!("required cannot negotiate TLS without a TLS backend in this build"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("TLS"), "{error}");
     }
 
     #[test]
