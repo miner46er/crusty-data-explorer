@@ -3,7 +3,7 @@
 //! Only visible rows render, via `TableBody::rows` virtualization.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -123,6 +123,86 @@ fn prune_selection(state: &AppState, ctx: &egui::Context) {
     let live: Vec<TabId> = state.tabs().iter().map(|tab| tab.id).collect();
     for tab in known.iter().filter(|tab| !live.contains(tab)) {
         clear_selection(ctx, *tab);
+    }
+    if known != live {
+        ctx.data_mut(|data| data.insert_temp(id, live));
+    }
+}
+
+/// Per-tab grid view state: hidden columns and explicit widths. Kept in egui
+/// temp data keyed by tab beside the selection, so it lasts the session and
+/// dies with the tab. Indices follow the result columns the way `sort_col`
+/// does; out-of-range entries are ignored.
+#[derive(Clone, Default, Debug, PartialEq)]
+struct GridView {
+    hidden: BTreeSet<usize>,
+    widths: BTreeMap<usize, f32>,
+}
+
+/// One keyboard resize step, the clamp explicit widths stay inside, and the
+/// fallback an auto-sized column widens from.
+const GRID_WIDTH_STEP: f32 = 24.0;
+const GRID_MIN_WIDTH: f32 = 48.0;
+const GRID_MAX_WIDTH: f32 = 640.0;
+const GRID_DEFAULT_WIDTH: f32 = 120.0;
+
+impl GridView {
+    fn hide(&mut self, col: usize) {
+        self.hidden.insert(col);
+    }
+    fn show_all(&mut self) {
+        self.hidden.clear();
+    }
+    fn is_hidden(&self, col: usize) -> bool {
+        self.hidden.contains(&col)
+    }
+    /// Result columns on display, in order.
+    fn visible(&self, ncols: usize) -> Vec<usize> {
+        (0..ncols).filter(|col| !self.is_hidden(*col)).collect()
+    }
+    /// In-range hidden columns, so stale entries never mislabel the count.
+    fn hidden_count(&self, ncols: usize) -> usize {
+        self.hidden.iter().filter(|col| **col < ncols).count()
+    }
+    fn set_width(&mut self, col: usize, width: f32) {
+        self.widths.insert(col, width.clamp(GRID_MIN_WIDTH, GRID_MAX_WIDTH));
+    }
+    fn reset_width(&mut self, col: usize) {
+        self.widths.remove(&col);
+    }
+    fn width(&self, col: usize) -> Option<f32> {
+        self.widths.get(&col).copied()
+    }
+    fn widen(&mut self, col: usize) {
+        let width = self.width(col).unwrap_or(GRID_DEFAULT_WIDTH) + GRID_WIDTH_STEP;
+        self.set_width(col, width);
+    }
+    fn narrow(&mut self, col: usize) {
+        let width = self.width(col).unwrap_or(GRID_DEFAULT_WIDTH) - GRID_WIDTH_STEP;
+        self.set_width(col, width);
+    }
+}
+
+fn grid_view_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_grid_view", tab))
+}
+
+fn grid_view_of(ctx: &egui::Context, tab: TabId) -> GridView {
+    ctx.data(|data| data.get_temp(grid_view_id(tab))).unwrap_or_default()
+}
+
+fn store_grid_view(ctx: &egui::Context, tab: TabId, view: &GridView) {
+    ctx.data_mut(|data| data.insert_temp(grid_view_id(tab), view.clone()));
+}
+
+/// Drop grid views for closed tabs, the way [`prune_selection`] forgets its
+/// selection state.
+fn prune_grid_views(state: &AppState, ctx: &egui::Context) {
+    let id = egui::Id::new("crusty_grid_view_tabs");
+    let known: Vec<TabId> = ctx.data_mut(|data| data.get_temp(id).unwrap_or_default());
+    let live: Vec<TabId> = state.tabs().iter().map(|tab| tab.id).collect();
+    for tab in known.iter().filter(|tab| !live.contains(tab)) {
+        ctx.data_mut(|data| data.remove::<GridView>(grid_view_id(*tab)));
     }
     if known != live {
         ctx.data_mut(|data| data.insert_temp(id, live));
@@ -367,6 +447,7 @@ fn column_names(tab: &Tab) -> Vec<String> {
 pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
     import_window(state, ui);
     prune_selection(state, ui.ctx());
+    prune_grid_views(state, ui.ctx());
     let modal_open = state.draft().is_some()
         || state.save_prompt().is_some()
         || state.password_prompt().is_some()
@@ -679,6 +760,60 @@ fn store_edit_field(ctx: &egui::Context, tab: TabId, field: Option<EditField>) {
     });
 }
 
+/// Open an in-place editor seeded with the typed text, so typing replaces
+/// the cell. Enter commits through [`EditAction::Stage`].
+fn type_edit_field(row: usize, col: usize, result: usize, seed: String) -> EditField {
+    EditField { row, col, result, text: seed, fresh: true }
+}
+
+/// Stage empty text for one cell. Empty renders as NULL through
+/// [`crate::edit::to_literal`], so Backspace sets NULL.
+fn null_stage(row: usize, col: usize) -> EditAction {
+    EditAction::Stage { row, col, text: String::new() }
+}
+
+/// One [`EditAction::Stage`] per target cell with the source text, skipping
+/// the source row itself so a fill never stages a no-op UPDATE.
+fn fill_stages(
+    source_row: usize,
+    col: usize,
+    rows: &[usize],
+    text: String,
+) -> Vec<EditAction> {
+    rows.iter()
+        .filter(|row| **row != source_row)
+        .map(|row| EditAction::Stage { row: *row, col, text: text.clone() })
+        .collect()
+}
+
+/// The fill for one focused cell: its effective text (the staged edit, else
+/// the full display) over `targets` in the same column. Empty for a deleted
+/// source, a blob source, or no in-range target, so the staged path only ever
+/// sees cells it can write.
+fn fill_from(tab: &Tab, row: usize, col: usize, targets: &[usize]) -> Vec<EditAction> {
+    let Some(result) = tab.active_query_result() else { return Vec::new() };
+    if row >= result.row_count() || col >= result.columns().len() {
+        return Vec::new();
+    }
+    if tab.is_row_deleted(row) {
+        return Vec::new();
+    }
+    let source = result.cell(row, col);
+    if matches!(source, Some(Value::Blob(_))) {
+        return Vec::new();
+    }
+    let text = match tab.edit_text(row, col) {
+        Some(staged) => staged.to_owned(),
+        None => source.map(|v| v.display(usize::MAX).into_owned()).unwrap_or_default(),
+    };
+    let in_range: Vec<usize> = targets
+        .iter()
+        .copied()
+        .filter(|target| *target < result.row_count() && !tab.is_row_deleted(*target))
+        .collect();
+    fill_stages(row, col, &in_range, text)
+}
+
 /// Result picker for a run that produced more than one result set.
 fn result_tabs(tab: &mut Tab, ui: &mut egui::Ui) {
     let count = tab.results().len();
@@ -892,10 +1027,18 @@ fn results_grid(
         Some(result) => visible_rows(result, sort_col, sort_dir, &filter),
         None => return actions,
     };
-    ui.label(
-        egui::RichText::new(format!("{} of {} rows", visible.len(), total)).small().weak(),
-    );
-    copy_bar(tab, editable, &selection, &visible, ui);
+    let mut view = grid_view_of(ui.ctx(), tab.id);
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format!("{} of {} rows", visible.len(), total)).small().weak(),
+        );
+        let hidden = view.hidden_count(cols.len());
+        if hidden > 0 && ui.button(format!("Show columns ({hidden})")).clicked() {
+            view.show_all();
+        }
+    });
+    let mut copied = copy_bar(tab, editable, &selection, &visible, total, ui);
+    actions.append(&mut copied);
     let ncols = cols.len();
     let active_result = tab.active_result();
     let added = tab.added_rows().len();
@@ -905,13 +1048,22 @@ fn results_grid(
         .filter(|field| field.result == active_result)
         .map(|field| (field.row, field.col));
     let mut pending_sort: Option<usize> = None;
+    let shown = view.visible(ncols);
+    let widths: Vec<Option<f32>> = shown.iter().map(|col| view.width(*col)).collect();
     egui::ScrollArea::both().show(ui, |ui| {
-        TableBuilder::new(ui)
-            .striped(true)
-            .resizable(true)
-            .columns(Column::auto(), ncols)
+        let mut table = TableBuilder::new(ui).striped(true);
+        for width in &widths {
+            table = table.column(match width {
+                Some(width) => Column::initial(*width).resizable(true),
+                None => Column::auto().resizable(true),
+            });
+        }
+        table
             .header(20.0, |mut header| {
                 for (i, (name, type_name)) in cols.iter().enumerate() {
+                    if view.is_hidden(i) {
+                        continue;
+                    }
                     let active = sort_col == Some(i);
                     let marker = if active {
                         match sort_dir {
@@ -922,21 +1074,38 @@ fn results_grid(
                         ""
                     };
                     header.col(|ui| {
-                        ui.horizontal(|ui| {
-                            if ui
+                        let head = ui.horizontal(|ui| {
+                            let sort = ui
                                 .selectable_label(
                                     active,
                                     egui::RichText::new(format!("{name}{marker}")).strong(),
                                 )
-                                .on_hover_text("Click to sort")
-                                .clicked()
-                            {
+                                .on_hover_text("Click to sort");
+                            if sort.clicked() {
                                 pending_sort = Some(i);
                             }
                             ui.label(egui::RichText::new(type_name).small().weak());
                             ui.label(
                                 egui::RichText::new(format!("#{}", i + 1)).small().weak(),
                             );
+                        });
+                        head.response.context_menu(|ui| {
+                            if ui.button(format!("Hide {name}")).clicked() {
+                                view.hide(i);
+                                ui.close();
+                            }
+                            if ui.button("Widen").clicked() {
+                                view.widen(i);
+                                ui.close();
+                            }
+                            if ui.button("Narrow").clicked() {
+                                view.narrow(i);
+                                ui.close();
+                            }
+                            if ui.button("Reset width").clicked() {
+                                view.reset_width(i);
+                                ui.close();
+                            }
                         });
                     });
                 }
@@ -946,6 +1115,9 @@ fn results_grid(
                     let index = row.index();
                     if let Some(added_index) = index.checked_sub(visible.len()) {
                         for c in 0..ncols {
+                            if view.is_hidden(c) {
+                                continue;
+                            }
                             row.col(|ui| {
                                 let mut text = tab
                                     .added_rows()
@@ -973,6 +1145,9 @@ fn results_grid(
                     }
                     let r = visible[index];
                     for c in 0..ncols {
+                        if view.is_hidden(c) {
+                            continue;
+                        }
                         row.col(|ui| {
                             if field_cell == Some((r, c)) {
                                 let mut open = open_field.clone().expect("the open field");
@@ -1093,9 +1268,12 @@ fn results_grid(
     for (row, col, shift, ctrl) in gestures {
         selection.gesture(row, col, shift, ctrl);
     }
-    let mut keyed = grid_clipboard_keys(tab, editable, &selection, &visible, modal_open, ui);
+    let mut keyed = grid_edit_keys(tab, editable, &selection, &visible, &mut view, modal_open, ui);
     actions.append(&mut keyed);
+    let mut clipboard = grid_clipboard_keys(tab, editable, &selection, &visible, modal_open, ui);
+    actions.append(&mut clipboard);
     store_selection(ui.ctx(), tab.id, &selection);
+    store_grid_view(ui.ctx(), tab.id, &view);
     if let Some(col) = pending_sort {
         tab.set_sort(col);
     }
@@ -1455,14 +1633,18 @@ fn export_all_results(tab: &mut Tab) {
 
 /// The selection copy row: TSV with a headers option, CSV, JSON, Markdown,
 /// and SQL INSERTs from the selection (or the whole view when empty), the
-/// IN-list builder from the active column, and paste as new rows.
+/// IN-list builder from the active column, fill down through the staged-edit
+/// path, and paste as new rows. Fill actions defer to the caller the way the
+/// grid key handler does, since the tab borrow is still live here.
 fn copy_bar(
     tab: &mut Tab,
     editable: bool,
     selection: &Selection,
     visible: &[usize],
+    total: usize,
     ui: &mut egui::Ui,
-) {
+) -> Vec<EditAction> {
+    let mut actions = Vec::new();
     ui.horizontal(|ui| {
         if tab.active_query_result().is_none_or(|result| result.columns().is_empty()) {
             return;
@@ -1564,6 +1746,23 @@ fn copy_bar(
                 }
             }
         }
+        let can_fill = selection.active().is_some_and(|(row, col)| {
+            row < total
+                && tab
+                    .active_query_result()
+                    .is_some_and(|result| col < result.columns().len())
+                && !tab.is_row_deleted(row)
+        });
+        if editable
+            && ui
+                .add_enabled(can_fill, egui::Button::new("Fill down"))
+                .on_hover_text("Fill the focused cell down the selection (Ctrl+D)")
+                .clicked()
+            && let Some((row, col)) = selection.active()
+        {
+            let targets: Vec<usize> = selection.resolve(visible);
+            actions.extend(fill_from(tab, row, col, &targets));
+        }
         if editable
             && ui
                 .button("Paste rows")
@@ -1588,10 +1787,26 @@ fn copy_bar(
             );
         }
     });
+    actions
 }
 
 pub fn copy_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C)
+}
+
+/// Ctrl+V pastes through the same mapping as the Paste rows button.
+pub fn paste_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::V)
+}
+
+/// Ctrl+D fills the focused cell down the selection.
+pub fn fill_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::D)
+}
+
+/// Ctrl+H hides the focused column; the Columns button restores.
+pub fn hide_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::H)
 }
 
 /// Grid clipboard keys, gated like the query editor: dead while any modal
@@ -1661,10 +1876,106 @@ fn grid_clipboard_keys(
     actions
 }
 
+/// Spreadsheet keys over the focused cell, gated like
+/// [`grid_clipboard_keys`]: dead while any modal is open, while a cell editor
+/// is open, or while a text field holds focus, so typing never stages rows by
+/// accident. Typing replaces the cell through the staged-edit path, Backspace
+/// stages NULL, Ctrl+D fills the selection, and Ctrl+V arms a paste through
+/// the existing mapping. Hiding and resizing are view state and stay
+/// available read-only, the way sorting does.
+fn grid_edit_keys(
+    tab: &mut Tab,
+    editable: bool,
+    selection: &Selection,
+    visible: &[usize],
+    view: &mut GridView,
+    modal_open: bool,
+    ui: &mut egui::Ui,
+) -> Vec<EditAction> {
+    let mut actions = Vec::new();
+    if modal_open {
+        return actions;
+    }
+    let typing = edit_field_of(ui.ctx(), tab.id).is_some()
+        || ui.ctx().memory(|memory| memory.focused().is_some());
+    if typing {
+        return actions;
+    }
+    let (total, ncols) = tab
+        .active_query_result()
+        .map(|result| (result.row_count(), result.columns().len()))
+        .unwrap_or((0, 0));
+    if ui.input_mut(|i| i.consume_shortcut(&hide_shortcut()))
+        && let Some((_, col)) = selection.active()
+        && col < ncols
+    {
+        view.hide(col);
+    }
+    if let Some((_, col)) = selection.active()
+        && col < ncols
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight))
+    {
+        view.widen(col);
+    } else if let Some((_, col)) = selection.active()
+        && col < ncols
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft))
+    {
+        view.narrow(col);
+    }
+    if !editable {
+        return actions;
+    }
+    if ui.input_mut(|i| i.consume_shortcut(&paste_shortcut())) {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+        ui.ctx().data_mut(|data| data.insert_temp(paste_armed_id(tab.id), true));
+    }
+    let Some((row, col)) = selection.active() else {
+        return actions;
+    };
+    if row >= total || col >= ncols || tab.is_row_deleted(row) {
+        return actions;
+    }
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)) {
+        actions.push(null_stage(row, col));
+        return actions;
+    }
+    if ui.input_mut(|i| i.consume_shortcut(&fill_shortcut())) {
+        let targets: Vec<usize> = selection.resolve(visible);
+        actions.extend(fill_from(tab, row, col, &targets));
+        return actions;
+    }
+    if ui.input(|i| i.modifiers).is_none() {
+        let seed = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::Text(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .next()
+        });
+        if let Some(seed) = seed {
+            let blob = tab
+                .active_query_result()
+                .and_then(|result| result.cell(row, col))
+                .is_some_and(|cell| matches!(cell, Value::Blob(_)));
+            if !blob {
+                store_edit_field(
+                    ui.ctx(),
+                    tab.id,
+                    Some(type_edit_field(row, col, tab.active_result(), seed)),
+                );
+            }
+        }
+    }
+    actions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::Column;
+    use crate::edit::{insert_statement, to_literal};
 
     fn one_col(values: Vec<Value>) -> QueryResult {
         QueryResult::from_columns(
@@ -2095,5 +2406,105 @@ mod tests {
         let shortcut = copy_shortcut();
         assert_eq!(shortcut.modifiers, egui::Modifiers::CTRL);
         assert_eq!(shortcut.logical_key, egui::Key::C);
+    }
+
+    #[test]
+    fn type_to_edit_seeds_the_field_and_stages_its_literal() {
+        let field = type_edit_field(2, 1, 0, "7".to_owned());
+        assert_eq!((field.row, field.col), (2, 1));
+        assert_eq!(field.text, "7");
+        assert!(field.fresh);
+        assert_eq!(to_literal(&field.text, false), "7");
+        let quoted = type_edit_field(0, 0, 0, "O'Brien".to_owned());
+        assert_eq!(to_literal(&quoted.text, false), "'O''Brien'");
+    }
+
+    #[test]
+    fn backspace_stages_empty_text_which_renders_null() {
+        let action = null_stage(1, 0);
+        match action {
+            EditAction::Stage { row, col, text } => {
+                assert_eq!((row, col), (1, 0));
+                assert_eq!(text, String::new());
+                assert_eq!(to_literal(&text, false), "NULL");
+            }
+            _ => panic!("Backspace must stage through the edit path"),
+        }
+    }
+
+    #[test]
+    fn column_hide_and_resize_state_is_exact() {
+        let mut view = GridView::default();
+        assert_eq!(view.visible(4), vec![0, 1, 2, 3]);
+        view.hide(1);
+        view.hide(3);
+        assert_eq!(view.visible(4), vec![0, 2]);
+        assert_eq!(view.hidden_count(4), 2);
+        view.hide(9);
+        assert_eq!(view.hidden_count(4), 2);
+        view.show_all();
+        assert_eq!(view.visible(4), vec![0, 1, 2, 3]);
+        assert_eq!(view.width(0), None);
+        view.set_width(0, 120.0);
+        assert_eq!(view.width(0), Some(120.0));
+        view.set_width(0, 10.0);
+        assert_eq!(view.width(0), Some(GRID_MIN_WIDTH));
+        view.set_width(0, 9999.0);
+        assert_eq!(view.width(0), Some(GRID_MAX_WIDTH));
+        view.reset_width(0);
+        assert_eq!(view.width(0), None);
+        view.widen(2);
+        assert_eq!(view.width(2), Some(GRID_DEFAULT_WIDTH + GRID_WIDTH_STEP));
+        view.narrow(2);
+        assert_eq!(view.width(2), Some(GRID_DEFAULT_WIDTH));
+        view.narrow(2);
+        assert_eq!(view.width(2), Some(GRID_DEFAULT_WIDTH - GRID_WIDTH_STEP));
+    }
+
+    #[test]
+    fn range_fill_marks_every_target_through_stage() {
+        let shortcut = fill_shortcut();
+        assert_eq!(shortcut.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(shortcut.logical_key, egui::Key::D);
+        let actions = fill_stages(0, 1, &[0, 1, 2], "ada".to_owned());
+        assert_eq!(actions.len(), 2);
+        for action in &actions {
+            match action {
+                EditAction::Stage { row, col, text } => {
+                    assert_ne!(*row, 0);
+                    assert_eq!(*col, 1);
+                    assert_eq!(text.as_str(), "ada");
+                    assert_eq!(to_literal(text, false), "'ada'");
+                }
+                _ => panic!("fill must stage through the edit path"),
+            }
+        }
+        let nulls = fill_stages(0, 0, &[0, 1], String::new());
+        assert_eq!(nulls.len(), 1);
+        match &nulls[0] {
+            EditAction::Stage { row, text, .. } => {
+                assert_eq!(*row, 1);
+                assert_eq!(to_literal(text, false), "NULL");
+            }
+            _ => panic!("fill must stage through the edit path"),
+        }
+    }
+
+    #[test]
+    fn keyboard_paste_maps_through_the_staged_rows() {
+        let shortcut = paste_shortcut();
+        assert_eq!(shortcut.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(shortcut.logical_key, egui::Key::V);
+        let hide = hide_shortcut();
+        assert_eq!(hide.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(hide.logical_key, egui::Key::H);
+        let columns = vec!["id".to_owned(), "name".to_owned()];
+        let parsed = parse_paste("id,name\n1,ada\n").expect("parses");
+        let staged = stage_parsed_rows(&parsed, &columns).expect("stages");
+        assert_eq!(staged, vec![vec!["1".to_owned(), "ada".to_owned()]]);
+        assert_eq!(
+            insert_statement("users", &columns, &staged[0]),
+            "INSERT INTO \"users\" (\"id\", \"name\") VALUES (1, 'ada')"
+        );
     }
 }
