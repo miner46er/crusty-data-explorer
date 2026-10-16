@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use crate::db::{
     CancelHandle, ConnectionConfig, ConnectionId, DbCommand, DbEvent, DbHandle, DbKind,
-    DriverRegistry, ForeignKeyInfo, Ids, QueryResult, RowCount, RunId, SchemaInfo, TabId,
-    TableInfo, TxIdle, Value, explain_sql, spawn_session,
+    DriverRegistry, ForeignKeyInfo, Ids, QueryResult, RowCount, RunId, SchemaInfo, SessionInfo,
+    TabId, TableInfo, TxIdle, Value, explain_sql, spawn_session,
     TX_IDLE_ROLLBACK_MINUTES,
 };
 use crate::edit::{
@@ -1579,6 +1579,14 @@ pub struct PendingWriteConfirm {
     pub table: String,
 }
 
+/// A session terminate held for its prod confirmation: the connection and
+/// backend Confirm would kill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTerminate {
+    pub conn: ConnectionId,
+    pub backend: String,
+}
+
 /// A run held for its parameter values: the tab and connection it would run
 /// on, whether it is an explain run, the raw scoped statements with their
 /// placeholders, and the collected parameters with the typed values. Confirm
@@ -1617,6 +1625,13 @@ pub struct AppState {
     /// Navigator counts requested on demand, keyed by connection, schema,
     /// and table, kept until the session ends.
     row_counts: HashMap<(ConnectionId, String, String), RowCountState>,
+    /// Session lists requested on demand per connection, kept until the
+    /// session ends.
+    sessions: HashMap<ConnectionId, Vec<SessionInfo>>,
+    sessions_loading: HashSet<ConnectionId>,
+    sessions_errors: HashMap<ConnectionId, String>,
+    /// The terminate awaiting its prod confirmation, if any.
+    pending_terminate: Option<PendingTerminate>,
     history: Vec<HistoryEntry>,
     /// True narrows the execution log to the current connection. False shows
     /// every connection. Never persisted, so a relaunch starts at all.
@@ -1667,6 +1682,10 @@ impl AppState {
             schema_loading: HashSet::new(),
             schema_errors: HashMap::new(),
             row_counts: HashMap::new(),
+            sessions: HashMap::new(),
+            sessions_loading: HashSet::new(),
+            sessions_errors: HashMap::new(),
+            pending_terminate: None,
             history: load_history(),
             history_current_only: false,
             saved,
@@ -1734,6 +1753,21 @@ impl AppState {
         table: &str,
     ) -> Option<&RowCountState> {
         self.row_counts.get(&(conn, schema.to_owned(), table.to_owned()))
+    }
+
+    /// The cached session list for one connection, if it was requested.
+    pub fn sessions(&self, conn: ConnectionId) -> Option<&[SessionInfo]> {
+        self.sessions.get(&conn).map(Vec::as_slice)
+    }
+    pub fn sessions_is_loading(&self, conn: ConnectionId) -> bool {
+        self.sessions_loading.contains(&conn)
+    }
+    pub fn sessions_error(&self, conn: ConnectionId) -> Option<&str> {
+        self.sessions_errors.get(&conn).map(String::as_str)
+    }
+    /// The terminate awaiting its prod confirmation, if any.
+    pub fn pending_terminate(&self) -> Option<&PendingTerminate> {
+        self.pending_terminate.as_ref()
     }
 
     pub fn connections(&self) -> &[Connection] {
@@ -3001,6 +3035,12 @@ impl AppState {
         self.schema_loading.remove(&id);
         self.schema_errors.remove(&id);
         self.row_counts.retain(|(conn, _, _), _| *conn != id);
+        self.sessions.remove(&id);
+        self.sessions_loading.remove(&id);
+        self.sessions_errors.remove(&id);
+        if self.pending_terminate.as_ref().is_some_and(|pending| pending.conn == id) {
+            self.pending_terminate = None;
+        }
     }
 
     pub fn delete_connection(&mut self, id: ConnectionId) {
@@ -3057,6 +3097,86 @@ impl AppState {
         });
         if sent.is_err() {
             self.row_counts.insert(key, RowCountState::Failed("connection is gone".to_owned()));
+        }
+    }
+
+    /// Ask the worker for the live backends. A click while one is in flight
+    /// is a no-op; the answer caches until the session ends.
+    pub fn request_sessions(&mut self, conn: ConnectionId) {
+        if self.sessions_loading.contains(&conn) {
+            return;
+        }
+        let handle = match self.connections.iter().find(|c| c.id == conn) {
+            Some(c) => match &c.state {
+                ConnectionState::Connected { session }
+                | ConnectionState::QueryRunning { session, .. } => session.handle.clone(),
+                _ => return,
+            },
+            None => return,
+        };
+        self.sessions_loading.insert(conn);
+        self.sessions_errors.remove(&conn);
+        if handle.send(DbCommand::ListSessions).is_err() {
+            self.sessions_loading.remove(&conn);
+            self.sessions_errors.insert(conn, "connection is gone".to_owned());
+        }
+    }
+
+    /// Terminate one backend by its session list id. Read-only connections
+    /// never terminate: the request records an error and sends nothing. A
+    /// prod connection arms the confirmation instead of sending; only the
+    /// confirmed path reaches the worker.
+    pub fn request_terminate(&mut self, conn: ConnectionId, backend: &str) {
+        let (handle, read_only, prod) = match self.connections.iter().find(|c| c.id == conn) {
+            Some(c) => (c.handle(), c.config.is_read_only(), c.env == Environment::Prod),
+            None => return,
+        };
+        if read_only {
+            self.sessions_errors
+                .insert(conn, "read-only connection cannot terminate sessions".to_owned());
+            return;
+        }
+        if prod {
+            self.pending_terminate =
+                Some(PendingTerminate { conn, backend: backend.to_owned() });
+            return;
+        }
+        self.send_terminate(conn, backend.to_owned(), handle);
+    }
+
+    /// Send the held terminate exactly as requested.
+    pub fn confirm_terminate(&mut self) {
+        let Some(pending) = self.pending_terminate.take() else { return };
+        let handle = self
+            .connections
+            .iter()
+            .find(|c| c.id == pending.conn)
+            .and_then(|c| c.handle());
+        self.send_terminate(pending.conn, pending.backend, handle);
+    }
+
+    /// Drop the held terminate without sending anything.
+    pub fn cancel_terminate(&mut self) {
+        self.pending_terminate = None;
+    }
+
+    /// One terminate send: the worker answers with `TerminateOk`, which
+    /// re-reads the list, or `TerminateErr`, which names the failure.
+    fn send_terminate(
+        &mut self,
+        conn: ConnectionId,
+        backend: String,
+        handle: Option<DbHandle>,
+    ) {
+        match handle {
+            Some(handle) => {
+                if handle.send(DbCommand::TerminateSession { backend }).is_err() {
+                    self.sessions_errors.insert(conn, "connection is gone".to_owned());
+                }
+            }
+            None => {
+                self.sessions_errors.insert(conn, "connection is gone".to_owned());
+            }
         }
     }
 
@@ -3972,9 +4092,12 @@ impl AppState {
                     None
                 };
                 if let Some(handle) = handle {
-                    // A fresh worker session invalidates the counts the
-                    // previous session cached.
+                    // A fresh worker session invalidates the counts and the
+                    // session list the previous session cached.
                     self.row_counts.retain(|(c, _, _), _| *c != conn);
+                    self.sessions.remove(&conn);
+                    self.sessions_loading.remove(&conn);
+                    self.sessions_errors.remove(&conn);
                     self.schema_loading.insert(conn);
                     self.schema_errors.remove(&conn);
                     if handle.send(DbCommand::LoadSchema).is_err() {
@@ -4012,6 +4135,36 @@ impl AppState {
             DbEvent::RowCountErr { conn, schema, table, error } => {
                 self.row_counts
                     .insert((conn, schema, table), RowCountState::Failed(error.to_string()));
+            }
+            DbEvent::SessionsOk { conn, sessions } => {
+                self.sessions_loading.remove(&conn);
+                self.sessions_errors.remove(&conn);
+                self.sessions.insert(conn, sessions);
+            }
+            DbEvent::SessionsErr { conn, error } => {
+                self.sessions_loading.remove(&conn);
+                self.sessions_errors.insert(conn, error.to_string());
+            }
+            DbEvent::TerminateOk { conn, backend } => {
+                let _ = backend;
+                self.sessions_errors.remove(&conn);
+                // Re-read the list so the panel drops the killed backend.
+                if let Some(handle) = self
+                    .connections
+                    .iter()
+                    .find(|c| c.id == conn)
+                    .and_then(|c| c.handle())
+                {
+                    self.sessions_loading.insert(conn);
+                    if handle.send(DbCommand::ListSessions).is_err() {
+                        self.sessions_loading.remove(&conn);
+                        self.sessions_errors.insert(conn, "connection is gone".to_owned());
+                    }
+                }
+            }
+            DbEvent::TerminateErr { conn, backend, error } => {
+                let _ = backend;
+                self.sessions_errors.insert(conn, error.to_string());
             }
             DbEvent::QueryErr { run, error } => {
                 let fatal = error.is_fatal();

@@ -20,6 +20,10 @@ pub enum SchemaAction {
     Count(ConnectionId, String, String),
     /// Toggle one table bookmark.
     Bookmark(ConnectionId, String, String),
+    /// Ask the worker for the live backends.
+    Sessions(ConnectionId),
+    /// Terminate one backend by its session list id.
+    Terminate(ConnectionId, String),
     /// The palette-requested table entry was opened and scrolled to.
     RevealHandled,
 }
@@ -102,7 +106,119 @@ pub fn connection_schema(
                     }
                 });
         });
+    sessions_panel(state, ui, conn, &mut actions);
     actions
+}
+
+/// Live backends behind one connection with terminate actions. SQLite is out
+/// of scope and renders nothing. The list is read-only introspection;
+/// terminate sends a kill that the worker refuses for the listing session
+/// itself. Read-only connections list but never terminate.
+fn sessions_panel(
+    state: &AppState,
+    ui: &mut egui::Ui,
+    conn: ConnectionId,
+    actions: &mut Vec<SchemaAction>,
+) {
+    let Some(connection) =
+        state.connections().iter().find(|c| c.id == conn)
+    else {
+        return;
+    };
+    if connection.config.kind() == DbKind::Sqlite {
+        return;
+    }
+    let read_only = connection.config.is_read_only();
+    egui::CollapsingHeader::new(egui::RichText::new("Sessions").small().strong())
+        .default_open(false)
+        .show(ui, |ui| {
+            if state.sessions_is_loading(conn) {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Loading sessions…").small().weak());
+                });
+                return;
+            }
+            if let Some(err) = state.sessions_error(conn) {
+                ui.colored_label(ui.visuals().error_fg_color, egui::RichText::new(err).small());
+                if ui.small_button("Retry").clicked() {
+                    actions.push(SchemaAction::Sessions(conn));
+                }
+                return;
+            }
+            let Some(sessions) = state.sessions(conn) else {
+                ui.label(egui::RichText::new("No session list loaded.").small().weak());
+                if ui.small_button("Load").clicked() {
+                    actions.push(SchemaAction::Sessions(conn));
+                }
+                return;
+            };
+            if sessions.is_empty() {
+                ui.label(egui::RichText::new("No sessions found.").small().weak());
+            }
+            for session in sessions {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(session.backend_id()).monospace().small(),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} · {} · {}",
+                            session.user(),
+                            session.database(),
+                            session.state()
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                    if !session.wait_note().is_empty() {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            egui::RichText::new(session.wait_note()).small(),
+                        );
+                    }
+                    if session.is_self() {
+                        ui.label(
+                            egui::RichText::new("(this session)").small().weak(),
+                        );
+                    } else if !read_only && ui.small_button("Terminate").clicked() {
+                        actions.push(SchemaAction::Terminate(
+                            conn,
+                            session.backend_id().to_owned(),
+                        ));
+                    }
+                });
+                if !session.query().is_empty() {
+                    ui.label(
+                        egui::RichText::new(truncate_session_query(session.query()))
+                            .small()
+                            .weak(),
+                    )
+                    .on_hover_text(session.query());
+                }
+            }
+            if ui.small_button("Refresh").clicked() {
+                actions.push(SchemaAction::Sessions(conn));
+            }
+            if read_only {
+                ui.label(
+                    egui::RichText::new("Read-only connection cannot terminate sessions.")
+                        .small()
+                        .weak(),
+                );
+            }
+        });
+}
+
+/// The panel's one-line query text, capped so a long statement stays a row.
+/// The full text sits on hover.
+fn truncate_session_query(query: &str) -> String {
+    const CAP: usize = 120;
+    if query.chars().count() > CAP {
+        query.chars().take(CAP).collect::<String>() + "…"
+    } else {
+        query.to_owned()
+    }
 }
 
 fn show_schema(

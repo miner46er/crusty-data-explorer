@@ -34,6 +34,8 @@ enum SidebarAction {
     RevealTable(ConnectionId, String, String),
     TableCount(ConnectionId, String, String),
     ToggleBookmark(ConnectionId, String, String),
+    RefreshSessions(ConnectionId),
+    TerminateSession(ConnectionId, String),
     OpenHistory(ConnectionId, String),
     ClearHistory,
     OpenSaved(u64),
@@ -616,6 +618,12 @@ fn connection_card(
                                 id, schema, table,
                             ));
                         }
+                        super::schema::SchemaAction::Sessions(id) => {
+                            actions.push(SidebarAction::RefreshSessions(id));
+                        }
+                        super::schema::SchemaAction::Terminate(id, backend) => {
+                            actions.push(SidebarAction::TerminateSession(id, backend));
+                        }
                         super::schema::SchemaAction::RevealHandled => {
                             state.clear_navigator_reveal();
                         }
@@ -750,6 +758,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
     // root() pumps this module through the sidebar, so the prod confirm
     // renders with the connect gestures that raise it.
     prod_confirm_window(state, ui);
+    terminate_confirm_window(state, ui);
     let palette = Palette::of(ui.ctx().theme());
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
         if ui
@@ -1206,6 +1215,12 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                         SidebarAction::ToggleBookmark(id, schema, table) => {
                             state.toggle_bookmark(id, &schema, &table);
                         }
+                        SidebarAction::RefreshSessions(id) => {
+                            state.request_sessions(id);
+                        }
+                        SidebarAction::TerminateSession(id, backend) => {
+                            state.request_terminate(id, &backend);
+                        }
                         SidebarAction::OpenHistory(conn, sql) => state.open_history(conn, &sql),
                         SidebarAction::ClearHistory => state.clear_history(),
                         SidebarAction::OpenSaved(id) => state.open_saved(id),
@@ -1448,6 +1463,36 @@ pub fn prod_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
         state.confirm_prod();
     } else if cancel {
         state.cancel_prod();
+    }
+}
+
+/// The prod-gated terminate confirmation: names the backend and the
+/// connection, with the production warning the connect confirm carries.
+/// Non-prod terminates never arm this modal; they send on click.
+pub fn terminate_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
+    let Some(pending) = state.pending_terminate().cloned() else { return };
+    let Some(name) =
+        state.connections().iter().find(|c| c.id == pending.conn).map(|c| c.name.clone())
+    else {
+        state.cancel_terminate();
+        return;
+    };
+    let mut confirm = false;
+    let mut cancel = false;
+    egui::Window::new("Terminate session?").show(ui.ctx(), |ui| {
+        ui.label(format!("Terminate backend {} on {name}?", pending.backend));
+        ui.label("The backend's running query stops and its connection drops.");
+        if ui.button("Terminate").clicked() {
+            confirm = true;
+        }
+        if ui.button("Cancel").clicked() {
+            cancel = true;
+        }
+    });
+    if confirm {
+        state.confirm_terminate();
+    } else if cancel {
+        state.cancel_terminate();
     }
 }
 

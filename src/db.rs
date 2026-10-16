@@ -807,6 +807,231 @@ impl RowCount {
     }
 }
 
+/// Cap on sessions materialized per list. The panel shows the first page.
+pub const SESSION_CAP: usize = 200;
+
+/// One live backend behind a connection: who it is, what it runs, and what
+/// lock it waits on. Built by read-only introspection queries; SQLite has
+/// none. Fields are private; construction checks happen in
+/// [`SessionInfo::new`], so an empty backend id cannot exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    backend_id: String,
+    user: String,
+    database: String,
+    state: String,
+    query: String,
+    waiting: bool,
+    locks: String,
+    is_self: bool,
+}
+
+impl SessionInfo {
+    /// Checked constructor. Rejects an empty backend id; every other field
+    /// keeps its text because engines report blanks and NULLs for idle or
+    /// restricted backends.
+    pub fn new(
+        backend_id: String,
+        user: String,
+        database: String,
+        state: String,
+        query: String,
+        waiting: bool,
+        locks: String,
+        is_self: bool,
+    ) -> Result<Self, SchemaError> {
+        if backend_id.trim().is_empty() {
+            return Err(SchemaError::EmptyName("session"));
+        }
+        Ok(Self { backend_id, user, database, state, query, waiting, locks, is_self })
+    }
+    pub fn backend_id(&self) -> &str {
+        &self.backend_id
+    }
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+    pub fn database(&self) -> &str {
+        &self.database
+    }
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+    pub fn waiting(&self) -> bool {
+        self.waiting
+    }
+    pub fn locks(&self) -> &str {
+        &self.locks
+    }
+    /// True for the backend running this listing, which terminate refuses.
+    pub fn is_self(&self) -> bool {
+        self.is_self
+    }
+    /// The panel's lock note: empty when the backend waits on nothing.
+    pub fn wait_note(&self) -> &str {
+        if !self.waiting {
+            return "";
+        }
+        if self.locks.is_empty() { "waiting on lock" } else { &self.locks }
+    }
+}
+
+/// The Postgres session list: one row per `pg_stat_activity` backend with
+/// its ungranted `pg_locks` aggregated. Column order is the decode contract
+/// in [`pg_session_from_parts`]: pid, user, database, state, query, waiting,
+/// locks.
+#[cfg(any(test, feature = "postgres"))]
+pub fn pg_sessions_sql() -> &'static str {
+    "SELECT a.pid, a.usename, a.datname, a.state, a.query, (a.wait_event IS NOT NULL), \
+     COALESCE((SELECT string_agg(l.locktype || ' ' || l.mode, ', ' \
+     ORDER BY l.locktype, l.mode) FROM pg_locks l \
+     WHERE l.pid = a.pid AND NOT l.granted), '') \
+     FROM pg_stat_activity a ORDER BY a.pid"
+}
+
+/// The MySQL session list: one row per `information_schema.processlist`
+/// entry. Column order is the decode contract in
+/// [`mysql_session_from_parts`]: id, user, database, command, state, query.
+#[cfg(any(test, feature = "mysql"))]
+pub fn mysql_sessions_sql() -> &'static str {
+    "SELECT ID, USER, DB, COMMAND, STATE, INFO \
+     FROM information_schema.processlist ORDER BY ID"
+}
+
+/// The MySQL lock waits behind the list: each requesting processlist id with
+/// its blocking processlist id, if that thread has one. Best effort: a
+/// missing or disabled `performance_schema` reads as no waits.
+#[cfg(any(test, feature = "mysql"))]
+pub fn mysql_lock_waits_sql() -> &'static str {
+    "SELECT rt.PROCESSLIST_ID, bt.PROCESSLIST_ID \
+     FROM performance_schema.data_lock_waits w \
+     JOIN performance_schema.threads rt ON rt.THREAD_ID = w.REQUESTING_THREAD_ID \
+     LEFT JOIN performance_schema.threads bt ON bt.THREAD_ID = w.BLOCKING_THREAD_ID \
+     WHERE rt.PROCESSLIST_ID IS NOT NULL"
+}
+
+/// Terminate one Postgres backend. `pid` is typed, so the id cannot inject.
+#[cfg(any(test, feature = "postgres"))]
+pub fn pg_terminate_sql(pid: i32) -> String {
+    format!("SELECT pg_terminate_backend({pid})")
+}
+
+/// Kill one MySQL connection. `id` is typed, so the id cannot inject.
+#[cfg(any(test, feature = "mysql"))]
+pub fn mysql_terminate_sql(id: u64) -> String {
+    format!("KILL {id}")
+}
+
+/// One Postgres introspection row as a [`SessionInfo`]. NULLs become empty
+/// text because restricted backends hide their user, database, or query.
+#[cfg(any(test, feature = "postgres"))]
+pub(crate) fn pg_session_from_parts(
+    pid: i32,
+    user: Option<String>,
+    database: Option<String>,
+    state: Option<String>,
+    query: Option<String>,
+    waiting: bool,
+    locks: Option<String>,
+    is_self: bool,
+) -> Result<SessionInfo, DbError> {
+    SessionInfo::new(
+        pid.to_string(),
+        user.unwrap_or_default(),
+        database.unwrap_or_default(),
+        state.unwrap_or_default(),
+        query.unwrap_or_default(),
+        waiting,
+        locks.unwrap_or_default(),
+        is_self,
+    )
+    .map_err(|e| DbError::Query(e.to_string()))
+}
+
+/// One MySQL processlist row as a [`SessionInfo`]. NULLs become empty text.
+#[cfg(any(test, feature = "mysql"))]
+pub(crate) fn mysql_session_from_parts(
+    id: u64,
+    user: Option<String>,
+    database: Option<String>,
+    command: Option<String>,
+    state: Option<String>,
+    query: Option<String>,
+    is_self: bool,
+) -> Result<SessionInfo, DbError> {
+    SessionInfo::new(
+        id.to_string(),
+        user.unwrap_or_default(),
+        database.unwrap_or_default(),
+        mysql_state_text(command, state),
+        query.unwrap_or_default(),
+        false,
+        String::new(),
+        is_self,
+    )
+    .map_err(|e| DbError::Query(e.to_string()))
+}
+
+/// The MySQL state text from its command plus detail words: each alone when
+/// the other is blank, joined when both name something, empty when neither.
+#[cfg(any(test, feature = "mysql"))]
+pub(crate) fn mysql_state_text(command: Option<String>, state: Option<String>) -> String {
+    let command = command.unwrap_or_default();
+    let state = state.unwrap_or_default();
+    match (command.is_empty(), state.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => command,
+        (true, false) => state,
+        (false, false) => format!("{command} · {state}"),
+    }
+}
+
+/// Fold MySQL lock waits into a loaded list: each requesting backend waits,
+/// named by its blocker when that thread has a processlist id.
+#[cfg(any(test, feature = "mysql"))]
+pub(crate) fn apply_mysql_lock_waits(
+    sessions: &mut [SessionInfo],
+    waits: &[(u64, Option<u64>)],
+) {
+    for (requesting, blocking) in waits {
+        let wanted = requesting.to_string();
+        if let Some(session) = sessions.iter_mut().find(|s| s.backend_id == wanted) {
+            session.waiting = true;
+            session.locks = match blocking {
+                Some(blocker) => format!("blocked by {blocker}"),
+                None => "waiting on lock".to_owned(),
+            };
+        }
+    }
+}
+
+/// One Postgres backend id from panel text. Rejects blanks, non-numbers,
+/// and non-positive pids, so interpolated SQL stays an integer literal.
+#[cfg(any(test, feature = "postgres"))]
+pub(crate) fn parse_pg_backend(backend: &str) -> Result<i32, DbError> {
+    backend
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| DbError::Query(format!("unknown backend {backend}")))
+}
+
+/// One MySQL connection id from panel text. Rejects blanks, non-numbers,
+/// and zero, so interpolated SQL stays an integer literal.
+#[cfg(any(test, feature = "mysql"))]
+pub(crate) fn parse_mysql_backend(backend: &str) -> Result<u64, DbError> {
+    backend
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| DbError::Query(format!("unknown backend {backend}")))
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ShapeError {
     #[error("ragged result: expected {expected} values per column")]
@@ -1547,6 +1772,10 @@ pub enum DbCommand {
     LoadSchema,
     /// One table's row count, on the navigator's explicit request.
     RowCount { schema: String, table: String },
+    /// The live backends, on the session panel's explicit request.
+    ListSessions,
+    /// Terminate one backend by its [`SessionInfo::backend_id`].
+    TerminateSession { backend: String },
     /// Flip the worker's autocommit for this session.
     SetAutocommit { on: bool },
 }
@@ -1563,6 +1792,12 @@ pub enum DbEvent {
     /// One table's row count landed for the navigator's affordance.
     RowCountOk { conn: ConnectionId, schema: String, table: String, count: RowCount },
     RowCountErr { conn: ConnectionId, schema: String, table: String, error: DbError },
+    /// The live backends landed for the session panel.
+    SessionsOk { conn: ConnectionId, sessions: Vec<SessionInfo> },
+    SessionsErr { conn: ConnectionId, error: DbError },
+    /// One backend terminated; the panel re-reads the list on this landing.
+    TerminateOk { conn: ConnectionId, backend: String },
+    TerminateErr { conn: ConnectionId, backend: String, error: DbError },
     /// The autocommit toggle landed. `on` and `tx_open` are the worker's
     /// state after applying it; an error means a rollback on the way back to
     /// autocommit failed and the connection was closed instead of returned.
@@ -1739,6 +1974,37 @@ impl Session {
             Session::Postgres(pg) => pg.schema(),
             #[cfg(feature = "mysql")]
             Session::Mysql(my) => my.schema(),
+        }
+    }
+
+    /// Live backends through read-only introspection, capped at
+    /// [`SESSION_CAP`]. The list includes this session, marked self.
+    /// SQLite has no sessions.
+    pub fn sessions(&mut self) -> Result<Vec<SessionInfo>, DbError> {
+        match self {
+            Session::Sqlite(_) => Err(DbError::NotSupported(
+                "session list needs the postgres or mysql feature".to_owned(),
+            )),
+            #[cfg(feature = "postgres")]
+            Session::Postgres(pg) => pg.sessions(),
+            #[cfg(feature = "mysql")]
+            Session::Mysql(my) => my.sessions(),
+        }
+    }
+
+    /// Terminate one backend by its [`SessionInfo::backend_id`]. Refuses the
+    /// session's own backend, so the lister cannot kill its own connection.
+    /// SQLite has no sessions.
+    pub fn terminate_session(&mut self, backend: &str) -> Result<(), DbError> {
+        let _ = backend;
+        match self {
+            Session::Sqlite(_) => Err(DbError::NotSupported(
+                "session list needs the postgres or mysql feature".to_owned(),
+            )),
+            #[cfg(feature = "postgres")]
+            Session::Postgres(pg) => pg.terminate_session(backend),
+            #[cfg(feature = "mysql")]
+            Session::Mysql(my) => my.terminate_session(backend),
         }
     }
 
@@ -2775,6 +3041,86 @@ impl PgSession {
             .map_err(|e| DbError::Query(e.to_string()))?;
         Ok(SchemaInfo::new(vec![db_node], tables_truncated, columns_truncated))
     }
+
+    /// Live backends from `pg_stat_activity` plus ungranted `pg_locks`, a
+    /// read-only SELECT pair. Runs on the manual pin when one is held, else
+    /// on a pool lease. The row carrying this session's pid is marked self.
+    fn sessions(&mut self) -> Result<Vec<SessionInfo>, DbError> {
+        use sqlx::Row as _;
+        // Manual mode holds the pool's only connection, so the list runs on
+        // the pin instead of timing out on an acquire.
+        let mut held = match &mut self.mode {
+            AutoMode::Pinned { conn, .. } => SchemaConn::Pinned(conn),
+            _ => {
+                let conn = self
+                    .rt
+                    .block_on(self.pool.acquire())
+                    .map_err(|e| DbError::Query(e.to_string()))?;
+                SchemaConn::Leased(PooledLease::new(&self.rt, conn))
+            }
+        };
+        let conn: &mut sqlx::PgConnection = held.conn();
+        let rows = self
+            .rt
+            .block_on(sqlx::query(pg_sessions_sql()).fetch_all(&mut *conn))
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        let own = self.backend_pid;
+        let mut out = Vec::with_capacity(rows.len().min(SESSION_CAP));
+        for row in rows.iter().take(SESSION_CAP) {
+            let pid: i32 =
+                row.try_get(0).map_err(|e| DbError::Query(e.to_string()))?;
+            let user: Option<String> =
+                row.try_get(1).map_err(|e| DbError::Query(e.to_string()))?;
+            let database: Option<String> =
+                row.try_get(2).map_err(|e| DbError::Query(e.to_string()))?;
+            let state: Option<String> =
+                row.try_get(3).map_err(|e| DbError::Query(e.to_string()))?;
+            let query: Option<String> =
+                row.try_get(4).map_err(|e| DbError::Query(e.to_string()))?;
+            let waiting: bool =
+                row.try_get(5).map_err(|e| DbError::Query(e.to_string()))?;
+            let locks: Option<String> =
+                row.try_get(6).map_err(|e| DbError::Query(e.to_string()))?;
+            out.push(pg_session_from_parts(
+                pid, user, database, state, query, waiting, locks, pid == own,
+            )?);
+        }
+        Ok(out)
+    }
+
+    /// Terminate one backend by its panel id. Refuses this session's own pid,
+    /// so the lister cannot kill its own connection. The id is parsed to an
+    /// integer before it reaches SQL, so the statement cannot inject.
+    fn terminate_session(&mut self, backend: &str) -> Result<(), DbError> {
+        use sqlx::Row as _;
+        let pid = parse_pg_backend(backend)?;
+        if pid == self.backend_pid {
+            return Err(DbError::Query("cannot terminate this session".to_owned()));
+        }
+        let mut held = match &mut self.mode {
+            AutoMode::Pinned { conn, .. } => SchemaConn::Pinned(conn),
+            _ => {
+                let conn = self
+                    .rt
+                    .block_on(self.pool.acquire())
+                    .map_err(|e| DbError::Query(e.to_string()))?;
+                SchemaConn::Leased(PooledLease::new(&self.rt, conn))
+            }
+        };
+        let conn: &mut sqlx::PgConnection = held.conn();
+        let sql = pg_terminate_sql(pid);
+        let row = self
+            .rt
+            .block_on(sqlx::query(&sql).fetch_one(&mut *conn))
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        let ended: bool =
+            row.try_get(0).map_err(|e| DbError::Query(e.to_string()))?;
+        if ended {
+            Ok(())
+        } else {
+            Err(DbError::Query(format!("backend {backend} is gone")))
+        }
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -3475,6 +3821,90 @@ impl MySession {
         }
         Ok(SchemaInfo::new(databases, tables_truncated, columns_truncated))
     }
+
+    /// Live backends from `information_schema.processlist` with lock waits
+    /// folded in from `performance_schema.data_lock_waits`, both read-only.
+    /// The locks read is best effort: a missing or disabled
+    /// `performance_schema` reads as no waits. Runs on the manual pin when
+    /// one is held, else on a pool lease. The row carrying this session's
+    /// connection id is marked self.
+    fn sessions(&mut self) -> Result<Vec<SessionInfo>, DbError> {
+        use sqlx::Row as _;
+        // Manual mode holds the pool's only connection, so the list runs on
+        // the pin instead of timing out on an acquire.
+        let mut held = match &mut self.mode {
+            AutoMode::Pinned { conn, .. } => SchemaConn::Pinned(conn),
+            _ => {
+                let conn = self
+                    .rt
+                    .block_on(self.pool.acquire())
+                    .map_err(|e| DbError::Query(e.to_string()))?;
+                SchemaConn::Leased(PooledLease::new(&self.rt, conn))
+            }
+        };
+        let conn: &mut sqlx::MySqlConnection = held.conn();
+        let rows = self
+            .rt
+            .block_on(sqlx::query(mysql_sessions_sql()).fetch_all(&mut *conn))
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        let own = self.connection_id;
+        let mut out = Vec::with_capacity(rows.len().min(SESSION_CAP));
+        for row in rows.iter().take(SESSION_CAP) {
+            let id: u64 = my_cell_u64(row, 0)?;
+            let user: Option<String> = my_cell_string(row, 1)?;
+            let database: Option<String> = my_cell_string(row, 2)?;
+            let command: Option<String> = my_cell_string(row, 3)?;
+            let state: Option<String> = my_cell_string(row, 4)?;
+            let query: Option<String> = my_cell_string(row, 5)?;
+            out.push(mysql_session_from_parts(
+                id, user, database, command, state, query, id == own,
+            )?);
+        }
+        let waits: Vec<(u64, Option<u64>)> = match self
+            .rt
+            .block_on(sqlx::query(mysql_lock_waits_sql()).fetch_all(&mut *conn))
+        {
+            Ok(lock_rows) => lock_rows
+                .iter()
+                .filter_map(|row| {
+                    let requesting: Option<u64> =
+                        row.try_get_unchecked(0).unwrap_or(None);
+                    let blocking: Option<u64> =
+                        row.try_get_unchecked(1).unwrap_or(None);
+                    requesting.map(|id| (id, blocking))
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        apply_mysql_lock_waits(&mut out, &waits);
+        Ok(out)
+    }
+
+    /// Kill one connection by its panel id. Refuses this session's own id,
+    /// so the lister cannot kill its own connection. The id is parsed to an
+    /// integer before it reaches SQL, so the statement cannot inject.
+    fn terminate_session(&mut self, backend: &str) -> Result<(), DbError> {
+        let id = parse_mysql_backend(backend)?;
+        if id == self.connection_id {
+            return Err(DbError::Query("cannot terminate this session".to_owned()));
+        }
+        let mut held = match &mut self.mode {
+            AutoMode::Pinned { conn, .. } => SchemaConn::Pinned(conn),
+            _ => {
+                let conn = self
+                    .rt
+                    .block_on(self.pool.acquire())
+                    .map_err(|e| DbError::Query(e.to_string()))?;
+                SchemaConn::Leased(PooledLease::new(&self.rt, conn))
+            }
+        };
+        let conn: &mut sqlx::MySqlConnection = held.conn();
+        let sql = mysql_terminate_sql(id);
+        self.rt
+            .block_on(sqlx::raw_sql(&sql).execute(&mut *conn))
+            .map(|_| ())
+            .map_err(|e| DbError::Query(e.to_string()))
+    }
 }
 
 #[cfg(feature = "mysql")]
@@ -3769,6 +4199,27 @@ pub fn mysql_url(
 fn my_string(row: &sqlx::mysql::MySqlRow, index: usize) -> Result<String, DbError> {
     use sqlx::Row as _;
     row.try_get_unchecked::<String, _>(index)
+        .map_err(|e| DbError::Query(e.to_string()))
+}
+
+/// One processlist integer cell. Unchecked for the same binary-flag reason
+/// as [`my_string`].
+#[cfg(feature = "mysql")]
+fn my_cell_u64(row: &sqlx::mysql::MySqlRow, index: usize) -> Result<u64, DbError> {
+    use sqlx::Row as _;
+    row.try_get_unchecked::<u64, _>(index)
+        .map_err(|e| DbError::Query(e.to_string()))
+}
+
+/// One nullable processlist text cell. Unchecked for the same binary-flag
+/// reason as [`my_string`].
+#[cfg(feature = "mysql")]
+fn my_cell_string(
+    row: &sqlx::mysql::MySqlRow,
+    index: usize,
+) -> Result<Option<String>, DbError> {
+    use sqlx::Row as _;
+    row.try_get_unchecked::<Option<String>, _>(index)
         .map_err(|e| DbError::Query(e.to_string()))
 }
 
@@ -4747,6 +5198,37 @@ fn worker_loop(
                         schema,
                         table,
                         error: DbError::Query("driver panicked while counting rows".to_owned()),
+                    },
+                };
+                emit(&events, &ui, event);
+            }
+            DbCommand::ListSessions => {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    session.sessions()
+                }));
+                let event = match outcome {
+                    Ok(Ok(sessions)) => DbEvent::SessionsOk { conn, sessions },
+                    Ok(Err(error)) => DbEvent::SessionsErr { conn, error },
+                    Err(_) => DbEvent::SessionsErr {
+                        conn,
+                        error: DbError::Query("driver panicked while listing sessions".to_owned()),
+                    },
+                };
+                emit(&events, &ui, event);
+            }
+            DbCommand::TerminateSession { backend } => {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    session.terminate_session(&backend)
+                }));
+                let event = match outcome {
+                    Ok(Ok(())) => DbEvent::TerminateOk { conn, backend },
+                    Ok(Err(error)) => DbEvent::TerminateErr { conn, backend, error },
+                    Err(_) => DbEvent::TerminateErr {
+                        conn,
+                        backend,
+                        error: DbError::Query(
+                            "driver panicked while terminating the session".to_owned(),
+                        ),
                     },
                 };
                 emit(&events, &ui, event);
@@ -7279,5 +7761,173 @@ mod tests {
             unqualified_write("UPDATE t SET a = (SELECT max(a) FROM u WHERE u.id = t.id)"),
             Some(UnqualifiedWrite { kind: "UPDATE", table: "t".to_owned() })
         );
+    }
+
+    #[test]
+    fn session_info_rejects_an_empty_backend_id() {
+        assert!(SessionInfo::new(String::new(), "cde".into(), "cde_test".into(), "active".into(), "SELECT 1".into(), false, String::new(), false).is_err());
+        assert!(SessionInfo::new("  ".into(), String::new(), String::new(), String::new(), String::new(), false, String::new(), false).is_err());
+        let session = SessionInfo::new("12345".into(), "cde".into(), "cde_test".into(), "active".into(), "SELECT 1".into(), false, String::new(), true).unwrap();
+        assert_eq!(session.backend_id(), "12345");
+        assert_eq!(session.user(), "cde");
+        assert_eq!(session.database(), "cde_test");
+        assert_eq!(session.state(), "active");
+        assert_eq!(session.query(), "SELECT 1");
+        assert!(!session.waiting());
+        assert_eq!(session.locks(), "");
+        assert_eq!(session.wait_note(), "");
+        assert!(session.is_self());
+    }
+
+    #[test]
+    fn session_wait_note_names_the_lock_only_while_waiting() {
+        let waiting = SessionInfo::new("11".into(), "cde".into(), "cde_test".into(), "active".into(), String::new(), true, "RowExclusiveLock relation".into(), false).unwrap();
+        assert!(waiting.waiting());
+        assert_eq!(waiting.wait_note(), "RowExclusiveLock relation");
+        let unnamed = SessionInfo::new("12".into(), "cde".into(), "cde_test".into(), "active".into(), String::new(), true, String::new(), false).unwrap();
+        assert_eq!(unnamed.wait_note(), "waiting on lock");
+    }
+
+    #[test]
+    fn pg_sessions_sql_reads_activity_plus_locks() {
+        let sql = pg_sessions_sql();
+        assert!(sql.contains("pg_stat_activity"), "{sql}");
+        assert!(sql.contains("pg_locks"), "{sql}");
+    }
+
+    #[test]
+    fn mysql_sessions_sql_reads_processlist_and_locks_read_lock_waits() {
+        assert!(mysql_sessions_sql().contains("processlist"), "{}", mysql_sessions_sql());
+        let locks = mysql_lock_waits_sql();
+        assert!(locks.contains("data_lock_waits"), "{locks}");
+        assert!(locks.contains("threads"), "{locks}");
+    }
+
+    #[test]
+    fn terminate_sql_names_the_backend_as_an_integer() {
+        assert_eq!(pg_terminate_sql(12345), "SELECT pg_terminate_backend(12345)");
+        assert_eq!(mysql_terminate_sql(7), "KILL 7");
+    }
+
+    #[test]
+    fn pg_session_from_parts_maps_nulls_to_empty_text() {
+        let session = pg_session_from_parts(
+            12345,
+            Some("cde".to_owned()),
+            None,
+            Some("active".to_owned()),
+            None,
+            true,
+            Some("RowExclusiveLock relation".to_owned()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(session.backend_id(), "12345");
+        assert_eq!(session.user(), "cde");
+        assert_eq!(session.database(), "");
+        assert_eq!(session.state(), "active");
+        assert_eq!(session.query(), "");
+        assert!(session.waiting());
+        assert_eq!(session.wait_note(), "RowExclusiveLock relation");
+        assert!(session.is_self());
+    }
+
+    #[test]
+    fn mysql_session_from_parts_joins_command_and_state() {
+        let session = mysql_session_from_parts(
+            7,
+            Some("root".to_owned()),
+            Some("cde_test".to_owned()),
+            Some("Query".to_owned()),
+            Some("executing".to_owned()),
+            Some("SELECT 1".to_owned()),
+            false,
+        )
+        .unwrap();
+        assert_eq!(session.backend_id(), "7");
+        assert_eq!(session.user(), "root");
+        assert_eq!(session.database(), "cde_test");
+        assert_eq!(session.state(), "Query · executing");
+        assert_eq!(session.query(), "SELECT 1");
+        assert!(!session.waiting());
+        assert_eq!(session.wait_note(), "");
+        assert!(!session.is_self());
+    }
+
+    #[test]
+    fn mysql_state_text_keeps_whichever_half_names_something() {
+        assert_eq!(mysql_state_text(Some("Sleep".to_owned()), None), "Sleep");
+        assert_eq!(mysql_state_text(None, Some("User sleep".to_owned())), "User sleep");
+        assert_eq!(mysql_state_text(None, None), "");
+        assert_eq!(
+            mysql_state_text(Some("Query".to_owned()), Some("executing".to_owned())),
+            "Query · executing"
+        );
+    }
+
+    #[test]
+    fn mysql_lock_waits_mark_requesting_backends_with_their_blocker() {
+        let mut sessions = vec![
+            mysql_session_from_parts(7, None, None, None, None, None, false).unwrap(),
+            mysql_session_from_parts(9, None, None, None, None, None, false).unwrap(),
+        ];
+        apply_mysql_lock_waits(&mut sessions, &[(7, Some(9)), (11, None)]);
+        assert!(sessions[0].waiting());
+        assert_eq!(sessions[0].wait_note(), "blocked by 9");
+        assert!(!sessions[1].waiting());
+        assert_eq!(sessions[1].wait_note(), "");
+    }
+
+    #[test]
+    fn backend_parsers_accept_positive_ids_and_reject_the_rest() {
+        assert_eq!(parse_pg_backend("12345").unwrap(), 12345);
+        assert_eq!(parse_pg_backend("  42 ").unwrap(), 42);
+        assert_eq!(parse_mysql_backend("7").unwrap(), 7);
+        for raw in ["", "  ", "abc", "0", "-3", "12x", "1.5"] {
+            assert!(parse_pg_backend(raw).is_err(), "{raw}");
+            assert!(parse_mysql_backend(raw).is_err(), "{raw}");
+        }
+        assert_eq!(
+            parse_pg_backend("abc"),
+            Err(DbError::Query("unknown backend abc".to_owned()))
+        );
+    }
+
+    /// Lists the live backends and finds its own among them.
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_session_lists_its_own_backend() {
+        let config = ConnectionConfig::Postgres { read_only: false,
+            host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
+            port: std::env::var("PGPORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
+            user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+            ssl_mode: PostgresSslMode::Disable,
+            ssh: None,
+        };
+        let password = std::env::var("PGPASSWORD").ok();
+        let mut session = Session::open(&config, password.as_deref(), None).expect("open");
+        let sessions = session.sessions().expect("list sessions");
+        assert!(!sessions.is_empty());
+        let own = sessions.iter().find(|s| s.is_self()).expect("own backend listed");
+        assert!(!own.backend_id().is_empty());
+        assert!(!own.user().is_empty());
+    }
+
+    /// Lists the live connections and finds its own among them.
+    #[cfg(feature = "mysql")]
+    #[test]
+    #[ignore = "needs a live MySQL; set MYSQLHOST/MYSQLPORT/MYSQLDATABASE/MYSQLUSER/MYSQLPASSWORD"]
+    fn mysql_live_session_lists_its_own_backend() {
+        let mut session = mysql_live_open();
+        let sessions = session.sessions().expect("list sessions");
+        assert!(!sessions.is_empty());
+        let own = sessions.iter().find(|s| s.is_self()).expect("own backend listed");
+        assert!(!own.backend_id().is_empty());
+        assert!(!own.user().is_empty());
     }
 }
