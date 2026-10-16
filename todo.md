@@ -106,7 +106,7 @@ Wave 8: grid depth, serial on `src/ui/grid.rs` and `src/app.rs`.
 
 Wave 9: discovery surface, serial where files overlap.
 - [x] T29 Foreign key jump navigation. Follow references from grid cells and schema links through the navigator reveal path. Owns `src/ui/schema.rs` and `src/app.rs`. Tests: reveal cases. DBeaver third. Size S. Landed c761dcc with flagged one-liners in `src/ui/connections.rs` and `src/ui/grid.rs`, live jump green in the parent run.
-- [ ] T30 Navigator bookmarks and object filters. Bookmark set beside saved groups plus tree filter text. Owns `src/app.rs` and `src/ui/connections.rs`. Tests: bookmark roundtrip, filter cases. DBeaver eleventh. Size S, after T29.
+- [x] T30 Navigator bookmarks and object filters. Bookmark set beside saved groups plus tree filter text. Owns `src/app.rs` and `src/ui/connections.rs`. Tests: bookmark roundtrip, filter cases. DBeaver eleventh. Size S, after T29. Landed 264736a with the flagged schema row hook, gates green in the parent run.
 - [ ] T31 Nested folders with drag and drop. Folder paths for saved queries and connections, folder context creation. Owns `src/app.rs` and `src/ui/connections.rs`. Tests: path grouping, move cases. Beekeeper eighth. Size M, after T30.
 - [ ] T32 Execution log panel with per-connection scope. Query manager view over HistoryEntry with timing, plus the existing per-connection filter at the call site. Owns `src/ui/connections.rs` and `src/app.rs`. Tests: scope toggle, stats rendering. Beekeeper sixth, DBeaver tenth. Size S, after T31.
 - [ ] T33 Saved-query version history with restore. Version the saved-query persist file on each save. Owns `src/app.rs`. Tests: version list, restore roundtrip. Beekeeper seventh. Size S, independent inside wave 9.
