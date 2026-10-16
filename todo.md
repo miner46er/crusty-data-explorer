@@ -82,7 +82,7 @@ Wave 6: discovery surface, after wave 5.
 Wave 7: breadth, individually optional after wave 6.
 - [ ] T20 MySQL SSL modes mirroring the Postgres `ssl_mode` field. Owns `src/db.rs` and `src/ui/connections.rs`. Tests: URL builder per mode. Beekeeper ninth.
 - [ ] T21 Row counts on demand in the navigator, estimates for Postgres and MySQL and COUNT for SQLite behind an explicit request. Owns `src/db.rs` and `src/ui/schema.rs`. Tests: live per engine.
-- [ ] T22 Import and export breadth. XLSX read and write, JSONL, multi-table export, streamed full-results export past the row cap. Owns `src/import.rs` and `src/export.rs`. Tests: format roundtrips. Beekeeper tenth.
+- [ ] T22 Import and export breadth, split. T22a JSONL both ways plus multi-result export landed 0d634e5, staging imports through the grid staged-edit path rather than the CSV import modal. Still open: XLSX read and write (needs a dependency decision), streamed full-results export past the row cap (needs a streaming query path in `src/db.rs`), and optionally routing JSONL through the import modal via one parse-by-extension branch in `begin_import`.
 
 Considered and deferred: vim mode (large with low daily friction for our users), plan graph view (large, our table EXPLAIN already leads Beekeeper), virtual keys, filter memory, row coloring, foreign key navigation panel, grouping and calc panels, formatter presets, and search depth over DDL and comments. Out of scope stays ERD, plugins, admin tooling, enterprise auth, AI shell, cloud sync, and backup wizards.
 
