@@ -24,6 +24,9 @@ use crate::import::{
     ColumnMap, ROW_CAP, dropped_rows, insert_batches, map_headers, parse_csv, parse_jsonl,
 };
 use crate::sql::{collect_params, current_statement, split_statements, statement_ranges, substitute};
+use crate::ui::compare::{
+    CompareError, CompareOutput, compare_select, diff_tables, parse_key_columns,
+};
 
 /// Everything that changes about one connection's lifecycle, in five states.
 /// `Connected` and `QueryRunning` carry a [`LiveSession`], so SQL can only
@@ -978,6 +981,75 @@ pub struct NavigatorReveal {
     pub table: String,
 }
 
+/// One side of a table data compare: the schema and table the read selects.
+/// Both halves are plain text, so a pick outlives a schema reload that no
+/// longer lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ComparePick {
+    pub schema: String,
+    pub table: String,
+}
+
+impl ComparePick {
+    /// False when either half is blank, so an unset pick never sends.
+    pub fn is_set(&self) -> bool {
+        !self.schema.trim().is_empty() && !self.table.trim().is_empty()
+    }
+}
+
+/// Which read a compare run id belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompareSide {
+    Left,
+    Right,
+}
+
+/// The table data compare: two read-only table picks with key columns, their
+/// loaded results, and the cached diff. Picks and keys move only through
+/// methods that drop stale results, so the view never diffs old rows under
+/// new picks. Runs land through [`AppState::apply`] with no tab outcome, so
+/// a compare never flashes the grid.
+#[derive(Debug, Default)]
+pub struct CompareState {
+    left: ComparePick,
+    right: ComparePick,
+    keys: String,
+    left_result: Option<QueryResult>,
+    right_result: Option<QueryResult>,
+    left_run: Option<RunId>,
+    right_run: Option<RunId>,
+    error: Option<String>,
+    output: Option<CompareOutput>,
+}
+
+impl CompareState {
+    pub fn left(&self) -> &ComparePick {
+        &self.left
+    }
+    pub fn right(&self) -> &ComparePick {
+        &self.right
+    }
+    pub fn keys(&self) -> &str {
+        &self.keys
+    }
+    pub fn left_result(&self) -> Option<&QueryResult> {
+        self.left_result.as_ref()
+    }
+    pub fn right_result(&self) -> Option<&QueryResult> {
+        self.right_result.as_ref()
+    }
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+    pub fn output(&self) -> Option<&CompareOutput> {
+        self.output.as_ref()
+    }
+    /// True while either read is in flight.
+    pub fn running(&self) -> bool {
+        self.left_run.is_some() || self.right_run.is_some()
+    }
+}
+
 /// Cap on retained history entries, newest first.
 const HISTORY_CAP: usize = 200;
 /// Cap on history rows rendered in the sidebar.
@@ -1674,6 +1746,7 @@ pub struct AppState {
     navigator_reveal: Option<NavigatorReveal>,
     save_prompt: Option<SavePrompt>,
     imports: Option<ImportDraft>,
+    compare: CompareState,
     theme: crate::ui::Theme,
     /// The idle schedule for open manual transactions, threaded to each
     /// worker at spawn. Tests swap in a short schedule.
@@ -1726,6 +1799,7 @@ impl AppState {
             navigator_reveal: None,
             save_prompt: None,
             imports: None,
+            compare: CompareState::default(),
             theme: settings.theme,
             tx_idle: TxIdle::default(),
         };
@@ -3489,6 +3563,181 @@ impl AppState {
         }
     }
 
+    /// The table data compare state, for the compare view.
+    pub fn compare(&self) -> &CompareState {
+        &self.compare
+    }
+
+    /// Retarget the left pick. Drops loaded rows and runs, so stale results
+    /// never diff under new picks.
+    pub fn set_compare_left(&mut self, schema: &str, table: &str) {
+        self.compare.left =
+            ComparePick { schema: schema.to_owned(), table: table.to_owned() };
+        self.clear_compare_results();
+    }
+
+    /// Retarget the right pick, dropping stale results like the left one.
+    pub fn set_compare_right(&mut self, schema: &str, table: &str) {
+        self.compare.right =
+            ComparePick { schema: schema.to_owned(), table: table.to_owned() };
+        self.clear_compare_results();
+    }
+
+    /// Replace the key columns and re-diff loaded rows at once, so a key
+    /// edit surfaces its error or its new counts without another read.
+    pub fn set_compare_keys(&mut self, keys: String) {
+        self.compare.keys = keys;
+        self.refresh_compare_output();
+    }
+
+    /// Drop loaded rows, in-flight runs, the cached diff, and the error. A
+    /// landing for a dropped run matches nothing and is silently ignored.
+    fn clear_compare_results(&mut self) {
+        self.compare.left_result = None;
+        self.compare.right_result = None;
+        self.compare.left_run = None;
+        self.compare.right_run = None;
+        self.compare.output = None;
+        self.compare.error = None;
+    }
+
+    /// Re-diff the loaded rows under the current keys. Missing rows clear the
+    /// cached diff; a key error replaces it with the error text.
+    fn refresh_compare_output(&mut self) {
+        let (Some(left), Some(right)) =
+            (self.compare.left_result.clone(), self.compare.right_result.clone())
+        else {
+            self.compare.output = None;
+            return;
+        };
+        match diff_tables(&left, &right, &parse_key_columns(&self.compare.keys)) {
+            Ok(output) => {
+                self.compare.output = Some(output);
+                self.compare.error = None;
+            }
+            Err(error) => {
+                self.compare.output = None;
+                self.compare.error = Some(error.to_string());
+            }
+        }
+    }
+
+    /// Read both picked tables through the worker batch path and diff the
+    /// landings. Two single-statement SELECT batches, so the read-only guard
+    /// below passes reads on a read-only connection and a SELECT never arms
+    /// the write confirm. Landings stash with no tab outcome and no history
+    /// entry, the silent-batch precedent, so the grid never flashes.
+    pub fn start_compare(&mut self) {
+        let conn = match self.default_connection() {
+            Some(id) => id,
+            None => {
+                self.compare.error = Some("no connection for compare".to_owned());
+                return;
+            }
+        };
+        let (handle, read_only, live, kind) =
+            match self.connections.iter().find(|c| c.id == conn) {
+                Some(c) => (
+                    c.handle(),
+                    c.config.is_read_only(),
+                    matches!(
+                        c.state,
+                        ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
+                    ),
+                    c.config.kind(),
+                ),
+                None => {
+                    self.compare.error = Some("connection not found".to_owned());
+                    return;
+                }
+            };
+        if !live {
+            self.compare.error = Some("not connected".to_owned());
+            return;
+        }
+        if !self.compare.left.is_set() || !self.compare.right.is_set() {
+            self.compare.error = Some("pick two tables to compare".to_owned());
+            return;
+        }
+        if parse_key_columns(&self.compare.keys).is_empty() {
+            self.compare.error = Some(CompareError::NoKeys.to_string());
+            return;
+        }
+        let left_sql = compare_select(
+            kind,
+            &self.compare.left.schema.clone(),
+            &self.compare.left.table.clone(),
+        );
+        let right_sql = compare_select(
+            kind,
+            &self.compare.right.schema.clone(),
+            &self.compare.right.table.clone(),
+        );
+        if read_only {
+            if let Some(kind) =
+                [left_sql.clone(), right_sql.clone()]
+                    .iter()
+                    .find_map(|statement| crate::db::write_statement_kind(statement))
+            {
+                self.compare.error =
+                    Some(format!("read-only connection refused {kind}"));
+                return;
+            }
+        }
+        self.clear_compare_results();
+        let Some(handle) = handle else {
+            self.compare.error = Some("not connected".to_owned());
+            return;
+        };
+        let left_run = self.ids.run();
+        match handle.send(DbCommand::QueryBatch {
+            run: left_run,
+            statements: vec![left_sql],
+        }) {
+            Ok(()) => self.compare.left_run = Some(left_run),
+            Err(error) => {
+                self.compare.error = Some(error.to_string());
+                return;
+            }
+        }
+        let right_run = self.ids.run();
+        match handle.send(DbCommand::QueryBatch {
+            run: right_run,
+            statements: vec![right_sql],
+        }) {
+            Ok(()) => self.compare.right_run = Some(right_run),
+            Err(error) => self.compare.error = Some(error.to_string()),
+        }
+    }
+
+    /// Clear the pending run a landing belongs to, if any. Late landings for
+    /// cleared picks match nothing, so a re-pick never inherits old rows.
+    fn take_compare_run(&mut self, run: RunId) -> Option<CompareSide> {
+        if self.compare.left_run == Some(run) {
+            self.compare.left_run = None;
+            Some(CompareSide::Left)
+        } else if self.compare.right_run == Some(run) {
+            self.compare.right_run = None;
+            Some(CompareSide::Right)
+        } else {
+            None
+        }
+    }
+
+    /// Stash one compare landing and re-diff when both sides hold rows. An
+    /// empty batch errors instead of stalling the view on a missing side.
+    fn land_compare_side(&mut self, side: CompareSide, results: Vec<QueryResult>) {
+        let Some(result) = results.into_iter().next() else {
+            self.compare.error = Some("empty compare batch".to_owned());
+            return;
+        };
+        match side {
+            CompareSide::Left => self.compare.left_result = Some(result),
+            CompareSide::Right => self.compare.right_result = Some(result),
+        }
+        self.refresh_compare_output();
+    }
+
     /// Follow the single-column foreign key behind one grid cell to its
     /// referenced row: the referenced table opens with a filtered SELECT and
     /// the navigator reveals its entry through [`AppState::reveal_table`].
@@ -4315,10 +4564,16 @@ impl AppState {
                 self.schema_loading.remove(&conn);
             }
             DbEvent::QueryOk { run, result } => {
-                self.finish_run(run, RunOutcome::Ok { results: vec![result], active: 0 });
+                match self.take_compare_run(run) {
+                    Some(side) => self.land_compare_side(side, vec![result]),
+                    None => self.finish_run(run, RunOutcome::Ok { results: vec![result], active: 0 }),
+                }
             }
             DbEvent::BatchOk { run, results } => {
-                self.finish_run(run, RunOutcome::Ok { results, active: 0 });
+                match self.take_compare_run(run) {
+                    Some(side) => self.land_compare_side(side, results),
+                    None => self.finish_run(run, RunOutcome::Ok { results, active: 0 }),
+                }
             }
             DbEvent::SchemaOk { conn, schema } => {
                 self.schema_loading.remove(&conn);
@@ -4367,6 +4622,10 @@ impl AppState {
                 self.sessions_errors.insert(conn, error.to_string());
             }
             DbEvent::QueryErr { run, error } => {
+                if self.take_compare_run(run).is_some() {
+                    self.compare.error = Some(error.to_string());
+                    return;
+                }
                 let fatal = error.is_fatal();
                 let message = error.to_string();
                 let conn_id = self
@@ -11771,6 +12030,319 @@ mod tests {
             assert_eq!(state.navigator_filter(), "use");
             assert!(table_matches_navigator_filter("users", state.navigator_filter()));
             assert!(!table_matches_navigator_filter("orders", state.navigator_filter()));
+        });
+    }
+
+    fn compare_result(rows: Vec<(i64, &str)>) -> QueryResult {
+        QueryResult::from_columns(
+            vec![
+                crate::db::Column::new(
+                    "id".to_owned(),
+                    "INTEGER".to_owned(),
+                    rows.iter().map(|(id, _)| Value::Integer(*id)).collect(),
+                ),
+                crate::db::Column::new(
+                    "name".to_owned(),
+                    "TEXT".to_owned(),
+                    rows.iter().map(|(_, name)| Value::Text((*name).to_owned())).collect(),
+                ),
+            ],
+            false,
+            None,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn compare_sends_two_read_only_batches() {
+        with_isolated_state("compare-send", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let commands = attach_test_session(state, conn);
+            let _tab = state.new_tab(conn);
+            state.set_compare_left("main", "users");
+            state.set_compare_right("main", "orders");
+            state.set_compare_keys("id".to_owned());
+            state.start_compare();
+            assert!(state.compare().running(), "both reads are in flight");
+            assert!(state.compare().error().is_none());
+            let mut statements = Vec::new();
+            for _ in 0..2 {
+                match commands.try_recv().expect("a read was sent") {
+                    DbCommand::QueryBatch { statements: sent, .. } => statements.push(sent),
+                    other => panic!("expected QueryBatch, got {other:?}"),
+                }
+            }
+            assert_eq!(
+                statements,
+                vec![
+                    vec!["SELECT * FROM \"main\".\"users\"".to_owned()],
+                    vec!["SELECT * FROM \"main\".\"orders\"".to_owned()],
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn compare_reads_pass_the_read_only_guard() {
+        with_isolated_state("compare-ro", |state| {
+            let conn = add_sqlite_connection(state, "mem-ro");
+            state
+                .connections
+                .iter_mut()
+                .find(|c| c.id == conn)
+                .expect("connection")
+                .config
+                .set_read_only(true);
+            let commands = attach_test_session(state, conn);
+            let _tab = state.new_tab(conn);
+            state.set_compare_left("main", "users");
+            state.set_compare_right("main", "orders");
+            state.set_compare_keys("id".to_owned());
+            state.start_compare();
+            assert!(state.compare().error().is_none(), "reads are allowed on read-only");
+            assert!(commands.try_recv().is_ok(), "the left read was sent");
+            assert!(commands.try_recv().is_ok(), "the right read was sent");
+        });
+    }
+
+    #[test]
+    fn compare_needs_picks_and_keys() {
+        with_isolated_state("compare-blank", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let commands = attach_test_session(state, conn);
+            let _tab = state.new_tab(conn);
+            state.set_compare_keys("id".to_owned());
+            state.start_compare();
+            assert_eq!(state.compare().error(), Some("pick two tables to compare"));
+            assert!(commands.try_recv().is_err(), "nothing was sent");
+            state.set_compare_left("main", "users");
+            state.set_compare_right("main", "orders");
+            state.set_compare_keys(String::new());
+            state.start_compare();
+            assert_eq!(state.compare().error(), Some("key columns are empty"));
+            assert!(commands.try_recv().is_err(), "nothing was sent");
+        });
+    }
+
+    #[test]
+    fn compare_landings_diff_into_counts() {
+        use crate::ui::compare::DiffKind;
+
+        with_isolated_state("compare-land", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let commands = attach_test_session(state, conn);
+            let _tab = state.new_tab(conn);
+            state.set_compare_left("main", "a");
+            state.set_compare_right("main", "b");
+            state.set_compare_keys("id".to_owned());
+            state.start_compare();
+            let left_run = state.compare.left_run.expect("left run");
+            let right_run = state.compare.right_run.expect("right run");
+            assert!(commands.try_recv().is_ok());
+            assert!(commands.try_recv().is_ok());
+            state.apply(DbEvent::BatchOk {
+                run: left_run,
+                results: vec![compare_result(vec![(1, "ada"), (2, "grace")])],
+            });
+            assert!(state.compare().output().is_none(), "one side alone diffs nothing");
+            assert!(state.compare().running(), "the right read is still in flight");
+            state.apply(DbEvent::BatchOk {
+                run: right_run,
+                results: vec![compare_result(vec![(1, "ada"), (2, "GRACE"), (3, "lin")])],
+            });
+            assert!(!state.compare().running());
+            let output = state.compare().output().expect("both sides diff");
+            assert_eq!(output.counts.added, 1);
+            assert_eq!(output.counts.removed, 0);
+            assert_eq!(output.counts.changed, 1);
+            assert_eq!(output.counts.unchanged, 1);
+            let changed =
+                output.rows.iter().find(|row| row.kind == DiffKind::Changed).expect("a change");
+            assert_eq!(changed.key, "2");
+            assert_eq!(changed.changed, vec!["name".to_owned()]);
+            assert_eq!(changed.left, vec!["2".to_owned(), "grace".to_owned()]);
+            assert_eq!(changed.right, vec!["2".to_owned(), "GRACE".to_owned()]);
+        });
+    }
+
+    #[test]
+    fn compare_error_landing_surfaces_the_message() {
+        with_isolated_state("compare-err", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let _commands = attach_test_session(state, conn);
+            let _tab = state.new_tab(conn);
+            state.set_compare_left("main", "a");
+            state.set_compare_right("main", "b");
+            state.set_compare_keys("id".to_owned());
+            state.start_compare();
+            let left_run = state.compare.left_run.expect("left run");
+            state.apply(DbEvent::QueryErr {
+                run: left_run,
+                error: crate::db::DbError::Query("boom".to_owned()),
+            });
+            assert_eq!(state.compare().error(), Some("query failed: boom"));
+            assert!(state.compare().output().is_none());
+        });
+    }
+
+    #[test]
+    fn compare_key_edits_recompute_and_picks_clear() {
+        with_isolated_state("compare-rekey", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let _commands = attach_test_session(state, conn);
+            let _tab = state.new_tab(conn);
+            state.set_compare_left("main", "a");
+            state.set_compare_right("main", "b");
+            state.set_compare_keys("id".to_owned());
+            let left_run = state.ids.run();
+            let right_run = state.ids.run();
+            state.compare.left_run = Some(left_run);
+            state.compare.right_run = Some(right_run);
+            state.apply(DbEvent::BatchOk {
+                run: left_run,
+                results: vec![compare_result(vec![(1, "ada")])],
+            });
+            state.apply(DbEvent::BatchOk {
+                run: right_run,
+                results: vec![compare_result(vec![(1, "ada")])],
+            });
+            assert!(state.compare().output().is_some());
+            state.set_compare_keys("nope".to_owned());
+            assert_eq!(
+                state.compare().error(),
+                Some("left result has no key column \"nope\"")
+            );
+            assert!(state.compare().output().is_none());
+            state.set_compare_keys("id".to_owned());
+            assert!(state.compare().error().is_none());
+            assert!(state.compare().output().is_some());
+            state.set_compare_left("main", "c");
+            assert!(state.compare().left_result().is_none(), "re-picks drop stale rows");
+            assert!(state.compare().output().is_none());
+            assert!(state.compare().error().is_none());
+        });
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_compare_scratch_tables_surfaces_the_planted_difference() {
+        use crate::ui::compare::DiffKind;
+
+        with_isolated_state("pg-compare-live", |state| {
+            let conn = add_postgres_probe_connection(state);
+            state.connect(conn);
+            assert!(
+                pump_until(state, |s| {
+                    s.connections().iter().any(|c| {
+                        c.id == conn && matches!(c.state(), ConnectionState::Connected { .. })
+                    })
+                }),
+                "connects to live Postgres"
+            );
+            let tab = state.new_tab(conn);
+            for sql in [
+                "DROP TABLE IF EXISTS cde_cmp_a",
+                "DROP TABLE IF EXISTS cde_cmp_b",
+                "CREATE TABLE cde_cmp_a (id INT PRIMARY KEY, name TEXT NOT NULL)",
+                "CREATE TABLE cde_cmp_b (id INT PRIMARY KEY, name TEXT NOT NULL)",
+                "INSERT INTO cde_cmp_a VALUES (1, 'ada'), (2, 'grace')",
+                "INSERT INTO cde_cmp_b VALUES (1, 'ada'), (2, 'GRACE'), (3, 'lin')",
+            ] {
+                live_run(state, tab, sql);
+            }
+            state.set_compare_left("public", "cde_cmp_a");
+            state.set_compare_right("public", "cde_cmp_b");
+            state.set_compare_keys("id".to_owned());
+            state.start_compare();
+            assert!(
+                pump_until(state, |s| {
+                    s.compare().output().is_some() || s.compare().error().is_some()
+                }),
+                "the compare lands"
+            );
+            if let Some(error) = state.compare().error() {
+                panic!("compare failed: {error}");
+            }
+            let output = state.compare().output().expect("a diff");
+            assert_eq!(output.counts.added, 1, "row 3 is right only");
+            assert_eq!(output.counts.removed, 0);
+            assert_eq!(output.counts.changed, 1, "row 2 differs");
+            assert_eq!(output.counts.unchanged, 1, "row 1 matches");
+            let changed = output
+                .rows
+                .iter()
+                .find(|row| row.kind == DiffKind::Changed)
+                .expect("the planted change");
+            assert_eq!(changed.key, "2");
+            assert_eq!(changed.changed, vec!["name".to_owned()]);
+            assert_eq!(changed.left, vec!["2".to_owned(), "grace".to_owned()]);
+            assert_eq!(changed.right, vec!["2".to_owned(), "GRACE".to_owned()]);
+            live_run(state, tab, "DROP TABLE cde_cmp_a");
+            live_run(state, tab, "DROP TABLE cde_cmp_b");
+        });
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    #[ignore = "needs a live MySQL; set MYSQLHOST/MYSQLPORT/MYSQLDATABASE/MYSQLUSER/MYSQLPASSWORD"]
+    fn mysql_live_compare_scratch_tables_surface_the_planted_difference() {
+        use crate::ui::compare::DiffKind;
+
+        with_isolated_state("mysql-compare-live", |state| {
+            let conn = add_mysql_probe_connection(state);
+            state.connect(conn);
+            assert!(
+                pump_until(state, |s| {
+                    s.connections().iter().any(|c| {
+                        c.id == conn && matches!(c.state(), ConnectionState::Connected { .. })
+                    })
+                }),
+                "connects to live MySQL"
+            );
+            let schema =
+                std::env::var("MYSQLDATABASE").unwrap_or_else(|_| "mysql".to_owned());
+            let tab = state.new_tab(conn);
+            for sql in [
+                "DROP TABLE IF EXISTS cde_cmp_a",
+                "DROP TABLE IF EXISTS cde_cmp_b",
+                "CREATE TABLE cde_cmp_a (id INT PRIMARY KEY, name TEXT NOT NULL)",
+                "CREATE TABLE cde_cmp_b (id INT PRIMARY KEY, name TEXT NOT NULL)",
+                "INSERT INTO cde_cmp_a VALUES (1, 'ada'), (2, 'grace')",
+                "INSERT INTO cde_cmp_b VALUES (1, 'ada'), (2, 'GRACE'), (3, 'lin')",
+            ] {
+                live_run(state, tab, sql);
+            }
+            state.set_compare_left(&schema, "cde_cmp_a");
+            state.set_compare_right(&schema, "cde_cmp_b");
+            state.set_compare_keys("id".to_owned());
+            state.start_compare();
+            assert!(
+                pump_until(state, |s| {
+                    s.compare().output().is_some() || s.compare().error().is_some()
+                }),
+                "the compare lands"
+            );
+            if let Some(error) = state.compare().error() {
+                panic!("compare failed: {error}");
+            }
+            let output = state.compare().output().expect("a diff");
+            assert_eq!(output.counts.added, 1, "row 3 is right only");
+            assert_eq!(output.counts.removed, 0);
+            assert_eq!(output.counts.changed, 1, "row 2 differs");
+            assert_eq!(output.counts.unchanged, 1, "row 1 matches");
+            let changed = output
+                .rows
+                .iter()
+                .find(|row| row.kind == DiffKind::Changed)
+                .expect("the planted change");
+            assert_eq!(changed.key, "2");
+            assert_eq!(changed.changed, vec!["name".to_owned()]);
+            assert_eq!(changed.left, vec!["2".to_owned(), "grace".to_owned()]);
+            assert_eq!(changed.right, vec!["2".to_owned(), "GRACE".to_owned()]);
+            live_run(state, tab, "DROP TABLE cde_cmp_a");
+            live_run(state, tab, "DROP TABLE cde_cmp_b");
         });
     }
 }

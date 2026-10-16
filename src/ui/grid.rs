@@ -797,6 +797,7 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
     import_window(state, ui);
     prune_selection(state, ui.ctx());
     prune_grid_views(state, ui.ctx());
+    super::compare::compare_section(state, ui);
     let modal_open = state.draft().is_some()
         || state.save_prompt().is_some()
         || state.password_prompt().is_some()
