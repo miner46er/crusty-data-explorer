@@ -17,8 +17,8 @@ use crate::db::{
     TX_IDLE_ROLLBACK_MINUTES,
 };
 use crate::edit::{
-    delete_statement, editable_table, insert_statement, is_text_type, qualified_parts,
-    to_literal, update_statement,
+    delete_statement, editable_table, ident, insert_statement, is_text_type, qualified_parts,
+    quote_qualified, to_literal, update_statement,
 };
 use crate::import::{ColumnMap, ROW_CAP, dropped_rows, insert_batches, map_headers, parse_csv};
 use crate::sql::{collect_params, current_statement, split_statements, statement_ranges, substitute};
@@ -183,6 +183,148 @@ impl RunScope {
     }
 }
 
+/// One structured WHERE operator. Equality, the four comparisons, LIKE,
+/// IN, and the two NULL tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum FilterOp {
+    #[default]
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    Like,
+    In,
+    IsNull,
+    IsNotNull,
+}
+
+impl FilterOp {
+    pub const ALL: [FilterOp; 10] = [
+        FilterOp::Eq,
+        FilterOp::NotEq,
+        FilterOp::Lt,
+        FilterOp::LtEq,
+        FilterOp::Gt,
+        FilterOp::GtEq,
+        FilterOp::Like,
+        FilterOp::In,
+        FilterOp::IsNull,
+        FilterOp::IsNotNull,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            FilterOp::Eq => "=",
+            FilterOp::NotEq => "<>",
+            FilterOp::Lt => "<",
+            FilterOp::LtEq => "<=",
+            FilterOp::Gt => ">",
+            FilterOp::GtEq => ">=",
+            FilterOp::Like => "LIKE",
+            FilterOp::In => "IN",
+            FilterOp::IsNull => "IS NULL",
+            FilterOp::IsNotNull => "IS NOT NULL",
+        }
+    }
+}
+
+/// One structured WHERE clause: a column, an operator, and the raw typed
+/// text rendered through [`to_literal`]. The NULL tests ignore the value;
+/// IN splits it on commas into one literal per item. Every field defaults
+/// so a filter file written before the field existed still loads.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FilterClause {
+    #[serde(default)]
+    pub column: String,
+    #[serde(default)]
+    pub op: FilterOp,
+    #[serde(default)]
+    pub value: String,
+}
+
+/// One clause as SQL: `"col" = <literal>`. None when the column is blank,
+/// when a valued operator has no value text, or when IN has no items.
+pub fn clause_sql(clause: &FilterClause) -> Option<String> {
+    let column = clause.column.trim();
+    if column.is_empty() {
+        return None;
+    }
+    let lhs = ident(column);
+    match clause.op {
+        FilterOp::IsNull => Some(format!("{lhs} IS NULL")),
+        FilterOp::IsNotNull => Some(format!("{lhs} IS NOT NULL")),
+        FilterOp::In => {
+            let items: Vec<String> = clause
+                .value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(|item| to_literal(item, false))
+                .collect();
+            if items.is_empty() {
+                return None;
+            }
+            Some(format!("{lhs} IN ({})", items.join(", ")))
+        }
+        op => {
+            let value = clause.value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            let sql_op = match op {
+                FilterOp::Eq => "=",
+                FilterOp::NotEq => "<>",
+                FilterOp::Lt => "<",
+                FilterOp::LtEq => "<=",
+                FilterOp::Gt => ">",
+                FilterOp::GtEq => ">=",
+                FilterOp::Like => "LIKE",
+                FilterOp::In | FilterOp::IsNull | FilterOp::IsNotNull => return None,
+            };
+            Some(format!("{lhs} {sql_op} {}", to_literal(value, false)))
+        }
+    }
+}
+
+/// Clauses plus the raw box as one WHERE body: the clause predicates and the
+/// raw text, parenthesized and appended exactly as written, joined by AND.
+/// None when both are empty.
+pub fn filter_where(clauses: &[FilterClause], raw: &str) -> Option<String> {
+    let mut parts: Vec<String> = clauses.iter().filter_map(clause_sql).collect();
+    let raw = raw.trim();
+    if !raw.is_empty() {
+        parts.push(format!("({raw})"));
+    }
+    if parts.is_empty() { None } else { Some(parts.join(" AND ")) }
+}
+
+/// A table SELECT with the filter's WHERE composed in, still capped at 100
+/// rows like [`table_select`].
+pub fn filtered_table_select(table: &str, clauses: &[FilterClause], raw: &str) -> String {
+    match filter_where(clauses, raw) {
+        Some(where_clause) => {
+            format!("SELECT * FROM {} WHERE {where_clause} LIMIT 100", quote_qualified(table))
+        }
+        None => format!("SELECT * FROM {} LIMIT 100", quote_qualified(table)),
+    }
+}
+
+/// Cap on retained named filters, newest first.
+const FILTER_HISTORY_CAP: usize = 50;
+
+/// One named structured filter: a tab's clauses plus its raw box. Clauses
+/// and raw default so a filter file written before the field existed still
+/// loads, with an empty filter in place of the missing shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SavedFilter {
+    pub name: String,
+    #[serde(default)]
+    pub clauses: Vec<FilterClause>,
+    #[serde(default)]
+    pub raw: String,
+}
+
 /// One staged cell edit: a result row and column with the text to write on
 /// the next apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +361,8 @@ pub struct Tab {
     sort_col: Option<usize>,
     sort_dir: SortDir,
     filter: String,
+    filter_clauses: Vec<FilterClause>,
+    filter_raw: String,
     export_notice: Option<String>,
     export_failed: bool,
     edits: Vec<RowEdit>,
@@ -301,6 +445,37 @@ impl Tab {
     }
     pub fn set_filter(&mut self, filter: String) {
         self.filter = filter;
+    }
+    pub fn filter_clauses(&self) -> &[FilterClause] {
+        &self.filter_clauses
+    }
+    pub fn filter_clauses_mut(&mut self) -> &mut Vec<FilterClause> {
+        &mut self.filter_clauses
+    }
+    /// Push one structured clause onto the tab.
+    pub fn add_filter_clause(&mut self, clause: FilterClause) {
+        self.filter_clauses.push(clause);
+    }
+    /// Drop the clause at `index`, if any.
+    pub fn remove_filter_clause(&mut self, index: usize) {
+        if index < self.filter_clauses.len() {
+            self.filter_clauses.remove(index);
+        }
+    }
+    pub fn filter_raw(&self) -> &str {
+        &self.filter_raw
+    }
+    pub fn set_filter_raw(&mut self, raw: String) {
+        self.filter_raw = raw;
+    }
+    /// The tab's clauses plus its raw box as one WHERE body.
+    pub fn filter_where(&self) -> Option<String> {
+        filter_where(&self.filter_clauses, &self.filter_raw)
+    }
+    /// Drop every structured clause and the raw box.
+    pub fn clear_table_filter(&mut self) {
+        self.filter_clauses.clear();
+        self.filter_raw.clear();
     }
     pub fn export_notice(&self) -> Option<&str> {
         self.export_notice.as_deref()
@@ -893,6 +1068,7 @@ pub struct AppState {
     row_counts: HashMap<(ConnectionId, String, String), RowCountState>,
     history: Vec<HistoryEntry>,
     saved: Vec<SavedQuery>,
+    filter_history: Vec<SavedFilter>,
     search: Option<SearchPalette>,
     /// The table the palette asked the navigator to reveal; the schema tree
     /// consumes it on its next render.
@@ -936,6 +1112,7 @@ impl AppState {
             row_counts: HashMap::new(),
             history: load_history(),
             saved,
+            filter_history: load_saved_filters(),
             search: None,
             navigator_reveal: None,
             save_prompt: None,
@@ -1074,6 +1251,8 @@ impl AppState {
             sort_col: None,
             sort_dir: SortDir::Asc,
             filter: String::new(),
+            filter_clauses: Vec::new(),
+            filter_raw: String::new(),
             export_notice: None,
             export_failed: false,
             edits: Vec::new(),
@@ -2023,6 +2202,93 @@ impl AppState {
         }
     }
 
+    /// The tab's SQL rebuilt as a filtered table SELECT: the single table its
+    /// SQL names with the tab's clauses and raw box composed into the WHERE.
+    /// None when the SQL is not a single-table SELECT.
+    pub fn table_filter_select(&self, tab: TabId) -> Option<String> {
+        let current = self.tabs.iter().find(|t| t.id == tab)?;
+        let table = editable_table(&current.sql)?;
+        Some(filtered_table_select(
+            &table,
+            &current.filter_clauses,
+            &current.filter_raw,
+        ))
+    }
+
+    /// Re-run the tab through the normal batch path with its structured
+    /// filter composed into the table SELECT. The tab's SQL becomes the
+    /// filtered SELECT, so apply, refresh, and history behave like any run.
+    /// No-op when the SQL names no single table.
+    pub fn apply_table_filter(&mut self, tab: TabId) {
+        let Some(sql) = self.table_filter_select(tab) else { return };
+        if let Some(slot) = self.tab_sql_mut(tab) {
+            *slot = sql.clone();
+        }
+        let len = sql.len();
+        self.start_run(tab, &sql, len, None);
+    }
+
+    /// Drop the tab's structured clauses and raw box. The grid re-reads on
+    /// the next apply.
+    pub fn clear_table_filter(&mut self, tab: TabId) {
+        if let Some(current) = self.tabs.iter_mut().find(|t| t.id == tab) {
+            current.clear_table_filter();
+        }
+    }
+
+    pub fn filter_history(&self) -> &[SavedFilter] {
+        &self.filter_history
+    }
+
+    /// Save the tab's clauses and raw box under `name`. A duplicate name
+    /// replaces the entry in place. False when the name is blank or the tab
+    /// is gone.
+    pub fn save_filter(&mut self, tab: TabId, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let Some(current) = self.tabs.iter().find(|t| t.id == tab) else { return false };
+        let saved = SavedFilter {
+            name: name.to_owned(),
+            clauses: current.filter_clauses.clone(),
+            raw: current.filter_raw.clone(),
+        };
+        match self.filter_history.iter_mut().find(|entry| entry.name == name) {
+            Some(existing) => *existing = saved,
+            None => {
+                self.filter_history.insert(0, saved);
+                self.filter_history.truncate(FILTER_HISTORY_CAP);
+            }
+        }
+        self.persist_filters();
+        true
+    }
+
+    /// Copy the named filter onto the tab. False for an unknown name or a
+    /// missing tab.
+    pub fn recall_filter(&mut self, tab: TabId, name: &str) -> bool {
+        let Some(saved) = self.filter_history.iter().find(|entry| entry.name == name).cloned()
+        else {
+            return false;
+        };
+        let Some(current) = self.tabs.iter_mut().find(|t| t.id == tab) else { return false };
+        current.filter_clauses = saved.clauses;
+        current.filter_raw = saved.raw;
+        true
+    }
+
+    /// Drop the named filter. False when no entry carries the name.
+    pub fn delete_filter(&mut self, name: &str) -> bool {
+        let before = self.filter_history.len();
+        self.filter_history.retain(|entry| entry.name != name);
+        let removed = self.filter_history.len() != before;
+        if removed {
+            self.persist_filters();
+        }
+        removed
+    }
+
     pub fn preview_table(&mut self, conn: ConnectionId, schema: &str, table: &str) {
         if self.connections.iter().find(|c| c.id == conn).is_none() {
             return;
@@ -2808,6 +3074,12 @@ impl AppState {
         }
     }
 
+    fn persist_filters(&self) {
+        if let Err(e) = save_saved_filters(&self.filter_history) {
+            log::warn!("persist saved filters: {e}");
+        }
+    }
+
     fn persist_tabs(&self) {
         if let Err(e) = save_tabs(&self.tabs) {
             log::warn!("persist tabs: {e}");
@@ -2973,6 +3245,45 @@ fn save_saved_queries(saved: &[SavedQuery]) -> std::io::Result<()> {
     }
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(saved).unwrap_or_default())?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// The named structured filters beside the saved queries, newest first.
+/// One file per store, one shape per file, so a corrupt filters file cannot
+/// take the saved queries down with it.
+fn saved_filters_path() -> std::path::PathBuf {
+    profiles_path().with_file_name("saved_filters.json")
+}
+
+/// Every retained filter in file order. A missing or corrupt file loads as
+/// empty, and the 50 entry cap holds across restarts through the truncate.
+fn load_saved_filters() -> Vec<SavedFilter> {
+    let path = saved_filters_path();
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    match serde_json::from_slice::<Vec<SavedFilter>>(&bytes) {
+        Ok(mut filters) => {
+            filters.retain(|f| !f.name.trim().is_empty());
+            filters.truncate(FILTER_HISTORY_CAP);
+            filters
+        }
+        Err(e) => {
+            log::warn!("parse {}: {e}", path.display());
+            Vec::new()
+        }
+    }
+}
+
+fn save_saved_filters(filters: &[SavedFilter]) -> std::io::Result<()> {
+    let path = saved_filters_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(filters).unwrap_or_default())?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
@@ -3593,6 +3904,367 @@ mod tests {
     }
 
     #[test]
+    fn filter_clause_sql_covers_every_operator_with_literal_typing() {
+        let clause = |column: &str, op: FilterOp, value: &str| FilterClause {
+            column: column.to_owned(),
+            op,
+            value: value.to_owned(),
+        };
+        assert_eq!(
+            clause_sql(&clause("age", FilterOp::Eq, "30")),
+            Some("\"age\" = 30".to_owned())
+        );
+        assert_eq!(
+            clause_sql(&clause("name", FilterOp::Eq, "Ada")),
+            Some("\"name\" = 'Ada'".to_owned())
+        );
+        assert_eq!(
+            clause_sql(&clause("name", FilterOp::Eq, "O'Brien")),
+            Some("\"name\" = 'O''Brien'".to_owned())
+        );
+        assert_eq!(
+            clause_sql(&clause("score", FilterOp::Eq, "2.5")),
+            Some("\"score\" = 2.5".to_owned())
+        );
+        assert_eq!(
+            clause_sql(&clause("label", FilterOp::Eq, "NaN")),
+            Some("\"label\" = 'NaN'".to_owned())
+        );
+        assert_eq!(
+            clause_sql(&clause("age", FilterOp::NotEq, "30")),
+            Some("\"age\" <> 30".to_owned())
+        );
+        assert_eq!(
+            clause_sql(&clause("age", FilterOp::Lt, "30")),
+            Some("\"age\" < 30".to_owned())
+        );
+        assert_eq!(
+            clause_sql(&clause("age", FilterOp::LtEq, "30")),
+            Some("\"age\" <= 30".to_owned())
+        );
+        assert_eq!(
+            clause_sql(&clause("age", FilterOp::Gt, "30")),
+            Some("\"age\" > 30".to_owned())
+        );
+        assert_eq!(
+            clause_sql(&clause("age", FilterOp::GtEq, "30")),
+            Some("\"age\" >= 30".to_owned())
+        );
+        assert_eq!(
+            clause_sql(&clause("name", FilterOp::Like, "Ada%")),
+            Some("\"name\" LIKE 'Ada%'".to_owned())
+        );
+        assert_eq!(
+            clause_sql(&clause("id", FilterOp::In, "1, 2, ada")),
+            Some("\"id\" IN (1, 2, 'ada')".to_owned())
+        );
+        assert_eq!(
+            clause_sql(&clause("name", FilterOp::IsNull, "ignored")),
+            Some("\"name\" IS NULL".to_owned())
+        );
+        assert_eq!(
+            clause_sql(&clause("name", FilterOp::IsNotNull, "")),
+            Some("\"name\" IS NOT NULL".to_owned())
+        );
+        assert_eq!(
+            clause_sql(&clause("user name", FilterOp::Eq, "7")),
+            Some("\"user name\" = 7".to_owned())
+        );
+        assert_eq!(clause_sql(&clause("", FilterOp::Eq, "30")), None);
+        assert_eq!(clause_sql(&clause("  ", FilterOp::Eq, "30")), None);
+        assert_eq!(clause_sql(&clause("age", FilterOp::Eq, "")), None);
+        assert_eq!(clause_sql(&clause("age", FilterOp::Gt, "   ")), None);
+        assert_eq!(clause_sql(&clause("id", FilterOp::In, "")), None);
+        assert_eq!(clause_sql(&clause("id", FilterOp::In, " , ")), None);
+    }
+
+    #[test]
+    fn filter_where_joins_clauses_and_appends_raw_verbatim() {
+        let clause = FilterClause {
+            column: "age".to_owned(),
+            op: FilterOp::Gt,
+            value: "30".to_owned(),
+        };
+        assert_eq!(
+            filter_where(&[clause.clone()], "name <> 'x'"),
+            Some("\"age\" > 30 AND (name <> 'x')".to_owned())
+        );
+        assert_eq!(
+            filter_where(&[clause.clone()], ""),
+            Some("\"age\" > 30".to_owned())
+        );
+        assert_eq!(
+            filter_where(&[], "id > 1"),
+            Some("(id > 1)".to_owned())
+        );
+        assert_eq!(filter_where(&[], "   "), None);
+        assert_eq!(filter_where(&[], ""), None);
+        let blank = FilterClause {
+            column: String::new(),
+            op: FilterOp::Eq,
+            value: "1".to_owned(),
+        };
+        assert_eq!(
+            filter_where(&[blank, clause.clone()], ""),
+            Some("\"age\" > 30".to_owned())
+        );
+        assert_eq!(filter_where(&[clause], "  padded  "), Some("\"age\" > 30 AND (padded)".to_owned()));
+    }
+
+    #[test]
+    fn filtered_table_select_quotes_tables_and_caps_rows() {
+        let clause = FilterClause {
+            column: "age".to_owned(),
+            op: FilterOp::GtEq,
+            value: "30".to_owned(),
+        };
+        assert_eq!(
+            filtered_table_select("public.users", &[clause], ""),
+            "SELECT * FROM \"public\".\"users\" WHERE \"age\" >= 30 LIMIT 100"
+        );
+        assert_eq!(
+            filtered_table_select("users", &[], "id > 1"),
+            "SELECT * FROM \"users\" WHERE (id > 1) LIMIT 100"
+        );
+        assert_eq!(
+            filtered_table_select("users", &[], ""),
+            "SELECT * FROM \"users\" LIMIT 100"
+        );
+    }
+
+    #[test]
+    fn filter_history_save_recall_and_delete_roundtrip() {
+        with_isolated_state("filter-hist", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT * FROM users".to_owned();
+            }
+            state.tab_mut(tab).expect("tab").add_filter_clause(FilterClause {
+                column: "age".to_owned(),
+                op: FilterOp::Gt,
+                value: "30".to_owned(),
+            });
+            state.tab_mut(tab).expect("tab").set_filter_raw("id > 1".to_owned());
+            assert!(state.save_filter(tab, "  seniors  "));
+            assert_eq!(state.filter_history().len(), 1);
+            assert_eq!(state.filter_history()[0].name, "seniors");
+            assert!(!state.save_filter(tab, "   "));
+            assert!(!state.save_filter(tab, ""));
+
+            state.tab_mut(tab).expect("tab").clear_table_filter();
+            assert!(state.tab(tab).expect("tab").filter_clauses().is_empty());
+            assert!(state.tab(tab).expect("tab").filter_where().is_none());
+            assert!(state.recall_filter(tab, "seniors"));
+            let view = state.tab(tab).expect("tab");
+            assert_eq!(view.filter_clauses().len(), 1);
+            assert_eq!(view.filter_clauses()[0].column, "age");
+            assert_eq!(view.filter_clauses()[0].op, FilterOp::Gt);
+            assert_eq!(view.filter_raw(), "id > 1");
+            assert_eq!(
+                view.filter_where(),
+                Some("\"age\" > 30 AND (id > 1)".to_owned())
+            );
+            assert!(!state.recall_filter(tab, "missing"));
+
+            state.tab_mut(tab).expect("tab").set_filter_raw("id > 2".to_owned());
+            assert!(state.save_filter(tab, "seniors"));
+            assert_eq!(state.filter_history().len(), 1, "a duplicate name replaces");
+            assert_eq!(state.filter_history()[0].raw, "id > 2");
+
+            assert!(state.delete_filter("seniors"));
+            assert!(state.filter_history().is_empty());
+            assert!(!state.delete_filter("seniors"));
+            assert!(!state.recall_filter(tab, "seniors"));
+        });
+    }
+
+    #[test]
+    fn filter_history_save_and_reload_roundtrip() {
+        with_isolated_state("filter-persist", |state| {
+            assert!(state.filter_history().is_empty());
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.tab_mut(tab).expect("tab").add_filter_clause(FilterClause {
+                column: "age".to_owned(),
+                op: FilterOp::Gt,
+                value: "30".to_owned(),
+            });
+            state.tab_mut(tab).expect("tab").set_filter_raw("id > 1".to_owned());
+            assert!(state.save_filter(tab, "seniors"));
+            assert_eq!(state.filter_history().len(), 1);
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.filter_history().len(), 1);
+            assert_eq!(reloaded.filter_history()[0].name, "seniors");
+            assert_eq!(
+                reloaded.filter_history()[0].clauses,
+                vec![FilterClause {
+                    column: "age".to_owned(),
+                    op: FilterOp::Gt,
+                    value: "30".to_owned(),
+                }]
+            );
+            assert_eq!(reloaded.filter_history()[0].raw, "id > 1");
+            assert!(state.delete_filter("seniors"));
+            let emptied = AppState::new(&eframe::egui::Context::default());
+            assert!(emptied.filter_history().is_empty());
+        });
+    }
+
+    #[test]
+    fn old_filter_file_without_raw_loads_empty_filter() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("cde-filter-old-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crusty-data-explorer")).unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        std::fs::write(
+            dir.join("crusty-data-explorer").join("saved_filters.json"),
+            br#"[{"name":"legacy","clauses":[{"column":"age","op":"Gt","value":"30"}]},{"name":"bare"},{"name":"minimal","clauses":[{"column":"age"}]}]"#,
+        )
+        .unwrap();
+        let state = AppState::new(&eframe::egui::Context::default());
+        assert_eq!(state.filter_history().len(), 3);
+        assert_eq!(state.filter_history()[0].name, "legacy");
+        assert_eq!(
+            state.filter_history()[0].clauses,
+            vec![FilterClause {
+                column: "age".to_owned(),
+                op: FilterOp::Gt,
+                value: "30".to_owned(),
+            }]
+        );
+        assert_eq!(state.filter_history()[0].raw, "");
+        assert_eq!(state.filter_history()[1].name, "bare");
+        assert!(state.filter_history()[1].clauses.is_empty());
+        assert_eq!(state.filter_history()[1].raw, "");
+        assert_eq!(state.filter_history()[2].name, "minimal");
+        assert_eq!(
+            state.filter_history()[2].clauses,
+            vec![FilterClause {
+                column: "age".to_owned(),
+                op: FilterOp::Eq,
+                value: String::new(),
+            }]
+        );
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filter_history_cap_holds_across_reload() {
+        with_isolated_state("filter-cap", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            for i in 0..60 {
+                assert!(state.save_filter(tab, &format!("f{i}")));
+            }
+            assert_eq!(state.filter_history().len(), 50);
+            assert_eq!(state.filter_history()[0].name, "f59");
+            assert_eq!(state.filter_history()[49].name, "f10");
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.filter_history().len(), 50);
+            assert_eq!(reloaded.filter_history()[0].name, "f59");
+            assert_eq!(reloaded.filter_history()[49].name, "f10");
+            let many: Vec<SavedFilter> = (0..60)
+                .map(|i| SavedFilter {
+                    name: format!("g{i}"),
+                    clauses: Vec::new(),
+                    raw: String::new(),
+                })
+                .collect();
+            save_saved_filters(&many).expect("filters save");
+            let loaded = load_saved_filters();
+            assert_eq!(loaded.len(), 50);
+            assert_eq!(loaded[0].name, "g0");
+            assert_eq!(loaded[49].name, "g49");
+        });
+    }
+
+    #[test]
+    fn table_filter_select_needs_a_single_table_select() {
+        with_isolated_state("filter-select", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT * FROM users JOIN orders ON orders.id = users.id".to_owned();
+            }
+            state.tab_mut(tab).expect("tab").add_filter_clause(FilterClause {
+                column: "age".to_owned(),
+                op: FilterOp::Gt,
+                value: "30".to_owned(),
+            });
+            assert_eq!(state.table_filter_select(tab), None);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT * FROM users".to_owned();
+            }
+            assert_eq!(
+                state.table_filter_select(tab),
+                Some("SELECT * FROM \"users\" WHERE \"age\" > 30 LIMIT 100".to_owned())
+            );
+            state.clear_table_filter(tab);
+            assert_eq!(
+                state.table_filter_select(tab),
+                Some("SELECT * FROM \"users\" LIMIT 100".to_owned())
+            );
+        });
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_structured_filter_narrows_a_scratch_table() {
+        with_isolated_state("pg-filter-live", |state| {
+            let conn = add_postgres_probe_connection(state);
+            state.connect(conn);
+            assert!(
+                pump_until(state, |s| {
+                    s.connections().iter().any(|c| {
+                        c.id == conn && matches!(c.state(), ConnectionState::Connected { .. })
+                    })
+                }),
+                "connects to live Postgres"
+            );
+            let tab = state.new_tab(conn);
+            live_run(state, tab, "DROP TABLE IF EXISTS cde_filter_probe");
+            live_run(state, tab, "CREATE TABLE cde_filter_probe (id INT PRIMARY KEY, name TEXT NOT NULL)");
+            live_run(
+                state,
+                tab,
+                "INSERT INTO cde_filter_probe VALUES (1, 'ada'), (2, 'grace'), (3, 'adam')",
+            );
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT * FROM cde_filter_probe".to_owned();
+            }
+            state.tab_mut(tab).expect("tab").add_filter_clause(FilterClause {
+                column: "name".to_owned(),
+                op: FilterOp::Like,
+                value: "ada%".to_owned(),
+            });
+            state.tab_mut(tab).expect("tab").set_filter_raw("id > 1".to_owned());
+            let sql = state.table_filter_select(tab).expect("filtered SELECT");
+            assert_eq!(
+                sql,
+                "SELECT * FROM \"cde_filter_probe\" WHERE \"name\" LIKE 'ada%' AND (id > 1) LIMIT 100"
+            );
+            state.apply_table_filter(tab);
+            settle(state, tab, "the filtered SELECT");
+            let result =
+                state.tab(tab).expect("tab").active_query_result().expect("a result");
+            assert_eq!(result.row_count(), 1, "only adam survives the clause plus the raw box");
+            assert_eq!(
+                result.cell(0, 1),
+                Some(&Value::Text("adam".to_owned())),
+                "the surviving row is adam"
+            );
+            live_run(state, tab, "DROP TABLE cde_filter_probe");
+        });
+    }
+
+    #[test]
     fn history_entry_shape_holds_sql_only() {
         let entry = HistoryEntry {
             conn: ConnectionId::from_raw(1),
@@ -4043,6 +4715,34 @@ mod tests {
                 state.connections()[0].state(),
                 ConnectionState::Connected { .. }
             ));
+        });
+    }
+
+    #[test]
+    fn structured_filter_header_renders_over_a_grid() {
+        with_isolated_state("filter-render", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT * FROM users".to_owned();
+            }
+            let run = start_running(state, tab, &["SELECT * FROM users"]);
+            state.apply(DbEvent::BatchOk { run, results: vec![rows_result(2)] });
+            state.activate(tab);
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            output.textures_delta.clear();
+            let text = rendered_text(&output);
+            assert!(text.iter().any(|t| t == "Structured filter"), "{text:?}");
         });
     }
 

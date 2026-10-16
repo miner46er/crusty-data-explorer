@@ -8,8 +8,9 @@ use std::collections::BTreeSet;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::app::{AppState, EditTarget, RunOutcome, SortDir, Tab};
+use crate::app::{AppState, EditTarget, FilterClause, FilterOp, RunOutcome, SavedFilter, SortDir, Tab};
 use crate::db::{CELL_CAP, QueryResult, TabId, Value};
+use crate::edit::editable_table;
 use crate::export::{
     to_csv, to_in_list, to_inserts, to_json, to_jsonl, to_markdown, to_tsv, to_xlsx,
 };
@@ -414,8 +415,9 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
         }
     }
     let target = state.edit_target(tab_id);
+    let filter_history = state.filter_history().to_vec();
     let Some(tab) = state.tab_mut(tab_id) else { return };
-    let actions = results_grid(tab, target.as_ref(), modal_open, ui);
+    let actions = results_grid(tab, target.as_ref(), &filter_history, modal_open, ui);
     apply_edit_actions(state, tab_id, actions);
 }
 
@@ -430,6 +432,11 @@ enum EditAction {
     ImportJsonl,
     ImportXlsx,
     PasteRows(Vec<Vec<String>>),
+    ApplyTableFilter,
+    ClearTableFilter,
+    SaveTableFilter { name: String },
+    RecallTableFilter { name: String },
+    DeleteTableFilter { name: String },
 }
 
 fn apply_edit_actions(state: &mut AppState, tab: TabId, actions: Vec<EditAction>) {
@@ -444,6 +451,17 @@ fn apply_edit_actions(state: &mut AppState, tab: TabId, actions: Vec<EditAction>
             EditAction::ImportJsonl => pick_import_jsonl_file(state, tab),
             EditAction::ImportXlsx => pick_import_xlsx_file(state, tab),
             EditAction::PasteRows(staged) => stage_rows_into(state, tab, staged, "Paste", "Pasted"),
+            EditAction::ApplyTableFilter => state.apply_table_filter(tab),
+            EditAction::ClearTableFilter => state.clear_table_filter(tab),
+            EditAction::SaveTableFilter { name } => {
+                state.save_filter(tab, &name);
+            }
+            EditAction::RecallTableFilter { name } => {
+                state.recall_filter(tab, &name);
+            }
+            EditAction::DeleteTableFilter { name } => {
+                state.delete_filter(&name);
+            }
         }
     }
 }
@@ -685,6 +703,7 @@ fn result_tabs(tab: &mut Tab, ui: &mut egui::Ui) {
 fn results_grid(
     tab: &mut Tab,
     target: Option<&EditTarget>,
+    filter_history: &[SavedFilter],
     modal_open: bool,
     ui: &mut egui::Ui,
 ) -> Vec<EditAction> {
@@ -854,6 +873,8 @@ fn results_grid(
             ui.colored_label(palette.success, notice);
         }
     }
+    let mut filter_actions = structured_filter_panel(tab, &cols, filter_history, ui);
+    actions.append(&mut filter_actions);
     let (sort_col, sort_dir, filter) = (tab.sort_col(), tab.sort_dir(), tab.filter().to_owned());
     let mut selection = match result_id_of(tab) {
         Some(id) => {
@@ -1078,6 +1099,144 @@ fn results_grid(
     if let Some(col) = pending_sort {
         tab.set_sort(col);
     }
+    actions
+}
+
+/// The save-name box for one tab's structured filter, kept in the egui
+/// context data keyed by tab, the pattern the find bar uses.
+fn filter_name_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_filter_name", tab))
+}
+
+/// The clause editor, raw WHERE box, and named history under one collapsed
+/// header. Clause and raw edits mutate the tab in place; apply, clear, save,
+/// and recall defer through [`EditAction`] so the batch send runs after the
+/// tab borrow ends. No shortcuts are added, so the existing modal and focus
+/// gates hold: typing in a box keeps focus and the grid copy key stays dead.
+fn structured_filter_panel(
+    tab: &mut Tab,
+    columns: &[(String, String)],
+    history: &[SavedFilter],
+    ui: &mut egui::Ui,
+) -> Vec<EditAction> {
+    let mut actions = Vec::new();
+    let tab_id = tab.id;
+    egui::CollapsingHeader::new("Structured filter").show(ui, |ui| {
+        let mut remove: Option<usize> = None;
+        for (index, clause) in tab.filter_clauses_mut().iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                if columns.is_empty() {
+                    ui.text_edit_singleline(&mut clause.column);
+                } else {
+                    let current =
+                        if clause.column.is_empty() { "<column>" } else { clause.column.as_str() };
+                    egui::ComboBox::from_id_salt((tab_id, "column", index))
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            for (name, _) in columns {
+                                ui.selectable_value(&mut clause.column, name.clone(), name);
+                            }
+                        });
+                }
+                egui::ComboBox::from_id_salt((tab_id, "op", index))
+                    .selected_text(clause.op.label())
+                    .show_ui(ui, |ui| {
+                        for op in FilterOp::ALL {
+                            ui.selectable_value(&mut clause.op, op, op.label());
+                        }
+                    });
+                match clause.op {
+                    FilterOp::IsNull | FilterOp::IsNotNull => {
+                        ui.label(egui::RichText::new("no value").small().weak());
+                    }
+                    FilterOp::In => {
+                        ui.text_edit_singleline(&mut clause.value)
+                            .on_hover_text("Comma-separated values");
+                    }
+                    _ => {
+                        ui.text_edit_singleline(&mut clause.value);
+                    }
+                }
+                if ui.button("Remove").clicked() {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove {
+            tab.remove_filter_clause(index);
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Add clause").clicked() {
+                let column = columns
+                    .first()
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_default();
+                tab.add_filter_clause(FilterClause {
+                    column,
+                    op: FilterOp::Eq,
+                    value: String::new(),
+                });
+            }
+            let single = editable_table(&tab.sql).is_some();
+            let can_apply = single && tab.filter_where().is_some();
+            if ui
+                .add_enabled(can_apply, egui::Button::new("Apply filter"))
+                .on_hover_text("Re-run the table SELECT with the WHERE composed in")
+                .clicked()
+            {
+                actions.push(EditAction::ApplyTableFilter);
+            }
+            if ui.button("Clear").clicked() {
+                actions.push(EditAction::ClearTableFilter);
+            }
+            if !single {
+                ui.label(
+                    egui::RichText::new("needs a single-table SELECT").small().weak(),
+                );
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Raw WHERE");
+            let mut raw = tab.filter_raw().to_owned();
+            if ui.text_edit_singleline(&mut raw).changed() {
+                tab.set_filter_raw(raw);
+            }
+        });
+        ui.label(
+            egui::RichText::new("Raw text is appended as written.").small().weak(),
+        );
+        ui.horizontal(|ui| {
+            ui.label("Save as");
+            let mut name: String =
+                ui.ctx().data(|data| data.get_temp(filter_name_id(tab_id))).unwrap_or_default();
+            if ui.text_edit_singleline(&mut name).changed() {
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(filter_name_id(tab_id), name.clone()));
+            }
+            if ui.button("Save").clicked() {
+                actions.push(EditAction::SaveTableFilter { name });
+            }
+        });
+        for entry in history {
+            ui.horizontal(|ui| {
+                ui.monospace(&entry.name);
+                let mut shape = format!("{} clause", entry.clauses.len());
+                if entry.clauses.len() != 1 {
+                    shape.push('s');
+                }
+                if !entry.raw.trim().is_empty() {
+                    shape.push_str(" + raw");
+                }
+                ui.label(egui::RichText::new(shape).small().weak());
+                if ui.button("Recall").clicked() {
+                    actions.push(EditAction::RecallTableFilter { name: entry.name.clone() });
+                }
+                if ui.button("Delete").clicked() {
+                    actions.push(EditAction::DeleteTableFilter { name: entry.name.clone() });
+                }
+            });
+        }
+    });
     actions
 }
 
