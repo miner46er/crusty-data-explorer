@@ -1066,6 +1066,108 @@ fn result_tabs(tab: &mut Tab, ui: &mut egui::Ui) {
     }
 }
 
+/// The row detail toggle for one tab, kept beside the selection.
+fn detail_open_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_row_detail_open", tab))
+}
+
+fn detail_open_of(ctx: &egui::Context, tab: TabId) -> bool {
+    ctx.data(|data| data.get_temp(detail_open_id(tab))).unwrap_or(false)
+}
+
+/// Pretty JSON for one result row in the exported [`to_json`] shape, so the
+/// pane and Copy JSON agree. None when the row left with the last run.
+fn detail_json(result: &QueryResult, row: usize) -> Option<String> {
+    if row >= result.row_count() {
+        return None;
+    }
+    Some(to_json(result, &[row]))
+}
+
+/// Full read-only text for one cell: whole text past [`CELL_CAP`], blobs as
+/// hex the way [`editor_seed`] seeds them, null spelled out.
+fn detail_cell_text(cell: Option<&Value>) -> String {
+    match cell {
+        None | Some(Value::Null) => "NULL".to_owned(),
+        Some(Value::Text(text)) => text.clone(),
+        Some(Value::Blob(bytes)) => blob_hex(bytes),
+        Some(value) => value.display(usize::MAX).into_owned(),
+    }
+}
+
+/// One transposed record row per column: name, type, and the grid-style value.
+/// Empty when the row is gone, so a stale focus renders the hint instead.
+fn detail_record(result: &QueryResult, row: usize) -> Vec<(String, String, String)> {
+    if row >= result.row_count() {
+        return Vec::new();
+    }
+    result
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(col, column)| {
+            let text = result
+                .cell(row, col)
+                .map(|value| value.display(CELL_CAP).into_owned())
+                .unwrap_or_default();
+            (column.name().to_owned(), column.type_name().to_owned(), text)
+        })
+        .collect()
+}
+
+/// Read-only detail for the focused row over the same active result the grid
+/// reads: its JSON, its transposed record, and the focused cell's full text.
+/// Labels and copies only, with no key handling, so no edit is ever staged
+/// and the modal and focus gates hold.
+fn row_detail(tab: &Tab, selection: &Selection, ui: &mut egui::Ui) {
+    ui.heading("Row detail");
+    let Some(result) = tab.active_query_result() else {
+        ui.label("No result to inspect.");
+        return;
+    };
+    let Some((row, col)) = selection.active() else {
+        ui.label("Click a cell to inspect its row.");
+        return;
+    };
+    if row >= result.row_count() {
+        ui.label("The focused row left with the last run.");
+        return;
+    }
+    ui.label(egui::RichText::new(format!("Row {} of {}", row + 1, result.row_count())).small().weak());
+    let json = detail_json(result, row).unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("JSON").strong());
+        if ui.button("Copy JSON").clicked() {
+            ui.ctx().copy_text(json.clone());
+        }
+    });
+    egui::ScrollArea::both().max_height(220.0).show(ui, |ui| {
+        ui.monospace(&json);
+    });
+    ui.separator();
+    ui.label(egui::RichText::new("Record").strong());
+    egui::Grid::new("crusty_row_detail_record").striped(true).show(ui, |ui| {
+        for (name, type_name, text) in detail_record(result, row) {
+            ui.label(egui::RichText::new(name).strong());
+            ui.label(egui::RichText::new(type_name).small().weak());
+            ui.monospace(text);
+            ui.end_row();
+        }
+    });
+    ui.separator();
+    if let Some(column) = result.columns().get(col) {
+        let (name, type_name) = (column.name().to_owned(), column.type_name().to_owned());
+        ui.label(egui::RichText::new("Value").strong());
+        ui.label(egui::RichText::new(format!("{name} · {type_name}")).small().weak());
+        if matches!(result.cell(row, col), Some(Value::Blob(_))) {
+            ui.label(egui::RichText::new("The blob shows as hex.").small().weak());
+        }
+        egui::ScrollArea::both().max_height(220.0).show(ui, |ui| {
+            ui.monospace(detail_cell_text(result.cell(row, col)));
+        });
+    }
+}
+
 fn results_grid(
     tab: &mut Tab,
     target: Option<&EditTarget>,
@@ -1129,6 +1231,7 @@ fn results_grid(
         store_edit_field(ui.ctx(), tab.id, None);
         store_cell_editor(ui.ctx(), tab.id, None);
     }
+    let mut detail_open = detail_open_of(ui.ctx(), tab.id);
     ui.horizontal(|ui| {
         ui.label("Filter");
         let mut text = tab.filter().to_owned();
@@ -1175,6 +1278,8 @@ fn results_grid(
         {
             export_all_results(tab);
         }
+        ui.checkbox(&mut detail_open, "Row detail")
+            .on_hover_text("Show the focused row as JSON and record beside the grid");
         ui.separator();
         match target {
             Some(target) => {
@@ -1233,6 +1338,7 @@ fn results_grid(
             }
         }
     });
+    ui.ctx().data_mut(|data| data.insert_temp(detail_open_id(tab.id), detail_open));
     if let Some(notice) = tab.export_notice().map(str::to_owned) {
         if tab.export_failed() {
             ui.colored_label(ui.visuals().error_fg_color, notice);
@@ -1271,6 +1377,13 @@ fn results_grid(
     });
     let mut copied = copy_bar(tab, editable, &selection, &visible, total, ui);
     actions.append(&mut copied);
+    if detail_open {
+        // A nested right panel reserves its side before the grid's scroll area
+        // draws, so the grid keeps the leftover width. Read-only content only.
+        egui::Panel::right("crusty_row_detail").default_size(360.0).show(ui, |ui| {
+            row_detail(tab, &selection, ui);
+        });
+    }
     let ncols = cols.len();
     let active_result = tab.active_result();
     let editor_open = cell_editor_of(ui.ctx(), tab.id).is_some();
@@ -2843,5 +2956,84 @@ mod tests {
         assert!(editor_size_ok(""));
         assert!(editor_size_ok(&"a".repeat(CELL_EDITOR_LIMIT)));
         assert!(!editor_size_ok(&"a".repeat(CELL_EDITOR_LIMIT + 1)));
+    }
+
+    #[test]
+    fn row_detail_json_renders_the_focused_row_like_export() {
+        let result = two_col(
+            vec![Value::Integer(1), Value::Null],
+            vec![Value::Text("a\"b".to_owned()), Value::Null],
+        );
+        assert_eq!(
+            detail_json(&result, 0),
+            Some("[\n  {\n    \"a\": 1,\n    \"b\": \"a\\\"b\"\n  }\n]".to_owned())
+        );
+        assert_eq!(
+            detail_json(&result, 1),
+            Some("[\n  {\n    \"a\": null,\n    \"b\": null\n  }\n]".to_owned())
+        );
+        assert_eq!(detail_json(&result, 5), None);
+    }
+
+    #[test]
+    fn row_detail_json_renders_blobs_as_size_tags() {
+        let result = one_col(vec![Value::Blob(vec![0x01, 0x02])]);
+        assert_eq!(
+            detail_json(&result, 0),
+            Some("[\n  {\n    \"v\": \"[BLOB 2 B]\"\n  }\n]".to_owned())
+        );
+    }
+
+    #[test]
+    fn row_detail_record_transposes_names_types_and_values() {
+        let result = two_col(vec![Value::Integer(7)], vec![Value::Null]);
+        assert_eq!(
+            detail_record(&result, 0),
+            vec![
+                ("a".to_owned(), "ANY".to_owned(), "7".to_owned()),
+                ("b".to_owned(), "TEXT".to_owned(), "NULL".to_owned()),
+            ]
+        );
+        assert!(detail_record(&result, 3).is_empty());
+    }
+
+    #[test]
+    fn row_detail_record_renders_blobs_as_size_tags() {
+        let result = one_col(vec![Value::Blob(vec![0xDE, 0xAD])]);
+        assert_eq!(
+            detail_record(&result, 0),
+            vec![("v".to_owned(), "ANY".to_owned(), "[BLOB 2 B]".to_owned())]
+        );
+    }
+
+    #[test]
+    fn row_detail_shows_large_text_full_past_the_display_cap() {
+        let long = "x".repeat(CELL_CAP + 50);
+        let result = one_col(vec![Value::Text(long.clone())]);
+        assert!(result.cell(0, 0).unwrap().display(CELL_CAP).into_owned().len() < long.len());
+        assert_eq!(detail_cell_text(result.cell(0, 0)), long);
+        assert_eq!(
+            detail_record(&result, 0),
+            vec![(
+                "v".to_owned(),
+                "ANY".to_owned(),
+                format!("{}…", "x".repeat(CELL_CAP))
+            )]
+        );
+        assert_eq!(
+            detail_json(&result, 0),
+            Some(format!("[\n  {{\n    \"v\": \"{long}\"\n  }}\n]"))
+        );
+    }
+
+    #[test]
+    fn row_detail_cell_text_spells_null_and_hex() {
+        assert_eq!(detail_cell_text(None), "NULL");
+        assert_eq!(detail_cell_text(Some(&Value::Null)), "NULL");
+        assert_eq!(
+            detail_cell_text(Some(&Value::Blob(vec![0xDE, 0xAD, 0x00, 0xFF]))),
+            "dead00ff"
+        );
+        assert_eq!(detail_cell_text(Some(&Value::Integer(7))), "7");
     }
 }
