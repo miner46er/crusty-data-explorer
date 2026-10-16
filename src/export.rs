@@ -86,6 +86,27 @@ pub fn to_json(result: &QueryResult, rows: &[usize]) -> String {
     out
 }
 
+/// One JSON object per line over `rows`, values rendered exactly like
+/// [`to_json`]: `{"id": 1, "name": "a\"b"}`. An empty row slice writes
+/// nothing; a result with no columns writes `{}` per row, the way
+/// [`to_json`] renders one.
+pub fn to_jsonl(result: &QueryResult, rows: &[usize]) -> String {
+    let mut out = String::new();
+    for &r in rows {
+        out.push('{');
+        for (c, col) in result.columns().iter().enumerate() {
+            if c > 0 {
+                out.push_str(", ");
+            }
+            let key = serde_json::to_string(col.name()).unwrap_or_else(|_| "\"\"".to_owned());
+            let val = value_to_json(result.cell(r, c));
+            out.push_str(&format!("{key}: {val}"));
+        }
+        out.push_str("}\n");
+    }
+    out
+}
+
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -338,6 +359,34 @@ mod tests {
             "[\n  {{\n    \"id\": 1,\n    \"name\": \"a\\\"b\",\n    \"score\": 2.5,\n    \"data\": \"{tag}\"\n  }},\n  {{\n    \"id\": null,\n    \"name\": null,\n    \"score\": 3,\n    \"data\": null\n  }}\n]"
         );
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn jsonl_exact_lines_on_mixed_values() {
+        let blob = Value::Blob(vec![0x01, 0x02, 0x03]);
+        let tag = blob.display(0).into_owned();
+        let r = result(vec![
+            col("id", vec![Value::Integer(1), Value::Null]),
+            col("name", vec![Value::Text("a\"b".to_owned()), Value::Null]),
+            col("score", vec![Value::Real(2.5), Value::Integer(3)]),
+            col("data", vec![blob, Value::Null]),
+        ]);
+        let got = to_jsonl(&r, &[0, 1]);
+        let want = format!(
+            "{{\"id\": 1, \"name\": \"a\\\"b\", \"score\": 2.5, \"data\": \"{tag}\"}}\n{{\"id\": null, \"name\": null, \"score\": 3, \"data\": null}}\n"
+        );
+        assert_eq!(got, want);
+        assert_eq!(to_jsonl(&r, &[]), "");
+        assert_eq!(
+            to_jsonl(&r, &[1]),
+            "{\"id\": null, \"name\": null, \"score\": 3, \"data\": null}\n"
+        );
+    }
+
+    #[test]
+    fn jsonl_writes_one_braces_object_per_row_without_columns() {
+        let r = result(vec![]);
+        assert_eq!(to_jsonl(&r, &[0, 1]), "{}\n{}\n");
     }
 
     #[test]

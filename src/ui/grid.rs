@@ -10,8 +10,8 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::app::{AppState, EditTarget, RunOutcome, SortDir, Tab};
 use crate::db::{CELL_CAP, QueryResult, TabId, Value};
-use crate::export::{to_csv, to_in_list, to_inserts, to_json, to_markdown, to_tsv};
-use crate::import::{ParsedCsv, parse_csv};
+use crate::export::{to_csv, to_in_list, to_inserts, to_json, to_jsonl, to_markdown, to_tsv};
+use crate::import::{ParsedCsv, parse_csv, parse_jsonl};
 
 use super::Palette;
 
@@ -318,11 +318,12 @@ fn parse_paste(text: &str) -> Option<ParsedCsv> {
     parse_csv(text)
 }
 
-/// A parsed paste into staged-row cells for `columns`: headers matched onto
-/// the result column names case-insensitively in column order, unmapped
-/// columns left empty, extra headers ignored. None when no header matches.
-/// Rows cap at the import [`crate::import::ROW_CAP`].
-fn stage_paste_rows(parsed: &ParsedCsv, columns: &[String]) -> Option<Vec<Vec<String>>> {
+/// A parsed file into staged-row cells for `columns`: headers matched onto
+/// the column names case-insensitively in column order, unmapped columns
+/// left empty, extra headers ignored. None when no header matches. Rows cap
+/// at the import [`crate::import::ROW_CAP`], so a paste and a JSONL import
+/// truncate alike.
+fn stage_parsed_rows(parsed: &ParsedCsv, columns: &[String]) -> Option<Vec<Vec<String>>> {
     let mut used = vec![false; parsed.headers.len()];
     let mut pairs: Vec<(usize, usize)> = Vec::new();
     for (col, name) in columns.iter().enumerate() {
@@ -423,6 +424,7 @@ enum EditAction {
     Apply,
     Discard,
     ImportCsv,
+    ImportJsonl,
     PasteRows(Vec<Vec<String>>),
 }
 
@@ -435,8 +437,16 @@ fn apply_edit_actions(state: &mut AppState, tab: TabId, actions: Vec<EditAction>
             EditAction::Apply => state.apply_edits(tab),
             EditAction::Discard => state.discard_edits(tab),
             EditAction::ImportCsv => pick_import_file(state, tab),
-            EditAction::PasteRows(staged) => paste_staged_rows_into(state, tab, staged),
+            EditAction::ImportJsonl => pick_import_jsonl_file(state, tab),
+            EditAction::PasteRows(staged) => stage_rows_into(state, tab, staged, "Paste", "Pasted"),
         }
+    }
+}
+
+/// Record one import notice on a tab that still exists.
+fn tab_notice(state: &mut AppState, tab: TabId, notice: String, failed: bool) {
+    if let Some(current) = state.tab_mut(tab) {
+        current.set_export_notice(notice, failed);
     }
 }
 
@@ -449,14 +459,54 @@ fn pick_import_file(state: &mut AppState, tab: TabId) {
     state.begin_import(tab, &path);
 }
 
-/// Stage clipboard rows as new inserts: one added row per pasted row, every
-/// cell through the normal staged-edit path so the user reviews before
-/// apply. Pre-existing added rows keep their indices.
-fn paste_staged_rows_into(state: &mut AppState, tab: TabId, staged: Vec<Vec<String>>) {
-    if state.edit_target(tab).is_none() {
-        if let Some(current) = state.tab_mut(tab) {
-            current.set_export_notice("Paste failed: the table is not editable".to_owned(), true);
+/// Ask for a JSONL file and stage its objects as new rows for review: the
+/// union of keys maps onto the result columns the way a paste's headers do,
+/// and the same staged-edit path builds the INSERTs on apply.
+fn pick_import_jsonl_file(state: &mut AppState, tab: TabId) {
+    let Some(path) = rfd::FileDialog::new().add_filter("JSONL", &["jsonl"]).pick_file() else {
+        return;
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            tab_notice(state, tab, format!("Import failed: {}: {error}", path.display()), true);
+            return;
         }
+    };
+    let Some(parsed) = parse_jsonl(&text) else {
+        tab_notice(
+            state,
+            tab,
+            "Import failed: the file needs one JSON object per line".to_owned(),
+            true,
+        );
+        return;
+    };
+    let columns = state.tab(tab).map(column_names).unwrap_or_default();
+    match stage_parsed_rows(&parsed, &columns) {
+        Some(staged) => stage_rows_into(state, tab, staged, "Import", "Imported"),
+        None => tab_notice(
+            state,
+            tab,
+            "Import failed: no JSONL key matches the result columns".to_owned(),
+            true,
+        ),
+    }
+}
+
+/// Stage rows as new inserts: one added row per staged row, every cell
+/// through the normal staged-edit path so the user reviews before apply.
+/// Pre-existing added rows keep their indices. `action` and `done` name the
+/// operation in the notices, as in `Paste failed` and `Pasted 3 rows`.
+fn stage_rows_into(
+    state: &mut AppState,
+    tab: TabId,
+    staged: Vec<Vec<String>>,
+    action: &str,
+    done: &str,
+) {
+    if state.edit_target(tab).is_none() {
+        tab_notice(state, tab, format!("{action} failed: the table is not editable"), true);
         return;
     }
     let shape = state.tab(tab).and_then(|current| {
@@ -471,12 +521,12 @@ fn paste_staged_rows_into(state: &mut AppState, tab: TabId, staged: Vec<Vec<Stri
             state.stage_edit(tab, total + base + index, col, text.clone());
         }
     }
-    if let Some(current) = state.tab_mut(tab) {
-        current.set_export_notice(
-            format!("Pasted {} rows for review — Apply to insert", staged.len()),
-            false,
-        );
-    }
+    tab_notice(
+        state,
+        tab,
+        format!("{done} {} rows for review — Apply to insert", staged.len()),
+        false,
+    );
 }
 
 /// The confirmation modal for a pending import: every mapped header beside
@@ -658,6 +708,8 @@ fn results_grid(
         let can_export = tab
             .active_query_result()
             .is_some_and(|result| !result.columns().is_empty());
+        let can_export_all =
+            tab.results().iter().any(|result| !result.columns().is_empty());
         if ui
             .add_enabled(can_export, egui::Button::new("Export CSV"))
             .clicked()
@@ -669,6 +721,19 @@ fn results_grid(
             .clicked()
         {
             export_json_view(tab);
+        }
+        if ui
+            .add_enabled(can_export, egui::Button::new("Export JSONL"))
+            .clicked()
+        {
+            export_jsonl_view(tab);
+        }
+        if ui
+            .add_enabled(can_export_all, egui::Button::new("Export all"))
+            .on_hover_text("Export every result set into one folder, one CSV per set")
+            .clicked()
+        {
+            export_all_results(tab);
         }
         ui.separator();
         match target {
@@ -687,6 +752,13 @@ fn results_grid(
                     .clicked()
                 {
                     actions.push(EditAction::ImportCsv);
+                }
+                if ui
+                    .button("Import JSONL")
+                    .on_hover_text("Load a JSONL file as new rows for review")
+                    .clicked()
+                {
+                    actions.push(EditAction::ImportJsonl);
                 }
                 if ui
                     .add_enabled(staged > 0, egui::Button::new("Discard"))
@@ -1006,6 +1078,126 @@ fn export_json_view(tab: &mut Tab) {
     }
 }
 
+fn export_jsonl_view(tab: &mut Tab) {
+    let (jsonl, default_name, nrows) = match tab.active_query_result() {
+        Some(result) => {
+            if result.columns().is_empty() {
+                return;
+            }
+            let visible = visible_rows(result, tab.sort_col(), tab.sort_dir(), tab.filter());
+            let jsonl = to_jsonl(result, &visible);
+            let name = format!("{}.jsonl", super::query::tab_title(tab.sql.clone()));
+            (jsonl, name, visible.len())
+        }
+        None => return,
+    };
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("JSONL", &["jsonl"])
+        .set_file_name(&default_name)
+        .save_file()
+    else {
+        return;
+    };
+    match std::fs::write(&path, jsonl) {
+        Ok(()) => tab.set_export_notice(
+            format!("Exported {nrows} rows to {}", path.display()),
+            false,
+        ),
+        Err(e) => tab.set_export_notice(format!("Export failed: {e}"), true),
+    }
+}
+
+/// A stable file-name slug: alphanumerics kept lowercase, every other run
+/// collapsed to one dash, capped at 40 characters, and `query` when nothing
+/// survives.
+fn slug(text: &str) -> String {
+    let mut out = String::new();
+    let mut separated = false;
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            if separated && !out.is_empty() {
+                out.push('-');
+            }
+            separated = false;
+            out.extend(c.to_lowercase());
+        } else {
+            separated = true;
+        }
+    }
+    let capped: String = out.chars().take(40).collect();
+    let capped = capped.trim_end_matches('-');
+    if capped.is_empty() { "query".to_owned() } else { capped.to_owned() }
+}
+
+/// One default file name per result set in run order: `<slug>-result-N.csv`,
+/// N the 1-based statement index the set came from. A set without columns
+/// keeps its number, so skipping it never renumbers a later set.
+fn result_file_names(slug: &str, count: usize) -> Vec<String> {
+    (1..=count).map(|index| format!("{slug}-result-{index}.csv")).collect()
+}
+
+/// The files a multi-result export writes: one default name and one CSV text
+/// per set with columns, in run order. Sets without columns write nothing and
+/// keep their number, and the filter and sort shape every set the way the
+/// grid shows them.
+fn result_files(
+    results: &[QueryResult],
+    slug: &str,
+    sort_col: Option<usize>,
+    sort_dir: SortDir,
+    filter: &str,
+) -> Vec<(String, String)> {
+    let names = result_file_names(slug, results.len());
+    results
+        .iter()
+        .enumerate()
+        .filter(|(_, result)| !result.columns().is_empty())
+        .map(|(index, result)| {
+            let visible = visible_rows(result, sort_col, sort_dir, filter);
+            (names[index].clone(), to_csv(result, &visible))
+        })
+        .collect()
+}
+
+/// Every result set the tab holds into one chosen folder, one file per set
+/// named by [`result_file_names`].
+fn export_all_results(tab: &mut Tab) {
+    let files = result_files(
+        tab.results(),
+        &slug(&super::query::tab_title(tab.sql.clone())),
+        tab.sort_col(),
+        tab.sort_dir(),
+        tab.filter(),
+    );
+    if files.is_empty() {
+        return;
+    }
+    let Some(dir) = rfd::FileDialog::new().pick_folder() else { return };
+    let mut written = 0;
+    let mut failed: Option<String> = None;
+    for (name, csv) in &files {
+        match std::fs::write(dir.join(name), csv) {
+            Ok(()) => written += 1,
+            Err(error) => {
+                failed = Some(error.to_string());
+                break;
+            }
+        }
+    }
+    match failed {
+        None => tab.set_export_notice(
+            format!("Exported {written} result sets to {}", dir.display()),
+            false,
+        ),
+        Some(error) if written == 0 => {
+            tab.set_export_notice(format!("Export failed: {error}"), true);
+        }
+        Some(error) => {
+            tab.set_export_notice(format!("Export failed after {written} files: {error}"), true);
+        }
+    }
+}
+
 /// The selection copy row: TSV with a headers option, CSV, JSON, Markdown,
 /// and SQL INSERTs from the selection (or the whole view when empty), the
 /// IN-list builder from the active column, and paste as new rows.
@@ -1182,7 +1374,7 @@ fn grid_clipboard_keys(
                             .to_owned(),
                         true,
                     ),
-                    Some(parsed) => match stage_paste_rows(&parsed, &column_names(tab)) {
+                    Some(parsed) => match stage_parsed_rows(&parsed, &column_names(tab)) {
                         Some(staged) => actions.push(EditAction::PasteRows(staged)),
                         None => tab.set_export_notice(
                             "Paste failed: no pasted header matches the result columns"
@@ -1480,7 +1672,7 @@ mod tests {
     fn paste_csv_maps_headers_case_insensitively_in_column_order() {
         let parsed = parse_paste("NAME,extra,ID\nada,x,1\ngrace,y,2\n").expect("parses");
         assert_eq!(
-            stage_paste_rows(&parsed, &paste_columns()),
+            stage_parsed_rows(&parsed, &paste_columns()),
             Some(vec![
                 vec!["1".to_owned(), "ada".to_owned()],
                 vec!["2".to_owned(), "grace".to_owned()],
@@ -1493,7 +1685,7 @@ mod tests {
         let parsed =
             parse_paste("id\tname\n1\t\"a\tb\"\n2\tplain\n").expect("parses");
         assert_eq!(
-            stage_paste_rows(&parsed, &paste_columns()),
+            stage_parsed_rows(&parsed, &paste_columns()),
             Some(vec![
                 vec!["1".to_owned(), "a\tb".to_owned()],
                 vec!["2".to_owned(), "plain".to_owned()],
@@ -1506,7 +1698,7 @@ mod tests {
         assert_eq!(parse_paste("just text"), None);
         assert_eq!(parse_paste("a,b\n1\n"), None);
         let parsed = parse_paste("zzz\n1\n").expect("parses");
-        assert_eq!(stage_paste_rows(&parsed, &paste_columns()), None);
+        assert_eq!(stage_parsed_rows(&parsed, &paste_columns()), None);
     }
 
     #[test]
@@ -1517,10 +1709,98 @@ mod tests {
         }
         let parsed = parse_paste(&text).expect("parses");
         let staged =
-            stage_paste_rows(&parsed, &["id".to_owned()]).expect("stages");
+            stage_parsed_rows(&parsed, &["id".to_owned()]).expect("stages");
         assert_eq!(staged.len(), crate::import::ROW_CAP);
         assert_eq!(staged[0], vec!["0".to_owned()]);
         assert_eq!(staged[staged.len() - 1], vec!["999".to_owned()]);
+    }
+
+    #[test]
+    fn jsonl_import_stages_a_ragged_union_onto_the_result_columns() {
+        let text = "{\"id\": 1, \"name\": \"ada\"}\n{\"name\": \"grace\", \"extra\": \"x\"}\n";
+        let parsed = parse_jsonl(text).expect("parses");
+        assert_eq!(parsed.headers, vec!["id", "name", "extra"]);
+        assert_eq!(
+            stage_parsed_rows(&parsed, &["name".to_owned(), "id".to_owned()]),
+            Some(vec![
+                vec!["ada".to_owned(), "1".to_owned()],
+                vec!["grace".to_owned(), String::new()],
+            ])
+        );
+        assert_eq!(stage_parsed_rows(&parsed, &["zzz".to_owned()]), None);
+    }
+
+    #[test]
+    fn jsonl_import_caps_rows_at_the_import_cap() {
+        let mut text = String::new();
+        for i in 0..1005 {
+            text.push_str(&format!("{{\"id\": {i}}}\n"));
+        }
+        let parsed = parse_jsonl(&text).expect("parses");
+        let staged = stage_parsed_rows(&parsed, &["id".to_owned()]).expect("stages");
+        assert_eq!(staged.len(), crate::import::ROW_CAP);
+        assert_eq!(staged[0], vec!["0".to_owned()]);
+        assert_eq!(staged[staged.len() - 1], vec!["999".to_owned()]);
+    }
+
+    #[test]
+    fn jsonl_export_roundtrips_through_parse_into_staged_rows() {
+        let result = two_col(
+            vec![Value::Integer(1), Value::Integer(2)],
+            vec![Value::Text("ada".to_owned()), Value::Null],
+        );
+        let text = to_jsonl(&result, &[0, 1]);
+        assert_eq!(text, "{\"a\": 1, \"b\": \"ada\"}\n{\"a\": 2, \"b\": null}\n");
+        let parsed = parse_jsonl(&text).expect("parses");
+        assert_eq!(parsed.headers, vec!["a", "b"]);
+        assert_eq!(
+            stage_parsed_rows(&parsed, &["b".to_owned(), "a".to_owned()]),
+            Some(vec![
+                vec!["ada".to_owned(), "1".to_owned()],
+                vec![String::new(), "2".to_owned()],
+            ])
+        );
+    }
+
+    #[test]
+    fn multi_result_names_slug_the_title_and_statement_index() {
+        assert_eq!(slug("SELECT * FROM users"), "select-from-users");
+        assert_eq!(slug("SELECT 1; SELECT 2"), "select-1-select-2");
+        assert_eq!(slug("* * *"), "query");
+        assert_eq!(slug(&"x".repeat(50)), "x".repeat(40));
+        assert_eq!(slug(&format!("{} y", "x".repeat(39))), "x".repeat(39));
+        assert_eq!(
+            result_file_names(&slug("SELECT * FROM users"), 3),
+            vec![
+                "select-from-users-result-1.csv".to_owned(),
+                "select-from-users-result-2.csv".to_owned(),
+                "select-from-users-result-3.csv".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_export_files_skip_columnless_sets_without_renumbering() {
+        let sets = vec![
+            two_col(vec![Value::Integer(1)], vec![Value::Text("ada".to_owned())]),
+            QueryResult::from_columns(
+                Vec::new(),
+                false,
+                Some(2),
+                std::time::Duration::from_millis(1),
+            )
+            .unwrap(),
+            two_col(vec![Value::Integer(3)], vec![Value::Null]),
+        ];
+        assert_eq!(
+            result_files(&sets, "select-a", None, SortDir::Asc, ""),
+            vec![
+                ("select-a-result-1.csv".to_owned(), "a,b\r\n1,ada\r\n".to_owned()),
+                ("select-a-result-3.csv".to_owned(), "a,b\r\n3,\r\n".to_owned()),
+            ]
+        );
+        let filtered = result_files(&sets, "select-a", None, SortDir::Asc, "ada");
+        assert_eq!(filtered[1].1, "a,b\r\n");
     }
 
     #[test]

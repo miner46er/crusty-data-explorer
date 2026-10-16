@@ -1,5 +1,5 @@
-//! CSV import: parse a file into headers and rows, map its headers onto a
-//! table's columns, and render the INSERT batches.
+//! CSV and JSONL import: parse a file into headers and rows, map its headers
+//! onto a table's columns, and render the INSERT batches.
 //!
 //! Pure text, no engine calls. `app.rs` holds the pending draft and sends
 //! what this module builds through the same batch path an edit apply uses,
@@ -13,7 +13,8 @@ pub const ROW_CAP: usize = 1000;
 /// Value tuples per INSERT statement.
 pub const BATCH_ROWS: usize = 50;
 
-/// One parsed CSV file: the header record and the data records.
+/// One parsed file: the header record (for JSONL, the union of its keys) and
+/// the data records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedCsv {
     pub headers: Vec<String>,
@@ -112,6 +113,55 @@ fn parse_records(text: &str) -> Vec<Vec<String>> {
         records.push(record);
     }
     records
+}
+
+/// Parse JSON Lines: one JSON object per line, blank lines skipped, a leading
+/// UTF-8 BOM dropped, CRLF or LF terminators, and an optional trailing
+/// newline. The union of keys in first-seen order is the header; each object
+/// is one record. None when a line is not an object or no line carries one,
+/// so a JSON array document or a non-JSON line is rejected whole, the way a
+/// ragged CSV is. Values render as the text a cell holds: strings bare,
+/// numbers and booleans as written, null and missing keys empty, and nested
+/// arrays or objects as compact JSON.
+pub fn parse_jsonl(text: &str) -> Option<ParsedCsv> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut objects = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let object: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(line).ok()?;
+        objects.push(object);
+    }
+    if objects.is_empty() {
+        return None;
+    }
+    let mut headers: Vec<String> = Vec::new();
+    for object in &objects {
+        for key in object.keys() {
+            if !headers.iter().any(|header| header == key) {
+                headers.push(key.clone());
+            }
+        }
+    }
+    let rows = objects
+        .iter()
+        .map(|object| {
+            headers
+                .iter()
+                .map(|key| object.get(key).map(json_cell).unwrap_or_default())
+                .collect()
+        })
+        .collect();
+    Some(ParsedCsv { headers, rows })
+}
+
+/// One JSON value as the text [`crate::edit::to_literal`] reads: null empty so
+/// it writes NULL, everything else the JSON spelling with strings bare.
+fn json_cell(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// Match CSV headers onto table columns: for each table column in order, the
@@ -220,6 +270,52 @@ mod tests {
         assert_eq!(parse_csv(""), None);
         assert_eq!(parse_csv("a,b"), None);
         assert_eq!(parse_csv("a,b\n"), None);
+    }
+
+    #[test]
+    fn jsonl_lines_union_their_keys_in_first_seen_order() {
+        let text = "{\"id\": 1, \"name\": \"ada\", \"note\": null}\n\
+                    {\"id\": 2, \"extra\": {\"a\": 1}, \"list\": [1, 2], \"ok\": true}\n";
+        let parsed = parse_jsonl(text).expect("parses");
+        assert_eq!(parsed.headers, vec!["id", "name", "note", "extra", "list", "ok"]);
+        assert_eq!(
+            parsed.rows,
+            vec![
+                vec![
+                    "1".to_owned(),
+                    "ada".to_owned(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ],
+                vec![
+                    "2".to_owned(),
+                    String::new(),
+                    String::new(),
+                    "{\"a\":1}".to_owned(),
+                    "[1,2]".to_owned(),
+                    "true".to_owned(),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn jsonl_reads_one_object_with_bom_crlf_and_blank_lines() {
+        let parsed = parse_jsonl("\u{feff}{\"a\": \"say \\\"hi\\\"\"}\r\n\r\n").expect("parses");
+        assert_eq!(parsed.headers, vec!["a"]);
+        assert_eq!(parsed.rows, vec![vec!["say \"hi\"".to_owned()]]);
+    }
+
+    #[test]
+    fn jsonl_rejects_lines_that_are_not_objects() {
+        assert_eq!(parse_jsonl(""), None);
+        assert_eq!(parse_jsonl("  \n\n"), None);
+        assert_eq!(parse_jsonl("not json"), None);
+        assert_eq!(parse_jsonl("[1, 2]"), None);
+        assert_eq!(parse_jsonl("{\"a\": 1}\ntrailing"), None);
+        assert_eq!(parse_jsonl("\"text\"\n{\"a\": 1}"), None);
     }
 
     #[test]
