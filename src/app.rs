@@ -614,6 +614,22 @@ pub struct HistoryEntry {
     pub at: u64,
 }
 
+/// One run's elapsed time as the log shows it, whole milliseconds.
+pub fn format_history_took(took: std::time::Duration) -> String {
+    let ms = took.as_secs_f64() * 1000.0;
+    format!("{ms:.0} ms")
+}
+
+/// One run's outcome, row count, and timing as the log shows it.
+pub fn history_stats(entry: &HistoryEntry) -> String {
+    let took = format_history_took(entry.took);
+    match (entry.succeeded, entry.rows) {
+        (true, Some(rows)) => format!("ok · {rows} rows · {took}"),
+        (true, None) => format!("ok · {took}"),
+        (false, _) => format!("failed · {took}"),
+    }
+}
+
 /// One named query. Newest first in [`AppState::saved`]. Holds the SQL and
 /// its connection only, never credentials. `folder` places it in a sidebar
 /// tree as a slash-separated path (`Some("ops/db")` nests under `ops`);
@@ -1493,6 +1509,9 @@ pub struct AppState {
     /// and table, kept until the session ends.
     row_counts: HashMap<(ConnectionId, String, String), RowCountState>,
     history: Vec<HistoryEntry>,
+    /// True narrows the execution log to the current connection. False shows
+    /// every connection. Never persisted, so a relaunch starts at all.
+    history_current_only: bool,
     saved: Vec<SavedQuery>,
     filter_history: Vec<SavedFilter>,
     bookmarks: Vec<TableBookmark>,
@@ -1540,6 +1559,7 @@ impl AppState {
             schema_errors: HashMap::new(),
             row_counts: HashMap::new(),
             history: load_history(),
+            history_current_only: false,
             saved,
             filter_history: load_saved_filters(),
             bookmarks: load_bookmarks(),
@@ -3118,6 +3138,41 @@ impl AppState {
 
     pub fn history_for(&self, conn: ConnectionId) -> Vec<&HistoryEntry> {
         self.history.iter().filter(|e| e.conn == conn).collect()
+    }
+
+    /// True narrows the execution log to the current connection.
+    pub fn history_current_only(&self) -> bool {
+        self.history_current_only
+    }
+
+    /// Pin the execution log to one scope. False shows every connection.
+    pub fn set_history_current_only(&mut self, only: bool) {
+        self.history_current_only = only;
+    }
+
+    /// Flip the execution log between the current connection and all.
+    pub fn toggle_history_scope(&mut self) {
+        self.history_current_only = !self.history_current_only;
+    }
+
+    /// The connection the log narrows to: the active tab's connection.
+    pub fn history_scope_connection(&self) -> Option<ConnectionId> {
+        self.active.and_then(|id| self.tab(id)).and_then(|tab| tab.conn)
+    }
+
+    /// True while the connection can run, so the log shows its rerun button.
+    pub fn is_connection_live(&self, conn: ConnectionId) -> bool {
+        self.connections.iter().find(|c| c.id == conn).is_some_and(|c| {
+            matches!(
+                c.state(),
+                ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
+            )
+        })
+    }
+
+    /// True while the entry's connection can rerun it now.
+    pub fn can_rerun(&self, entry: &HistoryEntry) -> bool {
+        self.is_connection_live(entry.conn)
     }
 
     pub fn clear_history(&mut self) {
@@ -5890,6 +5945,95 @@ mod tests {
             assert!(state.history().is_empty());
             let reloaded = AppState::new(&eframe::egui::Context::default());
             assert!(reloaded.history().is_empty());
+        });
+    }
+
+    #[test]
+    fn history_scope_defaults_to_all_and_toggles() {
+        with_isolated_state("hist-scope", |state| {
+            assert!(!state.history_current_only());
+            state.set_history_current_only(true);
+            assert!(state.history_current_only());
+            state.toggle_history_scope();
+            assert!(!state.history_current_only());
+            state.toggle_history_scope();
+            assert!(state.history_current_only());
+            state.set_history_current_only(false);
+            assert!(!state.history_current_only());
+        });
+    }
+
+    #[test]
+    fn history_scope_connection_follows_the_active_tab() {
+        with_isolated_state("hist-scope-conn", |state| {
+            assert_eq!(state.history_scope_connection(), None);
+            let a = add_sqlite_connection(state, "a");
+            let b = add_sqlite_connection(state, "b");
+            finish_ok(state, a, "SELECT a");
+            finish_ok(state, b, "SELECT b");
+            state.set_history_current_only(true);
+            assert!(state.history_current_only());
+            let tab = state.new_tab(a);
+            state.activate(tab);
+            assert_eq!(state.history_scope_connection(), Some(a));
+            let scoped = state.history_for(state.history_scope_connection().expect("conn"));
+            assert_eq!(scoped.len(), 1);
+            assert_eq!(scoped[0].sql, "SELECT a");
+            let other = state.new_tab(b);
+            state.activate(other);
+            assert_eq!(state.history_scope_connection(), Some(b));
+            let scoped = state.history_for(state.history_scope_connection().expect("conn"));
+            assert_eq!(scoped.len(), 1);
+            assert_eq!(scoped[0].sql, "SELECT b");
+        });
+    }
+
+    #[test]
+    fn history_stats_renders_outcome_rows_and_timing() {
+        let ok = HistoryEntry {
+            conn: ConnectionId::from_raw(1),
+            sql: "SELECT 1".to_owned(),
+            succeeded: true,
+            rows: Some(3),
+            took: std::time::Duration::from_millis(42),
+            at: 1,
+        };
+        assert_eq!(history_stats(&ok), "ok · 3 rows · 42 ms");
+        let affected = HistoryEntry {
+            conn: ConnectionId::from_raw(1),
+            sql: "DELETE FROM t".to_owned(),
+            succeeded: true,
+            rows: Some(1),
+            took: std::time::Duration::from_millis(5),
+            at: 2,
+        };
+        assert_eq!(history_stats(&affected), "ok · 1 rows · 5 ms");
+        let failed = HistoryEntry {
+            conn: ConnectionId::from_raw(1),
+            sql: "SELECT bad".to_owned(),
+            succeeded: false,
+            rows: None,
+            took: std::time::Duration::from_millis(7),
+            at: 3,
+        };
+        assert_eq!(history_stats(&failed), "failed · 7 ms");
+        assert_eq!(format_history_took(std::time::Duration::from_millis(2)), "2 ms");
+    }
+
+    #[test]
+    fn history_rerun_is_live_only() {
+        with_isolated_state("hist-rerun", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            finish_ok(state, conn, "SELECT 1");
+            let entry = state.history()[0].clone();
+            assert!(!state.can_rerun(&entry));
+            assert!(!state.is_connection_live(conn));
+            let _commands = attach_test_session(state, conn);
+            assert!(state.is_connection_live(conn));
+            assert!(state.can_rerun(&entry));
+            state.disconnect(conn);
+            assert!(!state.is_connection_live(conn));
+            assert!(!state.can_rerun(&entry));
         });
     }
 

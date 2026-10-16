@@ -720,25 +720,113 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
 
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("HISTORY").small().weak());
+                    let scope_label =
+                        if state.history_current_only() { "Current" } else { "All" };
+                    if ui
+                        .small_button(format!("Scope: {scope_label}"))
+                        .on_hover_text(
+                            "Toggle the log between the current connection and all connections",
+                        )
+                        .clicked()
+                    {
+                        state.toggle_history_scope();
+                    }
                     if ui.small_button("Clear").clicked() {
                         actions.push(SidebarAction::ClearHistory);
                     }
                 });
                 ui.add_space(4.0);
-                if state.history().is_empty() {
+                let history_conn_names: HashMap<ConnectionId, String> = state
+                    .connections()
+                    .iter()
+                    .map(|c| (c.id, c.name.clone()))
+                    .collect();
+                let scope_current_only = state.history_current_only();
+                let scope_conn = state.history_scope_connection();
+                let show_empty = state.history().is_empty();
+                if show_empty {
                     ui.label(egui::RichText::new("No runs yet.").small().weak());
+                } else if scope_current_only && scope_conn.is_none() {
+                    ui.label(
+                        egui::RichText::new("No current connection.")
+                            .small()
+                            .weak(),
+                    );
                 } else {
-                    for entry in state.history().iter().take(crate::app::HISTORY_SHOWN) {
-                        let dot = if entry.succeeded { palette.success } else { egui::Color32::RED };
-                        ui.horizontal(|ui| {
-                            ui.colored_label(dot, "●");
-                            if ui.small_button(history_title(&entry.sql)).clicked() {
-                                actions.push(SidebarAction::OpenHistory(
-                                    entry.conn,
-                                    entry.sql.clone(),
-                                ));
-                            }
-                        });
+                    let scoped: Vec<(ConnectionId, String, bool, Option<u64>, std::time::Duration)> =
+                        match (scope_current_only, scope_conn) {
+                            (true, Some(conn)) => state
+                                .history_for(conn)
+                                .into_iter()
+                                .take(crate::app::HISTORY_SHOWN)
+                                .map(|entry| {
+                                    (
+                                        entry.conn,
+                                        entry.sql.clone(),
+                                        entry.succeeded,
+                                        entry.rows,
+                                        entry.took,
+                                    )
+                                })
+                                .collect(),
+                            (true, None) => Vec::new(),
+                            (false, _) => state
+                                .history()
+                                .iter()
+                                .take(crate::app::HISTORY_SHOWN)
+                                .map(|entry| {
+                                    (
+                                        entry.conn,
+                                        entry.sql.clone(),
+                                        entry.succeeded,
+                                        entry.rows,
+                                        entry.took,
+                                    )
+                                })
+                                .collect(),
+                        };
+                    if scoped.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No runs for this connection.")
+                                .small()
+                                .weak(),
+                        );
+                    } else {
+                        for (conn, sql, succeeded, rows, took) in scoped {
+                            let dot =
+                                if succeeded { palette.success } else { egui::Color32::RED };
+                            let entry = crate::app::HistoryEntry {
+                                conn,
+                                sql: sql.clone(),
+                                succeeded,
+                                rows,
+                                took,
+                                at: 0,
+                            };
+                            let stats = crate::app::history_stats(&entry);
+                            let conn_name = history_conn_names
+                                .get(&conn)
+                                .map(String::as_str)
+                                .unwrap_or("deleted");
+                            let live = state.is_connection_live(conn);
+                            ui.horizontal(|ui| {
+                                ui.colored_label(dot, "●");
+                                if ui.small_button(history_title(&sql)).clicked() {
+                                    actions.push(SidebarAction::OpenHistory(
+                                        conn,
+                                        sql.clone(),
+                                    ));
+                                }
+                                if live && ui.small_button("Rerun").clicked() {
+                                    actions.push(SidebarAction::OpenHistory(conn, sql.clone()));
+                                }
+                            });
+                            ui.label(
+                                egui::RichText::new(format!("{stats} · {conn_name}"))
+                                    .small()
+                                    .weak(),
+                            );
+                        }
                     }
                 }
                 ui.add_space(8.0);
