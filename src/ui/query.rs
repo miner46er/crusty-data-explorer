@@ -19,6 +19,7 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
         || state.import_draft().is_some()
         || state.pending_write().is_some()
         || state.pending_params().is_some()
+        || state.pending_edit_preview().is_some()
         || state.palette_open();
     let (new_tab_shortcut_pressed, close_tab_shortcut_pressed, find_shortcut_pressed) = ui
         .input_mut(|i| {
@@ -53,6 +54,7 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     save_window(state, ui);
     write_confirm_window(state, ui);
+    edit_preview_window(state, ui);
     params_window(state, ui);
     if let Some(id) = state.active() {
         let hint = state
@@ -492,6 +494,46 @@ pub fn write_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
         state.confirm_write();
     } else if cancel {
         state.cancel_write();
+    }
+}
+
+/// The staged-edit SQL preview. Lists the exact UPDATE, DELETE, and INSERT
+/// statements the apply path would send, in send order; Confirm sends them
+/// through the unchanged apply path, Cancel keeps the staged edits.
+pub fn edit_preview_window(state: &mut AppState, ui: &mut egui::Ui) {
+    let Some(tab) = state.pending_edit_preview() else { return };
+    let table = state.edit_target(tab).map(|target| target.table).unwrap_or_default();
+    let statements = state.preview_edit_statements(tab).unwrap_or_default();
+    if statements.is_empty() {
+        state.cancel_pending_edits();
+        return;
+    }
+    let mut confirm = false;
+    let mut cancel = false;
+    egui::Window::new("Apply staged edits?").show(ui.ctx(), |ui| {
+        ui.label(format!(
+            "{} statement{} on {table}. Confirm sends them, Cancel keeps the staged edits.",
+            statements.len(),
+            if statements.len() == 1 { "" } else { "s" },
+        ));
+        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+            for statement in &statements {
+                ui.monospace(statement);
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Confirm").clicked() {
+                confirm = true;
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+        });
+    });
+    if confirm {
+        state.confirm_pending_edits();
+    } else if cancel {
+        state.cancel_pending_edits();
     }
 }
 

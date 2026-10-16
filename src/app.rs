@@ -1054,6 +1054,9 @@ pub struct AppState {
     pending_prod: Option<ConnectionId>,
     pending_write: Option<PendingWriteConfirm>,
     pending_params: Option<PendingParams>,
+    /// The tab whose staged edits await their SQL preview. Confirm sends
+    /// through the apply path, Cancel keeps the staged edits.
+    pending_edit_preview: Option<TabId>,
     prompt_password: String,
     ids: Ids,
     registry: DriverRegistry,
@@ -1100,6 +1103,7 @@ impl AppState {
             pending_prod: None,
             pending_write: None,
             pending_params: None,
+            pending_edit_preview: None,
             prompt_password: String::new(),
             ids,
             registry: DriverRegistry::bundled(),
@@ -1275,6 +1279,9 @@ impl AppState {
         }
         if self.pending_params.as_ref().is_some_and(|pending| pending.tab == tab) {
             self.pending_params = None;
+        }
+        if self.pending_edit_preview == Some(tab) {
+            self.pending_edit_preview = None;
         }
         self.repair_active();
     }
@@ -1681,8 +1688,12 @@ impl AppState {
     /// Stage one cell edit. `row` counts result rows first, then staged added
     /// rows. No-op unless the target resolves and the cell is in the active
     /// result or a staged added row. A later stage on the same cell replaces
-    /// its text.
+    /// its text. No-op while the SQL preview is open, so the previewed
+    /// statements cannot change underneath the modal.
     pub fn stage_edit(&mut self, tab: TabId, row: usize, col: usize, text: String) {
+        if self.pending_edit_preview.is_some() {
+            return;
+        }
         if self.edit_target(tab).is_none() {
             return;
         }
@@ -1705,18 +1716,26 @@ impl AppState {
         }
     }
 
-    /// Drop every staged change on the tab.
+    /// Drop every staged change on the tab. Clears its SQL preview as well,
+    /// since there is nothing left to confirm.
     pub fn discard_edits(&mut self, tab: TabId) {
         if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
             t.edits.clear();
             t.deleted_rows.clear();
             t.added_rows.clear();
         }
+        if self.pending_edit_preview == Some(tab) {
+            self.pending_edit_preview = None;
+        }
     }
 
     /// Stage a DELETE for one result row. Marking the row again restores it.
     /// No-op unless the target resolves and the row is in the active result.
+    /// No-op while the SQL preview is open, the way staging is.
     pub fn mark_row_deleted(&mut self, tab: TabId, row: usize) {
+        if self.pending_edit_preview.is_some() {
+            return;
+        }
         if self.edit_target(tab).is_none() {
             return;
         }
@@ -1734,8 +1753,12 @@ impl AppState {
     }
 
     /// Stage one empty row for INSERT, with one cell per result column.
-    /// No-op unless the target resolves.
+    /// No-op unless the target resolves. No-op while the SQL preview is
+    /// open, the way staging is.
     pub fn add_row(&mut self, tab: TabId) {
+        if self.pending_edit_preview.is_some() {
+            return;
+        }
         if self.edit_target(tab).is_none() {
             return;
         }
@@ -1744,11 +1767,65 @@ impl AppState {
         t.added_rows.push(vec![String::new(); cols]);
     }
 
-    /// Send every staged change as one batch: an UPDATE per dirty row, a
-    /// DELETE per deleted row, then an INSERT per added row. Nothing sends
-    /// when nothing is staged or the target does not resolve. A read-only
-    /// connection refuses the batch with the same error a run reports.
+    /// Preview the staged changes as the exact SQL the apply would send.
+    /// Some only while the target resolves and the result reads.
+    pub fn preview_edit_statements(&self, tab: TabId) -> Option<Vec<String>> {
+        let target = self.edit_target(tab)?;
+        self.edit_statements(tab, &target)
+    }
+
+    /// The tab whose staged edits await their SQL preview, if any.
+    pub fn pending_edit_preview(&self) -> Option<TabId> {
+        self.pending_edit_preview
+    }
+
+    /// Arm the SQL preview for the staged changes instead of sending. An
+    /// empty stage or an unresolvable target arms nothing. A read-only
+    /// connection refuses at once with the same error a run reports, so no
+    /// preview opens it cannot send. The grid Apply button enters here, and
+    /// the preview modal confirms from here.
     pub fn apply_edits(&mut self, tab: TabId) {
+        if self.pending_edit_preview == Some(tab) {
+            return;
+        }
+        let Some(target) = self.edit_target(tab) else { return };
+        let Some(statements) = self.edit_statements(tab, &target) else { return };
+        if statements.is_empty() {
+            return;
+        }
+        let read_only = match self.tabs.iter().find(|t| t.id == tab) {
+            Some(t) => {
+                match t.conn.and_then(|id| self.connections.iter().find(|c| c.id == id)) {
+                    Some(c) => c.config.is_read_only(),
+                    None => return,
+                }
+            }
+            None => return,
+        };
+        if read_only {
+            let kind = statements
+                .iter()
+                .find_map(|statement| crate::db::write_statement_kind(statement))
+                .unwrap_or("write");
+            self.set_outcome(
+                tab,
+                RunOutcome::Err(
+                    crate::db::DbError::Config(format!("read-only connection refused {kind}"))
+                        .to_string(),
+                ),
+            );
+            return;
+        }
+        self.pending_edit_preview = Some(tab);
+    }
+
+    /// Send the previewed batch exactly as the apply path would: an UPDATE
+    /// per dirty row, a DELETE per deleted row, then an INSERT per added
+    /// row. The statements re-resolve through the same builder the preview
+    /// reads, so the modal and the worker see the same text. Staging is
+    /// locked while the preview is open, so the two cannot drift.
+    pub fn confirm_pending_edits(&mut self) {
+        let Some(tab) = self.pending_edit_preview.take() else { return };
         let Some(target) = self.edit_target(tab) else { return };
         let Some(statements) = self.edit_statements(tab, &target) else { return };
         if statements.is_empty() {
@@ -1778,6 +1855,11 @@ impl AppState {
             return;
         }
         self.send_batch(tab, conn_id, handle, statements, BatchPurpose::ApplyEdits, None);
+    }
+
+    /// Drop the SQL preview without sending anything. Staged edits stay.
+    pub fn cancel_pending_edits(&mut self) {
+        self.pending_edit_preview = None;
     }
 
     /// Read and parse a CSV file for one tab and stage it for confirmation.
@@ -2953,6 +3035,9 @@ impl AppState {
                     t.edits.clear();
                     t.deleted_rows.clear();
                     t.added_rows.clear();
+                    if self.pending_edit_preview == Some(t.id) {
+                        self.pending_edit_preview = None;
+                    }
                 }
                 let (started, statements) = match &t.outcome {
                     RunOutcome::Running { started, statements, .. } => {
@@ -6418,17 +6503,20 @@ mod tests {
             state.stage_edit(tab, 2, 0, "initech".to_owned());
             state.stage_edit(tab, 2, 1, "3".to_owned());
             state.stage_edit(tab, 2, 2, "Lin".to_owned());
+            let expected = vec![
+                "UPDATE \"items\" SET \"name\" = 'ada lovelace' WHERE \"tenant\" = 'acme' AND \"id\" = 1".to_owned(),
+                "DELETE FROM \"items\" WHERE \"tenant\" = 'globex' AND \"id\" = 2".to_owned(),
+                "INSERT INTO \"items\" (\"tenant\", \"id\", \"name\") VALUES ('initech', 3, 'Lin')".to_owned(),
+            ];
             state.apply_edits(tab);
+            assert_eq!(state.pending_edit_preview(), Some(tab));
+            assert_eq!(state.preview_edit_statements(tab), Some(expected.clone()));
+            assert!(commands.try_recv().is_err(), "the preview holds the batch");
+            state.confirm_pending_edits();
+            assert_eq!(state.pending_edit_preview(), None);
             match commands.try_recv().expect("a command was sent") {
                 DbCommand::QueryBatch { statements, .. } => {
-                    assert_eq!(
-                        statements,
-                        vec![
-                            "UPDATE \"items\" SET \"name\" = 'ada lovelace' WHERE \"tenant\" = 'acme' AND \"id\" = 1",
-                            "DELETE FROM \"items\" WHERE \"tenant\" = 'globex' AND \"id\" = 2",
-                            "INSERT INTO \"items\" (\"tenant\", \"id\", \"name\") VALUES ('initech', 3, 'Lin')",
-                        ]
-                    );
+                    assert_eq!(statements, expected);
                 }
                 other => panic!("expected QueryBatch, got {other:?}"),
             }
@@ -6437,6 +6525,62 @@ mod tests {
                 RunOutcome::Running { .. }
             ));
             assert!(commands.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn apply_cancel_keeps_the_staged_edits() {
+        with_isolated_state("edit-preview-cancel", |state| {
+            let (tab, _conn, commands) = editable_tab(state);
+            state.stage_edit(tab, 0, 2, "Ada".to_owned());
+            state.mark_row_deleted(tab, 1);
+            assert_eq!(state.tab(tab).expect("tab").staged_count(), 2);
+            state.apply_edits(tab);
+            assert_eq!(state.pending_edit_preview(), Some(tab));
+            assert!(commands.try_recv().is_err(), "the preview holds the batch");
+            state.cancel_pending_edits();
+            assert_eq!(state.pending_edit_preview(), None);
+            assert!(commands.try_recv().is_err(), "cancel sends nothing");
+            let view = state.tab(tab).expect("tab");
+            assert_eq!(view.staged_count(), 2);
+            assert_eq!(view.edit_text(0, 2), Some("Ada"));
+            assert!(view.is_row_deleted(1));
+        });
+    }
+
+    #[test]
+    fn edit_preview_modal_lists_the_exact_statements() {
+        with_isolated_state("edit-preview-render", |state| {
+            let (tab, _conn, _commands) = editable_tab(state);
+            state.activate(tab);
+            state.stage_edit(tab, 0, 2, "Ada".to_owned());
+            state.mark_row_deleted(tab, 1);
+            state.apply_edits(tab);
+            let expected = state.preview_edit_statements(tab).expect("preview");
+            assert_eq!(expected.len(), 2);
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input.clone(), |ui| {
+                crate::ui::query::editor(state, ui);
+            });
+            output.textures_delta.clear();
+            let mut output = ctx.run_ui(input, |ui| {
+                crate::ui::query::editor(state, ui);
+            });
+            output.textures_delta.clear();
+            let text = rendered_text(&output);
+            assert!(text.iter().any(|t| t == "Apply staged edits?"), "{text:?}");
+            for statement in &expected {
+                assert!(text.iter().any(|t| t == statement), "{text:?}");
+            }
+            assert!(text.iter().any(|t| t == "Confirm"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Cancel"), "{text:?}");
         });
     }
 
@@ -6468,6 +6612,15 @@ mod tests {
             assert_eq!(target.pk_types, vec![true, false]);
             state.stage_edit(tab, 0, 2, "Ada".to_owned());
             state.apply_edits(tab);
+            assert_eq!(state.pending_edit_preview(), Some(tab));
+            assert_eq!(
+                state.preview_edit_statements(tab),
+                Some(vec![
+                    "UPDATE \"items\" SET \"name\" = 'Ada' WHERE \"tenant\" = '010' AND \"id\" = 1".to_owned()
+                ])
+            );
+            assert!(commands.try_recv().is_err(), "the preview holds the batch");
+            state.confirm_pending_edits();
             match commands.try_recv().expect("a command was sent") {
                 DbCommand::QueryBatch { statements, .. } => assert_eq!(
                     statements,
@@ -6510,6 +6663,9 @@ mod tests {
             let sql = state.tab(tab).expect("tab").sql.clone();
             state.stage_edit(tab, 0, 2, "Ada".to_owned());
             state.apply_edits(tab);
+            assert_eq!(state.pending_edit_preview(), Some(tab));
+            assert!(commands.try_recv().is_err(), "the preview holds the batch");
+            state.confirm_pending_edits();
             let apply_run = match commands.try_recv().expect("apply batch") {
                 DbCommand::QueryBatch { run, statements } => {
                     assert_eq!(statements.len(), 1);
@@ -6544,6 +6700,8 @@ mod tests {
             // A failed apply keeps the staged changes for a retry.
             state.stage_edit(tab, 0, 2, "Ada".to_owned());
             state.apply_edits(tab);
+            assert_eq!(state.pending_edit_preview(), Some(tab));
+            state.confirm_pending_edits();
             let failed_run = match commands.try_recv().expect("apply batch") {
                 DbCommand::QueryBatch { run, .. } => run,
                 other => panic!("expected QueryBatch, got {other:?}"),
@@ -6844,6 +7002,9 @@ mod tests {
             state.stage_edit(tab, 2, 1, "3".to_owned());
             state.stage_edit(tab, 2, 2, "Lin".to_owned());
             state.apply_edits(tab);
+            assert_eq!(state.pending_edit_preview(), Some(tab));
+            state.confirm_pending_edits();
+            assert_eq!(state.pending_edit_preview(), None);
             loop {
                 state.drain_events();
                 let running = matches!(
@@ -7389,6 +7550,7 @@ mod tests {
                 .set_read_only(true);
             state.stage_edit(tab, 0, 2, "Ada".to_owned());
             state.apply_edits(tab);
+            assert_eq!(state.pending_edit_preview(), None, "read-only refuses without a preview");
             match state.tab(tab).expect("tab").outcome() {
                 RunOutcome::Err(message) => assert_eq!(
                     message,
