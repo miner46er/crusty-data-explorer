@@ -2,14 +2,17 @@
 
 use eframe::egui;
 
-use crate::app::AppState;
+use crate::app::{AppState, RowCountState};
 use crate::db::{ConnectionId, DbKind, TableInfo, TableKind};
 
 use super::ddl;
 
+#[derive(Debug)]
 pub enum SchemaAction {
     Refresh(ConnectionId),
     Preview(ConnectionId, String, String),
+    /// Ask the worker for one table's row count.
+    Count(ConnectionId, String, String),
 }
 
 pub fn connection_schema(
@@ -74,7 +77,14 @@ pub fn connection_schema(
                             .default_open(true)
                             .show(ui, |ui| {
                                 for schema_node in db.schemas() {
-                                    show_schema(ui, conn, schema_node, dialect, &mut actions);
+                                    show_schema(
+                                        state,
+                                        ui,
+                                        conn,
+                                        schema_node,
+                                        dialect,
+                                        &mut actions,
+                                    );
                                 }
                             });
                         });
@@ -85,6 +95,7 @@ pub fn connection_schema(
 }
 
 fn show_schema(
+    state: &AppState,
     ui: &mut egui::Ui,
     conn: ConnectionId,
     schema_node: &crate::db::SchemaNode,
@@ -108,7 +119,7 @@ fn show_schema(
                     if i > 0 {
                         ui.separator();
                     }
-                    show_table(ui, conn, schema_node.name(), table, dialect, actions);
+                    show_table(state, ui, conn, schema_node.name(), table, dialect, actions);
                 }
             });
             ui.add_space(4.0);
@@ -125,7 +136,7 @@ fn show_schema(
                     if i > 0 {
                         ui.separator();
                     }
-                    show_table(ui, conn, schema_node.name(), view, dialect, actions);
+                    show_table(state, ui, conn, schema_node.name(), view, dialect, actions);
                 }
             });
             ui.add_space(4.0);
@@ -240,7 +251,54 @@ fn show_schema(
     });
 }
 
+/// The on-demand count row for one table: a button that requests the count,
+/// a spinner while it is in flight, the landed number, or the engine error
+/// with a retry. Views get nothing because neither estimate engine reports a
+/// meaningful one for them.
+fn count_affordance(
+    state: &AppState,
+    ui: &mut egui::Ui,
+    conn: ConnectionId,
+    schema: &str,
+    table: &TableInfo,
+    actions: &mut Vec<SchemaAction>,
+) {
+    if table.kind() != TableKind::Table {
+        return;
+    }
+    let name = table.name();
+    ui.horizontal(|ui| match state.row_count(conn, schema, name) {
+        None => {
+            if ui.small_button("Count rows").clicked() {
+                actions.push(SchemaAction::Count(conn, schema.to_owned(), name.to_owned()));
+            }
+        }
+        Some(RowCountState::Pending) => {
+            ui.spinner();
+            ui.label(egui::RichText::new("Counting…").small().weak());
+        }
+        Some(RowCountState::Ready(count)) => {
+            let text = if count.is_estimate() {
+                format!("{} rows (estimate)", count.label())
+            } else {
+                format!("{} rows", count.label())
+            };
+            ui.label(egui::RichText::new(text).small());
+        }
+        Some(RowCountState::Failed(message)) => {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                egui::RichText::new(message.clone()).small(),
+            );
+            if ui.small_button("Retry").clicked() {
+                actions.push(SchemaAction::Count(conn, schema.to_owned(), name.to_owned()));
+            }
+        }
+    });
+}
+
 fn show_table(
+    state: &AppState,
     ui: &mut egui::Ui,
     conn: ConnectionId,
     schema: &str,
@@ -254,6 +312,7 @@ fn show_table(
     let header =
         egui::RichText::new(format!("{name} ({})", columns.len())).monospace().small();
     let resp = egui::CollapsingHeader::new(header).default_open(false).show(ui, |ui| {
+        count_affordance(state, ui, conn, schema, table, actions);
         if !table.columns().is_empty() {
             egui::CollapsingHeader::new(
                 egui::RichText::new(format!("Columns ({})", table.columns().len()))

@@ -730,6 +730,32 @@ impl QueryResult {
     }
 }
 
+/// One table's row count. SQLite counts exactly; Postgres and MySQL read
+/// their catalog's estimate, so the UI can label those honestly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowCount {
+    Exact(u64),
+    Estimate(u64),
+}
+
+impl RowCount {
+    pub fn value(self) -> u64 {
+        match self {
+            RowCount::Exact(n) | RowCount::Estimate(n) => n,
+        }
+    }
+    pub fn is_estimate(self) -> bool {
+        matches!(self, RowCount::Estimate(_))
+    }
+    /// Display text: a bare number when exact, a tilde prefix on estimates.
+    pub fn label(self) -> String {
+        match self {
+            RowCount::Exact(n) => n.to_string(),
+            RowCount::Estimate(n) => format!("~{n}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ShapeError {
     #[error("ragged result: expected {expected} values per column")]
@@ -1468,6 +1494,8 @@ pub enum IdleTick {
 pub enum DbCommand {
     QueryBatch { run: RunId, statements: Vec<String> },
     LoadSchema,
+    /// One table's row count, on the navigator's explicit request.
+    RowCount { schema: String, table: String },
     /// Flip the worker's autocommit for this session.
     SetAutocommit { on: bool },
 }
@@ -1481,6 +1509,9 @@ pub enum DbEvent {
     QueryErr { run: RunId, error: DbError },
     SchemaOk { conn: ConnectionId, schema: SchemaInfo },
     SchemaErr { conn: ConnectionId, error: DbError },
+    /// One table's row count landed for the navigator's affordance.
+    RowCountOk { conn: ConnectionId, schema: String, table: String, count: RowCount },
+    RowCountErr { conn: ConnectionId, schema: String, table: String, error: DbError },
     /// The autocommit toggle landed. `on` and `tx_open` are the worker's
     /// state after applying it; an error means a rollback on the way back to
     /// autocommit failed and the connection was closed instead of returned.
@@ -1605,6 +1636,49 @@ impl Session {
         }
     }
 
+    /// One engine query for one table's row count, scoped to the schema the
+    /// navigator names. SQLite counts the table exactly; Postgres reads
+    /// `pg_class.reltuples` and MySQL `information_schema.tables.table_rows`,
+    /// so those come back as estimates. Identifiers are quoted inline because
+    /// this goes through the same text-only query path as the introspection.
+    pub fn row_count(&mut self, schema: &str, table: &str) -> Result<RowCount, DbError> {
+        match self {
+            Session::Sqlite(conn) => {
+                let sql = format!(
+                    "SELECT COUNT(*) FROM {}.{}",
+                    quote_ident(schema),
+                    quote_ident(table)
+                );
+                let result = execute_sqlite(conn, &sql, ROW_CAP)?;
+                count_cell(&result, schema, table).map(RowCount::Exact)
+            }
+            #[cfg(feature = "postgres")]
+            Session::Postgres(pg) => {
+                let sql = format!(
+                    "SELECT GREATEST(c.reltuples, 0)::bigint FROM pg_class c \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = {} AND c.relname = {}",
+                    sql_text(schema),
+                    sql_text(table)
+                );
+                let result = pg.query(&sql)?;
+                count_cell(&result, schema, table).map(RowCount::Estimate)
+            }
+            #[cfg(feature = "mysql")]
+            Session::Mysql(my) => {
+                let sql = format!(
+                    "SELECT CAST(COALESCE(table_rows, 0) AS SIGNED) \
+                     FROM information_schema.tables \
+                     WHERE table_schema = {} AND table_name = {}",
+                    sql_text(schema),
+                    sql_text(table)
+                );
+                let result = my.query(&sql)?;
+                count_cell(&result, schema, table).map(RowCount::Estimate)
+            }
+        }
+    }
+
     /// Ordered schema load, capped with truncation flags. No client type
     /// crosses the boundary.
     pub fn schema(&mut self) -> Result<SchemaInfo, DbError> {
@@ -1672,6 +1746,27 @@ impl Session {
             #[cfg(feature = "mysql")]
             Session::Mysql(my) => my.tick_tx_idle(_idle),
         }
+    }
+}
+
+/// One identifier part for inline SQL: double-quoted with embedded quotes
+/// doubled, the same shape the introspection paths write.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// One SQL string literal for inline SQL: single quotes doubled.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+fn sql_text(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// The single non-negative integer a count query returns. No row means the
+/// table vanished between the schema load and the request.
+fn count_cell(result: &QueryResult, schema: &str, table: &str) -> Result<u64, DbError> {
+    match result.cell(0, 0) {
+        Some(Value::Integer(n)) if *n >= 0 => Ok(*n as u64),
+        _ => Err(DbError::Query(format!("no row count for \"{schema}\".\"{table}\""))),
     }
 }
 
@@ -4573,6 +4668,22 @@ fn worker_loop(
                 };
                 emit(&events, &ui, event);
             }
+            DbCommand::RowCount { schema, table } => {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    session.row_count(&schema, &table)
+                }));
+                let event = match outcome {
+                    Ok(Ok(count)) => DbEvent::RowCountOk { conn, schema, table, count },
+                    Ok(Err(error)) => DbEvent::RowCountErr { conn, schema, table, error },
+                    Err(_) => DbEvent::RowCountErr {
+                        conn,
+                        schema,
+                        table,
+                        error: DbError::Query("driver panicked while counting rows".to_owned()),
+                    },
+                };
+                emit(&events, &ui, event);
+            }
             DbCommand::SetAutocommit { on } => {
                 let was_open = session.manual_tx_open();
                 let applied = session.set_autocommit(on);
@@ -5806,6 +5917,60 @@ mod tests {
         assert!(!node.triggers_truncated());
     }
 
+    /// The schema and table name the navigator would pass for one probe
+    /// table, read back from a loaded tree.
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    fn probe_location(schema: &SchemaInfo, name: &str) -> (String, String) {
+        schema
+            .databases()
+            .iter()
+            .flat_map(|db| db.schemas())
+            .find_map(|s| {
+                s.tables()
+                    .iter()
+                    .find(|t| t.name() == name)
+                    .map(|t| (s.name().to_owned(), t.name().to_owned()))
+            })
+            .expect("probe table in the schema")
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_row_count_estimates_an_analyzed_table() {
+        let config = ConnectionConfig::Postgres { read_only: false,
+            host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
+            port: std::env::var("PGPORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
+            user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+            ssl_mode: PostgresSslMode::Disable,
+            ssh: None,
+        };
+        let password = std::env::var("PGPASSWORD").ok();
+        let mut session = Session::open(&config, password.as_deref(), None).expect("open");
+        session
+            .query("DROP TABLE IF EXISTS cde_count_probe")
+            .expect("drop probe");
+        session
+            .query("CREATE TABLE cde_count_probe (id INT)")
+            .expect("create probe");
+        session
+            .query("INSERT INTO cde_count_probe (id) VALUES (1), (2), (3), (4), (5)")
+            .expect("seed probe");
+        session.query("ANALYZE cde_count_probe").expect("analyze probe");
+        let schema = session.schema().expect("schema loads");
+        let (schema_name, table) = probe_location(&schema, "cde_count_probe");
+        let count = session.row_count(&schema_name, &table).expect("count");
+        session
+            .query("DROP TABLE IF EXISTS cde_count_probe")
+            .expect("cleanup probe");
+        assert_eq!(count, RowCount::Estimate(5));
+        assert!(matches!(session.row_count(&schema_name, &table), Err(DbError::Query(_))));
+    }
+
     #[cfg(feature = "mysql")]
     #[test]
     fn my_cell_kind_covers_listed_type_names() {
@@ -6108,6 +6273,27 @@ mod tests {
             "{:?}",
             routine.definition()
         );
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    #[ignore = "needs a live MySQL; set MYSQLHOST/MYSQLPORT/MYSQLDATABASE/MYSQLUSER/MYSQLPASSWORD"]
+    fn mysql_live_row_count_estimates_an_analyzed_table() {
+        let mut session = mysql_live_open();
+        session.query("DROP TABLE IF EXISTS cde_count_probe").expect("drop probe");
+        session
+            .query("CREATE TABLE cde_count_probe (id INT)")
+            .expect("create probe");
+        session
+            .query("INSERT INTO cde_count_probe (id) VALUES (1), (2), (3), (4), (5)")
+            .expect("seed probe");
+        session.query("ANALYZE TABLE cde_count_probe").expect("analyze probe");
+        let schema = session.schema().expect("schema loads");
+        let (schema_name, table) = probe_location(&schema, "cde_count_probe");
+        let count = session.row_count(&schema_name, &table).expect("count");
+        session.query("DROP TABLE IF EXISTS cde_count_probe").expect("cleanup probe");
+        assert_eq!(count, RowCount::Estimate(5));
+        assert!(matches!(session.row_count(&schema_name, &table), Err(DbError::Query(_))));
     }
 
     #[cfg(feature = "mysql")]
@@ -6467,6 +6653,43 @@ mod tests {
     }
 
     #[test]
+    fn row_count_labels_exact_and_estimate() {
+        assert_eq!(RowCount::Exact(3).label(), "3");
+        assert_eq!(RowCount::Estimate(3).label(), "~3");
+        assert!(RowCount::Estimate(3).is_estimate());
+        assert!(!RowCount::Exact(3).is_estimate());
+        assert_eq!(RowCount::Exact(3).value(), 3);
+        assert_eq!(RowCount::Estimate(7).value(), 7);
+    }
+
+    #[test]
+    fn sqlite_row_count_is_exact_and_a_dropped_table_errors() {
+        let mut session = Session::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        session.query("CREATE TABLE users (id INTEGER PRIMARY KEY)").expect("create");
+        session
+            .query("INSERT INTO users (id) VALUES (1), (2), (3)")
+            .expect("seed");
+        assert_eq!(session.row_count("main", "users").expect("count"), RowCount::Exact(3));
+        session.query("DROP TABLE users").expect("drop");
+        assert!(matches!(session.row_count("main", "users"), Err(DbError::Query(_))));
+    }
+
+    #[test]
+    fn sqlite_row_count_quotes_awkward_identifiers() {
+        let mut session = Session::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        session
+            .query("CREATE TABLE \"we\"\"ird table\" (id INTEGER)")
+            .expect("create");
+        session
+            .query("INSERT INTO \"we\"\"ird table\" (id) VALUES (1)")
+            .expect("seed");
+        assert_eq!(
+            session.row_count("main", "we\"ird table").expect("count"),
+            RowCount::Exact(1)
+        );
+    }
+
+    #[test]
     fn batch_runs_in_order_and_stops_at_the_failing_statement() {
         let mut session = Session::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
         let statements: Vec<String> = vec![
@@ -6511,6 +6734,21 @@ mod tests {
         let plan = explain_sql(DbKind::Sqlite, "SELECT 1");
         let result = session.query(&plan).expect("explain runs");
         assert!(result.row_count() > 0);
+    }
+
+    #[test]
+    #[ignore = "live engine test; run with --ignored"]
+    fn sqlite_live_row_count_counts_exactly() {
+        let mut session = Session::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        session
+            .query("CREATE TABLE cde_count_probe (id INTEGER)")
+            .expect("create probe");
+        session
+            .query("INSERT INTO cde_count_probe (id) VALUES (1), (2), (3), (4)")
+            .expect("seed probe");
+        let count = session.row_count("main", "cde_count_probe").expect("count");
+        session.query("DROP TABLE cde_count_probe").expect("cleanup probe");
+        assert_eq!(count, RowCount::Exact(4));
     }
 
     #[test]

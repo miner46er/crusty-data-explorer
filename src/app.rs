@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use crate::db::{
     CancelHandle, ConnectionConfig, ConnectionId, DbCommand, DbEvent, DbHandle, DbKind,
-    DriverRegistry, Ids, QueryResult, RunId, SchemaInfo, TabId, TableInfo, TxIdle, Value,
-    explain_sql, spawn_session,
+    DriverRegistry, Ids, QueryResult, RowCount, RunId, SchemaInfo, TabId, TableInfo, TxIdle,
+    Value, explain_sql, spawn_session,
     TX_IDLE_ROLLBACK_MINUTES,
 };
 use crate::edit::{
@@ -355,6 +355,15 @@ pub enum RunOutcome {
     Running { run: RunId, started: Instant, statements: Vec<String> },
     Ok { results: Vec<QueryResult>, active: usize },
     Err(String),
+}
+
+/// One table's on-demand count as the navigator sees it, from the click
+/// until the session ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowCountState {
+    Pending,
+    Ready(RowCount),
+    Failed(String),
 }
 
 /// Why a batch was sent, so its landing knows what it ended.
@@ -699,6 +708,9 @@ pub struct AppState {
     schemas: HashMap<ConnectionId, SchemaInfo>,
     schema_loading: HashSet<ConnectionId>,
     schema_errors: HashMap<ConnectionId, String>,
+    /// Navigator counts requested on demand, keyed by connection, schema,
+    /// and table, kept until the session ends.
+    row_counts: HashMap<(ConnectionId, String, String), RowCountState>,
     history: Vec<HistoryEntry>,
     saved: Vec<SavedQuery>,
     save_prompt: Option<SavePrompt>,
@@ -737,6 +749,7 @@ impl AppState {
             schemas: HashMap::new(),
             schema_loading: HashSet::new(),
             schema_errors: HashMap::new(),
+            row_counts: HashMap::new(),
             history: load_history(),
             saved,
             save_prompt: None,
@@ -788,6 +801,16 @@ impl AppState {
     }
     pub fn schema_error(&self, conn: ConnectionId) -> Option<&str> {
         self.schema_errors.get(&conn).map(String::as_str)
+    }
+
+    /// The cached count state for one table, if its count was requested.
+    pub fn row_count(
+        &self,
+        conn: ConnectionId,
+        schema: &str,
+        table: &str,
+    ) -> Option<&RowCountState> {
+        self.row_counts.get(&(conn, schema.to_owned(), table.to_owned()))
     }
 
     pub fn connections(&self) -> &[Connection] {
@@ -1758,6 +1781,7 @@ impl AppState {
         self.schemas.remove(&id);
         self.schema_loading.remove(&id);
         self.schema_errors.remove(&id);
+        self.row_counts.retain(|(conn, _, _), _| *conn != id);
     }
 
     pub fn delete_connection(&mut self, id: ConnectionId) {
@@ -1785,6 +1809,31 @@ impl AppState {
         if handle.send(DbCommand::LoadSchema).is_err() {
             self.schema_loading.remove(&conn);
             self.schema_errors.insert(conn, "connection is gone".to_owned());
+        }
+    }
+
+    /// Ask the worker for one table's row count. A click while one is in
+    /// flight is a no-op; the answer caches until the session ends.
+    pub fn request_row_count(&mut self, conn: ConnectionId, schema: &str, table: &str) {
+        let key = (conn, schema.to_owned(), table.to_owned());
+        if matches!(self.row_counts.get(&key), Some(RowCountState::Pending)) {
+            return;
+        }
+        let handle = match self.connections.iter().find(|c| c.id == conn) {
+            Some(c) => match &c.state {
+                ConnectionState::Connected { session }
+                | ConnectionState::QueryRunning { session, .. } => session.handle.clone(),
+                _ => return,
+            },
+            None => return,
+        };
+        self.row_counts.insert(key.clone(), RowCountState::Pending);
+        let sent = handle.send(DbCommand::RowCount {
+            schema: schema.to_owned(),
+            table: table.to_owned(),
+        });
+        if sent.is_err() {
+            self.row_counts.insert(key, RowCountState::Failed("connection is gone".to_owned()));
         }
     }
 
@@ -2138,6 +2187,9 @@ impl AppState {
                     None
                 };
                 if let Some(handle) = handle {
+                    // A fresh worker session invalidates the counts the
+                    // previous session cached.
+                    self.row_counts.retain(|(c, _, _), _| *c != conn);
                     self.schema_loading.insert(conn);
                     self.schema_errors.remove(&conn);
                     if handle.send(DbCommand::LoadSchema).is_err() {
@@ -2168,6 +2220,13 @@ impl AppState {
             DbEvent::SchemaErr { conn, error } => {
                 self.schema_loading.remove(&conn);
                 self.schema_errors.insert(conn, error.to_string());
+            }
+            DbEvent::RowCountOk { conn, schema, table, count } => {
+                self.row_counts.insert((conn, schema, table), RowCountState::Ready(count));
+            }
+            DbEvent::RowCountErr { conn, schema, table, error } => {
+                self.row_counts
+                    .insert((conn, schema, table), RowCountState::Failed(error.to_string()));
             }
             DbEvent::QueryErr { run, error } => {
                 let fatal = error.is_fatal();
@@ -5368,6 +5427,185 @@ mod tests {
             let text = rendered_text(&output);
             assert!(text.iter().any(|t| t == "read only"), "{text:?}");
             assert!(!text.iter().any(|t| t.starts_with("Apply")), "{text:?}");
+        });
+    }
+
+    #[test]
+    fn table_count_requests_once_caches_and_clears_with_the_session() {
+        with_isolated_state("row-count-state", |state| {
+            let conn = add_sqlite_connection(state, "mem-count");
+            let commands = attach_test_session(state, conn);
+            state.request_row_count(conn, "main", "items");
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::RowCount { schema, table } => {
+                    assert_eq!(schema, "main");
+                    assert_eq!(table, "items");
+                }
+                other => panic!("expected RowCount, got {other:?}"),
+            }
+            assert_eq!(state.row_count(conn, "main", "items"), Some(&RowCountState::Pending));
+            // A second request while the first is in flight sends nothing.
+            state.request_row_count(conn, "main", "items");
+            assert!(commands.try_recv().is_err());
+            state.apply(DbEvent::RowCountOk {
+                conn,
+                schema: "main".to_owned(),
+                table: "items".to_owned(),
+                count: RowCount::Exact(12),
+            });
+            assert_eq!(
+                state.row_count(conn, "main", "items"),
+                Some(&RowCountState::Ready(RowCount::Exact(12)))
+            );
+            state.disconnect(conn);
+            assert_eq!(state.row_count(conn, "main", "items"), None);
+        });
+    }
+
+    #[test]
+    fn table_count_error_caches_the_message_and_a_retry_sends_again() {
+        with_isolated_state("row-count-error", |state| {
+            let conn = add_sqlite_connection(state, "mem-count-error");
+            let commands = attach_test_session(state, conn);
+            state.request_row_count(conn, "main", "gone");
+            assert!(matches!(commands.try_recv(), Ok(DbCommand::RowCount { .. })));
+            state.apply(DbEvent::RowCountErr {
+                conn,
+                schema: "main".to_owned(),
+                table: "gone".to_owned(),
+                error: crate::db::DbError::Query("no such table: main.gone".to_owned()),
+            });
+            assert_eq!(
+                state.row_count(conn, "main", "gone"),
+                Some(&RowCountState::Failed(
+                    crate::db::DbError::Query("no such table: main.gone".to_owned())
+                        .to_string()
+                ))
+            );
+            state.request_row_count(conn, "main", "gone");
+            assert!(matches!(commands.try_recv(), Ok(DbCommand::RowCount { .. })));
+
+            // A fresh worker session drops the previous session's cache.
+            let _reconnect = attach_test_handle(state, conn);
+            state.apply(DbEvent::Connected {
+                conn,
+                cancel: CancelHandle::new(|| {}),
+                server_version: "test".to_owned(),
+            });
+            assert_eq!(state.row_count(conn, "main", "gone"), None);
+        });
+    }
+
+    #[test]
+    fn schema_count_affordance_requests_and_renders_the_cached_count() {
+        with_isolated_state("count-render", |state| {
+            let conn = add_sqlite_connection(state, "mem-count-render");
+            let commands = attach_test_session(state, conn);
+            state.apply(DbEvent::SchemaOk { conn, schema: items_schema() });
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            type Action = crate::ui::schema::SchemaAction;
+            let render = |state: &mut AppState, events: Vec<eframe::egui::Event>| {
+                let mut raw = input.clone();
+                raw.events = events;
+                let mut captured = Vec::new();
+                let mut output = ctx.run_ui(raw, |ui| {
+                    captured = crate::ui::schema::connection_schema(state, ui, conn);
+                });
+                output.textures_delta.clear();
+                (output, captured)
+            };
+            let click = |pos, pressed| eframe::egui::Event::PointerButton {
+                pos,
+                button: eframe::egui::PointerButton::Primary,
+                pressed,
+                modifiers: eframe::egui::Modifiers::NONE,
+            };
+            let click_at = |pos| {
+                vec![
+                    eframe::egui::Event::PointerMoved(pos),
+                    click(pos, true),
+                    click(pos, false),
+                ]
+            };
+
+            // Collapsed tables render no affordance.
+            let (first, _) = render(state, Vec::new());
+            let text = rendered_text(&first);
+            assert!(text.iter().any(|t| t == "items (3)"), "{text:?}");
+            assert!(!text.iter().any(|t| t == "Count rows"), "{text:?}");
+
+            // Clicking the table header expands it, which reveals the count row.
+            let header = text_center(&first, "items (3)").expect("table header");
+            let (_, header_actions) = render(state, click_at(header));
+            assert!(
+                header_actions.iter().any(
+                    |a| matches!(a, Action::Preview(_, s, t) if s == "main" && t == "items")
+                ),
+                "{header_actions:?}"
+            );
+            let (open, _) = render(state, Vec::new());
+            let text = rendered_text(&open);
+            assert!(text.iter().any(|t| t == "Count rows"), "{text:?}");
+
+            // The count button returns a request action for this table.
+            let count = text_center(&open, "Count rows").expect("count button");
+            let (_, count_actions) = render(state, click_at(count));
+            assert!(
+                count_actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Count(_, s, t) if s == "main" && t == "items")),
+                "{count_actions:?}"
+            );
+
+            state.request_row_count(conn, "main", "items");
+            assert!(matches!(commands.try_recv(), Ok(DbCommand::RowCount { .. })));
+            let (pending, _) = render(state, Vec::new());
+            let text = rendered_text(&pending);
+            assert!(text.iter().any(|t| t == "Counting…"), "{text:?}");
+
+            state.apply(DbEvent::RowCountOk {
+                conn,
+                schema: "main".to_owned(),
+                table: "items".to_owned(),
+                count: RowCount::Estimate(42),
+            });
+            let (estimated, _) = render(state, Vec::new());
+            let text = rendered_text(&estimated);
+            assert!(text.iter().any(|t| t == "~42 rows (estimate)"), "{text:?}");
+
+            state.apply(DbEvent::RowCountOk {
+                conn,
+                schema: "main".to_owned(),
+                table: "items".to_owned(),
+                count: RowCount::Exact(7),
+            });
+            let (exact, _) = render(state, Vec::new());
+            let text = rendered_text(&exact);
+            assert!(text.iter().any(|t| t == "7 rows"), "{text:?}");
+            assert!(!text.iter().any(|t| t.contains("estimate")), "{text:?}");
+
+            // A failed count shows the engine error and a retry, and the
+            // table's own sections still render.
+            let message =
+                crate::db::DbError::Query("no such table: main.items".to_owned()).to_string();
+            state.apply(DbEvent::RowCountErr {
+                conn,
+                schema: "main".to_owned(),
+                table: "items".to_owned(),
+                error: crate::db::DbError::Query("no such table: main.items".to_owned()),
+            });
+            let (failed, _) = render(state, Vec::new());
+            let text = rendered_text(&failed);
+            assert!(text.iter().any(|t| t == &message), "{text:?}");
+            assert!(text.iter().any(|t| t == "Retry"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Columns (3)"), "{text:?}");
         });
     }
 
