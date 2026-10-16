@@ -6,6 +6,9 @@
 
 use std::ops::Range;
 
+use crate::db::DbError;
+use crate::edit::to_literal;
+
 /// Byte ranges of the statements in `sql`, in order. Each range is trimmed of
 /// surrounding whitespace and empty pieces are dropped.
 pub fn statement_ranges(sql: &str) -> Vec<Range<usize>> {
@@ -46,6 +49,197 @@ pub fn statement_ranges(sql: &str) -> Vec<Range<usize>> {
         ranges.push(range);
     }
     ranges
+}
+
+/// Which placeholder spelling a [`Param`] came from. One style per run: a
+/// run mixing `:name` and `?` is refused before anything sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceholderStyle {
+    Named,
+    Positional,
+}
+
+/// One query parameter: a `:name` or `?` placeholder with the raw text the
+/// user typed for it. An empty value substitutes as NULL through
+/// [`to_literal`]. A `$n` spelling is not a placeholder here; it passes
+/// through untouched for the engine's own native binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Param {
+    pub name: String,
+    pub style: PlaceholderStyle,
+    pub value: String,
+}
+
+impl Param {
+    /// The text the prompt lists: `:name` or `?1`.
+    pub fn display(&self) -> String {
+        match self.style {
+            PlaceholderStyle::Named => format!(":{}", self.name),
+            PlaceholderStyle::Positional => format!("?{}", self.name),
+        }
+    }
+}
+
+/// Parameters across `statements`, in first-appearance order. A repeated
+/// `:name` collects once; each `?` collects separately, numbered from 1 in
+/// scan order. Placeholders inside string literals, quoted identifiers, line
+/// comments, and block comments do not count. A `::` cast never counts, and
+/// `$n` passes through untouched. Mixing `:name` and `?` in one run is a
+/// [`DbError::Config`].
+pub fn collect_params(statements: &[String]) -> Result<Vec<Param>, DbError> {
+    let mut params = Vec::new();
+    let mut positional = 0u32;
+    let mut has_named = false;
+    let mut has_positional = false;
+    for statement in statements {
+        let bytes = statement.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\'' => i = scan_quote(bytes, i, b'\''),
+                b'"' => i = scan_quote(bytes, i, b'"'),
+                b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i < bytes.len()
+                        && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/'))
+                    {
+                        i += 1;
+                    }
+                    i = (i + 2).min(bytes.len());
+                }
+                b'?' => {
+                    has_positional = true;
+                    positional += 1;
+                    params.push(Param {
+                        name: positional.to_string(),
+                        style: PlaceholderStyle::Positional,
+                        value: String::new(),
+                    });
+                    i += 1;
+                }
+                b':' if bytes.get(i + 1).is_some_and(|b| is_name_start(*b))
+                    && (i == 0 || bytes[i - 1] != b':') =>
+                {
+                    let mut end = i + 1;
+                    while end < bytes.len() && is_name_char(bytes[end]) {
+                        end += 1;
+                    }
+                    let name = statement[i + 1..end].to_owned();
+                    has_named = true;
+                    if !params
+                        .iter()
+                        .any(|p| p.style == PlaceholderStyle::Named && p.name == name)
+                    {
+                        params.push(Param {
+                            name,
+                            style: PlaceholderStyle::Named,
+                            value: String::new(),
+                        });
+                    }
+                    i = end;
+                }
+                _ => i += 1,
+            }
+        }
+    }
+    if has_named && has_positional {
+        return Err(DbError::Config(
+            "cannot mix :name and ? placeholders in one run".to_owned(),
+        ));
+    }
+    Ok(params)
+}
+
+/// `statement` with placeholders replaced by `params` values rendered through
+/// [`to_literal`], so text quotes and numbers stay bare, and an empty value
+/// renders as NULL. String literals, quoted identifiers, and comments copy
+/// through untouched, as does a `:name` with no matching param and a `?`
+/// past the end of the positional values. Each `?` consumes the next
+/// positional param from `*next_pos`, which the caller threads across the
+/// run's statements in order, so one counter numbers every `?` in the run.
+pub fn substitute(statement: &str, params: &[Param], next_pos: &mut usize) -> String {
+    let positional: Vec<&str> = params
+        .iter()
+        .filter(|p| p.style == PlaceholderStyle::Positional)
+        .map(|p| p.value.as_str())
+        .collect();
+    let bytes = statement.as_bytes();
+    let mut out = String::with_capacity(statement.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                let end = scan_quote(bytes, i, bytes[i]);
+                out.push_str(&statement[i..end]);
+                i = end;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                let mut end = i + 2;
+                while end < bytes.len() && bytes[end] != b'\n' {
+                    end += 1;
+                }
+                out.push_str(&statement[i..end]);
+                i = end;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let mut end = i + 2;
+                while end < bytes.len()
+                    && !(bytes[end] == b'*' && bytes.get(end + 1) == Some(&b'/'))
+                {
+                    end += 1;
+                }
+                end = (end + 2).min(bytes.len());
+                out.push_str(&statement[i..end]);
+                i = end;
+            }
+            b'?' => {
+                match positional.get(*next_pos) {
+                    Some(value) => out.push_str(&to_literal(value, false)),
+                    None => out.push('?'),
+                }
+                *next_pos += 1;
+                i += 1;
+            }
+            b':' if bytes.get(i + 1).is_some_and(|b| is_name_start(*b))
+                && (i == 0 || bytes[i - 1] != b':') =>
+            {
+                let mut end = i + 1;
+                while end < bytes.len() && is_name_char(bytes[end]) {
+                    end += 1;
+                }
+                match params.iter().find(|p| {
+                    p.style == PlaceholderStyle::Named && p.name.as_str() == &statement[i + 1..end]
+                }) {
+                    Some(param) => out.push_str(&to_literal(&param.value, false)),
+                    None => out.push_str(&statement[i..end]),
+                }
+                i = end;
+            }
+            _ => {
+                let c = statement[i..].chars().next().expect("non-empty slice");
+                out.push(c);
+                i += c.len_utf8();
+            }
+        }
+    }
+    out
+}
+
+/// First byte of a `:name`: a letter or underscore, never a digit, so `:1`
+/// and `:=` are not placeholders.
+fn is_name_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+/// A `:name` continuation byte.
+fn is_name_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 /// Scan from an opening quote to just past its closing quote. A doubled quote
@@ -211,5 +405,129 @@ mod tests {
         for (range, statement) in ranges.iter().zip(statements.iter()) {
             assert_eq!(&sql[range.clone()], statement);
         }
+    }
+
+    #[test]
+    fn named_repeats_collect_once_in_order() {
+        let params =
+            collect_params(&["SELECT :b, :a, :b".to_owned(), "SELECT :c".to_owned()])
+                .unwrap();
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].name, "b");
+        assert_eq!(params[1].name, "a");
+        assert_eq!(params[2].name, "c");
+        assert!(params.iter().all(|p| p.style == PlaceholderStyle::Named));
+        assert!(params.iter().all(|p| p.value.is_empty()));
+        assert_eq!(params[0].display(), ":b");
+    }
+
+    #[test]
+    fn positional_placeholders_number_in_order() {
+        let params =
+            collect_params(&["SELECT ?, ?".to_owned(), "SELECT ?".to_owned()]).unwrap();
+        assert_eq!(params.len(), 3);
+        assert!(params.iter().all(|p| p.style == PlaceholderStyle::Positional));
+        assert_eq!(params[0].name, "1");
+        assert_eq!(params[1].name, "2");
+        assert_eq!(params[2].name, "3");
+        assert_eq!(params[2].display(), "?3");
+    }
+
+    #[test]
+    fn placeholders_in_strings_identifiers_and_comments_do_not_count() {
+        let params = collect_params(
+            &["SELECT ':a', \"?\", x FROM t -- :b\n WHERE y = ? /* ? */".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].display(), "?1");
+    }
+
+    #[test]
+    fn mixing_named_and_positional_is_a_config_error() {
+        let error =
+            collect_params(&["SELECT :a".to_owned(), "SELECT ?".to_owned()]).unwrap_err();
+        assert!(matches!(error, DbError::Config(_)));
+        assert!(error.to_string().contains(":name"), "{error}");
+        assert!(error.to_string().contains("?"), "{error}");
+        assert!(collect_params(&["SELECT :a, ?".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn dollar_casts_and_bare_colons_pass_through() {
+        assert!(collect_params(&["SELECT $1, $2".to_owned()]).unwrap().is_empty());
+        assert!(collect_params(&["SELECT 1::text".to_owned()]).unwrap().is_empty());
+        assert!(collect_params(&["SELECT :1, := 2".to_owned()]).unwrap().is_empty());
+    }
+
+    fn named_param(name: &str, value: &str) -> Param {
+        Param {
+            name: name.to_owned(),
+            style: PlaceholderStyle::Named,
+            value: value.to_owned(),
+        }
+    }
+
+    #[test]
+    fn substitute_renders_values_through_to_literal() {
+        let mut next = 0;
+        assert_eq!(
+            substitute(
+                "SELECT * FROM t WHERE name = :name",
+                &[named_param("name", "ada")],
+                &mut next
+            ),
+            "SELECT * FROM t WHERE name = 'ada'"
+        );
+        let mut next = 0;
+        assert_eq!(
+            substitute("SELECT * FROM t WHERE id = :id", &[named_param("id", "42")], &mut next),
+            "SELECT * FROM t WHERE id = 42"
+        );
+        let mut next = 0;
+        assert_eq!(
+            substitute("SELECT :v", &[named_param("v", "O'Brien")], &mut next),
+            "SELECT 'O''Brien'"
+        );
+        let mut next = 0;
+        assert_eq!(
+            substitute("SELECT :v", &[named_param("v", "")], &mut next),
+            "SELECT NULL"
+        );
+    }
+
+    #[test]
+    fn substitute_leaves_strings_comments_and_unknowns_alone() {
+        let mut next = 0;
+        assert_eq!(
+            substitute(
+                "SELECT ':name', x FROM t -- :name\nWHERE y = :name AND z = :missing",
+                &[named_param("name", "ada")],
+                &mut next
+            ),
+            "SELECT ':name', x FROM t -- :name\nWHERE y = 'ada' AND z = :missing"
+        );
+    }
+
+    #[test]
+    fn substitute_numbers_positional_in_order() {
+        let params = vec![
+            Param {
+                name: "1".to_owned(),
+                style: PlaceholderStyle::Positional,
+                value: "ada".to_owned(),
+            },
+            Param {
+                name: "2".to_owned(),
+                style: PlaceholderStyle::Positional,
+                value: "7".to_owned(),
+            },
+        ];
+        let mut next = 0;
+        assert_eq!(substitute("SELECT ?, ?", &params, &mut next), "SELECT 'ada', 7");
+        assert_eq!(next, 2);
+        let mut next = 0;
+        assert_eq!(substitute("SELECT ?", &[], &mut next), "SELECT ?");
+        assert_eq!(next, 1);
     }
 }

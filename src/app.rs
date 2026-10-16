@@ -20,7 +20,7 @@ use crate::edit::{
     to_literal, update_statement,
 };
 use crate::import::{ColumnMap, ROW_CAP, dropped_rows, insert_batches, map_headers, parse_csv};
-use crate::sql::{current_statement, split_statements, statement_ranges};
+use crate::sql::{collect_params, current_statement, split_statements, statement_ranges, substitute};
 
 /// Everything that changes about one connection's lifecycle, in five states.
 /// `Connected` and `QueryRunning` carry a [`LiveSession`], so SQL can only
@@ -532,6 +532,20 @@ pub struct PendingWriteConfirm {
     pub table: String,
 }
 
+/// A run held for its parameter values: the tab and connection it would run
+/// on, whether it is an explain run, the raw scoped statements with their
+/// placeholders, and the collected parameters with the typed values. Confirm
+/// substitutes the values and continues through the prepared send path, so
+/// history keeps this raw text, not the substituted batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingParams {
+    pub tab: TabId,
+    pub conn: ConnectionId,
+    pub explain: bool,
+    pub statements: Vec<String>,
+    pub params: Vec<crate::sql::Param>,
+}
+
 pub struct AppState {
     connections: Vec<Connection>,
     tabs: Vec<Tab>,
@@ -540,6 +554,7 @@ pub struct AppState {
     password_prompt: Option<ConnectionId>,
     pending_prod: Option<ConnectionId>,
     pending_write: Option<PendingWriteConfirm>,
+    pending_params: Option<PendingParams>,
     prompt_password: String,
     ids: Ids,
     registry: DriverRegistry,
@@ -574,6 +589,7 @@ impl AppState {
             password_prompt: None,
             pending_prod: None,
             pending_write: None,
+            pending_params: None,
             prompt_password: String::new(),
             ids,
             registry: DriverRegistry::bundled(),
@@ -719,6 +735,9 @@ impl AppState {
         if self.pending_write.as_ref().is_some_and(|pending| pending.tab == tab) {
             self.pending_write = None;
         }
+        if self.pending_params.as_ref().is_some_and(|pending| pending.tab == tab) {
+            self.pending_params = None;
+        }
         self.repair_active();
     }
 
@@ -730,6 +749,7 @@ impl AppState {
 
     /// Resolve the tab's scope against the editor text and send the batch.
     /// An empty effective set is an error before anything reaches the worker.
+    /// A batch with placeholders arms the value prompt instead of sending.
     pub fn start_run(
         &mut self,
         tab: TabId,
@@ -737,7 +757,7 @@ impl AppState {
         cursor: usize,
         selection: Option<Range<usize>>,
     ) {
-        self.start_batch(tab, sql, cursor, selection, |_, statement| statement);
+        self.start_batch(tab, sql, cursor, selection, false);
     }
 
     /// Send the same statements [`AppState::start_run`] would, each in its
@@ -750,24 +770,24 @@ impl AppState {
         cursor: usize,
         selection: Option<Range<usize>>,
     ) {
-        self.start_batch(tab, sql, cursor, selection, |kind, statement| {
-            explain_sql(kind, &statement)
-        });
+        self.start_batch(tab, sql, cursor, selection, true);
     }
 
     /// The shared body of run and explain. Resolves the tab's connection, its
-    /// handle, and the effective statements, maps each through `prepare`, and
-    /// sends one batch. Both entry points share these error paths: a missing
-    /// connection or an empty effective set never sends. A read-only
-    /// connection refuses the batch when any prepared statement writes, and
-    /// an UPDATE or DELETE without WHERE arms the write confirm instead.
+    /// handle, and the effective statements. A batch with `:name` or `?`
+    /// placeholders arms the value prompt and holds instead of sending; a
+    /// mixed-style run errors before anything reaches the worker. The rest
+    /// continues through [`AppState::continue_batch`]: each statement in its
+    /// prepared form, a read-only refusal when any prepared statement writes,
+    /// and the write confirm for an UPDATE or DELETE without WHERE.
+    /// Placeholder-free runs behave exactly as before.
     fn start_batch(
         &mut self,
         tab: TabId,
         sql: &str,
         cursor: usize,
         selection: Option<Range<usize>>,
-        prepare: impl Fn(DbKind, String) -> String,
+        explain: bool,
     ) {
         let (conn_id, kind, handle, scope, read_only) =
             match self.tabs.iter().find(|t| t.id == tab) {
@@ -792,11 +812,55 @@ impl AppState {
             self.set_outcome(tab, RunOutcome::Err("nothing to run".to_owned()));
             return;
         }
-        let statements: Vec<String> =
-            statements.into_iter().map(|statement| prepare(kind, statement)).collect();
+        match collect_params(&statements) {
+            Err(error) => {
+                self.set_outcome(tab, RunOutcome::Err(error.to_string()));
+                return;
+            }
+            Ok(params) if !params.is_empty() => {
+                self.pending_params = Some(PendingParams {
+                    tab,
+                    conn: conn_id,
+                    explain,
+                    statements,
+                    params,
+                });
+                return;
+            }
+            Ok(_) => {}
+        }
+        self.continue_batch(tab, conn_id, kind, handle, read_only, &statements, explain, None);
+    }
+
+    /// The prepared tail of [`AppState::start_batch`]: map each statement
+    /// through the run or explain form, then the read-only guard, the write
+    /// confirm, and the send. `raw_history` carries the raw placeholder text
+    /// when the batch was substituted, so history keeps `:name` and `?`.
+    fn continue_batch(
+        &mut self,
+        tab: TabId,
+        conn: ConnectionId,
+        kind: DbKind,
+        handle: Option<DbHandle>,
+        read_only: bool,
+        statements: &[String],
+        explain: bool,
+        raw_history: Option<&[String]>,
+    ) {
+        let prepare = |statement: &String| {
+            if explain { explain_sql(kind, statement) } else { statement.clone() }
+        };
+        let prepared: Vec<String> = statements.iter().map(prepare).collect();
+        let history = raw_history.map(|raw| {
+            raw.iter()
+                .map(|statement| {
+                    if explain { explain_sql(kind, statement) } else { statement.clone() }
+                })
+                .collect()
+        });
         if read_only {
             if let Some(kind) =
-                statements.iter().find_map(|statement| crate::db::write_statement_kind(statement))
+                prepared.iter().find_map(|statement| crate::db::write_statement_kind(statement))
             {
                 self.set_outcome(
                     tab,
@@ -811,18 +875,64 @@ impl AppState {
             }
         }
         if let Some(found) =
-            statements.iter().find_map(|statement| crate::db::unqualified_write(statement))
+            prepared.iter().find_map(|statement| crate::db::unqualified_write(statement))
         {
             self.pending_write = Some(PendingWriteConfirm {
                 tab,
-                conn: conn_id,
-                statements,
+                conn,
+                statements: prepared,
                 kind: found.kind.to_owned(),
                 table: found.table,
             });
             return;
         }
-        self.send_batch(tab, conn_id, handle, statements, BatchPurpose::Run);
+        self.send_batch(tab, conn, handle, prepared, BatchPurpose::Run, history);
+    }
+
+    /// The run held for its parameter values, if any.
+    pub fn pending_params(&self) -> Option<&PendingParams> {
+        self.pending_params.as_ref()
+    }
+
+    /// The held parameters with their typed values, for the prompt to edit.
+    pub fn pending_params_mut(&mut self) -> Option<&mut PendingParams> {
+        self.pending_params.as_mut()
+    }
+
+    /// Substitute the typed values into the held batch and continue through
+    /// the exact prepared path, including the write guard after substitution.
+    /// History keeps the raw placeholder text.
+    pub fn confirm_params(&mut self) {
+        let Some(pending) = self.pending_params.take() else { return };
+        let mut next_pos = 0;
+        let substituted: Vec<String> = pending
+            .statements
+            .iter()
+            .map(|statement| substitute(statement, &pending.params, &mut next_pos))
+            .collect();
+        let (kind, handle, read_only) =
+            match self.connections.iter().find(|c| c.id == pending.conn) {
+                Some(c) => (c.config.kind(), c.handle(), c.config.is_read_only()),
+                None => {
+                    self.set_outcome(pending.tab, RunOutcome::Err("connection not found".to_owned()));
+                    return;
+                }
+            };
+        self.continue_batch(
+            pending.tab,
+            pending.conn,
+            kind,
+            handle,
+            read_only,
+            &substituted,
+            pending.explain,
+            Some(&pending.statements),
+        );
+    }
+
+    /// Drop the held parameter batch without sending anything.
+    pub fn cancel_params(&mut self) {
+        self.pending_params = None;
     }
 
     /// The run held for its write guard, if any.
@@ -838,7 +948,7 @@ impl AppState {
             .iter()
             .find(|c| c.id == pending.conn)
             .and_then(|c| c.handle());
-        self.send_batch(pending.tab, pending.conn, handle, pending.statements, BatchPurpose::Run);
+        self.send_batch(pending.tab, pending.conn, handle, pending.statements, BatchPurpose::Run, None);
     }
 
     /// Drop the held batch without sending anything.
@@ -848,7 +958,9 @@ impl AppState {
 
     /// One prepared batch: mint the run, send it, and fold the tab's outcome
     /// and the connection's running state. `purpose` marks the batch so the
-    /// landing knows what it ended.
+    /// landing knows what it ended. `history` carries the raw placeholder
+    /// text when the sent batch was substituted, so history keeps `:name`
+    /// and `?`; None stores the sent batch as before.
     fn send_batch(
         &mut self,
         tab: TabId,
@@ -856,6 +968,7 @@ impl AppState {
         handle: Option<DbHandle>,
         statements: Vec<String>,
         purpose: BatchPurpose,
+        history: Option<Vec<String>>,
     ) {
         debug_assert!(!statements.is_empty());
         let run = self.ids.run();
@@ -876,7 +989,11 @@ impl AppState {
                         }
                         self.set_outcome(
                             tab,
-                            RunOutcome::Running { run, started: Instant::now(), statements },
+                            RunOutcome::Running {
+                                run,
+                                started: Instant::now(),
+                                statements: history.unwrap_or(statements),
+                            },
                         );
                         if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn_id) {
                             if let ConnectionState::Connected { session } = &c.state {
@@ -1062,7 +1179,7 @@ impl AppState {
             );
             return;
         }
-        self.send_batch(tab, conn_id, handle, statements, BatchPurpose::ApplyEdits);
+        self.send_batch(tab, conn_id, handle, statements, BatchPurpose::ApplyEdits, None);
     }
 
     /// Read and parse a CSV file for one tab and stage it for confirmation.
@@ -1181,6 +1298,7 @@ impl AppState {
             handle,
             statements,
             BatchPurpose::Import(notice),
+            None,
         );
     }
 
@@ -1262,7 +1380,7 @@ impl AppState {
             }
             None => return,
         };
-        self.send_batch(tab, conn_id, handle, statements, BatchPurpose::Refresh);
+        self.send_batch(tab, conn_id, handle, statements, BatchPurpose::Refresh, None);
     }
 
     /// Connect from a user gesture. A prod connection arms the confirmation
@@ -4895,6 +5013,169 @@ mod tests {
                 }
                 other => panic!("expected QueryBatch, got {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn named_param_prompts_then_sends_substituted_with_raw_history() {
+        with_isolated_state("params-run", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            let sql = "SELECT * FROM users WHERE name = :name";
+            state.start_run(tab, sql, 0, None);
+            assert!(commands.try_recv().is_err(), "the prompt holds the batch");
+            assert!(state.pending_write().is_none());
+            assert!(state.pending_params().is_some());
+            let pending = state.pending_params().expect("held params");
+            assert_eq!(pending.tab, tab);
+            assert_eq!(pending.conn, conn);
+            assert!(!pending.explain);
+            assert_eq!(pending.statements, vec![sql]);
+            assert_eq!(pending.params.len(), 1);
+            assert_eq!(pending.params[0].display(), ":name");
+
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input.clone(), |ui| {
+                crate::ui::query::editor(state, ui);
+            });
+            output.textures_delta.clear();
+            let mut output = ctx.run_ui(input, |ui| {
+                crate::ui::query::editor(state, ui);
+            });
+            output.textures_delta.clear();
+            let text = rendered_text(&output);
+            assert!(text.iter().any(|t| t == "Query parameters"), "{text:?}");
+            assert!(text.iter().any(|t| t == ":name"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Run"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Cancel"), "{text:?}");
+
+            state.pending_params_mut().expect("params").params[0].value =
+                "ada".to_owned();
+            state.confirm_params();
+            assert!(state.pending_params().is_none());
+            let run = match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { run, statements } => {
+                    assert_eq!(statements, vec!["SELECT * FROM users WHERE name = 'ada'"]);
+                    run
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            match state.tab(tab).expect("tab").outcome() {
+                RunOutcome::Running { statements, .. } => {
+                    assert_eq!(statements, &vec![sql.to_owned()]);
+                }
+                other => panic!("expected Running, got {other:?}"),
+            }
+            state.apply(DbEvent::BatchOk { run, results: vec![rows_result(2)] });
+            assert_eq!(state.history().len(), 1);
+            assert_eq!(state.history()[0].sql, sql);
+            assert!(state.history()[0].succeeded);
+            assert_eq!(state.history()[0].rows, Some(2));
+        });
+    }
+
+    #[test]
+    fn positional_params_number_across_statements() {
+        with_isolated_state("params-pos", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.start_run(tab, "SELECT ?; SELECT ?, ?", 0, None);
+            assert!(commands.try_recv().is_err());
+            let names: Vec<String> = state
+                .pending_params()
+                .expect("held params")
+                .params
+                .iter()
+                .map(|p| p.display())
+                .collect();
+            assert_eq!(names, vec!["?1", "?2", "?3"]);
+            {
+                let pending = state.pending_params_mut().expect("params");
+                pending.params[0].value = "1".to_owned();
+                pending.params[1].value = "ada".to_owned();
+                pending.params[2].value = "7".to_owned();
+            }
+            state.confirm_params();
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["SELECT 1", "SELECT 'ada', 7"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn params_cancel_sends_nothing() {
+        with_isolated_state("params-cancel", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.start_run(tab, "SELECT * FROM t WHERE id = ?", 0, None);
+            let pending = state.pending_params().expect("held params");
+            assert_eq!(pending.params.len(), 1);
+            assert_eq!(pending.params[0].display(), "?1");
+            state.cancel_params();
+            assert!(state.pending_params().is_none());
+            assert!(commands.try_recv().is_err());
+            assert!(matches!(
+                state.tab(tab).expect("tab").outcome(),
+                RunOutcome::Never
+            ));
+        });
+    }
+
+    #[test]
+    fn mixed_placeholder_styles_error_without_sending() {
+        with_isolated_state("params-mixed", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.start_run(tab, "SELECT :a, ?", 0, None);
+            match state.tab(tab).expect("tab").outcome() {
+                RunOutcome::Err(message) => assert!(message.contains("mix"), "{message}"),
+                other => panic!("expected Err, got {other:?}"),
+            }
+            assert!(commands.try_recv().is_err());
+            assert!(state.pending_params().is_none());
+            assert!(state.pending_write().is_none());
+        });
+    }
+
+    #[test]
+    fn substituted_unqualified_update_arms_the_write_guard() {
+        with_isolated_state("params-write", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.start_run(tab, "UPDATE users SET name = :name", 0, None);
+            assert!(commands.try_recv().is_err());
+            assert!(state.pending_write().is_none());
+            state.pending_params_mut().expect("params").params[0].value =
+                "ada".to_owned();
+            state.confirm_params();
+            assert!(state.pending_params().is_none());
+            let pending = state.pending_write().expect("held write").clone();
+            assert_eq!(pending.tab, tab);
+            assert_eq!(pending.statements, vec!["UPDATE users SET name = 'ada'"]);
+            assert_eq!(pending.kind, "UPDATE");
+            assert_eq!(pending.table, "users");
+            state.confirm_write();
+            assert!(state.pending_write().is_none());
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["UPDATE users SET name = 'ada'"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+            assert!(matches!(
+                state.tab(tab).expect("tab").outcome(),
+                RunOutcome::Running { .. }
+            ));
         });
     }
 }

@@ -17,7 +17,8 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
         || state.save_prompt().is_some()
         || state.password_prompt().is_some()
         || state.import_draft().is_some()
-        || state.pending_write().is_some();
+        || state.pending_write().is_some()
+        || state.pending_params().is_some();
     let (new_tab_shortcut_pressed, close_tab_shortcut_pressed, find_shortcut_pressed) = ui
         .input_mut(|i| {
             (
@@ -51,6 +52,7 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     save_window(state, ui);
     write_confirm_window(state, ui);
+    params_window(state, ui);
     if let Some(id) = state.active() {
         let hint = state
             .tab(id)
@@ -433,6 +435,39 @@ pub fn write_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
         state.confirm_write();
     } else if cancel {
         state.cancel_write();
+    }
+}
+
+/// The value prompt for a run holding `:name` and `?` placeholders. Lists
+/// each parameter with a text field; Run substitutes the values and continues
+/// the prepared batch through the send path, Cancel sends nothing.
+pub fn params_window(state: &mut AppState, ui: &mut egui::Ui) {
+    if state.pending_params().is_none() {
+        return;
+    }
+    let mut run = false;
+    let mut cancel = false;
+    egui::Window::new("Query parameters").show(ui.ctx(), |ui| {
+        let Some(pending) = state.pending_params_mut() else { return };
+        for param in &mut pending.params {
+            ui.horizontal(|ui| {
+                ui.label(param.display());
+                ui.text_edit_singleline(&mut param.value);
+            });
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Run").clicked() {
+                run = true;
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+        });
+    });
+    if run {
+        state.confirm_params();
+    } else if cancel {
+        state.cancel_params();
     }
 }
 
