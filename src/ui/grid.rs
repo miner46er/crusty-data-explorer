@@ -10,8 +10,10 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::app::{AppState, EditTarget, RunOutcome, SortDir, Tab};
 use crate::db::{CELL_CAP, QueryResult, TabId, Value};
-use crate::export::{to_csv, to_in_list, to_inserts, to_json, to_jsonl, to_markdown, to_tsv};
-use crate::import::{ParsedCsv, parse_csv, parse_jsonl};
+use crate::export::{
+    to_csv, to_in_list, to_inserts, to_json, to_jsonl, to_markdown, to_tsv, to_xlsx,
+};
+use crate::import::{ParsedCsv, parse_csv, parse_jsonl, parse_xlsx};
 
 use super::Palette;
 
@@ -425,6 +427,7 @@ enum EditAction {
     Discard,
     ImportCsv,
     ImportJsonl,
+    ImportXlsx,
     PasteRows(Vec<Vec<String>>),
 }
 
@@ -438,6 +441,7 @@ fn apply_edit_actions(state: &mut AppState, tab: TabId, actions: Vec<EditAction>
             EditAction::Discard => state.discard_edits(tab),
             EditAction::ImportCsv => pick_import_file(state, tab),
             EditAction::ImportJsonl => pick_import_jsonl_file(state, tab),
+            EditAction::ImportXlsx => pick_import_xlsx_file(state, tab),
             EditAction::PasteRows(staged) => stage_rows_into(state, tab, staged, "Paste", "Pasted"),
         }
     }
@@ -489,6 +493,48 @@ fn pick_import_jsonl_file(state: &mut AppState, tab: TabId) {
             state,
             tab,
             "Import failed: no JSONL key matches the result columns".to_owned(),
+            true,
+        ),
+    }
+}
+
+/// Ask for an XLSX file and stage its first worksheet's rows for review the
+/// way [`pick_import_jsonl_file`] does; the notice names the sheet when the
+/// workbook carries several.
+fn pick_import_xlsx_file(state: &mut AppState, tab: TabId) {
+    let Some(path) = rfd::FileDialog::new().add_filter("XLSX", &["xlsx"]).pick_file() else {
+        return;
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tab_notice(state, tab, format!("Import failed: {}: {error}", path.display()), true);
+            return;
+        }
+    };
+    let Some(workbook) = parse_xlsx(&bytes) else {
+        tab_notice(
+            state,
+            tab,
+            "Import failed: the first sheet needs a header row with rows under it".to_owned(),
+            true,
+        );
+        return;
+    };
+    let columns = state.tab(tab).map(column_names).unwrap_or_default();
+    match stage_parsed_rows(&workbook.parsed, &columns) {
+        Some(staged) => {
+            let done = if workbook.sheet_count > 1 {
+                format!("Imported from sheet \"{}\":", workbook.sheet)
+            } else {
+                "Imported".to_owned()
+            };
+            stage_rows_into(state, tab, staged, "Import", &done);
+        }
+        None => tab_notice(
+            state,
+            tab,
+            "Import failed: no XLSX header matches the result columns".to_owned(),
             true,
         ),
     }
@@ -729,6 +775,13 @@ fn results_grid(
             export_jsonl_view(tab);
         }
         if ui
+            .add_enabled(can_export, egui::Button::new("Export XLSX"))
+            .on_hover_text("Export this view as a spreadsheet workbook")
+            .clicked()
+        {
+            export_xlsx_view(tab);
+        }
+        if ui
             .add_enabled(can_export_all, egui::Button::new("Export all"))
             .on_hover_text("Export every result set into one folder, one CSV per set")
             .clicked()
@@ -759,6 +812,13 @@ fn results_grid(
                     .clicked()
                 {
                     actions.push(EditAction::ImportJsonl);
+                }
+                if ui
+                    .button("Import XLSX")
+                    .on_hover_text("Load the first sheet of an XLSX file as new rows for review")
+                    .clicked()
+                {
+                    actions.push(EditAction::ImportXlsx);
                 }
                 if ui
                     .add_enabled(staged > 0, egui::Button::new("Discard"))
@@ -1099,6 +1159,41 @@ fn export_jsonl_view(tab: &mut Tab) {
         return;
     };
     match std::fs::write(&path, jsonl) {
+        Ok(()) => tab.set_export_notice(
+            format!("Exported {nrows} rows to {}", path.display()),
+            false,
+        ),
+        Err(e) => tab.set_export_notice(format!("Export failed: {e}"), true),
+    }
+}
+
+fn export_xlsx_view(tab: &mut Tab) {
+    let (bytes, default_name, nrows) = match tab.active_query_result() {
+        Some(result) => {
+            if result.columns().is_empty() {
+                return;
+            }
+            let visible = visible_rows(result, tab.sort_col(), tab.sort_dir(), tab.filter());
+            let bytes = match to_xlsx(result, &visible) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tab.set_export_notice(format!("Export failed: {error}"), true);
+                    return;
+                }
+            };
+            let name = format!("{}.xlsx", super::query::tab_title(tab.sql.clone()));
+            (bytes, name, visible.len())
+        }
+        None => return,
+    };
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("XLSX", &["xlsx"])
+        .set_file_name(&default_name)
+        .save_file()
+    else {
+        return;
+    };
+    match std::fs::write(&path, bytes) {
         Ok(()) => tab.set_export_notice(
             format!("Exported {nrows} rows to {}", path.display()),
             false,
@@ -1760,6 +1855,38 @@ mod tests {
                 vec![String::new(), "2".to_owned()],
             ])
         );
+    }
+
+    #[test]
+    fn xlsx_export_roundtrips_through_parse_into_staged_rows() {
+        let result = two_col(
+            vec![Value::Integer(1), Value::Integer(2)],
+            vec![Value::Text("ada".to_owned()), Value::Null],
+        );
+        let bytes = to_xlsx(&result, &[0, 1]).expect("writes");
+        let workbook = parse_xlsx(&bytes).expect("parses");
+        assert_eq!(workbook.sheet_count, 1);
+        assert_eq!(workbook.parsed.headers, vec!["a", "b"]);
+        assert_eq!(
+            stage_parsed_rows(&workbook.parsed, &["b".to_owned(), "a".to_owned()]),
+            Some(vec![
+                vec!["ada".to_owned(), "1".to_owned()],
+                vec![String::new(), "2".to_owned()],
+            ])
+        );
+        assert_eq!(stage_parsed_rows(&workbook.parsed, &["zzz".to_owned()]), None);
+    }
+
+    #[test]
+    fn xlsx_import_caps_rows_at_the_import_cap() {
+        let numbers: Vec<Value> = (0..1005).map(|i| Value::Integer(i as i64)).collect();
+        let result = two_col(numbers, vec![Value::Null; 1005]);
+        let bytes = to_xlsx(&result, &(0..1005).collect::<Vec<_>>()).expect("writes");
+        let workbook = parse_xlsx(&bytes).expect("parses");
+        let staged = stage_parsed_rows(&workbook.parsed, &["a".to_owned()]).expect("stages");
+        assert_eq!(staged.len(), crate::import::ROW_CAP);
+        assert_eq!(staged[0], vec!["0".to_owned()]);
+        assert_eq!(staged[staged.len() - 1], vec!["999".to_owned()]);
     }
 
     #[test]

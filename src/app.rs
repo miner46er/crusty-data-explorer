@@ -4898,7 +4898,7 @@ mod tests {
             let input = eframe::egui::RawInput {
                 screen_rect: Some(eframe::egui::Rect::from_min_size(
                     eframe::egui::Pos2::ZERO,
-                    eframe::egui::vec2(1200.0, 800.0),
+                    eframe::egui::vec2(1800.0, 800.0),
                 )),
                 ..Default::default()
             };

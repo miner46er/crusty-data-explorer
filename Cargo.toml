@@ -25,6 +25,13 @@ env_logger = "0.11"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "mysql"], optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }
 ssh2 = { version = "0.9", optional = true }
+# XLSX support. zip 8.x is fully yanked upstream (9.0.3 is the only live
+# version) and every xlsx crate still requires ^8, so Cargo.lock pins the
+# checksum-verified zip 8.6.0 registry release by hand. Do not run
+# `cargo update` until calamine or rust_xlsxwriter accept zip 9; re-resolving
+# fails. Migrate when upstream ships zip 9 support.
+calamine = "0.36"
+rust_xlsxwriter = "0.99"
 
 [features]
 default = []

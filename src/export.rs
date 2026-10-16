@@ -1,3 +1,5 @@
+use rust_xlsxwriter::{Workbook, XlsxError};
+
 use crate::db::{QueryResult, Value};
 use crate::edit::to_literal;
 
@@ -105,6 +107,49 @@ pub fn to_jsonl(result: &QueryResult, rows: &[usize]) -> String {
         out.push_str("}\n");
     }
     out
+}
+
+/// One worksheet, named by the writer's default, with a header row then
+/// `rows`, as the bytes of a workbook a spreadsheet app opens. Integers and
+/// reals write as numbers, so a spreadsheet sums and sorts them; an integer
+/// past the ±2^53 that an f64 holds exactly writes as text to keep its
+/// digits. Text and blob tags write as text, empty text and null leave the
+/// cell blank. The value model has no date, so a date stored as text stays
+/// text.
+pub fn to_xlsx(result: &QueryResult, rows: &[usize]) -> Result<Vec<u8>, XlsxError> {
+    const EXACT_INT: i64 = 1 << 53;
+    let mut workbook = Workbook::new();
+    {
+        let sheet = workbook.add_worksheet();
+        for (c, column) in result.columns().iter().enumerate() {
+            sheet.write_string(0, c as u16, column.name())?;
+        }
+        for (index, &r) in rows.iter().enumerate() {
+            let row = index as u32 + 1;
+            for c in 0..result.columns().len() {
+                let Some(value) = result.cell(r, c) else { continue };
+                match value {
+                    Value::Null => {}
+                    Value::Integer(n) if (-EXACT_INT..=EXACT_INT).contains(n) => {
+                        sheet.write_number(row, c as u16, *n as f64)?;
+                    }
+                    Value::Integer(n) => {
+                        sheet.write_string(row, c as u16, n.to_string())?;
+                    }
+                    Value::Real(f) => {
+                        sheet.write_number(row, c as u16, *f)?;
+                    }
+                    Value::Text(text) => {
+                        sheet.write_string(row, c as u16, text.as_str())?;
+                    }
+                    Value::Blob(_) => {
+                        sheet.write_string(row, c as u16, value.display(0).into_owned())?;
+                    }
+                }
+            }
+        }
+    }
+    workbook.save_to_buffer()
 }
 
 fn quote_ident(name: &str) -> String {
@@ -487,5 +532,99 @@ mod tests {
         assert_eq!(to_in_list(&r, &[0, 1], 0), None);
         assert_eq!(to_in_list(&r, &[], 0), None);
         assert_eq!(to_in_list(&r, &[0], 9), None);
+    }
+
+    /// The sheet's cells as calamine reads them back.
+    fn xlsx_cells(bytes: &[u8]) -> Vec<Vec<calamine::Data>> {
+        use calamine::Reader;
+        let mut workbook: calamine::Xlsx<std::io::Cursor<&[u8]>> =
+            calamine::open_workbook_from_rs(std::io::Cursor::new(bytes)).expect("reads");
+        let name = workbook.sheet_names().remove(0);
+        workbook.worksheet_range(&name).expect("sheet").rows().map(<[_]>::to_vec).collect()
+    }
+
+    #[test]
+    fn xlsx_roundtrips_exact_cells_through_calamine() {
+        use calamine::Data;
+        let blob = Value::Blob(vec![0x01, 0x02]);
+        let tag = blob.display(0).into_owned();
+        let r = result(vec![
+            col("n", vec![Value::Integer(3), Value::Real(2.5), Value::Null]),
+            col(
+                "label",
+                vec![
+                    Value::Text("a,b \"quoted\"".to_owned()),
+                    Value::Text("line\nbreak".to_owned()),
+                    Value::Null,
+                ],
+            ),
+            col(
+                "note",
+                vec![
+                    Value::Text(String::new()),
+                    Value::Null,
+                    Value::Text("kept".to_owned()),
+                ],
+            ),
+            col("data", vec![blob, Value::Null, Value::Null]),
+        ]);
+        let cells = xlsx_cells(&to_xlsx(&r, &[0, 1, 2]).expect("writes"));
+        assert_eq!(
+            cells[0],
+            vec![
+                Data::String("n".to_owned()),
+                Data::String("label".to_owned()),
+                Data::String("note".to_owned()),
+                Data::String("data".to_owned()),
+            ]
+        );
+        assert_eq!(
+            cells[1],
+            vec![
+                Data::Float(3.0),
+                Data::String("a,b \"quoted\"".to_owned()),
+                Data::Empty,
+                Data::String(tag),
+            ]
+        );
+        assert_eq!(
+            cells[2],
+            vec![
+                Data::Float(2.5),
+                Data::String("line\nbreak".to_owned()),
+                Data::Empty,
+                Data::Empty,
+            ]
+        );
+        assert_eq!(
+            cells[3],
+            vec![Data::Empty, Data::Empty, Data::String("kept".to_owned()), Data::Empty]
+        );
+        assert_eq!(cells.len(), 4);
+    }
+
+    #[test]
+    fn xlsx_writes_integers_beyond_f64_exactness_as_text() {
+        use calamine::Data;
+        let r = result(vec![col(
+            "n",
+            vec![Value::Integer(1 << 53), Value::Integer(9_007_199_254_740_993)],
+        )]);
+        let cells = xlsx_cells(&to_xlsx(&r, &[0, 1]).expect("writes"));
+        assert_eq!(cells[1], vec![Data::Float(9_007_199_254_740_992.0)]);
+        assert_eq!(cells[2], vec![Data::String("9007199254740993".to_owned())]);
+    }
+
+    #[test]
+    fn xlsx_rows_follow_the_given_order() {
+        use calamine::Data;
+        let r = result(vec![col(
+            "v",
+            vec![Value::Integer(3), Value::Integer(1), Value::Integer(2)],
+        )]);
+        let cells = xlsx_cells(&to_xlsx(&r, &[1, 2, 0]).expect("writes"));
+        assert_eq!(cells[1], vec![Data::Float(1.0)]);
+        assert_eq!(cells[2], vec![Data::Float(2.0)]);
+        assert_eq!(cells[3], vec![Data::Float(3.0)]);
     }
 }
