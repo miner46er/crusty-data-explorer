@@ -438,6 +438,15 @@ fn save_window(state: &mut AppState, ui: &mut egui::Ui) {
             ui.label("Name:");
             ui.text_edit_singleline(&mut prompt.name);
         });
+        ui.horizontal(|ui| {
+            ui.label("Folder:");
+            ui.add(
+                egui::TextEdit::singleline(&mut prompt.folder)
+                    .hint_text("no folder"),
+            );
+        });
+        ui.checkbox(&mut prompt.pinned, "Pinned")
+            .on_hover_text("List this entry first inside its folder group");
         if let Some(error) = prompt.error.clone() {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }

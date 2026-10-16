@@ -207,6 +207,9 @@ pub struct Tab {
     pub id: TabId,
     pub conn: Option<ConnectionId>,
     pub sql: String,
+    /// The saved entry the tab was opened from or last saved as, so the save
+    /// prompt reopens with its name, folder, and pin. Not persisted.
+    saved: Option<u64>,
     outcome: RunOutcome,
     run_scope: RunScope,
     /// Display results kept when the outcome stops being `Ok`, so a failed
@@ -380,13 +383,19 @@ pub struct HistoryEntry {
 }
 
 /// One named query. Newest first in [`AppState::saved`]. Holds the SQL and
-/// its connection only, never credentials.
+/// its connection only, never credentials. `folder` places it in a sidebar
+/// group (`None` is the group at the top); `pinned` floats it to the top of
+/// its group. Both default so files written before folders still load.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SavedQuery {
     pub id: u64,
     pub name: String,
     pub sql: String,
     pub conn: ConnectionId,
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -402,12 +411,49 @@ impl SavedQuery {
         name: String,
         sql: String,
         conn: ConnectionId,
+        folder: Option<String>,
+        pinned: bool,
     ) -> Result<Self, SavedQueryError> {
         if name.trim().is_empty() {
             return Err(SavedQueryError::EmptyName);
         }
-        Ok(Self { id, name, sql, conn })
+        Ok(Self { id, name, sql, conn, folder, pinned })
     }
+}
+
+/// One sidebar group. `folder` is `None` for the no-folder group, which leads.
+/// Entries are pinned first, each pin class in stored order.
+#[derive(Debug)]
+pub struct SavedGroup<'a> {
+    pub folder: Option<&'a str>,
+    pub entries: Vec<&'a SavedQuery>,
+}
+
+/// Group saved queries for the sidebar: the no-folder group first, then
+/// folders in alphabetical order, pinned entries before unpinned ones.
+pub fn saved_groups(saved: &[SavedQuery]) -> Vec<SavedGroup<'_>> {
+    let mut folders: Vec<&str> = saved.iter().filter_map(|q| q.folder.as_deref()).collect();
+    folders.sort_unstable();
+    folders.dedup();
+    let mut groups: Vec<SavedGroup<'_>> =
+        vec![SavedGroup { folder: None, entries: Vec::new() }];
+    groups.extend(folders.into_iter().map(|folder| SavedGroup {
+        folder: Some(folder),
+        entries: Vec::new(),
+    }));
+    for query in saved {
+        let group = groups
+            .iter_mut()
+            .find(|g| g.folder == query.folder.as_deref())
+            .expect("every folder became a group");
+        group.entries.push(query);
+    }
+    for group in &mut groups {
+        // Stable, so each pin class keeps the stored newest-first order.
+        group.entries.sort_by(|a, b| b.pinned.cmp(&a.pinned));
+    }
+    groups.retain(|group| !group.entries.is_empty());
+    groups
 }
 
 /// Cap on retained history entries, newest first.
@@ -593,6 +639,8 @@ pub struct ConnectDraft {
 #[derive(Debug)]
 pub struct SavePrompt {
     pub name: String,
+    pub folder: String,
+    pub pinned: bool,
     pub error: Option<String>,
 }
 
@@ -809,6 +857,7 @@ impl AppState {
             id,
             conn,
             sql,
+            saved: None,
             outcome: RunOutcome::Never,
             run_scope: RunScope::All,
             results: Vec::new(),
@@ -1782,13 +1831,22 @@ impl AppState {
         &self.saved
     }
 
-    /// Save the active tab's SQL under `name` for its connection. A duplicate
-    /// name replaces the existing entry in place and keeps its id.
-    pub fn save_active_tab(&mut self, name: &str) -> Option<u64> {
+    /// Save the active tab's SQL under `name` in `folder`. A duplicate name
+    /// replaces the entry in place when it sits in the same folder and keeps
+    /// its id; the same name in another folder saves beside it. The active
+    /// tab remembers the entry, so a later save prompt reopens with its
+    /// folder and pin.
+    pub fn save_active_tab(
+        &mut self,
+        name: &str,
+        folder: Option<&str>,
+        pinned: bool,
+    ) -> Option<u64> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
             return None;
         }
+        let folder = folder.map(str::trim).filter(|f| !f.is_empty());
         let (conn, sql) = match self.active.and_then(|id| self.tab(id)) {
             Some(tab) => match tab.conn {
                 Some(conn) => (conn, tab.sql.clone()),
@@ -1796,18 +1854,32 @@ impl AppState {
             },
             None => return None,
         };
-        if let Some(existing) = self.saved.iter_mut().find(|q| q.name == trimmed) {
+        if let Some(existing) = self
+            .saved
+            .iter_mut()
+            .find(|q| q.name == trimmed && q.folder.as_deref() == folder)
+        {
             existing.sql = sql;
             existing.conn = conn;
+            existing.pinned = pinned;
             let id = existing.id;
+            self.link_active_tab_to_saved(id);
             self.persist_saved();
             return Some(id);
         }
         let id = self.ids.saved();
-        match SavedQuery::new(id, trimmed.to_owned(), sql, conn) {
+        match SavedQuery::new(
+            id,
+            trimmed.to_owned(),
+            sql,
+            conn,
+            folder.map(str::to_owned),
+            pinned,
+        ) {
             Ok(query) => {
                 self.saved.insert(0, query);
                 self.saved.truncate(SAVED_CAP);
+                self.link_active_tab_to_saved(id);
                 self.persist_saved();
                 Some(id)
             }
@@ -1815,7 +1887,16 @@ impl AppState {
         }
     }
 
+    /// Remember which saved entry the active tab came from or last saved as.
+    fn link_active_tab_to_saved(&mut self, saved: u64) {
+        let Some(active) = self.active else { return };
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active) {
+            tab.saved = Some(saved);
+        }
+    }
+
     /// Open a saved query in a fresh tab on its connection. Never auto-runs.
+    /// The tab remembers the entry, so the save prompt reopens filled from it.
     pub fn open_saved(&mut self, id: u64) {
         let Some(query) = self.saved.iter().find(|q| q.id == id).cloned() else {
             return;
@@ -1823,6 +1904,9 @@ impl AppState {
         let tab = self.new_tab(query.conn);
         if let Some(slot) = self.tab_sql_mut(tab) {
             *slot = query.sql;
+        }
+        if let Some(slot) = self.tab_mut(tab) {
+            slot.saved = Some(id);
         }
         self.activate(tab);
         self.set_outcome(tab, RunOutcome::Never);
@@ -1859,9 +1943,28 @@ impl AppState {
         self.save_prompt.as_mut()
     }
 
+    /// Open the save prompt, prefilled from the active tab's saved entry when
+    /// it has one, so a re-save keeps the entry's folder and pin.
     pub fn open_save_prompt(&mut self) {
-        self.save_prompt =
-            Some(SavePrompt { name: String::new(), error: None });
+        let prefill = self
+            .active
+            .and_then(|id| self.tab(id))
+            .and_then(|tab| tab.saved)
+            .and_then(|saved| {
+                self.saved
+                    .iter()
+                    .find(|q| q.id == saved)
+                    .map(|q| (q.name.clone(), q.folder.clone().unwrap_or_default(), q.pinned))
+            });
+        self.save_prompt = Some(match prefill {
+            Some((name, folder, pinned)) => SavePrompt { name, folder, pinned, error: None },
+            None => SavePrompt {
+                name: String::new(),
+                folder: String::new(),
+                pinned: false,
+                error: None,
+            },
+        });
     }
 
     pub fn close_save_prompt(&mut self) {
@@ -1869,10 +1972,10 @@ impl AppState {
     }
 
     pub fn confirm_save_prompt(&mut self) -> Option<u64> {
-        let name = self
+        let (name, folder, pinned) = self
             .save_prompt
             .as_ref()
-            .map(|p| p.name.clone())
+            .map(|p| (p.name.clone(), p.folder.clone(), p.pinned))
             .unwrap_or_default();
         if name.trim().is_empty() {
             if let Some(prompt) = self.save_prompt.as_mut() {
@@ -1880,7 +1983,7 @@ impl AppState {
             }
             return None;
         }
-        match self.save_active_tab(&name) {
+        match self.save_active_tab(&name, Some(folder.as_str()), pinned) {
             Some(id) => {
                 self.save_prompt = None;
                 Some(id)
@@ -2451,6 +2554,15 @@ fn load_saved_queries() -> Vec<SavedQuery> {
     match serde_json::from_slice::<Vec<SavedQuery>>(&bytes) {
         Ok(mut queries) => {
             queries.retain(|q| !q.name.trim().is_empty());
+            for query in &mut queries {
+                let folder = query
+                    .folder
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|f| !f.is_empty())
+                    .map(str::to_owned);
+                query.folder = folder;
+            }
             queries.truncate(SAVED_CAP);
             queries
         }
@@ -3674,12 +3786,34 @@ mod tests {
     #[test]
     fn saved_query_constructor_rejects_empty_names() {
         let conn = ConnectionId::from_raw(1);
-        assert!(SavedQuery::new(1, String::new(), "SELECT 1".to_owned(), conn).is_err());
-        assert!(SavedQuery::new(1, "   ".to_owned(), "SELECT 1".to_owned(), conn).is_err());
-        let query =
-            SavedQuery::new(1, "daily".to_owned(), "SELECT 1".to_owned(), conn).unwrap();
+        assert!(
+            SavedQuery::new(1, String::new(), "SELECT 1".to_owned(), conn, None, false)
+                .is_err()
+        );
+        assert!(
+            SavedQuery::new(
+                1,
+                "   ".to_owned(),
+                "SELECT 1".to_owned(),
+                conn,
+                None,
+                false
+            )
+            .is_err()
+        );
+        let query = SavedQuery::new(
+            1,
+            "daily".to_owned(),
+            "SELECT 1".to_owned(),
+            conn,
+            Some("ops".to_owned()),
+            true,
+        )
+        .unwrap();
         assert_eq!(query.id, 1);
         assert_eq!(query.name, "daily");
+        assert_eq!(query.folder.as_deref(), Some("ops"));
+        assert!(query.pinned);
         let json = serde_json::to_string(&query).unwrap();
         assert!(!json.contains("password"));
         assert!(json.contains("SELECT 1"));
@@ -3694,16 +3828,18 @@ mod tests {
                 *slot = "SELECT 1".to_owned();
             }
             state.activate(tab);
-            assert!(state.save_active_tab("   ").is_none());
+            assert!(state.save_active_tab("   ", None, false).is_none());
             assert!(state.saved_queries().is_empty());
-            let id = state.save_active_tab("first").expect("saved");
+            let id = state.save_active_tab("first", None, false).expect("saved");
             assert_eq!(state.saved_queries().len(), 1);
             assert_eq!(state.saved_queries()[0].sql, "SELECT 1");
             assert_eq!(state.saved_queries()[0].conn, conn);
+            assert_eq!(state.saved_queries()[0].folder, None);
+            assert!(!state.saved_queries()[0].pinned);
             if let Some(slot) = state.tab_sql_mut(tab) {
                 *slot = "SELECT 2".to_owned();
             }
-            let again = state.save_active_tab("first").expect("replaced");
+            let again = state.save_active_tab("first", None, false).expect("replaced");
             assert_eq!(id, again);
             assert_eq!(state.saved_queries().len(), 1);
             assert_eq!(state.saved_queries()[0].sql, "SELECT 2");
@@ -3723,6 +3859,8 @@ mod tests {
             assert_eq!(reloaded.saved_queries().len(), 1);
             assert_eq!(reloaded.saved_queries()[0].name, "renamed");
             assert_eq!(reloaded.saved_queries()[0].sql, "SELECT 2");
+            assert_eq!(reloaded.saved_queries()[0].folder, None);
+            assert!(!reloaded.saved_queries()[0].pinned);
             assert!(state.delete_saved(id));
             assert!(state.saved_queries().is_empty());
             assert!(!state.delete_saved(id));
@@ -3741,7 +3879,7 @@ mod tests {
                 if let Some(slot) = state.tab_sql_mut(tab) {
                     *slot = format!("SELECT {i}");
                 }
-                state.save_active_tab(&format!("q{i}")).expect("saved");
+                state.save_active_tab(&format!("q{i}"), None, false).expect("saved");
             }
             assert_eq!(state.saved_queries().len(), 200);
             assert_eq!(state.saved_queries()[0].name, "q249");
@@ -3771,6 +3909,8 @@ mod tests {
                 name: format!("q{i}"),
                 sql: format!("SELECT {i}"),
                 conn: ConnectionId::from_raw(1),
+                folder: None,
+                pinned: false,
             })
             .collect();
         std::fs::write(
@@ -3786,6 +3926,162 @@ mod tests {
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_saved_file_without_folder_or_pinned_loads_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("cde-saved-old-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crusty-data-explorer")).unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        std::fs::write(
+            dir.join("crusty-data-explorer").join("saved_queries.json"),
+            br#"[{"id":7,"name":"daily","sql":"SELECT 1","conn":1}]"#,
+        )
+        .unwrap();
+        let state = AppState::new(&eframe::egui::Context::default());
+        assert_eq!(state.saved_queries().len(), 1);
+        assert_eq!(state.saved_queries()[0].name, "daily");
+        assert_eq!(state.saved_queries()[0].folder, None);
+        assert!(!state.saved_queries()[0].pinned);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_dedup_scopes_to_the_folder() {
+        with_isolated_state("saved-folder-dedup", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            let ops = state.save_active_tab("daily", Some("ops"), false).expect("saved");
+            let personal =
+                state.save_active_tab("daily", Some("personal"), true).expect("saved");
+            assert_ne!(ops, personal);
+            assert_eq!(state.saved_queries().len(), 2);
+            let again = state.save_active_tab("daily", Some("  ops  "), true).expect("replaced");
+            assert_eq!(again, ops);
+            assert_eq!(state.saved_queries().len(), 2);
+            let entry = state.saved_queries().iter().find(|q| q.id == ops).unwrap();
+            assert_eq!(entry.folder.as_deref(), Some("ops"));
+            assert!(entry.pinned);
+            let loose = state.save_active_tab("daily", None, false).expect("saved");
+            assert_ne!(loose, ops);
+            assert_eq!(state.saved_queries().len(), 3);
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.saved_queries().len(), 3);
+            assert_eq!(
+                reloaded.saved_queries().iter().filter(|q| q.name == "daily").count(),
+                3
+            );
+        });
+    }
+
+    #[test]
+    fn saved_cap_counts_across_folders() {
+        with_isolated_state("saved-cap-folders", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            for i in 0..250 {
+                let folder = if i % 2 == 0 { "evens" } else { "odds" };
+                state
+                    .save_active_tab(&format!("q{i}"), Some(folder), i % 3 == 0)
+                    .expect("saved");
+            }
+            assert_eq!(state.saved_queries().len(), 200);
+            assert_eq!(state.saved_queries()[0].name, "q249");
+            assert_eq!(state.saved_queries()[199].name, "q50");
+        });
+    }
+
+    #[test]
+    fn saved_groups_order_folders_and_pins() {
+        let conn = ConnectionId::from_raw(1);
+        let query = |id: u64, name: &str, folder: Option<&str>, pinned: bool| {
+            SavedQuery::new(
+                id,
+                name.to_owned(),
+                "SELECT 1".to_owned(),
+                conn,
+                folder.map(str::to_owned),
+                pinned,
+            )
+            .expect("named")
+        };
+        let saved = vec![
+            query(1, "loose-old", None, false),
+            query(2, "zeta-pinned", Some("zeta"), true),
+            query(3, "alpha-plain", Some("alpha"), false),
+            query(4, "loose-pinned", None, true),
+            query(5, "zeta-plain", Some("zeta"), false),
+            query(6, "alpha-pinned", Some("alpha"), true),
+        ];
+        let shape: Vec<(Option<&str>, Vec<&str>)> = saved_groups(&saved)
+            .iter()
+            .map(|g| (g.folder, g.entries.iter().map(|q| q.name.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (None, vec!["loose-pinned", "loose-old"]),
+                (Some("alpha"), vec!["alpha-pinned", "alpha-plain"]),
+                (Some("zeta"), vec!["zeta-pinned", "zeta-plain"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn save_prompt_prefills_folder_and_pin_from_the_tabs_entry() {
+        with_isolated_state("saved-prefill", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 1".to_owned();
+            }
+            state.activate(tab);
+            let id = state.save_active_tab("daily", Some("ops"), true).expect("saved");
+            state.open_save_prompt();
+            {
+                let prompt = state.save_prompt().expect("prompt");
+                assert_eq!(prompt.name, "daily");
+                assert_eq!(prompt.folder, "ops");
+                assert!(prompt.pinned);
+            }
+            if let Some(slot) = state.tab_sql_mut(tab) {
+                *slot = "SELECT 2".to_owned();
+            }
+            state.confirm_save_prompt();
+            assert_eq!(state.saved_queries().len(), 1);
+            assert_eq!(state.saved_queries()[0].id, id);
+            assert_eq!(state.saved_queries()[0].sql, "SELECT 2");
+            assert_eq!(state.saved_queries()[0].folder.as_deref(), Some("ops"));
+            assert!(state.saved_queries()[0].pinned);
+
+            let fresh = state.new_tab(conn);
+            state.activate(fresh);
+            state.open_save_prompt();
+            {
+                let prompt = state.save_prompt().expect("prompt");
+                assert_eq!(prompt.name, "");
+                assert_eq!(prompt.folder, "");
+                assert!(!prompt.pinned);
+            }
+            state.close_save_prompt();
+
+            let reopened = state.new_tab(conn);
+            state.activate(reopened);
+            state.open_saved(id);
+            state.open_save_prompt();
+            let prompt = state.save_prompt().expect("prompt");
+            assert_eq!(prompt.name, "daily");
+            assert_eq!(prompt.folder, "ops");
+            assert!(prompt.pinned);
+        });
     }
 
     #[test]

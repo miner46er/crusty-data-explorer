@@ -1,10 +1,11 @@
 //! Connection sidebar and the new/edit connection modal.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use eframe::egui;
 
-use crate::app::{AppState, ConnectionState, Environment};
+use crate::app::{AppState, ConnectionState, Environment, SavedQuery, saved_groups};
 use crate::db::{ConnectionConfig, ConnectionId, PostgresSslMode, parse_connection_url};
 use crate::ssh::{SshAuth, SshConfig};
 
@@ -49,6 +50,29 @@ fn env_badge(ui: &mut egui::Ui, env: Environment) {
         .show(ui, |ui| {
             ui.label(egui::RichText::new(env.label()).small().strong().color(color));
         });
+}
+
+/// One saved-query row: pin mark, open button, connection name, delete.
+fn saved_row(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    query: &SavedQuery,
+    conn_names: &HashMap<ConnectionId, String>,
+    actions: &mut Vec<SidebarAction>,
+) {
+    ui.horizontal(|ui| {
+        if query.pinned {
+            ui.label(egui::RichText::new("★").small().color(palette.accent));
+        }
+        if ui.small_button(&query.name).clicked() {
+            actions.push(SidebarAction::OpenSaved(query.id));
+        }
+        let conn_name = conn_names.get(&query.conn).map(String::as_str).unwrap_or("deleted");
+        ui.label(egui::RichText::new(conn_name).small().weak());
+        if ui.small_button("Delete").clicked() {
+            actions.push(SidebarAction::DeleteSaved(query.id));
+        }
+    });
 }
 
 pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
@@ -283,27 +307,34 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                 if state.saved_queries().is_empty() {
                     ui.label(egui::RichText::new("No saved queries.").small().weak());
                 } else {
-                    let rows: Vec<(u64, String, String)> = state
-                        .saved_queries()
+                    let conn_names: HashMap<ConnectionId, String> = state
+                        .connections()
                         .iter()
-                        .map(|q| {
-                            let conn_name = state
-                                .connections()
-                                .iter()
-                                .find(|c| c.id == q.conn)
-                                .map(|c| c.name.clone())
-                                .unwrap_or_else(|| "deleted".to_owned());
-                            (q.id, q.name.clone(), conn_name)
-                        })
+                        .map(|c| (c.id, c.name.clone()))
                         .collect();
-                    for (id, name, conn_name) in rows {
-                        ui.horizontal(|ui| {
-                            if ui.small_button(&name).clicked() {
-                                actions.push(SidebarAction::OpenSaved(id));
+                    for group in saved_groups(state.saved_queries()) {
+                        let Some(folder) = group.folder else {
+                            for query in &group.entries {
+                                saved_row(ui, &palette, query, &conn_names, &mut actions);
                             }
-                            ui.label(egui::RichText::new(conn_name).small().weak());
-                            if ui.small_button("Delete").clicked() {
-                                actions.push(SidebarAction::DeleteSaved(id));
+                            continue;
+                        };
+                        let open_id = egui::Id::new(("crusty_saved_folder", folder));
+                        let mut open: bool =
+                            ui.ctx().data_mut(|d| d.get_temp(open_id)).unwrap_or(true);
+                        ui.horizontal(|ui| {
+                            let arrow = if open { "▾" } else { "▸" };
+                            if ui.small_button(format!("{arrow} {folder}")).clicked() {
+                                open = !open;
+                            }
+                        });
+                        ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
+                        if !open {
+                            continue;
+                        }
+                        ui.indent(egui::Id::new(("crusty_saved_entries", folder)), |ui| {
+                            for query in &group.entries {
+                                saved_row(ui, &palette, query, &conn_names, &mut actions);
                             }
                         });
                     }
