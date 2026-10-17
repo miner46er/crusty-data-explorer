@@ -85,6 +85,17 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
         {
             close_find(ui.ctx(), id);
         }
+    } else if state.connections().is_empty() {
+        let palette = Palette::of(ui.ctx().theme());
+        if ui
+            .add(
+                egui::Button::new(egui::RichText::new("+ New connection").strong())
+                    .fill(palette.accent),
+            )
+            .clicked()
+        {
+            state.open_draft(None);
+        }
     } else {
         ui.label("Open a connection and start a new query.");
     }
