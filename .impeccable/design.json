@@ -1,0 +1,743 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-17T12:47:25Z",
+  "title": "Design System: crusty-data-explorer",
+  "extensions": {
+    "colorMeta": {
+      "cockpit-window": {
+        "role": "neutral",
+        "displayName": "Cockpit Window",
+        "canonical": "#181d25",
+        "tonalRamp": [
+          "#070b12",
+          "#1f242d",
+          "#3d434c",
+          "#5b616a",
+          "#7d848e",
+          "#9ea5b0",
+          "#c4cbd6",
+          "#e8effa"
+        ]
+      },
+      "panel-slate": {
+        "role": "neutral",
+        "displayName": "Panel Slate",
+        "canonical": "#202732",
+        "tonalRamp": [
+          "#060b15",
+          "#1d242f",
+          "#3b434f",
+          "#59616e",
+          "#7b8491",
+          "#9ca5b3",
+          "#c2cbda",
+          "#e6effe"
+        ]
+      },
+      "raised-slate": {
+        "role": "neutral",
+        "displayName": "Raised Slate",
+        "canonical": "#2a323f",
+        "tonalRamp": [
+          "#050b16",
+          "#1d2431",
+          "#3a4350",
+          "#58616f",
+          "#7a8493",
+          "#9ba5b5",
+          "#c1cbdc",
+          "#e5efff"
+        ]
+      },
+      "ink-well": {
+        "role": "neutral",
+        "displayName": "Ink Well",
+        "canonical": "#12171e",
+        "tonalRamp": [
+          "#070b12",
+          "#1f242c",
+          "#3d434b",
+          "#5b616a",
+          "#7d848d",
+          "#9ea5af",
+          "#c4cbd5",
+          "#e8eff9"
+        ]
+      },
+      "code-well": {
+        "role": "neutral",
+        "displayName": "Code Well",
+        "canonical": "#28303c",
+        "tonalRamp": [
+          "#050b15",
+          "#1d2430",
+          "#3a4350",
+          "#58616f",
+          "#7a8492",
+          "#9ba5b4",
+          "#c1cbdb",
+          "#e5efff"
+        ]
+      },
+      "paper-window": {
+        "role": "neutral",
+        "displayName": "Daylight Paper Window",
+        "canonical": "#f2f4f7",
+        "tonalRamp": [
+          "#0a0b0d",
+          "#232426",
+          "#414245",
+          "#5f6063",
+          "#818386",
+          "#a3a5a7",
+          "#c9cbcd",
+          "#edeff2"
+        ]
+      },
+      "paper-panel": {
+        "role": "neutral",
+        "displayName": "Daylight Paper Panel",
+        "canonical": "#eceef2",
+        "tonalRamp": [
+          "#0a0b0e",
+          "#232427",
+          "#414246",
+          "#5f6064",
+          "#818387",
+          "#a3a5a8",
+          "#c9cace",
+          "#eceef2"
+        ]
+      },
+      "paper-raised": {
+        "role": "neutral",
+        "displayName": "Daylight Paper Raised",
+        "canonical": "#e4e7ec",
+        "tonalRamp": [
+          "#090b0e",
+          "#222428",
+          "#404246",
+          "#5e6065",
+          "#818388",
+          "#a2a5a9",
+          "#c8cbcf",
+          "#eceff4"
+        ]
+      },
+      "paper-well": {
+        "role": "neutral",
+        "displayName": "Daylight Paper Well",
+        "canonical": "#e1e4e9",
+        "tonalRamp": [
+          "#090b0e",
+          "#222428",
+          "#404246",
+          "#5e6065",
+          "#818388",
+          "#a2a5a9",
+          "#c8cbcf",
+          "#eceff4"
+        ]
+      },
+      "paper-code-well": {
+        "role": "neutral",
+        "displayName": "Daylight Paper Code",
+        "canonical": "#f0f2f5",
+        "tonalRamp": [
+          "#0a0b0d",
+          "#232426",
+          "#414245",
+          "#5f6063",
+          "#818386",
+          "#a3a5a7",
+          "#c9cbcd",
+          "#edeff2"
+        ]
+      },
+      "console-blue": {
+        "role": "primary",
+        "displayName": "Console Blue",
+        "canonical": "#3a6ea5",
+        "tonalRamp": [
+          "#000b1e",
+          "#002448",
+          "#0b4377",
+          "#2f6399",
+          "#5287bf",
+          "#73a9e4",
+          "#a3cfff",
+          "#e3f0ff"
+        ]
+      },
+      "selection-outline-dark": {
+        "role": "accent",
+        "displayName": "Selection Outline (Dark)",
+        "canonical": "#c0deff",
+        "tonalRamp": [
+          "#000b1d",
+          "#0d253e",
+          "#2b445f",
+          "#48637f",
+          "#6a86a4",
+          "#8ba8c7",
+          "#b0ceee",
+          "#e3f0ff"
+        ]
+      },
+      "selection-outline-light": {
+        "role": "accent",
+        "displayName": "Selection Outline (Light)",
+        "canonical": "#1e508c",
+        "tonalRamp": [
+          "#000a20",
+          "#00234c",
+          "#0d427c",
+          "#30619f",
+          "#5285c5",
+          "#73a7ea",
+          "#a7ceff",
+          "#e4f0ff"
+        ]
+      },
+      "selection-text": {
+        "role": "accent",
+        "displayName": "Selection Text",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#242424",
+          "#424242",
+          "#606060",
+          "#838383",
+          "#a4a4a4",
+          "#cacaca",
+          "#eeeeee"
+        ]
+      },
+      "commit-green-dark": {
+        "role": "success",
+        "displayName": "Commit Green (Dark)",
+        "canonical": "#73b473",
+        "tonalRamp": [
+          "#001001",
+          "#002e04",
+          "#0b5113",
+          "#317133",
+          "#559556",
+          "#76b776",
+          "#9cde9b",
+          "#caffc9"
+        ]
+      },
+      "commit-green-light": {
+        "role": "success",
+        "displayName": "Commit Green (Light)",
+        "canonical": "#388e3c",
+        "tonalRamp": [
+          "#001001",
+          "#002e04",
+          "#00520c",
+          "#187421",
+          "#439946",
+          "#67bc68",
+          "#8de38d",
+          "#caffc9"
+        ]
+      },
+      "staging-amber": {
+        "role": "warning",
+        "displayName": "Staging Amber",
+        "canonical": "rgba(227, 179, 65, 0.25)",
+        "tonalRamp": [
+          "#110a00",
+          "#302100",
+          "#553e00",
+          "#7a5b00",
+          "#a57c00",
+          "#cc9d22",
+          "#f4c353",
+          "#ffedc6"
+        ]
+      },
+      "caution-amber-dark": {
+        "role": "warning",
+        "displayName": "Caution Amber (Dark)",
+        "canonical": "#e3b341",
+        "tonalRamp": [
+          "#110a00",
+          "#302100",
+          "#553e00",
+          "#7a5b00",
+          "#a57c00",
+          "#cc9d22",
+          "#f4c353",
+          "#ffedc6"
+        ]
+      },
+      "caution-amber-light": {
+        "role": "warning",
+        "displayName": "Caution Amber (Light)",
+        "canonical": "#966e0f",
+        "tonalRamp": [
+          "#120900",
+          "#312100",
+          "#573d00",
+          "#7d5a00",
+          "#a47c25",
+          "#c79d4b",
+          "#efc472",
+          "#ffecca"
+        ]
+      },
+      "guard-red-dark": {
+        "role": "danger",
+        "displayName": "Guard Red (Dark)",
+        "canonical": "#e05b5b",
+        "tonalRamp": [
+          "#1f0001",
+          "#4b0008",
+          "#810016",
+          "#ab2830",
+          "#d55152",
+          "#fc7472",
+          "#ffb4b0",
+          "#ffe8e7"
+        ]
+      },
+      "guard-red-light": {
+        "role": "danger",
+        "displayName": "Guard Red (Light)",
+        "canonical": "#bc3c3c",
+        "tonalRamp": [
+          "#1f0001",
+          "#4b0006",
+          "#810012",
+          "#aa2a2d",
+          "#d4524f",
+          "#fb7570",
+          "#ffb5ae",
+          "#ffe9e6"
+        ]
+      },
+      "advisory-orange-dark": {
+        "role": "warning",
+        "displayName": "Advisory Orange (Dark)",
+        "canonical": "#ff8f00",
+        "tonalRamp": [
+          "#160700",
+          "#391b00",
+          "#643400",
+          "#8f4d00",
+          "#c06a00",
+          "#ef8600",
+          "#ffba81",
+          "#ffeada"
+        ]
+      },
+      "advisory-orange-light": {
+        "role": "warning",
+        "displayName": "Advisory Orange (Light)",
+        "canonical": "#ff6400",
+        "tonalRamp": [
+          "#1a0400",
+          "#411300",
+          "#712800",
+          "#a03c00",
+          "#d75300",
+          "#ff7637",
+          "#ffb79a",
+          "#ffe9e1"
+        ]
+      },
+      "fault-red": {
+        "role": "danger",
+        "displayName": "Fault Red",
+        "canonical": "#ff0000",
+        "tonalRamp": [
+          "#1f0000",
+          "#4b0000",
+          "#820000",
+          "#b70000",
+          "#f50000",
+          "#ff7361",
+          "#ffb5a9",
+          "#ffe9e5"
+        ]
+      },
+      "signal-blue-dark": {
+        "role": "syntax",
+        "displayName": "Signal Blue (Dark)",
+        "canonical": "#78aadc",
+        "tonalRamp": [
+          "#000c1c",
+          "#002545",
+          "#134570",
+          "#346492",
+          "#5787b7",
+          "#77a9db",
+          "#a1d0ff",
+          "#e2f0ff"
+        ]
+      },
+      "signal-blue-light": {
+        "role": "syntax",
+        "displayName": "Signal Blue (Light)",
+        "canonical": "#1976d2",
+        "tonalRamp": [
+          "#000b1f",
+          "#00244a",
+          "#00427f",
+          "#0060b3",
+          "#2c84e1",
+          "#5ba8ff",
+          "#a5ceff",
+          "#e3f0ff"
+        ]
+      },
+      "lichen-dark": {
+        "role": "syntax",
+        "displayName": "Lichen (Dark)",
+        "canonical": "#8cc896",
+        "tonalRamp": [
+          "#001003",
+          "#002d0e",
+          "#135024",
+          "#356f42",
+          "#599364",
+          "#7ab584",
+          "#9fdca9",
+          "#c8ffd0"
+        ]
+      },
+      "lichen-light": {
+        "role": "syntax",
+        "displayName": "Lichen (Light)",
+        "canonical": "#2e7d32",
+        "tonalRamp": [
+          "#001001",
+          "#002e04",
+          "#00520c",
+          "#227328",
+          "#4a984c",
+          "#6cba6d",
+          "#92e192",
+          "#caffc9"
+        ]
+      },
+      "steel-comment-dark": {
+        "role": "syntax",
+        "displayName": "Steel Comment (Dark)",
+        "canonical": "#828c9b",
+        "tonalRamp": [
+          "#050b16",
+          "#1c2430",
+          "#3a4350",
+          "#58616f",
+          "#7a8493",
+          "#9ba5b5",
+          "#c1cbdb",
+          "#e5efff"
+        ]
+      },
+      "steel-comment-light": {
+        "role": "syntax",
+        "displayName": "Steel Comment (Light)",
+        "canonical": "#6e7781",
+        "tonalRamp": [
+          "#060c13",
+          "#1d252d",
+          "#3b434c",
+          "#59616b",
+          "#7b848e",
+          "#9ca6b0",
+          "#c2ccd7",
+          "#e6f0fb"
+        ]
+      },
+      "brass-dark": {
+        "role": "syntax",
+        "displayName": "Brass (Dark)",
+        "canonical": "#dcaa6e",
+        "tonalRamp": [
+          "#140800",
+          "#351e00",
+          "#5d3900",
+          "#835614",
+          "#a8793d",
+          "#cb9a5e",
+          "#f3c083",
+          "#ffebd4"
+        ]
+      },
+      "brass-light": {
+        "role": "syntax",
+        "displayName": "Brass (Light)",
+        "canonical": "#aa641e",
+        "tonalRamp": [
+          "#160700",
+          "#391b00",
+          "#643500",
+          "#8e4e00",
+          "#b7702d",
+          "#db9151",
+          "#ffba80",
+          "#ffeada"
+        ]
+      },
+      "dev-steel-dark": {
+        "role": "neutral",
+        "displayName": "Dev Steel (Dark)",
+        "canonical": "#949ba6",
+        "tonalRamp": [
+          "#070b13",
+          "#1f242d",
+          "#3d434c",
+          "#5a616b",
+          "#7d848e",
+          "#9ea5b0",
+          "#c4cbd7",
+          "#e7effb"
+        ]
+      },
+      "dev-steel-light": {
+        "role": "neutral",
+        "displayName": "Dev Steel (Light)",
+        "canonical": "#5f6973",
+        "tonalRamp": [
+          "#050c13",
+          "#1c252d",
+          "#3a444d",
+          "#58626c",
+          "#7a858f",
+          "#9ba6b1",
+          "#c1ccd7",
+          "#e4f0fc"
+        ]
+      },
+      "quiet-text-dark": {
+        "role": "neutral",
+        "displayName": "Quiet Text (Dark)",
+        "canonical": "#8c8c8c",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#242424",
+          "#424242",
+          "#606060",
+          "#838383",
+          "#a4a4a4",
+          "#cacaca",
+          "#eeeeee"
+        ]
+      },
+      "quiet-text-light": {
+        "role": "neutral",
+        "displayName": "Quiet Text (Light)",
+        "canonical": "#505050",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#242424",
+          "#424242",
+          "#606060",
+          "#838383",
+          "#a4a4a4",
+          "#cacaca",
+          "#eeeeee"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "heading": {
+        "displayName": "Heading",
+        "purpose": "Panel and window headings, dialog titles (16px, Ubuntu-Light)."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Labels, buttons, menu items, form prose (13px, Ubuntu-Light)."
+      },
+      "button": {
+        "displayName": "Button",
+        "purpose": "Button and toolbar labels (13px)."
+      },
+      "small": {
+        "displayName": "Small",
+        "purpose": "Section labels, state text, hints, badges, diff labels (11px); often at 60% alpha."
+      },
+      "mono": {
+        "displayName": "Mono",
+        "purpose": "SQL editor, grid cells, DDL, plan stats, JSON, record forms (12.5px, Hack)."
+      }
+    },
+    "shadows": [
+      {
+        "name": "floating-layer",
+        "value": "10px 20px 15px 0px rgba(0, 0, 0, 0.376)",
+        "purpose": "egui's window shadow. Dialogs, menus, the command palette, and tooltips only; never panels, cards, or cells."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-default",
+        "value": "0.2s eased transition (egui animation_time)",
+        "purpose": "Hover, selection, and window fades. The app sets no custom easing."
+      },
+      {
+        "name": "tooltip-delay",
+        "value": "0.5s",
+        "purpose": "Hover tooltips appear after a still pause."
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Run Button",
+      "kind": "button",
+      "refersTo": "button-run",
+      "description": "The single filled commit action: Commit Green, strong label. One per screen.",
+      "html": "<button class=\"ds-btn-run\">&#9654; Run</button>",
+      "css": ".ds-btn-run { background: #73b473; color: #ffffff; font-family: 'Ubuntu-Light', system-ui, sans-serif; font-size: 13px; font-weight: 500; padding: 6px 10px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; transition: border-color 0.2s; } .ds-btn-run:hover { border-color: #969696; } .ds-btn-run:active { border-color: #ffffff; } .ds-btn-run:focus-visible { outline: 2px solid #c0deff; outline-offset: 1px; }"
+    },
+    {
+      "name": "Create Button",
+      "kind": "button",
+      "refersTo": "button-create",
+      "description": "Console Blue fill for create actions ('+ New connection', 'New query'). Blue means this makes something.",
+      "html": "<button class=\"ds-btn-create\">+ New connection</button>",
+      "css": ".ds-btn-create { background: #3a6ea5; color: #ffffff; font-family: 'Ubuntu-Light', system-ui, sans-serif; font-size: 13px; font-weight: 500; padding: 6px 10px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; transition: border-color 0.2s; } .ds-btn-create:hover { border-color: #969696; } .ds-btn-create:active { border-color: #ffffff; } .ds-btn-create:focus-visible { outline: 2px solid #c0deff; outline-offset: 1px; }"
+    },
+    {
+      "name": "Default Button",
+      "kind": "button",
+      "refersTo": "button-default",
+      "description": "Neutral chrome: quiet gray fill, one step brighter text; hovers a tonal step up.",
+      "html": "<button class=\"ds-btn\">Apply filter</button>",
+      "css": ".ds-btn { background: #3c3c3c; color: #b4b4b4; font-family: 'Ubuntu-Light', system-ui, sans-serif; font-size: 13px; padding: 6px 10px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; transition: background 0.2s, border-color 0.2s; } .ds-btn:hover { background: #464646; color: #f0f0f0; border-color: #969696; } .ds-btn:active { background: #373737; color: #ffffff; border-color: #ffffff; } .ds-btn:focus-visible { outline: 2px solid #c0deff; outline-offset: 1px; }"
+    },
+    {
+      "name": "Small Action Button",
+      "kind": "button",
+      "refersTo": "button-small",
+      "description": "Destructive and secondary actions stay understated: same neutral fill, 11px text, flush vertical padding. 'Delete' is never red.",
+      "html": "<button class=\"ds-btn-sm\">Delete</button>",
+      "css": ".ds-btn-sm { background: #3c3c3c; color: #b4b4b4; font-family: 'Ubuntu-Light', system-ui, sans-serif; font-size: 11px; padding: 1px 10px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; transition: background 0.2s, border-color 0.2s; } .ds-btn-sm:hover { background: #464646; color: #f0f0f0; border-color: #969696; } .ds-btn-sm:active { background: #373737; color: #ffffff; border-color: #ffffff; }"
+    },
+    {
+      "name": "Environment Badge",
+      "kind": "chip",
+      "refersTo": "env-badge",
+      "description": "The most important fact on a connection card, in six pixels of type. 20% fill, 60% stroke, full-color 11px text, 3px corners.",
+      "html": "<span class=\"ds-badge ds-badge--dev\">Dev</span> <span class=\"ds-badge ds-badge--test\">Test</span> <span class=\"ds-badge ds-badge--prod\">Prod</span>",
+      "css": ".ds-badge { display: inline-block; font-family: 'Ubuntu-Light', system-ui, sans-serif; font-size: 11px; font-weight: 500; padding: 1px 4px; border-radius: 3px; border: 1px solid; line-height: 1.4; } .ds-badge--dev { color: #949ba6; background: rgba(148, 155, 166, 0.2); border-color: rgba(148, 155, 166, 0.6); } .ds-badge--test { color: #e3b341; background: rgba(227, 179, 65, 0.2); border-color: rgba(227, 179, 65, 0.6); } .ds-badge--prod { color: #e05b5b; background: rgba(224, 91, 91, 0.2); border-color: rgba(224, 91, 91, 0.6); }"
+    },
+    {
+      "name": "Data Cell",
+      "kind": "custom",
+      "description": "The square machined surface: monospace values; Console Blue selection switches the text to white with a pale outline; translucent amber for staged edits; strikethrough for staged deletes.",
+      "html": "<table class=\"ds-grid\"><tr><td class=\"ds-cell\">1</td><td class=\"ds-cell ds-cell--selected\">ada@example.com</td><td class=\"ds-cell ds-cell--staged\">pending</td><td class=\"ds-cell ds-cell--deleted\">old@example.com</td><td class=\"ds-cell\">NULL</td></tr></table>",
+      "css": ".ds-grid { border-collapse: collapse; background: #202732; } .ds-cell { font-family: 'Hack', monospace; font-size: 12.5px; color: #8c8c8c; padding: 2px 8px; border-radius: 0; } .ds-cell--selected { background: #3a6ea5; color: #ffffff; outline: 1px solid #c0deff; outline-offset: -1px; } .ds-cell--staged { background: rgba(227, 179, 65, 0.25); } .ds-cell--deleted { text-decoration: line-through; color: rgba(140, 140, 140, 0.6); }"
+    },
+    {
+      "name": "Editor Tab",
+      "kind": "nav",
+      "description": "Tabs are selectable labels: the active tab fills Console Blue with white strong text; inactive tabs are quiet at 60% alpha. An open transaction adds a small strong 'tx' marker.",
+      "html": "<div class=\"ds-tabs\"><button class=\"ds-tab ds-tab--active\">SELECT * FROM users</button><span class=\"ds-tab-tx\">tx</span><button class=\"ds-tab\">SELECT 1</button><button class=\"ds-tab-x\">&times;</button></div>",
+      "css": ".ds-tabs { display: flex; align-items: center; gap: 8px; } .ds-tab { font-family: 'Ubuntu-Light', system-ui, sans-serif; font-size: 13px; background: #3c3c3c; color: rgba(140, 140, 140, 0.6); padding: 6px 10px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; } .ds-tab:hover { background: #464646; border-color: #969696; } .ds-tab--active { background: #3a6ea5; color: #ffffff; font-weight: 500; } .ds-tab--active:hover { background: #3a6ea5; border-color: transparent; } .ds-tab-tx { font-family: 'Ubuntu-Light', system-ui, sans-serif; font-size: 11px; font-weight: 500; color: #ffffff; background: #3c3c3c; border-radius: 4px; padding: 1px 4px; } .ds-tab-x { background: none; border: none; color: #b4b4b4; font-size: 13px; cursor: pointer; }"
+    },
+    {
+      "name": "Section Label",
+      "kind": "custom",
+      "description": "The one uppercase element in the system: 11px sidebar section headers at 60% alpha. Nothing else uppercases.",
+      "html": "<div class=\"ds-section\">CONNECTIONS</div>",
+      "css": ".ds-section { font-family: 'Ubuntu-Light', system-ui, sans-serif; font-size: 11px; color: rgba(140, 140, 140, 0.6); letter-spacing: 0; }"
+    },
+    {
+      "name": "Editor Well",
+      "kind": "input",
+      "description": "The SQL surface: recessed into the Ink Well, 4px corners, 6px margin, mono 12.5px, muted syntax tints below the semaphore.",
+      "html": "<div class=\"ds-well\"><pre><span class=\"ds-kw\">SELECT</span> id, <span class=\"ds-str\">'ada'</span> <span class=\"ds-kw\">FROM</span> users <span class=\"ds-kw\">WHERE</span> n &gt; <span class=\"ds-num\">10</span>; <span class=\"ds-cmt\">-- recent signups</span></pre></div>",
+      "css": ".ds-well { background: #12171e; border: 1px solid #3c3c3c; border-radius: 4px; padding: 6px; } .ds-well pre { margin: 0; font-family: 'Hack', monospace; font-size: 12.5px; color: #8c8c8c; } .ds-kw { color: #78aadc; } .ds-str { color: #8cc896; } .ds-cmt { color: #828c9b; } .ds-num { color: #dcaa6e; }"
+    },
+    {
+      "name": "Heavy Path Plan Node",
+      "kind": "card",
+      "description": "Plan trees render as bordered group frames; nodes on the heavy path take a 2px Console Blue stroke and a strong operation name. Cost share draws as a thin bar.",
+      "html": "<div class=\"ds-plan\"><div class=\"ds-plan-op\">Hash Join</div><div class=\"ds-plan-stats\">cost 142.31 &middot; rows 1200</div><div class=\"ds-track\"><div class=\"ds-bar\"></div></div></div>",
+      "css": ".ds-plan { background: #202732; border: 2px solid #3a6ea5; border-radius: 4px; padding: 6px; width: 100%; max-width: 280px; font-family: 'Ubuntu-Light', system-ui, sans-serif; } .ds-plan-op { color: #ffffff; font-weight: 500; font-size: 13px; } .ds-plan-stats { color: #8c8c8c; font-size: 13px; margin-top: 2px; } .ds-track { background: #2a323f; border-radius: 3px; height: 6px; margin-top: 4px; } .ds-bar { background: #3a6ea5; border-radius: 3px; height: 6px; width: 72%; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Instrument Flight Deck",
+    "overview": "This is a dark calibrated cockpit for a single operator working against real, sometimes dangerous databases. The interface is quiet at rest: a cold blue-gray panel stack, one structural blue, and a semaphore of green, amber, and red that stays dark until state or safety demands it speak. Nothing is decorative. Every tint on screen is reporting something: a staged cell, a transaction, a production connection, a row that differs. The mood is quiet precision, and the discipline that produces it is subtraction. Color arrives late and leaves early.\n\nThe system is dark-first and tonal. Depth is carried by four measured steps of the same blue-gray family, not by shadow or glow; shadow exists only where a surface genuinely floats (dialogs, menus, the command palette, tooltips). Data is always monospace and always the loudest thing on screen by sheer density, never by color. Chrome controls stay neutral gray, so the single green Run button reads as the only commitment device in the app. The light theme is a daylight translation of the same instrument, not a second identity.\n\nThe incumbent implementation is a Rust/egui desktop application. The tokens here were extracted from the shipped code: src/ui/mod.rs owns both themes and the environment palette, and every module reads colors through it. Values below are that theme's exact literals.",
+    "keyCharacteristics": [
+      "Dark-first blue-gray tonal stack; light theme is a parallel \"daylight paper\" translation.",
+      "One structural accent (Console Blue); saturation is reserved for signals.",
+      "A safety semaphore: green commits, amber stages and cautions, red guards and faults.",
+      "Monospace data everywhere a value can be copied, aliased, or diffed.",
+      "Flat panels, 1px strokes; shadow only on true floating layers.",
+      "Small, tight type (11px to 16px); emphasis through weight and brightness, never size.",
+      "Unicode glyphs as the entire icon set: \u25b6 Run, \u2605 pin, \u00d7 close, + new, \u25cf/\u25cb connection state."
+    ],
+    "rules": [
+      {
+        "name": "The Semaphore Rule",
+        "body": "Saturation is a message. Green means committing, amber means staged, cautioned, or changed, red means guarded or failed. If a surface is saturated and none of those is true, the color is wrong.",
+        "section": "colors"
+      },
+      {
+        "name": "The Two Reds Rule",
+        "body": "Guards wear the softened Guard Red; raw Fault Red is reserved for terminal text about failure. Never swap them.",
+        "section": "colors"
+      },
+      {
+        "name": "The Data Is Monospace Rule",
+        "body": "If a value can be copied, aliased, diffed, or executed, it renders in Hack. If it cannot, it renders in Ubuntu-Light. No exceptions to date.",
+        "section": "typography"
+      },
+      {
+        "name": "The Weight Rule",
+        "body": "Emphasis is weight and brightness (strong() brightens, weak() dims), never a bigger font. Every size is fixed; the app has no fluid type.",
+        "section": "typography"
+      },
+      {
+        "name": "The Instrument Frame Rule",
+        "body": "The four panels are the cockpit. Work lands inside them; it does not reshape them.",
+        "section": "layout"
+      },
+      {
+        "name": "The Tonal-First Rule",
+        "body": "Depth is a tone difference, and shadow is reserved for true floating layers. A panel with a shadow is a bug.",
+        "section": "elevation"
+      },
+      {
+        "name": "The One Well Rule",
+        "body": "Inputs, editors, and any surface that accepts text recess into the Ink Well (light theme: paper well). Nothing that accepts typing is ever raised or tinted.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Quiet Edge Rule",
+        "body": "Rounding is a whisper: 6px for surfaces, 4px for widgets, 3px for badges, 0 for data. Nothing is a pill and nothing has a double border.",
+        "section": "shapes"
+      }
+    ],
+    "dos": [
+      "Do keep Commit Green to one control per screen: the action that commits work.",
+      "Do switch selected-cell text to Selection Text (#ffffff); quiet gray text never sits on the Console Blue fill.",
+      "Do paint staged-but-unapplied changes with the Staging Amber tint (rgba(227, 179, 65, 0.25)); translucency is reserved for this meaning.",
+      "Do render every value in Hack monospace and every label in Ubuntu-Light, at the fixed sizes 11 / 13 / 16 (and 12.5 mono).",
+      "Do carry depth with the four tonal steps and 1px strokes; reserve shadow for dialogs, menus, the palette, and tooltips.",
+      "Do keep text quiet (weak() at 60% for anything ignorable) so the semaphore and the data own the contrast budget.",
+      "Do keep badges at 20% fill / 60% stroke with full-color 11px strong text, and keep Prod red softened (Guard Red), not raw.",
+      "Do use the Unicode glyph set (\u25b6, \u2605, \u00d7, +, \u25cf, \u25cb) instead of introducing an icon font or SVG sprite.",
+      "Do keep destructive actions understated, and put danger into environment badges, read-only flags, and confirm modals instead."
+    ],
+    "donts": [
+      "Don't introduce a saturated color outside the semaphore: blue locates, green commits, amber stages or cautions, red guards or faults. There is no decorative fifth color.",
+      "Don't apply shadow, gradient, or glow to panels, cards, or cells. A raised panel is off-system by definition.",
+      "Don't use pill radii, double borders, or any stroke heavier than the 2px heavy-path accent.",
+      "Don't fill destructive buttons with red or style errors into field backgrounds; Fault Red is text-only, and it is never used for a standing identity (that is Guard Red's job).",
+      "Don't add a second font family, a display face, or fluid type; the embedded Ubuntu-Light / Hack pairing is the identity.",
+      "Don't uppercase anything except the sidebar section labels.",
+      "Don't spend Console Blue as decoration: it marks location (selection, active cell, selected card) and structure (create actions, heavy path), and it should read as rare on any given screen.",
+      "Don't round grid cells or tint them for anything except staged state."
+    ]
+  }
+}
