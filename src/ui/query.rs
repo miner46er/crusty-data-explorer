@@ -3,6 +3,8 @@
 //! Clicks are collected while a tab borrow is live and applied after it
 //! ends, so the editor borrow never overlaps a transition.
 
+use std::collections::HashMap;
+
 use eframe::egui;
 
 use super::editor::{char_range, format_sql, FindState};
@@ -338,7 +340,7 @@ pub(crate) fn tab_title(sql: String) -> String {
 /// Tab-strip labels: each title, with " 2", " 3", … appended to the second
 /// and later tabs sharing a title, in tab order.
 fn numbered_titles(titles: &[String]) -> Vec<String> {
-    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut seen: HashMap<&str, usize> = HashMap::new();
     titles
         .iter()
         .map(|title| {
