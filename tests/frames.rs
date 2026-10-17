@@ -170,7 +170,8 @@ fn sample_chip(harness: &mut Harness<AppState>, name: &str) -> ChipPixels {
 }
 
 /// Step frames until `pred` holds, panicking after a bounded wait.
-fn step_until(harness: &mut Harness<AppState>, what: &str, pred: impl Fn(&AppState) -> bool) {    for _ in 0..600 {
+fn step_until(harness: &mut Harness<AppState>, what: &str, pred: impl Fn(&AppState) -> bool) {
+    for _ in 0..600 {
         if pred(harness.state()) {
             return;
         }
@@ -370,6 +371,7 @@ fn chart_hover_frame() {
     let note = harness.get_by_label("5 plotted").rect();
     harness.hover_at(egui::pos2(note.center().x, note.top() - 110.0));
     harness.run_steps(4);
+    // Only the tooltip puts a point's label and its value in one node.
     assert!(
         harness.query_all_by_label_contains("@example.com · ").next().is_some(),
         "the hover tooltip names the point"
@@ -381,6 +383,7 @@ fn chart_hover_frame() {
     let note = harness.get_by_label("5 plotted").rect();
     harness.hover_at(egui::pos2(note.center().x, note.top() - 110.0));
     harness.run_steps(4);
+    // Only the tooltip puts a point's label and its value in one node.
     assert!(
         harness.query_all_by_label_contains("@example.com · ").next().is_some(),
         "the hover tooltip names the point"

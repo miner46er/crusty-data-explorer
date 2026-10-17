@@ -10314,6 +10314,7 @@ mod tests {
             assert!(!text.iter().any(|t| t == "SAVED"), "{text:?}");
             assert!(!text.iter().any(|t| t == "BOOKMARKS"), "{text:?}");
             assert!(!text.iter().any(|t| t.contains("Filter tables")), "{text:?}");
+            assert!(text.iter().any(|t| t.contains("Import SQL")), "{text:?}");
             assert!(text.iter().any(|t| t == "+ New connection"), "{text:?}");
 
             // Rows that outlive the last connection keep their sections
@@ -11390,21 +11391,30 @@ mod tests {
             // No connection at all.
             let unbound = state.push_tab(None, String::new());
             assert_eq!(AutocommitSlot::of(state, unbound), AutocommitSlot::Offline);
-            assert_eq!(reason(AutocommitSlot::of(state, unbound), true), Some("Connect to change autocommit"));
+            assert_eq!(
+                reason(AutocommitSlot::of(state, unbound), true),
+                Some("Connect to change autocommit")
+            );
 
             let sqlite = add_sqlite_connection(state, "mem-chip");
             let tab = state.new_tab(sqlite);
 
             // Connecting, then failed: nothing to switch either way.
             attach_test_handle(state, sqlite);
-            assert_eq!(reason(AutocommitSlot::of(state, tab), true), Some("Connect to change autocommit"));
+            assert_eq!(
+                reason(AutocommitSlot::of(state, tab), true),
+                Some("Connect to change autocommit")
+            );
             state
                 .connections
                 .iter_mut()
                 .find(|c| c.id == sqlite)
                 .expect("connection")
                 .state = ConnectionState::Error { message: "boom".to_owned() };
-            assert_eq!(reason(AutocommitSlot::of(state, tab), false), Some("Connect to change autocommit"));
+            assert_eq!(
+                reason(AutocommitSlot::of(state, tab), false),
+                Some("Connect to change autocommit")
+            );
 
             // Live on SQLite: the engine explains the chip, run or not.
             let commands = attach_test_session(state, sqlite);

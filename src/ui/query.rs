@@ -721,7 +721,10 @@ mod tests {
             tab_title("SELECT (SELECT count(*) FROM audit_log) AS m FROM users".to_owned()),
             "users"
         );
-        assert_eq!(tab_title("SELECT 1; DELETE FROM users".to_owned()), "SELECT 1; DELETE FROM us…");
+        assert_eq!(
+            tab_title("SELECT 1; DELETE FROM users".to_owned()),
+            "SELECT 1; DELETE FROM us…"
+        );
         assert_eq!(tab_title("-- pick\nSELECT * FROM users".to_owned()), "users");
         assert_eq!(tab_title("SELECT * FROM \"my\"\"table\"".to_owned()), "my\"table");
         assert_eq!(tab_title("SELECT * FROM \"users 2\"".to_owned()), "users 2");

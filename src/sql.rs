@@ -359,11 +359,12 @@ pub fn capped_title(text: &str) -> String {
 pub fn select_table_title(sql: &str) -> Option<String> {
     let first = split_statements(sql).into_iter().next()?;
     let head = head_word(&first)?;
-    if !first[head.clone()].eq_ignore_ascii_case("select") {
+    let after_head = head.end;
+    if !first[head].eq_ignore_ascii_case("select") {
         return None;
     }
-    let from = top_level_from(&first[head.end..])?;
-    let table = last_identifier(&first[head.end + from + 4..])?;
+    let from = top_level_from(&first[after_head..])?;
+    let table = last_identifier(&first[after_head + from + 4..])?;
     if table.is_empty() {
         return None;
     }
