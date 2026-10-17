@@ -23,7 +23,10 @@ use crate::edit::{
 use crate::import::{
     ColumnMap, ROW_CAP, dropped_rows, insert_batches, map_headers, parse_csv, parse_jsonl,
 };
-use crate::sql::{collect_params, current_statement, split_statements, statement_ranges, substitute};
+use crate::sql::{
+    collect_params, current_statement, split_statements, sql_changes_schema, statement_ranges,
+    substitute,
+};
 use crate::ui::compare::{
     CompareError, CompareOutput, compare_select, diff_tables, parse_key_columns,
 };
@@ -1732,6 +1735,9 @@ pub struct AppState {
     table_editor: Option<TableEditorState>,
     /// The table DDL batch awaiting its prod confirmation, if any.
     pending_table_confirm: Option<PendingTableDdl>,
+    /// Runs whose statements classified as schema-changing at send, kept
+    /// until their landing so a successful one reloads the navigator.
+    schema_change_runs: HashSet<RunId>,
     history: Vec<HistoryEntry>,
     /// True narrows the execution log to the current connection. False shows
     /// every connection. Never persisted, so a relaunch starts at all.
@@ -1789,6 +1795,7 @@ impl AppState {
             pending_terminate: None,
             table_editor: None,
             pending_table_confirm: None,
+            schema_change_runs: HashSet::new(),
             history: load_history(),
             history_current_only: false,
             saved,
@@ -2280,6 +2287,12 @@ impl AppState {
                 match handle.send(DbCommand::QueryBatch { run, statements: statements.clone() })
                 {
                     Ok(()) => {
+                        // Classify before the statements move into the run
+                        // outcome, so the landing knows whether its success
+                        // should reload the navigator.
+                        if statements.iter().any(|statement| sql_changes_schema(statement)) {
+                            self.schema_change_runs.insert(run);
+                        }
                         if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
                             match purpose {
                                 BatchPurpose::Run => {}
@@ -4759,6 +4772,9 @@ impl AppState {
     /// displayed rows, so it clears the staged changes; a failure leaves them
     /// staged for a retry.
     fn finish_run(&mut self, run: RunId, outcome: RunOutcome) {
+        // Consume the send-time classification first: a dropped or failed
+        // run must not leave its flag behind.
+        let schema_change = self.schema_change_runs.remove(&run);
         let matched = match self
             .tabs
             .iter_mut()
@@ -4791,7 +4807,9 @@ impl AppState {
                 if table_ddl {
                     t.pending_table = None;
                 }
-                let table_schema_refresh = table_ddl && ok;
+                // One reload covers the DDL editor's post-apply refresh and
+                // a run whose statements classified as schema-changing.
+                let schema_refresh = ok && (table_ddl || schema_change);
                 if ok {
                     t.edits.clear();
                     t.deleted_rows.clear();
@@ -4850,11 +4868,11 @@ impl AppState {
                 // Only an Ok landing moves the transaction flag, so a failed
                 // BEGIN, COMMIT, or ROLLBACK leaves it as it was.
                 let transaction = if ok { transaction_action(&statements) } else { None };
-                Some((tab_id, conn, entries, refresh, import_notice, transaction, table_schema_refresh))
+                Some((tab_id, conn, entries, refresh, import_notice, transaction, schema_refresh))
             }
             None => None,
         };
-        let Some((tab_id, conn, entries, refresh, import_notice, transaction, table_schema_refresh)) =
+        let Some((tab_id, conn, entries, refresh, import_notice, transaction, schema_refresh)) =
             matched
         else {
             return;
@@ -4891,7 +4909,7 @@ impl AppState {
         if refresh {
             self.start_refresh(tab_id);
         }
-        if table_schema_refresh {
+        if schema_refresh {
             self.refresh_schema(conn);
         }
         // After the refresh send: its set_outcome clears the notice, so the
@@ -9562,6 +9580,69 @@ mod tests {
                 DbCommand::LoadSchema => {}
                 other => panic!("expected LoadSchema, got {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn schema_changing_run_reloads_the_navigator_on_ok() {
+        with_isolated_state("schema-change-run", |state| {
+            let conn = add_sqlite_connection(state, "mem-schema");
+            let commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+
+            state.start_run(tab, "CREATE TABLE users (id INTEGER)", 0, None);
+            let run = match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { run, statements } => {
+                    assert_eq!(statements, vec!["CREATE TABLE users (id INTEGER)"]);
+                    run
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            state.apply(DbEvent::BatchOk { run, results: vec![affected_result(0)] });
+            match commands.try_recv().expect("the schema reload was sent") {
+                DbCommand::LoadSchema => {}
+                other => panic!("expected LoadSchema, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn plain_run_sends_no_schema_reload() {
+        with_isolated_state("select-no-reload", |state| {
+            let conn = add_sqlite_connection(state, "mem-select");
+            let commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+
+            state.start_run(tab, "SELECT 1", 0, None);
+            let run = match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { run, .. } => run,
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            state.apply(DbEvent::BatchOk { run, results: vec![rows_result(1)] });
+            assert!(commands.try_recv().is_err(), "a SELECT sends no schema reload");
+        });
+    }
+
+    #[test]
+    fn errored_schema_changing_run_sends_no_reload() {
+        with_isolated_state("schema-change-err", |state| {
+            let conn = add_sqlite_connection(state, "mem-schema-err");
+            let commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+
+            state.start_run(tab, "DROP TABLE users", 0, None);
+            let run = match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { run, .. } => run,
+                other => panic!("expected QueryBatch, got {other:?}"),
+            };
+            state.apply(DbEvent::QueryErr {
+                run,
+                error: crate::db::DbError::Query("no such table".to_owned()),
+            });
+            assert!(
+                commands.try_recv().is_err(),
+                "a failed schema-changing run sends no reload"
+            );
         });
     }
 
