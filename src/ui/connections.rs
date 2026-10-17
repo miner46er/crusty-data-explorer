@@ -483,11 +483,8 @@ fn connection_card(
         Some((d, t)) => (d.to_owned(), t.to_owned()),
         None => ("○".to_owned(), state_label.to_owned()),
     };
-    let frame_fill = if selected {
-        ui.visuals().selection.bg_fill.gamma_multiply(0.35)
-    } else {
-        ui.visuals().faint_bg_color
-    };
+    let frame_fill =
+        if selected { palette.selected_card_fill } else { ui.visuals().faint_bg_color };
     let frame_stroke = if selected {
         egui::Stroke::new(1.0, palette.accent)
     } else {

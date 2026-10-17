@@ -11,11 +11,12 @@
 //! as the tests run.
 
 use std::ffi::OsString;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 use eframe::egui;
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 
 use crusty_data_explorer::app::{AppState, ConnectionState, Environment, RunOutcome};
 use crusty_data_explorer::db::{ConnectionConfig, ConnectionId, TabId};
@@ -23,9 +24,18 @@ use crusty_data_explorer::ui;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// Serialize the tests that mutate `XDG_CONFIG_HOME`, tolerating a mutex a
+/// panicking test left poisoned: the scratch dir is restored on drop, so the
+/// next test still starts from clean state.
+fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The screen the captures render at. `CDE_FRAME_SIZE=WxH` overrides it so
 /// width-dependent defects can be reproduced at the width where they bite.
-fn size() -> [u32; 2] {
+/// Parsed once per process: one clear parse panic on the first deref, and
+/// later tests fail on that memoized panic, not on a poisoned lock.
+static FRAME_SIZE: LazyLock<[u32; 2]> = LazyLock::new(|| {
     let Some(value) = std::env::var_os("CDE_FRAME_SIZE") else {
         return [1440, 900];
     };
@@ -40,11 +50,11 @@ fn size() -> [u32; 2] {
             "CDE_FRAME_SIZE must be WxH with nonzero dimensions, got {text:?}"
         ),
     }
-}
+});
 
 /// Points `XDG_CONFIG_HOME` at a scratch dir for the guard's lifetime and
 /// restores it on drop, so no real profile, tab, or settings file is read
-/// or written. The caller serializes through `ENV_LOCK`.
+/// or written. The caller serializes through [`env_lock`].
 struct Scratch {
     dir: std::path::PathBuf,
     prev: Option<OsString>,
@@ -71,7 +81,7 @@ impl Drop for Scratch {
 }
 
 fn build() -> Harness<'static, AppState> {
-    let [w, h] = size();
+    let [w, h] = *FRAME_SIZE;
     Harness::builder()
         .with_size(egui::vec2(w as f32, h as f32))
         .build_eframe(|cc| {
@@ -84,7 +94,7 @@ fn build() -> Harness<'static, AppState> {
 /// rendered at the requested size so a broken render fails the test.
 fn capture(harness: &mut Harness<AppState>, name: &str) {
     let image = harness.render().expect("render the frame");
-    let [w, h] = size();
+    let [w, h] = *FRAME_SIZE;
     assert_eq!(
         image.dimensions(),
         (w, h),
@@ -165,24 +175,14 @@ fn demo_sql() -> &'static str {
      ('barbara@example.com', 'free', 0, '2026-04-01');"
 }
 
-#[test]
-fn empty_frame() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    let _scratch = Scratch::new("empty");
+/// One harness on a fresh scratch profile with the in-memory demo schema
+/// loaded and its tab selected: the preamble every data capture shares. The
+/// scratch dir must outlive the harness, so it comes back beside it.
+fn demo_setup(tag: &str) -> (Scratch, Harness<'static, AppState>, TabId) {
+    let scratch = Scratch::new(tag);
     let mut harness = build();
-    harness.run();
-    capture(&mut harness, "empty-dark");
-}
-
-#[test]
-fn grid_frames() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    let _scratch = Scratch::new("grid");
-    let mut harness = build();
-
     let conn = add_memory_database(harness.state_mut());
     connect_and_wait(&mut harness, conn);
-
     let tab = harness.state_mut().new_tab(conn);
     harness.state_mut().activate(tab);
     run_sql(&mut harness, tab, demo_sql());
@@ -191,6 +191,22 @@ fn grid_frames() {
         tab,
         "SELECT id, email, plan, active, joined FROM users ORDER BY id;",
     );
+    (scratch, harness, tab)
+}
+
+#[test]
+fn empty_frame() {
+    let _guard = env_lock();
+    let _scratch = Scratch::new("empty");
+    let mut harness = build();
+    harness.run();
+    capture(&mut harness, "empty-dark");
+}
+
+#[test]
+fn grid_frames() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, _tab) = demo_setup("grid");
     harness.run();
     capture(&mut harness, "grid-dark");
 
@@ -209,4 +225,15 @@ fn grid_frames() {
     harness.run();
     assert!(harness.state().palette_open(), "the palette stays open for the capture");
     capture(&mut harness, "palette-dark");
+}
+
+#[test]
+fn line_chart_frame() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, _tab) = demo_setup("line");
+    harness.run();
+
+    harness.get_by_label("Line").click();
+    harness.run();
+    capture(&mut harness, "chart-line-dark");
 }

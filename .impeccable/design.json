@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-17T12:47:25Z",
+  "generatedAt": "2026-10-17T15:21:41Z",
   "title": "Design System: crusty-data-explorer",
   "extensions": {
     "colorMeta": {
@@ -169,39 +169,39 @@
           "#e3f0ff"
         ]
       },
-      "selection-outline-dark": {
-        "role": "accent",
-        "displayName": "Selection Outline (Dark)",
-        "canonical": "#c0deff",
+      "selection-fill-dark": {
+        "role": "primary",
+        "displayName": "Selection Fill (Dark)",
+        "canonical": "#3a6ea5",
         "tonalRamp": [
-          "#000b1d",
-          "#0d253e",
-          "#2b445f",
-          "#48637f",
-          "#6a86a4",
-          "#8ba8c7",
-          "#b0ceee",
+          "#000b1e",
+          "#002448",
+          "#0b4377",
+          "#2f6399",
+          "#5287bf",
+          "#73a9e4",
+          "#a3cfff",
           "#e3f0ff"
         ]
       },
-      "selection-outline-light": {
-        "role": "accent",
-        "displayName": "Selection Outline (Light)",
-        "canonical": "#1e508c",
+      "selection-fill-light": {
+        "role": "primary",
+        "displayName": "Selection Fill (Light)",
+        "canonical": "#cfe2f7",
         "tonalRamp": [
-          "#000a20",
-          "#00234c",
-          "#0d427c",
-          "#30619f",
-          "#5285c5",
-          "#73a7ea",
-          "#a7ceff",
-          "#e4f0ff"
+          "#020c19",
+          "#172535",
+          "#344455",
+          "#526274",
+          "#748598",
+          "#95a7bb",
+          "#bacde1",
+          "#e3f0ff"
         ]
       },
-      "selection-text": {
+      "selection-text-dark": {
         "role": "accent",
-        "displayName": "Selection Text",
+        "displayName": "Selection Text (Dark)",
         "canonical": "#ffffff",
         "tonalRamp": [
           "#0b0b0b",
@@ -212,6 +212,21 @@
           "#a4a4a4",
           "#cacaca",
           "#eeeeee"
+        ]
+      },
+      "selection-text-light": {
+        "role": "accent",
+        "displayName": "Selection Text (Light)",
+        "canonical": "#1e508c",
+        "tonalRamp": [
+          "#000a20",
+          "#00234c",
+          "#0d427c",
+          "#30619f",
+          "#5285c5",
+          "#73a7ea",
+          "#a7ceff",
+          "#e4f0ff"
         ]
       },
       "commit-green-dark": {
@@ -594,7 +609,7 @@
       "refersTo": "button-run",
       "description": "The single filled commit action: Commit Green, strong label. One per screen.",
       "html": "<button class=\"ds-btn-run\">&#9654; Run</button>",
-      "css": ".ds-btn-run { background: #73b473; color: #ffffff; font-family: 'Ubuntu-Light', system-ui, sans-serif; font-size: 13px; font-weight: 500; padding: 6px 10px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; transition: border-color 0.2s; } .ds-btn-run:hover { border-color: #969696; } .ds-btn-run:active { border-color: #ffffff; } .ds-btn-run:focus-visible { outline: 2px solid #c0deff; outline-offset: 1px; }"
+      "css": ".ds-btn-run { background: #73b473; color: #ffffff; font-family: 'Ubuntu-Light', system-ui, sans-serif; font-size: 13px; font-weight: 500; padding: 6px 10px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; transition: border-color 0.2s; } .ds-btn-run:hover { border-color: #969696; } .ds-btn-run:active { border-color: #ffffff; } .ds-btn-run:focus-visible { outline: 2px solid #ffffff; outline-offset: 1px; }"
     },
     {
       "name": "Create Button",
@@ -602,7 +617,7 @@
       "refersTo": "button-create",
       "description": "Console Blue fill for create actions ('+ New connection', 'New query'). Blue means this makes something.",
       "html": "<button class=\"ds-btn-create\">+ New connection</button>",
-      "css": ".ds-btn-create { background: #3a6ea5; color: #ffffff; font-family: 'Ubuntu-Light', system-ui, sans-serif; font-size: 13px; font-weight: 500; padding: 6px 10px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; transition: border-color 0.2s; } .ds-btn-create:hover { border-color: #969696; } .ds-btn-create:active { border-color: #ffffff; } .ds-btn-create:focus-visible { outline: 2px solid #c0deff; outline-offset: 1px; }"
+      "css": ".ds-btn-create { background: #3a6ea5; color: #ffffff; font-family: 'Ubuntu-Light', system-ui, sans-serif; font-size: 13px; font-weight: 500; padding: 6px 10px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; transition: border-color 0.2s; } .ds-btn-create:hover { border-color: #969696; } .ds-btn-create:active { border-color: #ffffff; } .ds-btn-create:focus-visible { outline: 2px solid #ffffff; outline-offset: 1px; }"
     },
     {
       "name": "Default Button",
@@ -610,7 +625,7 @@
       "refersTo": "button-default",
       "description": "Neutral chrome: quiet gray fill, one step brighter text; hovers a tonal step up.",
       "html": "<button class=\"ds-btn\">Apply filter</button>",
-      "css": ".ds-btn { background: #3c3c3c; color: #b4b4b4; font-family: 'Ubuntu-Light', system-ui, sans-serif; font-size: 13px; padding: 6px 10px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; transition: background 0.2s, border-color 0.2s; } .ds-btn:hover { background: #464646; color: #f0f0f0; border-color: #969696; } .ds-btn:active { background: #373737; color: #ffffff; border-color: #ffffff; } .ds-btn:focus-visible { outline: 2px solid #c0deff; outline-offset: 1px; }"
+      "css": ".ds-btn { background: #3c3c3c; color: #b4b4b4; font-family: 'Ubuntu-Light', system-ui, sans-serif; font-size: 13px; padding: 6px 10px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; transition: background 0.2s, border-color 0.2s; } .ds-btn:hover { background: #464646; color: #f0f0f0; border-color: #969696; } .ds-btn:active { background: #373737; color: #ffffff; border-color: #ffffff; } .ds-btn:focus-visible { outline: 2px solid #ffffff; outline-offset: 1px; }"
     },
     {
       "name": "Small Action Button",
@@ -631,9 +646,9 @@
     {
       "name": "Data Cell",
       "kind": "custom",
-      "description": "The square machined surface: monospace values; Console Blue selection switches the text to white with a pale outline; translucent amber for staged edits; strikethrough for staged deletes.",
+      "description": "The square machined surface: monospace values; in the dark theme selection switches the text to white with a white outline; translucent amber for staged edits; strikethrough for staged deletes.",
       "html": "<table class=\"ds-grid\"><tr><td class=\"ds-cell\">1</td><td class=\"ds-cell ds-cell--selected\">ada@example.com</td><td class=\"ds-cell ds-cell--staged\">pending</td><td class=\"ds-cell ds-cell--deleted\">old@example.com</td><td class=\"ds-cell\">NULL</td></tr></table>",
-      "css": ".ds-grid { border-collapse: collapse; background: #202732; } .ds-cell { font-family: 'Hack', monospace; font-size: 12.5px; color: #8c8c8c; padding: 2px 8px; border-radius: 0; } .ds-cell--selected { background: #3a6ea5; color: #ffffff; outline: 1px solid #c0deff; outline-offset: -1px; } .ds-cell--staged { background: rgba(227, 179, 65, 0.25); } .ds-cell--deleted { text-decoration: line-through; color: rgba(140, 140, 140, 0.6); }"
+      "css": ".ds-grid { border-collapse: collapse; background: #202732; } .ds-cell { font-family: 'Hack', monospace; font-size: 12.5px; color: #8c8c8c; padding: 2px 8px; border-radius: 0; } .ds-cell--selected { background: #3a6ea5; color: #ffffff; outline: 1px solid #ffffff; outline-offset: -1px; } .ds-cell--staged { background: rgba(227, 179, 65, 0.25); } .ds-cell--deleted { text-decoration: line-through; color: rgba(140, 140, 140, 0.6); }"
     },
     {
       "name": "Editor Tab",
@@ -720,7 +735,7 @@
     ],
     "dos": [
       "Do keep Commit Green to one control per screen: the action that commits work.",
-      "Do switch selected-cell text to Selection Text (#ffffff); quiet gray text never sits on the Console Blue fill.",
+      "Do switch selected-cell text to the theme's Selection Text (#ffffff dark, #1e508c light); quiet gray text never sits on a selection fill.",
       "Do paint staged-but-unapplied changes with the Staging Amber tint (rgba(227, 179, 65, 0.25)); translucency is reserved for this meaning.",
       "Do render every value in Hack monospace and every label in Ubuntu-Light, at the fixed sizes 11 / 13 / 16 (and 12.5 mono).",
       "Do carry depth with the four tonal steps and 1px strokes; reserve shadow for dialogs, menus, the palette, and tooltips.",
@@ -736,7 +751,7 @@
       "Don't fill destructive buttons with red or style errors into field backgrounds; Fault Red is text-only, and it is never used for a standing identity (that is Guard Red's job).",
       "Don't add a second font family, a display face, or fluid type; the embedded Ubuntu-Light / Hack pairing is the identity.",
       "Don't uppercase anything except the sidebar section labels.",
-      "Don't spend Console Blue as decoration: it marks location (selection, active cell, selected card) and structure (create actions, heavy path), and it should read as rare on any given screen.",
+      "Don't spend Console Blue as decoration: it marks location (the active cell, the selected card's stroke, the dark theme's selection fill) and structure (create actions, heavy path), and it should read as rare on any given screen.",
       "Don't round grid cells or tint them for anything except staged state."
     ]
   }

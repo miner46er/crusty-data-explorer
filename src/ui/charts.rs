@@ -278,25 +278,69 @@ fn parked_list(result: &QueryResult, ui: &mut egui::Ui) {
     ui.label(egui::RichText::new(format!("Not plottable: {}", names.join(", "))).small().weak());
 }
 
-/// Below this width a tick label would be a stub, so it is skipped.
-const MIN_TICK_LABEL_WIDTH: f32 = 16.0;
-
-/// Evenly spaced tick positions that include both ends without repeats.
+/// Evenly spaced tick positions over `n` points, both ends included without
+/// repeats. Empty for an empty series; `ticks` clamps to `n`, and the spread
+/// rounds to the nearest point so a short span does not bunch ticks on the
+/// left.
 fn tick_indices(n: usize, ticks: usize) -> Vec<usize> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let ticks = ticks.min(n).max(1);
     let last = n.saturating_sub(1);
     let span = ticks.saturating_sub(1).max(1);
-    (0..ticks).map(|i| i * last / span).collect()
+    (0..ticks).map(|i| (i * last + span / 2) / span).collect()
 }
 
-/// The label width each tick can use while keeping `gap` to its neighbours.
-fn tick_budgets(xs: &[f32], lo: f32, hi: f32, gap: f32) -> Vec<f32> {
+/// The x for every series point: bar centers inset by half a slot, line
+/// points spanning `lo..hi`, a lone line point centered. Empty with no
+/// points.
+fn tick_xs(kind: ChartKind, n: usize, lo: f32, hi: f32) -> Vec<f32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let span = hi - lo;
+    match kind {
+        ChartKind::Bar => {
+            let slot = span / n as f32;
+            (0..n).map(|i| lo + (i as f32 + 0.5) * slot).collect()
+        }
+        ChartKind::Line if n == 1 => vec![lo + span / 2.0],
+        ChartKind::Line => {
+            (0..n).map(|i| lo + i as f32 / (n - 1) as f32 * span).collect()
+        }
+    }
+}
+
+/// The x positions of the drawn ticks: the point mapping sampled at
+/// [`tick_indices`], so the drawing path and its tests share one mapping.
+fn drawn_tick_xs(kind: ChartKind, n: usize, lo: f32, hi: f32) -> Vec<f32> {
+    let xs = tick_xs(kind, n, lo, hi);
+    tick_indices(n, 6).iter().map(|index| xs[*index]).collect()
+}
+
+/// One tick's x, the room its label may use on each side, and the total
+/// width those rooms allow.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TickPlacement {
+    x: f32,
+    left: f32,
+    right: f32,
+    budget: f32,
+}
+
+/// One placement per tick x. Each adjacent pair splits the free distance
+/// between them, half per side, so two labels can never claim the same room;
+/// an end tick takes its full distance to the plot edge as outer room, which
+/// is zero for a line endpoint.
+fn tick_placements(xs: &[f32], lo: f32, hi: f32, gap: f32) -> Vec<TickPlacement> {
+    let last = xs.len().saturating_sub(1);
     xs.iter()
         .enumerate()
-        .map(|(i, x)| {
-            let x = *x;
-            let before = if i == 0 { 2.0 * (x - lo) } else { x - xs[i - 1] };
-            let after = if i + 1 == xs.len() { 2.0 * (hi - x) } else { xs[i + 1] - x };
-            (before.min(after) - gap).max(0.0)
+        .map(|(i, &x)| {
+            let left = if i == 0 { x - lo } else { (x - xs[i - 1] - gap) / 2.0 };
+            let right = if i == last { hi - x } else { (xs[i + 1] - x - gap) / 2.0 };
+            TickPlacement { x, left, right, budget: (left + right).max(0.0) }
         })
         .collect()
 }
@@ -317,17 +361,12 @@ fn draw_series(kind: ChartKind, series: &Series, ui: &mut egui::Ui) {
     }
     let y_of = |value: f64| plot.bottom() - ((value - lo) / (hi - lo)) as f32 * plot.height();
     let n = series.values.len();
-    let slot = plot.width() / n as f32;
-    let x_of = |index: usize| match kind {
-        ChartKind::Bar => plot.left() + (index as f32 + 0.5) * slot,
-        ChartKind::Line if n == 1 => plot.center().x,
-        ChartKind::Line => plot.left() + index as f32 / (n - 1) as f32 * plot.width(),
-    };
+    let xs = tick_xs(kind, n, plot.left(), plot.right());
     match kind {
         ChartKind::Bar => {
-            let bar = slot * 0.7;
+            let bar = plot.width() / n as f32 * 0.7;
             for (index, value) in series.values.iter().enumerate() {
-                let center = x_of(index);
+                let center = xs[index];
                 let top = y_of(value.max(0.0));
                 let bottom = y_of(value.min(0.0));
                 painter.rect_filled(
@@ -341,11 +380,10 @@ fn draw_series(kind: ChartKind, series: &Series, ui: &mut egui::Ui) {
             }
         }
         ChartKind::Line => {
-            let points: Vec<egui::Pos2> = series
-                .values
+            let points: Vec<egui::Pos2> = xs
                 .iter()
-                .enumerate()
-                .map(|(index, value)| egui::pos2(x_of(index), y_of(*value)))
+                .zip(&series.values)
+                .map(|(x, value)| egui::pos2(*x, y_of(*value)))
                 .collect();
             for window in points.windows(2) {
                 painter.line_segment(
@@ -372,29 +410,29 @@ fn draw_series(kind: ChartKind, series: &Series, ui: &mut egui::Ui) {
         font.clone(),
         weak,
     );
-    let ticks = tick_indices(n, 6usize.min(n));
-    let xs: Vec<f32> = ticks.iter().map(|index| x_of(*index)).collect();
-    let budgets = tick_budgets(&xs, plot.left(), plot.right(), ui.spacing().item_spacing.x);
-    for (index, budget) in ticks.iter().zip(budgets) {
-        if budget < MIN_TICK_LABEL_WIDTH {
-            continue;
-        }
+    let ticks = tick_indices(n, 6);
+    let placements = tick_placements(
+        &drawn_tick_xs(kind, n, plot.left(), plot.right()),
+        plot.left(),
+        plot.right(),
+        ui.spacing().item_spacing.x,
+    );
+    for (index, placement) in ticks.iter().zip(placements) {
         let mut job = egui::text::LayoutJob::default();
         job.append(
             &series.labels[*index],
             0.0,
             egui::TextFormat { font_id: font.clone(), color: weak, ..Default::default() },
         );
-        job.wrap = egui::text::TextWrapping::truncate_at_width(budget);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(placement.budget);
         let galley = painter.layout_job(job);
-        painter.galley(
-            egui::pos2(
-                x_of(*index) - galley.size().x / 2.0,
-                response.rect.bottom() - 2.0 - galley.size().y,
-            ),
-            galley,
-            weak,
+        let left_limit = placement.x - placement.left;
+        let right_limit = (placement.x + placement.right - galley.size().x).max(left_limit);
+        let pos = egui::pos2(
+            (placement.x - galley.size().x / 2.0).clamp(left_limit, right_limit),
+            response.rect.bottom() - 2.0 - galley.size().y,
         );
+        painter.galley(pos, galley, weak);
     }
 }
 
@@ -566,35 +604,158 @@ mod tests {
 
     #[test]
     fn tick_indices_spread_across_seven_points() {
-        assert_eq!(tick_indices(7, 6), vec![0, 1, 2, 3, 4, 6]);
+        assert_eq!(tick_indices(7, 6), vec![0, 1, 2, 4, 5, 6]);
     }
 
     #[test]
     fn tick_indices_reach_the_last_point_of_a_long_series() {
-        assert_eq!(tick_indices(200, 6), vec![0, 39, 79, 119, 159, 199]);
+        assert_eq!(tick_indices(200, 6), vec![0, 40, 80, 119, 159, 199]);
     }
 
     #[test]
-    fn tick_budgets_split_even_spacing_symmetrically() {
-        let budgets = tick_budgets(&[10.0, 20.0, 30.0, 40.0], 0.0, 50.0, 2.0);
-        assert_eq!(budgets, vec![8.0, 8.0, 8.0, 8.0]);
+    fn tick_indices_never_repeat_when_ticks_exceed_points() {
+        assert_eq!(tick_indices(3, 6), vec![0, 1, 2]);
     }
 
     #[test]
-    fn tick_budgets_follow_uneven_spacing() {
-        let budgets = tick_budgets(&[10.0, 20.0, 30.0, 40.0, 50.0, 70.0], 0.0, 80.0, 2.0);
-        assert_eq!(budgets, vec![8.0, 8.0, 8.0, 8.0, 8.0, 18.0]);
+    fn tick_indices_are_empty_without_points() {
+        assert_eq!(tick_indices(0, 6), Vec::<usize>::new());
     }
 
     #[test]
-    fn tick_budgets_use_both_sides_for_a_single_tick() {
-        assert_eq!(tick_budgets(&[20.0], 0.0, 100.0, 5.0), vec![35.0]);
+    fn tick_xs_inset_bar_centers() {
+        assert_eq!(tick_xs(ChartKind::Bar, 4, 0.0, 100.0), vec![12.5, 37.5, 62.5, 87.5]);
     }
 
     #[test]
-    fn tick_budgets_fall_under_the_skip_floor_for_tight_neighbours() {
-        let budgets = tick_budgets(&[10.0, 19.0], 0.0, 28.0, 6.0);
-        assert_eq!(budgets, vec![3.0, 3.0]);
-        assert!(budgets[0] < MIN_TICK_LABEL_WIDTH);
+    fn tick_xs_span_line_endpoints_and_center_a_lone_point() {
+        assert_eq!(tick_xs(ChartKind::Line, 3, 0.0, 100.0), vec![0.0, 50.0, 100.0]);
+        assert_eq!(tick_xs(ChartKind::Line, 1, 0.0, 100.0), vec![50.0]);
+    }
+
+    #[test]
+    fn tick_xs_are_empty_without_points() {
+        assert_eq!(tick_xs(ChartKind::Bar, 0, 0.0, 100.0), Vec::<f32>::new());
+        assert_eq!(tick_xs(ChartKind::Line, 0, 0.0, 100.0), Vec::<f32>::new());
+    }
+
+    /// Below this budget a tick label is a stub rather than a label; the
+    /// sweep is the yardstick for keeping endpoints out of that class.
+    const MIN_TICK_LABEL_WIDTH: f32 = 16.0;
+
+    fn budgets(placements: &[TickPlacement]) -> Vec<f32> {
+        placements.iter().map(|p| p.budget).collect()
+    }
+
+    #[test]
+    fn tick_placements_give_the_edge_labels_room() {
+        let placements = tick_placements(&[0.0, 50.0, 100.0], 0.0, 100.0, 8.0);
+        assert_eq!(budgets(&placements), vec![21.0, 42.0, 21.0]);
+    }
+
+    #[test]
+    fn tick_placements_keep_even_line_labels_apart() {
+        let placements = tick_placements(&[0.0, 71.0, 142.0, 213.0, 284.0], 0.0, 284.0, 8.0);
+        assert_eq!(budgets(&placements), vec![31.5, 63.0, 63.0, 63.0, 31.5]);
+    }
+
+    #[test]
+    fn tick_placements_split_a_two_point_line_between_the_ends() {
+        let placements = tick_placements(&[0.0, 284.0], 0.0, 284.0, 8.0);
+        assert_eq!(budgets(&placements), vec![138.0, 138.0]);
+    }
+
+    #[test]
+    fn tick_placements_center_inset_bar_ticks() {
+        let placements = tick_placements(&[40.0, 120.0, 200.0, 280.0, 360.0], 0.0, 400.0, 8.0);
+        assert_eq!(budgets(&placements), vec![76.0, 72.0, 72.0, 72.0, 76.0]);
+    }
+
+    #[test]
+    fn tick_placements_keep_the_bar_budget_pin() {
+        let xs = [28.75, 86.25, 143.75, 201.25, 258.75];
+        let placements = tick_placements(&xs, 0.0, 287.5, 8.0);
+        assert_eq!(budgets(&placements), vec![53.5, 49.5, 49.5, 49.5, 53.5]);
+    }
+
+    #[test]
+    fn tick_placements_use_both_sides_for_a_single_tick() {
+        let placements = tick_placements(&[50.0], 0.0, 100.0, 5.0);
+        assert_eq!(placements[0].budget, 100.0);
+    }
+
+    #[test]
+    fn tick_placements_collapse_a_pair_tighter_than_the_gap() {
+        let placements = tick_placements(&[50.0, 52.0], 50.0, 52.0, 8.0);
+        assert_eq!(budgets(&placements), vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn dense_bar_endpoints_clear_the_label_floor() {
+        // The A3-1 geometry: a 384px plot with 40 bars. The centred model
+        // turned each endpoint budget into 9.6 and skipped both labels.
+        let placements = tick_placements(
+            &drawn_tick_xs(ChartKind::Bar, 40, 0.0, 384.0),
+            0.0,
+            384.0,
+            8.0,
+        );
+        assert_eq!(placements.len(), 6);
+        for endpoint in [placements.first().unwrap(), placements.last().unwrap()] {
+            assert!(
+                endpoint.budget >= MIN_TICK_LABEL_WIDTH,
+                "a dense bar endpoint holds {:.1}px, under the floor",
+                endpoint.budget
+            );
+        }
+    }
+
+    #[test]
+    fn tick_placements_leave_the_gap_between_every_pair() {
+        let mut geometries = 0usize;
+        let mut pairs = 0usize;
+        for kind in [ChartKind::Bar, ChartKind::Line] {
+            for n in 1..=200usize {
+                for width in [64.0f32, 150.0, 284.0, 400.0, 1400.0] {
+                    geometries += 1;
+                    let placements =
+                        tick_placements(&drawn_tick_xs(kind, n, 0.0, width), 0.0, width, 8.0);
+                    for placement in &placements {
+                        assert!(
+                            placement.x - placement.left >= -0.001
+                                && placement.x + placement.right <= width + 0.001,
+                            "{kind:?} n={n} width={width}: a label leaves the plot"
+                        );
+                    }
+                    // Strict floor parity cannot hold: an endpoint's inner
+                    // share is half its neighbour's pair share, so a 150px
+                    // 8-point line has 6.7px endpoints beside 24.1px
+                    // interiors. The form that does hold is that no endpoint
+                    // is dropped to a zero budget while other labels draw.
+                    if placements.iter().any(|p| p.budget >= MIN_TICK_LABEL_WIDTH) {
+                        for endpoint in
+                            [placements.first().unwrap(), placements.last().unwrap()]
+                        {
+                            assert!(
+                                endpoint.budget > 0.0,
+                                "{kind:?} n={n} width={width}: an endpoint label collapses"
+                            );
+                        }
+                    }
+                    for pair in placements.windows(2) {
+                        if pair[0].budget <= 0.0 || pair[1].budget <= 0.0 {
+                            continue;
+                        }
+                        pairs += 1;
+                        let gap = (pair[1].x - pair[1].left) - (pair[0].x + pair[0].right);
+                        assert!(
+                            gap >= 8.0 - 0.001,
+                            "{kind:?} n={n} width={width}: adjacent labels leave {gap:.3}px, under the 8px gap"
+                        );
+                    }
+                }
+            }
+        }
+        println!("swept {geometries} geometries, asserted {pairs} adjacent pairs");
     }
 }

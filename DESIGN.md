@@ -16,9 +16,10 @@ colors:
   paper-code-well: "#f0f2f5"
   # Structural accent
   console-blue: "#3a6ea5"
-  selection-outline-dark: "#c0deff"
-  selection-outline-light: "#1e508c"
-  selection-text: "#ffffff"
+  selection-fill-dark: "#3a6ea5"
+  selection-fill-light: "#cfe2f7"
+  selection-text-dark: "#ffffff"
+  selection-text-light: "#1e508c"
   # Signal family
   commit-green-dark: "#73b473"
   commit-green-light: "#388e3c"
@@ -125,7 +126,7 @@ The incumbent implementation is a Rust/egui desktop application. The tokens here
 A cold blue-gray night panel, one structural blue, and a semaphore that speaks only when something needs attention.
 
 ### Primary
-- **Console Blue** (#3a6ea5, identical in both themes): the system's single structural accent. Selection fills, the active-cell outline (via its light/dark outline pair), pinned `★` marks, hyperlinks and keywords in dark mode (#78aadc / #1976d2), `+ New connection` and `New query` fills, the selected connection card stroke, charts (2px stroke, 2.5px dots), and the heavy-path stroke in plan views (2px). If a screen has more than a few touches of this blue, it is misusing it: the blue marks *where you are*, not what is important.
+- **Console Blue** (#3a6ea5, identical in both themes): the system's single structural accent. The dark theme's selection fill (light draws its selection as the pale tint below), pinned `★` marks, hyperlinks and keywords in dark mode (#78aadc / #1976d2), `+ New connection` and `New query` fills, the selected connection card stroke, charts (2px stroke, 2.5px dots), and the heavy-path stroke in plan views (2px). If a screen has more than a few touches of this blue, it is misusing it: the blue marks *where you are*, not what is important.
 
 ### Signals
 - **Commit Green** (#73b473 dark / #388e3c light): the fill of the `▶ Run` button, the "transaction open" note, and success text. It appears at most once per screen, on the one control that commits work.
@@ -151,8 +152,8 @@ A cold blue-gray night panel, one structural blue, and a semaphore that speaks o
 - **Code Well** (#28303c; light #f0f2f5): code background token, for inset code surfaces.
 - **Quiet Text** (#8c8c8c dark / #505050 light, egui default): normal label text. Most secondary text renders at 60% of this (egui `weak()`); plain button text runs a step brighter (#b4b4b4 dark / #3c3c3c light), and `strong` labels (Run, New connection, the active tab) render at the theme's maximum contrast: white on dark, black on light. Text is quiet so state can be loud.
 - **Dev Steel** (#949ba6 dark / #5f6973 light): the `Dev` badge, neutral indicators.
-- **Selection Outline** (#c0deff dark / #1e508c light): the 1px stroke around the active grid cell.
-- **Selection Text** (#ffffff, both themes): the label color on a selection fill. Selected grid cells switch to it, because white holds 5.3 to 1 on Console Blue where the quiet text colors fall near 1.6 to 1.
+- **Selection Fill** (#3a6ea5 dark / #cfe2f7 light): the selected-row and selected-widget fill. The dark theme selects with saturated Console Blue; the light theme selects with a pale tint, egui's own light-theme convention, so dark text can stay legible on it.
+- **Selection Text** (#ffffff dark / #1e508c light): one value per theme for every stroke and label that rides a selection. Each theme's `selection.stroke` is set from this token, so it is the selected-widget text color, the focused text-field ring, and the active-cell outline at once. White holds 5.3 to 1 on the dark fill; #1e508c holds 6.2 to 1 on the light fill and 6.4 to 1 as the ring on the light field.
 
 ## Typography
 
@@ -193,7 +194,7 @@ Tonal-first. Panels are flat and separated by tone alone: window, panel, raised,
 
 ## Shapes
 
-Lightly rounded instrument edges, nothing softer. Windows and cards take 6px corners; widgets (buttons, inputs, tabs, frames) take 4px in both themes (an explicit override of egui's 2px default); environment badges take 3px; plan cost bars take 3px. Grid cells are the deliberate square element: selection fills and active-cell outlines paint with 0 radius so data reads as a machined surface, not a set of buttons. Strokes are uniformly 1px except two sanctioned exceptions: the active-cell outline (1px selection stroke in the selection-outline color) and the heavy-path plan node (2px Console Blue). No pills, no circles except status dots and chart points, no heavy borders.
+Lightly rounded instrument edges, nothing softer. Windows and cards take 6px corners; widgets (buttons, inputs, tabs, frames) take 4px in both themes (an explicit override of egui's 2px default); environment badges take 3px; plan cost bars take 3px. Grid cells are the deliberate square element: selection fills and active-cell outlines paint with 0 radius so data reads as a machined surface, not a set of buttons. Strokes are uniformly 1px except two sanctioned exceptions: the active-cell outline (1px selection stroke in the theme's selection text color) and the heavy-path plan node (2px Console Blue). No pills, no circles except status dots and chart points, no heavy borders.
 
 **The Quiet Edge Rule.** Rounding is a whisper: 6px for surfaces, 4px for widgets, 3px for badges, 0 for data. Nothing is a pill and nothing has a double border.
 
@@ -211,7 +212,7 @@ Small and calm; the fill carries the meaning, never the shape.
 Six pixels of typography carrying the most important fact on the card. Fill is the badge color at 20% alpha, stroke is the same color at 60% (1px), text is the full color at 11px strong weight, corners 3px, padding 4px by 1px. `Dev` is Dev Steel, `Test` is Caution Amber, `Prod` is Guard Red. The badge never grows, animates, or gains a shadow; its restraint is its authority.
 
 ### Cards (Connection)
-6px radius, 8px inner margin, Raised Slate fill with a 1px neutral stroke; the selected card swaps to a 35% Console Blue fill with a full Console Blue stroke. Contains: state dot (`●` connected / `○` offline), name, environment badge, state text in `small().weak()`, then action buttons; the live schema tree nests inside with 16px indents.
+6px radius, 8px inner margin, Raised Slate fill with a 1px neutral stroke; the selected card swaps to a tinted fill (35% Console Blue in dark, the full pale selection fill in light) with a full Console Blue stroke. Contains: state dot (`●` connected / `○` offline), name, environment badge, state text in `small().weak()`, then action buttons; the live schema tree nests inside with 16px indents.
 
 ### Inputs / Fields
 Recessed Ink Well fill on the 4px widget radius with a 1px stroke (egui's window stroke) and 13px text. Focus is egui's automatic treatment; validation errors render as Fault Red text beside or above the field, never as recolored field fills.
@@ -220,7 +221,7 @@ Recessed Ink Well fill on the 4px widget radius with a 1px stroke (egui's window
 The sidebar is a stack of uppercase 11px `weak()` section labels (`CONNECTIONS`, `HISTORY`, `SAVED`, `BOOKMARKS`) over collapsible groups. Tree rows step 16px per depth; folders are drag targets and their headers read "drop here for root" in weak text while a drag is live. Tabs are selectable labels: the active tab is strong weight, inactive tabs weak, an open transaction adds a small strong `tx` marker beside the title, and `×` closes.
 
 ### Signature components
-- **Data cell (grid):** square; monospace 12.5px; selection paints a full Console Blue fill and switches the label to Selection Text (white), with a 1px Selection Outline on the active cell; staged edits overlay the translucent Staging Amber tint; staged deletes render strikethrough and weak; NULL is the literal word `NULL`. Cells are the only place translucency and strikethrough appear.
+- **Data cell (grid):** square; monospace 12.5px; selection paints the theme's selection fill and switches the label to Selection Text (white in dark, #1e508c in light), with a 1px Selection Text stroke on the active cell; staged edits overlay the translucent Staging Amber tint; staged deletes render strikethrough and weak; NULL is the literal word `NULL`. Cells are the only place translucency and strikethrough appear.
 - **Editor well:** the SQL surface recesses into the Ink Well inside a 4px-radius frame with 6px margin; syntax tints from the Syntax palette; the cursor's line is the only line-level highlight. The completion popup and find bar are the only overlays inside it.
 - **Heavy-path plan node:** plan trees render as bordered group frames; nodes on the heavy path take a 2px Console Blue stroke, and their operation name turns strong. Each node's cost share draws as a thin bar: Raised Slate track, Console Blue fill when heavy, weak text color otherwise.
 - **Command palette:** the floating layer done right: 460px wide, centered 60px from the top, recessed filter input, then a list of rows where the selection is egui's standard selectable highlight. No accent color is spent here beyond the platform's own selection fill.
@@ -231,7 +232,7 @@ The sidebar is a stack of uppercase 11px `weak()` section labels (`CONNECTIONS`,
 
 ### Do:
 - **Do** keep Commit Green to one control per screen: the action that commits work.
-- **Do** switch selected-cell text to Selection Text (#ffffff); quiet gray text never sits on the Console Blue fill.
+- **Do** switch selected-cell text to the theme's Selection Text (#ffffff dark, #1e508c light); quiet gray text never sits on a selection fill.
 - **Do** paint staged-but-unapplied changes with the Staging Amber tint (rgba(227, 179, 65, 0.25)); translucency is reserved for this meaning.
 - **Do** render every value in Hack monospace and every label in Ubuntu-Light, at the fixed sizes 11 / 13 / 16 (and 12.5 mono).
 - **Do** carry depth with the four tonal steps and 1px strokes; reserve shadow for dialogs, menus, the palette, and tooltips.
@@ -247,5 +248,5 @@ The sidebar is a stack of uppercase 11px `weak()` section labels (`CONNECTIONS`,
 - **Don't** fill destructive buttons with red or style errors into field backgrounds; Fault Red is text-only, and it is never used for a standing identity (that is Guard Red's job).
 - **Don't** add a second font family, a display face, or fluid type; the embedded Ubuntu-Light / Hack pairing is the identity.
 - **Don't** uppercase anything except the sidebar section labels.
-- **Don't** spend Console Blue as decoration: it marks location (selection, active cell, selected card) and structure (create actions, heavy path), and it should read as rare on any given screen.
+- **Don't** spend Console Blue as decoration: it marks location (the active cell, the selected card's stroke, the dark theme's selection fill) and structure (create actions, heavy path), and it should read as rare on any given screen.
 - **Don't** round grid cells or tint them for anything except staged state.

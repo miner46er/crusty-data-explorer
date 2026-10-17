@@ -143,6 +143,12 @@ pub struct Palette {
     pub success: egui::Color32,
     /// Selected-cell text; each theme's selection stroke equals this color.
     pub selection_text: egui::Color32,
+    /// The fill behind selected cells and selected widgets.
+    pub selection_fill: egui::Color32,
+    /// A selected connection card: the dark fill pulled down, the light
+    /// fill as-is, which is lighter than the faint row but darker than the
+    /// window.
+    pub selected_card_fill: egui::Color32,
     pub edit_tint: egui::Color32,
     pub keyword: egui::Color32,
     pub string: egui::Color32,
@@ -155,10 +161,13 @@ pub struct Palette {
 
 impl Palette {
     pub fn dark() -> Self {
+        let selection_fill = egui::Color32::from_rgb(58, 110, 165);
         Self {
             accent: egui::Color32::from_rgb(58, 110, 165),
             success: egui::Color32::from_rgb(115, 180, 115),
             selection_text: egui::Color32::from_rgb(255, 255, 255),
+            selection_fill,
+            selected_card_fill: selection_fill.gamma_multiply(0.35),
             edit_tint: egui::Color32::from_rgba_unmultiplied(227, 179, 65, 64),
             keyword: egui::Color32::from_rgb(120, 170, 220),
             string: egui::Color32::from_rgb(140, 200, 150),
@@ -170,10 +179,13 @@ impl Palette {
         }
     }
     pub fn light() -> Self {
+        let selection_fill = egui::Color32::from_rgb(207, 226, 247);
         Self {
             accent: egui::Color32::from_rgb(58, 110, 165),
             success: egui::Color32::from_rgb(56, 142, 60),
             selection_text: egui::Color32::from_rgb(30, 80, 140),
+            selection_fill,
+            selected_card_fill: selection_fill,
             edit_tint: egui::Color32::from_rgba_unmultiplied(227, 179, 65, 64),
             keyword: egui::Color32::from_rgb(25, 118, 210),
             string: egui::Color32::from_rgb(46, 125, 50),
@@ -230,8 +242,8 @@ fn dark_visuals() -> egui::Visuals {
     visuals.faint_bg_color = egui::Color32::from_rgb(42, 50, 63);
     visuals.extreme_bg_color = egui::Color32::from_rgb(18, 23, 30);
     visuals.code_bg_color = egui::Color32::from_rgb(40, 48, 60);
-    visuals.selection.bg_fill = egui::Color32::from_rgb(58, 110, 165);
-    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 255, 255));
+    visuals.selection.bg_fill = Palette::dark().selection_fill;
+    visuals.selection.stroke = egui::Stroke::new(1.0, Palette::dark().selection_text);
     visuals.hyperlink_color = egui::Color32::from_rgb(120, 170, 220);
     visuals.window_corner_radius = egui::CornerRadius::same(6);
     visuals.menu_corner_radius = egui::CornerRadius::same(6);
@@ -257,8 +269,8 @@ fn light_visuals() -> egui::Visuals {
     visuals.faint_bg_color = egui::Color32::from_rgb(228, 231, 236);
     visuals.extreme_bg_color = egui::Color32::from_rgb(225, 228, 233);
     visuals.code_bg_color = egui::Color32::from_rgb(240, 242, 245);
-    visuals.selection.bg_fill = egui::Color32::from_rgb(207, 226, 247);
-    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(30, 80, 140));
+    visuals.selection.bg_fill = Palette::light().selection_fill;
+    visuals.selection.stroke = egui::Stroke::new(1.0, Palette::light().selection_text);
     visuals.hyperlink_color = egui::Color32::from_rgb(25, 118, 210);
     visuals.window_corner_radius = egui::CornerRadius::same(6);
     visuals.menu_corner_radius = egui::CornerRadius::same(6);
@@ -328,16 +340,45 @@ mod tests {
     }
 
     #[test]
+    fn palette_apply_both_ways_paints_each_bucket() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx, Theme::Dark);
+        assert_eq!(
+            ctx.style_of(egui::Theme::Dark).visuals.window_fill,
+            egui::Color32::from_rgb(24, 29, 37)
+        );
+        assert_eq!(
+            ctx.style_of(egui::Theme::Light).visuals.window_fill,
+            egui::Color32::from_rgb(242, 244, 247)
+        );
+        apply_theme(&ctx, Theme::Light);
+        assert_eq!(
+            ctx.style_of(egui::Theme::Dark).visuals.window_fill,
+            egui::Color32::from_rgb(24, 29, 37)
+        );
+        assert_eq!(
+            ctx.style_of(egui::Theme::Light).visuals.window_fill,
+            egui::Color32::from_rgb(242, 244, 247)
+        );
+    }
+
+    #[test]
     fn selection_stroke_matches_palette_text_with_contrast() {
         let ctx = egui::Context::default();
         apply_theme(&ctx, Theme::Dark);
         for theme in [egui::Theme::Dark, egui::Theme::Light] {
             let visuals = &ctx.style_of(theme).visuals;
-            let text = Palette::of(theme).selection_text;
+            let palette = Palette::of(theme);
+            let text = palette.selection_text;
             assert_eq!(visuals.selection.stroke.color, text);
+            assert_eq!(visuals.selection.bg_fill, palette.selection_fill);
             assert!(
                 contrast_ratio(text, visuals.selection.bg_fill) >= 4.5,
                 "{theme:?} selection text holds 4.5 to 1 on its fill"
+            );
+            assert!(
+                contrast_ratio(visuals.selection.stroke.color, visuals.text_edit_bg_color()) >= 3.0,
+                "{theme:?} focused ring holds 3.0 to 1 on the field it outlines"
             );
         }
     }
@@ -349,11 +390,15 @@ mod tests {
         assert_eq!(dark.success, egui::Color32::from_rgb(115, 180, 115));
         assert_eq!(dark.keyword, egui::Color32::from_rgb(120, 170, 220));
         assert_eq!(dark.selection_text, egui::Color32::from_rgb(255, 255, 255));
+        assert_eq!(dark.selection_fill, egui::Color32::from_rgb(58, 110, 165));
+        assert_eq!(dark.selected_card_fill, dark.selection_fill.gamma_multiply(0.35));
         let light = Palette::of(egui::Theme::Light);
         assert_eq!(light.accent, egui::Color32::from_rgb(58, 110, 165));
         assert_eq!(light.success, egui::Color32::from_rgb(56, 142, 60));
         assert_eq!(light.keyword, egui::Color32::from_rgb(25, 118, 210));
         assert_eq!(light.selection_text, egui::Color32::from_rgb(30, 80, 140));
+        assert_eq!(light.selection_fill, egui::Color32::from_rgb(207, 226, 247));
+        assert_eq!(light.selected_card_fill, egui::Color32::from_rgb(207, 226, 247));
         assert_ne!(dark.success, light.success);
         assert_ne!(dark.keyword, light.keyword);
     }

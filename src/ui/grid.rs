@@ -1539,9 +1539,9 @@ fn row_detail(tab: &Tab, selection: &Selection, ui: &mut egui::Ui) {
 }
 
 /// The text color a data cell's label carries: a selected cell switches to
-/// the selection text color so its value stays legible on the Console Blue
-/// fill, where the quiet text colors fall near 1.6 to 1. Deleted cells keep
-/// their weak treatment either way; the strikethrough carries the delete cue.
+/// its theme's selection text so the value stays legible on either selection
+/// fill. A deleted cell always carries the strikethrough, and the weak
+/// treatment only when it is unselected, since the selection color wins.
 fn cell_label_color(selected: bool, palette: &Palette) -> Option<egui::Color32> {
     selected.then_some(palette.selection_text)
 }
@@ -3467,11 +3467,8 @@ mod tests {
 
     #[test]
     fn selected_cell_text_switches_to_the_selection_color() {
-        for (palette, expected) in [
-            (Palette::dark(), egui::Color32::from_rgb(255, 255, 255)),
-            (Palette::light(), egui::Color32::from_rgb(30, 80, 140)),
-        ] {
-            assert_eq!(cell_label_color(true, &palette), Some(expected));
+        for palette in [Palette::dark(), Palette::light()] {
+            assert_eq!(cell_label_color(true, &palette), Some(palette.selection_text));
             assert_eq!(cell_label_color(false, &palette), None);
         }
     }
