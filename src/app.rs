@@ -1735,9 +1735,6 @@ pub struct AppState {
     table_editor: Option<TableEditorState>,
     /// The table DDL batch awaiting its prod confirmation, if any.
     pending_table_confirm: Option<PendingTableDdl>,
-    /// Runs whose statements classified as schema-changing at send, kept
-    /// until their landing so a successful one reloads the navigator.
-    schema_change_runs: HashSet<RunId>,
     history: Vec<HistoryEntry>,
     /// True narrows the execution log to the current connection. False shows
     /// every connection. Never persisted, so a relaunch starts at all.
@@ -1795,7 +1792,6 @@ impl AppState {
             pending_terminate: None,
             table_editor: None,
             pending_table_confirm: None,
-            schema_change_runs: HashSet::new(),
             history: load_history(),
             history_current_only: false,
             saved,
@@ -2287,12 +2283,6 @@ impl AppState {
                 match handle.send(DbCommand::QueryBatch { run, statements: statements.clone() })
                 {
                     Ok(()) => {
-                        // Classify before the statements move into the run
-                        // outcome, so the landing knows whether its success
-                        // should reload the navigator.
-                        if statements.iter().any(|statement| sql_changes_schema(statement)) {
-                            self.schema_change_runs.insert(run);
-                        }
                         if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
                             match purpose {
                                 BatchPurpose::Run => {}
@@ -4772,9 +4762,6 @@ impl AppState {
     /// displayed rows, so it clears the staged changes; a failure leaves them
     /// staged for a retry.
     fn finish_run(&mut self, run: RunId, outcome: RunOutcome) {
-        // Consume the send-time classification first: a dropped or failed
-        // run must not leave its flag behind.
-        let schema_change = self.schema_change_runs.remove(&run);
         let matched = match self
             .tabs
             .iter_mut()
@@ -4786,6 +4773,14 @@ impl AppState {
                 let Some(conn) = t.conn else {
                     t.outcome = outcome;
                     return;
+                };
+                // The run's own statements decide whether a successful
+                // landing should reload the navigator.
+                let schema_change = match &t.outcome {
+                    RunOutcome::Running { statements, .. } => {
+                        statements.iter().any(|statement| sql_changes_schema(statement))
+                    }
+                    _ => false,
                 };
                 let ok = matches!(&outcome, RunOutcome::Ok { .. });
                 // An import landing behaves like an apply that adds no
@@ -4807,8 +4802,6 @@ impl AppState {
                 if table_ddl {
                     t.pending_table = None;
                 }
-                // One reload covers the DDL editor's post-apply refresh and
-                // a run whose statements classified as schema-changing.
                 let schema_refresh = ok && (table_ddl || schema_change);
                 if ok {
                     t.edits.clear();

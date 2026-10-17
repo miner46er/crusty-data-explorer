@@ -288,8 +288,7 @@ pub fn split_statements(sql: &str) -> Vec<String> {
         .collect()
 }
 
-/// Statement heads that may add, drop, or rename schema objects, so a run
-/// that begins with one is worth a navigator reload when it lands Ok.
+/// Statement heads that may add, drop, or rename schema objects.
 const SCHEMA_KEYWORDS: [&str; 6] =
     ["CREATE", "ALTER", "DROP", "RENAME", "ATTACH", "DETACH"];
 
