@@ -220,15 +220,25 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
             }
             ui.add_space(6.0);
             let mut shown = autocommit;
-            let toggle = ui
-                .add_enabled_ui(transaction_ready && !sqlite, |ui| {
+            let toggle = if transaction_ready && !sqlite {
+                ui.add_enabled_ui(true, |ui| {
                     ui.toggle_value(&mut shown, "Autocommit")
                 })
                 .inner
                 .on_hover_text(
                     "Off: every statement runs inside a transaction on one tagged \
                      connection until Commit or Rollback",
-                );
+                )
+            } else {
+                autocommit_chip(
+                    ui,
+                    if sqlite {
+                        "SQLite handles autocommit itself"
+                    } else {
+                        "Connect to change autocommit"
+                    },
+                )
+            };
             if toggle.clicked() {
                 autocommit_clicked = Some(!autocommit);
             }
@@ -297,6 +307,20 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
         state.start_explain(tab_id, &sql, cursor, selection);
     }
     find_opened
+}
+
+/// An Autocommit chip for the states where the toggle cannot act: filled and
+/// colored as unavailable, sensed as hover only so it never lights up or
+/// moves, with the reason on the tooltip.
+fn autocommit_chip(ui: &mut egui::Ui, reason: &str) -> egui::Response {
+    let palette = Palette::of(ui.ctx().theme());
+    ui.add(
+        egui::Button::new(egui::RichText::new("Autocommit").color(palette.disabled_text))
+            .fill(palette.disabled_fill)
+            .stroke(egui::Stroke::NONE)
+            .sense(egui::Sense::hover()),
+    )
+    .on_hover_text(reason)
 }
 
 pub(crate) fn tab_title(sql: String) -> String {
