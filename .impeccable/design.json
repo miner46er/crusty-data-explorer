@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-17T18:03:34Z",
+  "generatedAt": "2026-10-17T19:18:37Z",
   "title": "Design System: crusty-data-explorer",
   "extensions": {
     "colorMeta": {
@@ -811,7 +811,7 @@
       "Don't fill destructive buttons with red or style errors into field backgrounds; Fault Red is text-only, and it is never used for a standing identity (that is Guard Red's job).",
       "Don't add a second font family, a display face, or fluid type; the embedded Ubuntu-Light / Hack pairing is the identity.",
       "Don't uppercase anything except the sidebar section labels.",
-      "Don't use fullwidth or halfwidth forms (U+FF01 to U+FF60) in UI text; the embedded fonts lack them and they render as hollow boxes. Use the ASCII forms; tests/glyph_set.rs guards this.",
+      "Don't use fullwidth or halfwidth forms (U+FF01 to U+FFEF) in UI text; the embedded fonts lack them and they render as hollow boxes. Use the ASCII forms; tests/glyph_set.rs guards this.",
       "Don't spend Console Blue as decoration: it marks location (the active cell, the selected card's stroke, the dark theme's selection fill) and structure (create actions, heavy path), and it should read as rare on any given screen.",
       "Don't round grid cells or tint them for anything except staged state."
     ]

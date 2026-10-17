@@ -158,7 +158,7 @@ A cold blue-gray night panel, one structural blue, and a semaphore that speaks o
 - **Dev Steel** (#949ba6 dark / #5f6973 light): the `Dev` badge, neutral indicators.
 - **Selection Fill** (#3a6ea5 dark / #cfe2f7 light): the selected-row and selected-widget fill. The dark theme selects with saturated Console Blue; the light theme selects with a pale tint, egui's own light-theme convention, so dark text can stay legible on it.
 - **Selection Text** (#ffffff dark / #1e508c light): one value per theme for every stroke and label that rides a selection. Each theme's `selection.stroke` is set from this token, so it is the selected-widget text color, the focused text-field ring, and the active-cell outline at once. White holds 5.3 to 1 on the dark fill; #1e508c holds 6.2 to 1 on the light fill and 6.4 to 1 as the ring on the light field.
-- **Disabled** (fill #232933 dark / #eaedf1 light; text #949ba6 dark / #5f6973 light): an unavailable control reads as steel text on a quiet fill and never wears Console Blue. The pairs hold 5.2 to 1 and 4.8 to 1.
+- **Disabled** (fill #232933 dark / #eaedf1 light; text #949ba6 dark / #5f6973 light; 1px neutral edge): a control that cannot act but stays on screen reads as steel text on a quiet fill inside a neutral hairline, never Console Blue. The pairs hold 5.2 to 1 and 4.8 to 1, and other disabled widgets keep egui's default look.
 
 ## Typography
 
@@ -253,6 +253,6 @@ The sidebar is a stack of uppercase 11px `weak()` section labels (`CONNECTIONS`,
 - **Don't** fill destructive buttons with red or style errors into field backgrounds; Fault Red is text-only, and it is never used for a standing identity (that is Guard Red's job).
 - **Don't** add a second font family, a display face, or fluid type; the embedded Ubuntu-Light / Hack pairing is the identity.
 - **Don't** uppercase anything except the sidebar section labels.
-- **Don't** use fullwidth or halfwidth forms (U+FF01 to U+FF60) in UI text; the embedded fonts lack them and they render as hollow boxes. Use the ASCII forms; `tests/glyph_set.rs` guards this.
+- **Don't** use fullwidth or halfwidth forms (U+FF01 to U+FFEF) in UI text; the embedded fonts lack them and they render as hollow boxes. Use the ASCII forms; `tests/glyph_set.rs` guards this.
 - **Don't** spend Console Blue as decoration: it marks location (the active cell, the selected card's stroke, the dark theme's selection fill) and structure (create actions, heavy path), and it should read as rare on any given screen.
 - **Don't** round grid cells or tint them for anything except staged state.
