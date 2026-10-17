@@ -773,10 +773,13 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                 let mut actions: Vec<SidebarAction> = Vec::new();
+                let first_run = state.connections().is_empty();
                 let conn_header = ui
                     .horizontal(|ui| {
                         ui.label(egui::RichText::new("CONNECTIONS").small().weak());
-                        if ui.small_button("+ Folder").on_hover_text("New folder").clicked() {
+                        if !first_run
+                            && ui.small_button("+ Folder").on_hover_text("New folder").clicked()
+                        {
                             arm_folder_input(ui.ctx(), "conn", "");
                         }
                         if egui::DragAndDrop::has_payload_of_type::<ConnDrag>(ui.ctx()) {
@@ -796,23 +799,25 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                     folder_creation_editor(ui, "conn", "");
                 }
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Filter tables:").small().weak());
-                    let mut filter = state.navigator_filter().to_owned();
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut filter)
-                                .hint_text("narrow tables by name")
-                                .desired_width(120.0),
-                        )
-                        .changed()
-                    {
-                        state.set_navigator_filter(filter);
-                    }
-                });
-                ui.add_space(4.0);
+                if !first_run {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Filter tables:").small().weak());
+                        let mut filter = state.navigator_filter().to_owned();
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut filter)
+                                    .hint_text("narrow tables by name")
+                                    .desired_width(120.0),
+                            )
+                            .changed()
+                        {
+                            state.set_navigator_filter(filter);
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
 
-                if state.connections().is_empty() {
+                if first_run {
                     ui.label("No connections yet.");
                     ui.small("Add one below to start querying.");
                     ui.add_space(8.0);
@@ -912,200 +917,206 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                     ui.add_space(4.0);
                 }
 
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("HISTORY").small().weak());
-                    let scope_label =
-                        if state.history_current_only() { "Current" } else { "All" };
-                    if ui
-                        .small_button(format!("Scope: {scope_label}"))
-                        .on_hover_text(
-                            "Toggle the log between the current connection and all connections",
-                        )
-                        .clicked()
-                    {
-                        state.toggle_history_scope();
-                    }
-                    if ui.small_button("Clear").clicked() {
-                        actions.push(SidebarAction::ClearHistory);
-                    }
-                });
-                ui.add_space(4.0);
-                let history_conn_names: HashMap<ConnectionId, String> = state
-                    .connections()
-                    .iter()
-                    .map(|c| (c.id, c.name.clone()))
-                    .collect();
-                let scope_current_only = state.history_current_only();
-                let scope_conn = state.history_scope_connection();
-                let show_empty = state.history().is_empty();
-                if show_empty {
-                    ui.label(egui::RichText::new("No runs yet.").small().weak());
-                } else if scope_current_only && scope_conn.is_none() {
-                    ui.label(
-                        egui::RichText::new("No current connection.")
-                            .small()
-                            .weak(),
-                    );
-                } else {
-                    let scoped: Vec<(ConnectionId, String, bool, Option<u64>, std::time::Duration)> =
-                        match (scope_current_only, scope_conn) {
-                            (true, Some(conn)) => state
-                                .history_for(conn)
-                                .into_iter()
-                                .take(crate::app::HISTORY_SHOWN)
-                                .map(|entry| {
-                                    (
-                                        entry.conn,
-                                        entry.sql.clone(),
-                                        entry.succeeded,
-                                        entry.rows,
-                                        entry.took,
-                                    )
-                                })
-                                .collect(),
-                            (true, None) => Vec::new(),
-                            (false, _) => state
-                                .history()
-                                .iter()
-                                .take(crate::app::HISTORY_SHOWN)
-                                .map(|entry| {
-                                    (
-                                        entry.conn,
-                                        entry.sql.clone(),
-                                        entry.succeeded,
-                                        entry.rows,
-                                        entry.took,
-                                    )
-                                })
-                                .collect(),
-                        };
-                    if scoped.is_empty() {
+                if !first_run {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("HISTORY").small().weak());
+                        let scope_label =
+                            if state.history_current_only() { "Current" } else { "All" };
+                        if ui
+                            .small_button(format!("Scope: {scope_label}"))
+                            .on_hover_text(
+                                "Toggle the log between the current connection and all connections",
+                            )
+                            .clicked()
+                        {
+                            state.toggle_history_scope();
+                        }
+                        if ui.small_button("Clear").clicked() {
+                            actions.push(SidebarAction::ClearHistory);
+                        }
+                    });
+                    ui.add_space(4.0);
+                    let history_conn_names: HashMap<ConnectionId, String> = state
+                        .connections()
+                        .iter()
+                        .map(|c| (c.id, c.name.clone()))
+                        .collect();
+                    let scope_current_only = state.history_current_only();
+                    let scope_conn = state.history_scope_connection();
+                    let show_empty = state.history().is_empty();
+                    if show_empty {
+                        ui.label(egui::RichText::new("No runs yet.").small().weak());
+                    } else if scope_current_only && scope_conn.is_none() {
                         ui.label(
-                            egui::RichText::new("No runs for this connection.")
+                            egui::RichText::new("No current connection.")
                                 .small()
                                 .weak(),
                         );
                     } else {
-                        for (conn, sql, succeeded, rows, took) in scoped {
-                            let dot =
-                                if succeeded { palette.success } else { egui::Color32::RED };
-                            let entry = crate::app::HistoryEntry {
-                                conn,
-                                sql: sql.clone(),
-                                succeeded,
-                                rows,
-                                took,
-                                at: 0,
+                        let scoped: Vec<(ConnectionId, String, bool, Option<u64>, std::time::Duration)> =
+                            match (scope_current_only, scope_conn) {
+                                (true, Some(conn)) => state
+                                    .history_for(conn)
+                                    .into_iter()
+                                    .take(crate::app::HISTORY_SHOWN)
+                                    .map(|entry| {
+                                        (
+                                            entry.conn,
+                                            entry.sql.clone(),
+                                            entry.succeeded,
+                                            entry.rows,
+                                            entry.took,
+                                        )
+                                    })
+                                    .collect(),
+                                (true, None) => Vec::new(),
+                                (false, _) => state
+                                    .history()
+                                    .iter()
+                                    .take(crate::app::HISTORY_SHOWN)
+                                    .map(|entry| {
+                                        (
+                                            entry.conn,
+                                            entry.sql.clone(),
+                                            entry.succeeded,
+                                            entry.rows,
+                                            entry.took,
+                                        )
+                                    })
+                                    .collect(),
                             };
-                            let stats = crate::app::history_stats(&entry);
-                            let conn_name = history_conn_names
-                                .get(&conn)
-                                .map(String::as_str)
-                                .unwrap_or("deleted");
-                            let live = state.is_connection_live(conn);
-                            ui.horizontal(|ui| {
-                                ui.colored_label(dot, "●");
-                                if ui.small_button(history_title(&sql)).clicked() {
-                                    actions.push(SidebarAction::OpenHistory(
-                                        conn,
-                                        sql.clone(),
-                                    ));
-                                }
-                                if live && ui.small_button("Rerun").clicked() {
-                                    actions.push(SidebarAction::OpenHistory(conn, sql.clone()));
-                                }
-                            });
+                        if scoped.is_empty() {
                             ui.label(
-                                egui::RichText::new(format!("{stats} · {conn_name}"))
+                                egui::RichText::new("No runs for this connection.")
                                     .small()
                                     .weak(),
                             );
-                        }
-                    }
-                }
-                ui.add_space(8.0);
-
-                let saved_header = ui
-                    .horizontal(|ui| {
-                        ui.label(egui::RichText::new("SAVED").small().weak());
-                        if ui.small_button("+ Folder").on_hover_text("New folder").clicked() {
-                            arm_folder_input(ui.ctx(), "saved", "");
-                        }
-                        if egui::DragAndDrop::has_payload_of_type::<SavedDrag>(ui.ctx()) {
-                            ui.label(
-                                egui::RichText::new("drop here for root").small().weak(),
-                            );
-                        }
-                    })
-                    .response;
-                if saved_header.dnd_hover_payload::<SavedDrag>().is_some() {
-                    paint_drop_highlight(ui, &palette, saved_header.rect);
-                }
-                if let Some(payload) = saved_header.dnd_release_payload::<SavedDrag>() {
-                    actions.push(SidebarAction::MoveSaved(payload.id, None));
-                }
-                if folder_input_armed(ui.ctx(), "saved", "") {
-                    folder_creation_editor(ui, "saved", "");
-                }
-                ui.add_space(4.0);
-                let modal_open = sidebar_modal_open(state);
-                let conn_names: HashMap<ConnectionId, String> = state
-                    .connections()
-                    .iter()
-                    .map(|c| (c.id, c.name.clone()))
-                    .collect();
-                let saved_versions: HashMap<u64, Vec<SavedQueryVersion>> = state
-                    .saved_queries()
-                    .iter()
-                    .map(|q| (q.id, state.saved_versions(q.id)))
-                    .collect();
-                let saved_plan: Vec<SavedPlan<'_>> = {
-                    let mut tree = saved_folder_tree(state.saved_queries());
-                    let mut extra: Vec<String> =
-                        created_folders(ui.ctx(), "saved").into_iter().collect();
-                    extra.sort();
-                    for path in &extra {
-                        tree.ensure_path(path);
-                    }
-                    let mut plan = Vec::new();
-                    for query in &tree.entries {
-                        plan.push(SavedPlan::Entry { query, depth: 0 });
-                    }
-                    flatten_saved(ui.ctx(), &tree, 0, &mut plan);
-                    plan
-                };
-                if saved_plan.is_empty() {
-                    ui.label(egui::RichText::new("No saved queries.").small().weak());
-                } else {
-                    for item in &saved_plan {
-                        match item {
-                            SavedPlan::Folder { path, name, depth, open, count } => {
-                                saved_folder_header(
-                                    ui, &palette, path, name, *depth, *open, *count,
-                                    &mut actions,
+                        } else {
+                            for (conn, sql, succeeded, rows, took) in scoped {
+                                let dot =
+                                    if succeeded { palette.success } else { egui::Color32::RED };
+                                let entry = crate::app::HistoryEntry {
+                                    conn,
+                                    sql: sql.clone(),
+                                    succeeded,
+                                    rows,
+                                    took,
+                                    at: 0,
+                                };
+                                let stats = crate::app::history_stats(&entry);
+                                let conn_name = history_conn_names
+                                    .get(&conn)
+                                    .map(String::as_str)
+                                    .unwrap_or("deleted");
+                                let live = state.is_connection_live(conn);
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(dot, "●");
+                                    if ui.small_button(history_title(&sql)).clicked() {
+                                        actions.push(SidebarAction::OpenHistory(
+                                            conn,
+                                            sql.clone(),
+                                        ));
+                                    }
+                                    if live && ui.small_button("Rerun").clicked() {
+                                        actions.push(SidebarAction::OpenHistory(conn, sql.clone()));
+                                    }
+                                });
+                                ui.label(
+                                    egui::RichText::new(format!("{stats} · {conn_name}"))
+                                        .small()
+                                        .weak(),
                                 );
                             }
-                            SavedPlan::Entry { query, depth } => {
-                                indented(ui, *depth, |ui| {
-                                    let empty: Vec<SavedQueryVersion> = Vec::new();
-                                    let versions = saved_versions
-                                        .get(&query.id)
-                                        .unwrap_or(&empty);
-                                    saved_row(
-                                        ui,
-                                        &palette,
-                                        query,
-                                        versions,
-                                        modal_open,
-                                        &conn_names,
+                        }
+                    }
+                    ui.add_space(8.0);
+                }
+
+                // The saved rows and the action loop both gate on a modal, so
+                // the flag lives outside the first-run gate.
+                let modal_open = sidebar_modal_open(state);
+                if !first_run {
+                    let saved_header = ui
+                        .horizontal(|ui| {
+                            ui.label(egui::RichText::new("SAVED").small().weak());
+                            if ui.small_button("+ Folder").on_hover_text("New folder").clicked() {
+                                arm_folder_input(ui.ctx(), "saved", "");
+                            }
+                            if egui::DragAndDrop::has_payload_of_type::<SavedDrag>(ui.ctx()) {
+                                ui.label(
+                                    egui::RichText::new("drop here for root").small().weak(),
+                                );
+                            }
+                        })
+                        .response;
+                    if saved_header.dnd_hover_payload::<SavedDrag>().is_some() {
+                        paint_drop_highlight(ui, &palette, saved_header.rect);
+                    }
+                    if let Some(payload) = saved_header.dnd_release_payload::<SavedDrag>() {
+                        actions.push(SidebarAction::MoveSaved(payload.id, None));
+                    }
+                    if folder_input_armed(ui.ctx(), "saved", "") {
+                        folder_creation_editor(ui, "saved", "");
+                    }
+                    ui.add_space(4.0);
+                    let conn_names: HashMap<ConnectionId, String> = state
+                        .connections()
+                        .iter()
+                        .map(|c| (c.id, c.name.clone()))
+                        .collect();
+                    let saved_versions: HashMap<u64, Vec<SavedQueryVersion>> = state
+                        .saved_queries()
+                        .iter()
+                        .map(|q| (q.id, state.saved_versions(q.id)))
+                        .collect();
+                    let saved_plan: Vec<SavedPlan<'_>> = {
+                        let mut tree = saved_folder_tree(state.saved_queries());
+                        let mut extra: Vec<String> =
+                            created_folders(ui.ctx(), "saved").into_iter().collect();
+                        extra.sort();
+                        for path in &extra {
+                            tree.ensure_path(path);
+                        }
+                        let mut plan = Vec::new();
+                        for query in &tree.entries {
+                            plan.push(SavedPlan::Entry { query, depth: 0 });
+                        }
+                        flatten_saved(ui.ctx(), &tree, 0, &mut plan);
+                        plan
+                    };
+                    if saved_plan.is_empty() {
+                        ui.label(egui::RichText::new("No saved queries.").small().weak());
+                    } else {
+                        for item in &saved_plan {
+                            match item {
+                                SavedPlan::Folder { path, name, depth, open, count } => {
+                                    saved_folder_header(
+                                        ui, &palette, path, name, *depth, *open, *count,
                                         &mut actions,
                                     );
-                                });
+                                }
+                                SavedPlan::Entry { query, depth } => {
+                                    indented(ui, *depth, |ui| {
+                                        let empty: Vec<SavedQueryVersion> = Vec::new();
+                                        let versions = saved_versions
+                                            .get(&query.id)
+                                            .unwrap_or(&empty);
+                                        saved_row(
+                                            ui,
+                                            &palette,
+                                            query,
+                                            versions,
+                                            modal_open,
+                                            &conn_names,
+                                            &mut actions,
+                                        );
+                                    });
+                                }
                             }
                         }
                     }
+                    ui.add_space(8.0);
                 }
-                ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Import SQL:").small().weak());
@@ -1140,43 +1151,45 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                 }
                 ui.add_space(8.0);
 
-                ui.label(egui::RichText::new("BOOKMARKS").small().weak());
-                ui.add_space(4.0);
-                if state.bookmarks().is_empty() {
-                    ui.label(egui::RichText::new("No bookmarks.").small().weak());
-                } else {
-                    let conn_names: HashMap<ConnectionId, String> = state
-                        .connections()
-                        .iter()
-                        .map(|c| (c.id, c.name.clone()))
-                        .collect();
-                    for bookmark in state.bookmarks().to_vec() {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("★").small().color(palette.accent));
-                            let title = format!("{}.{}", bookmark.schema, bookmark.table);
-                            if ui.small_button(&title).clicked() {
-                                actions.push(SidebarAction::PreviewTable(
-                                    bookmark.conn,
-                                    bookmark.schema.clone(),
-                                    bookmark.table.clone(),
-                                ));
-                            }
-                            let conn_name = conn_names
-                                .get(&bookmark.conn)
-                                .map(String::as_str)
-                                .unwrap_or("deleted");
-                            ui.label(egui::RichText::new(conn_name).small().weak());
-                            if ui.small_button("Remove").clicked() {
-                                actions.push(SidebarAction::ToggleBookmark(
-                                    bookmark.conn,
-                                    bookmark.schema.clone(),
-                                    bookmark.table.clone(),
-                                ));
-                            }
-                        });
+                if !first_run {
+                    ui.label(egui::RichText::new("BOOKMARKS").small().weak());
+                    ui.add_space(4.0);
+                    if state.bookmarks().is_empty() {
+                        ui.label(egui::RichText::new("No bookmarks.").small().weak());
+                    } else {
+                        let conn_names: HashMap<ConnectionId, String> = state
+                            .connections()
+                            .iter()
+                            .map(|c| (c.id, c.name.clone()))
+                            .collect();
+                        for bookmark in state.bookmarks().to_vec() {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("★").small().color(palette.accent));
+                                let title = format!("{}.{}", bookmark.schema, bookmark.table);
+                                if ui.small_button(&title).clicked() {
+                                    actions.push(SidebarAction::PreviewTable(
+                                        bookmark.conn,
+                                        bookmark.schema.clone(),
+                                        bookmark.table.clone(),
+                                    ));
+                                }
+                                let conn_name = conn_names
+                                    .get(&bookmark.conn)
+                                    .map(String::as_str)
+                                    .unwrap_or("deleted");
+                                ui.label(egui::RichText::new(conn_name).small().weak());
+                                if ui.small_button("Remove").clicked() {
+                                    actions.push(SidebarAction::ToggleBookmark(
+                                        bookmark.conn,
+                                        bookmark.schema.clone(),
+                                        bookmark.table.clone(),
+                                    ));
+                                }
+                            });
+                        }
                     }
+                    ui.add_space(8.0);
                 }
-                ui.add_space(8.0);
 
                 for action in actions {
                     match action {
