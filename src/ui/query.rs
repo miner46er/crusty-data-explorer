@@ -107,9 +107,11 @@ fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
     let mut close: Vec<TabId> = Vec::new();
     let mut new_tab = false;
     ui.horizontal(|ui| {
-        for tab in state.tabs() {
+        let titles = numbered_titles(
+            &state.tabs().iter().map(|tab| tab_title(tab.sql.clone())).collect::<Vec<_>>(),
+        );
+        for (tab, title) in state.tabs().iter().zip(titles) {
             let is_active = Some(tab.id) == active;
-            let title = tab_title(tab.sql.clone());
             let label = if is_active {
                 egui::RichText::new(title).strong()
             } else {
@@ -298,12 +300,132 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
 }
 
 pub(crate) fn tab_title(sql: String) -> String {
+    if let Some(table) = select_table(&sql) {
+        return table;
+    }
     let first = sql.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("SQL");
     let mut title: String = first.chars().take(24).collect();
     if first.chars().count() > 24 {
         title += "…";
     }
     title
+}
+
+/// Tab-strip labels: each title, with " 2", " 3", … appended to the second
+/// and later tabs sharing a title, in tab order.
+fn numbered_titles(titles: &[String]) -> Vec<String> {
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    titles
+        .iter()
+        .map(|title| {
+            let count = seen.entry(title.as_str()).or_insert(0);
+            *count += 1;
+            if *count == 1 { title.clone() } else { format!("{title} {count}") }
+        })
+        .collect()
+}
+
+/// The table named by the SQL when its first statement is a SELECT: the
+/// identifier after the FROM keyword. Anything else (no SELECT first, no
+/// FROM, a subquery or a join without a first identifier) is None, so the
+/// label falls back to the trimmed text.
+fn select_table(sql: &str) -> Option<String> {
+    let text = sql.trim_start();
+    if !text.get(..6)?.eq_ignore_ascii_case("select") {
+        return None;
+    }
+    if text[6..].chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let from = find_keyword(text, "from")?;
+    let table = last_identifier(&text[from + 4..])?;
+    if table.is_empty() { None } else { Some(table) }
+}
+
+/// Byte index of the first `keyword` token that is not inside quotes, a
+/// line comment, or a block comment.
+fn find_keyword(text: &str, keyword: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            quote @ (b'\'' | b'"' | b'`') => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    index += 1;
+                }
+                index += 1;
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len()
+                    && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index += 2;
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = index;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                if text[start..index].eq_ignore_ascii_case(keyword) {
+                    return Some(start);
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// The last segment of the possibly quoted, possibly dotted identifier at
+/// the start of `text`: `users`, `"my table"`, and `` main.`orders` `` all
+/// land as their final name.
+fn last_identifier(text: &str) -> Option<String> {
+    let mut rest = text.trim_start();
+    loop {
+        let (segment, tail) = read_identifier(rest)?;
+        rest = tail.trim_start();
+        match rest.strip_prefix('.') {
+            Some(after) => rest = after.trim_start(),
+            None => return Some(segment),
+        }
+    }
+}
+
+/// One identifier at the start of `text` and the text after it, with the
+/// surrounding quotes or backticks removed.
+fn read_identifier(text: &str) -> Option<(String, &str)> {
+    let first = text.chars().next()?;
+    match first {
+        '"' | '\'' | '`' => {
+            let start = first.len_utf8();
+            let end = text[start..].find(first)? + start;
+            let segment = text[start..end].to_owned();
+            Some((segment, &text[end + first.len_utf8()..]))
+        }
+        _ if first.is_alphabetic() || first == '_' => {
+            let mut end = first.len_utf8();
+            for (index, character) in text.char_indices().skip(1) {
+                if character.is_alphanumeric() || character == '_' {
+                    end = index + character.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            Some((text[..end].to_owned(), &text[end..]))
+        }
+        _ => None,
+    }
 }
 
 pub fn run_shortcut() -> egui::KeyboardShortcut {
@@ -601,6 +723,47 @@ mod tests {
         let find = find_shortcut();
         assert_eq!(find.modifiers, egui::Modifiers::CTRL);
         assert_eq!(find.logical_key, egui::Key::F);
+    }
+
+    #[test]
+    fn tab_title_names_the_select_table() {
+        assert_eq!(
+            tab_title("SELECT id, email FROM users WHERE active = 1 ORDER BY id".to_owned()),
+            "users"
+        );
+        assert_eq!(tab_title("select * from Public.Users".to_owned()), "Users");
+        assert_eq!(tab_title("SELECT * FROM \"my table\"".to_owned()), "my table");
+        assert_eq!(tab_title("SELECT * FROM main.`orders`".to_owned()), "orders");
+        assert_eq!(
+            tab_title("SELECT * FROM (SELECT id FROM users) recent".to_owned()),
+            "SELECT * FROM (SELECT id…"
+        );
+        assert_eq!(tab_title("SELECT /* from x */ * FROM users".to_owned()), "users");
+        assert_eq!(tab_title("SELECT 1 -- from audit\nFROM users".to_owned()), "users");
+    }
+
+    #[test]
+    fn tab_title_falls_back_to_the_trimmed_prefix() {
+        assert_eq!(
+            tab_title("WITH recent AS (SELECT * FROM users) SELECT * FROM recent".to_owned()),
+            "WITH recent AS (SELECT *…"
+        );
+        assert_eq!(
+            tab_title("INSERT INTO users VALUES (1)".to_owned()),
+            "INSERT INTO users VALUES…"
+        );
+        assert_eq!(tab_title("SELECT 1".to_owned()), "SELECT 1");
+        assert_eq!(tab_title("   ".to_owned()), "SQL");
+    }
+
+    #[test]
+    fn numbered_titles_suffix_repeats_in_tab_order() {
+        let titles: Vec<String> =
+            ["users", "orders", "users", "users"].map(str::to_owned).to_vec();
+        assert_eq!(
+            numbered_titles(&titles),
+            ["users", "orders", "users 2", "users 3"].map(str::to_owned).to_vec()
+        );
     }
 }
 // Manual check: Ctrl+T creates a tab on default_connection and activates it
