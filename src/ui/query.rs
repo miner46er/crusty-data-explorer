@@ -3,12 +3,12 @@
 //! Clicks are collected while a tab borrow is live and applied after it
 //! ends, so the editor borrow never overlaps a transition.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
 
 use super::editor::{char_range, format_sql, FindState};
-use crate::app::{AppState, RunOutcome, RunScope, TransactionAction};
+use crate::app::{AppState, ConnectionState, RunOutcome, RunScope, TransactionAction};
 use crate::db::{DbKind, TabId};
 
 use super::Palette;
@@ -177,12 +177,13 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
             Some(RunOutcome::Running { .. })
         );
         let transaction_ready = state.transaction_ready(tab_id);
-        let (autocommit, sqlite) = state
+        let autocommit = state
             .tab(tab_id)
             .and_then(|t| t.conn)
             .and_then(|id| state.connections().iter().find(|c| c.id == id))
-            .map(|c| (c.autocommit(), c.config.kind() == DbKind::Sqlite))
-            .unwrap_or((true, false));
+            .map(|c| c.autocommit())
+            .unwrap_or(true);
+        let slot = AutocommitSlot::of(state, tab_id);
         ui.horizontal(|ui| {
             if running {
                 cancel_clicked = ui.button("Cancel").clicked();
@@ -221,21 +222,15 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                 }
             }
             ui.add_space(6.0);
-            let mut shown = autocommit;
-            let toggle = if transaction_ready && !sqlite {
-                ui.toggle_value(&mut shown, "Autocommit").on_hover_text(
-                    "Off: every statement runs inside a transaction on one tagged \
-                     connection until Commit or Rollback",
-                )
-            } else {
-                autocommit_chip(
-                    ui,
-                    if sqlite {
-                        "SQLite handles autocommit itself"
-                    } else {
-                        "Connect to change autocommit"
-                    },
-                )
+            let toggle = match slot.chip(autocommit) {
+                Some((label, reason)) => autocommit_chip(ui, &label, reason),
+                None => {
+                    let mut shown = autocommit;
+                    ui.toggle_value(&mut shown, "Autocommit").on_hover_text(
+                        "Off: every statement runs inside a transaction on one tagged \
+                         connection until Commit or Rollback",
+                    )
+                }
             };
             if toggle.clicked() {
                 autocommit_clicked = Some(!autocommit);
@@ -307,147 +302,99 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
     find_opened
 }
 
+/// The Autocommit control's situation, read from the tab's connection at the
+/// call site. The first three render as a chip; `Toggle` is the live toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutocommitSlot {
+    /// No connection, still connecting, or failed: nothing to switch.
+    Offline,
+    /// Live on SQLite, which has no manual mode.
+    Sqlite,
+    /// Live on another engine with a run in flight: the mode has to wait.
+    Running,
+    /// Live on another engine and idle: the toggle can act.
+    Toggle,
+}
+
+impl AutocommitSlot {
+    /// Which slot `tab`'s connection is in.
+    pub(crate) fn of(state: &AppState, tab: TabId) -> Self {
+        let conn = state
+            .tab(tab)
+            .and_then(|t| t.conn)
+            .and_then(|id| state.connections().iter().find(|c| c.id == id));
+        let Some(conn) = conn else { return Self::Offline };
+        if !matches!(
+            conn.state(),
+            ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
+        ) {
+            return Self::Offline;
+        }
+        if conn.config.kind() == DbKind::Sqlite {
+            return Self::Sqlite;
+        }
+        if state.transaction_ready(tab) { Self::Toggle } else { Self::Running }
+    }
+
+    /// The chip's label and the reason on its tooltip, or None for the live
+    /// toggle. The mode rides the label wherever it is not SQLite's constant
+    /// to explain.
+    pub(crate) fn chip(self, on: bool) -> Option<(String, &'static str)> {
+        let mode = if on { "Autocommit: on" } else { "Autocommit: off" };
+        match self {
+            Self::Toggle => None,
+            Self::Offline => Some((mode.to_owned(), "Connect to change autocommit")),
+            Self::Running => Some((mode.to_owned(), "Wait for the run to finish")),
+            Self::Sqlite => {
+                Some(("Autocommit".to_owned(), "SQLite handles autocommit itself"))
+            }
+        }
+    }
+}
+
 /// An Autocommit chip for the states where the toggle cannot act: filled and
 /// colored as unavailable, sensed as hover only so it never lights up or
-/// moves, with the reason on the tooltip.
-fn autocommit_chip(ui: &mut egui::Ui, reason: &str) -> egui::Response {
+/// moves, with the reason on the tooltip. The hairline edge is the neutral
+/// outline color: the fill alone sits within a few percent of the panel, so
+/// the edge is what makes the chip read as a control slot.
+fn autocommit_chip(ui: &mut egui::Ui, label: &str, reason: &str) -> egui::Response {
     let palette = Palette::of(ui.ctx().theme());
+    let edge = ui.visuals().widgets.noninteractive.bg_stroke.color;
     ui.add(
-        egui::Button::new(egui::RichText::new("Autocommit").color(palette.disabled_text))
+        egui::Button::new(egui::RichText::new(label).color(palette.disabled_text))
             .fill(palette.disabled_fill)
-            .stroke(egui::Stroke::NONE)
+            .stroke(egui::Stroke::new(1.0, edge))
             .sense(egui::Sense::hover()),
     )
     .on_hover_text(reason)
 }
 
 pub(crate) fn tab_title(sql: String) -> String {
-    if let Some(table) = select_table(&sql) {
+    if let Some(table) = crate::sql::select_table_title(&sql) {
         return table;
     }
     let first = sql.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("SQL");
-    let mut title: String = first.chars().take(24).collect();
-    if first.chars().count() > 24 {
-        title += "…";
-    }
-    title
+    crate::sql::capped_title(first)
 }
 
-/// Tab-strip labels: each title, with " 2", " 3", … appended to the second
-/// and later tabs sharing a title, in tab order.
+/// Tab-strip labels: each title, with " 2", " 3", … appended to repeats in
+/// tab order. A suffix a literal title already holds keeps bumping, so a
+/// table named "users 2" never collides with the numbering.
 fn numbered_titles(titles: &[String]) -> Vec<String> {
-    let mut seen: HashMap<&str, usize> = HashMap::new();
-    titles
-        .iter()
-        .map(|title| {
-            let count = seen.entry(title.as_str()).or_insert(0);
+    let mut used: HashSet<String> = HashSet::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut labels = Vec::with_capacity(titles.len());
+    for title in titles {
+        let count = counts.entry(title.clone()).or_insert(0);
+        *count += 1;
+        let mut label = if *count == 1 { title.clone() } else { format!("{title} {count}") };
+        while !used.insert(label.clone()) {
             *count += 1;
-            if *count == 1 { title.clone() } else { format!("{title} {count}") }
-        })
-        .collect()
-}
-
-/// The table named by the SQL when its first statement is a SELECT: the
-/// identifier after the FROM keyword. Anything else (no SELECT first, no
-/// FROM, a subquery or a join without a first identifier) is None, so the
-/// label falls back to the trimmed text.
-fn select_table(sql: &str) -> Option<String> {
-    let text = sql.trim_start();
-    if !text.get(..6)?.eq_ignore_ascii_case("select") {
-        return None;
-    }
-    if text[6..].chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_') {
-        return None;
-    }
-    let from = find_keyword(text, "from")?;
-    let table = last_identifier(&text[from + 4..])?;
-    if table.is_empty() { None } else { Some(table) }
-}
-
-/// Byte index of the first `keyword` token that is not inside quotes, a
-/// line comment, or a block comment.
-fn find_keyword(text: &str, keyword: &str) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            quote @ (b'\'' | b'"' | b'`') => {
-                index += 1;
-                while index < bytes.len() && bytes[index] != quote {
-                    index += 1;
-                }
-                index += 1;
-            }
-            b'-' if bytes.get(index + 1) == Some(&b'-') => {
-                while index < bytes.len() && bytes[index] != b'\n' {
-                    index += 1;
-                }
-            }
-            b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                index += 2;
-                while index + 1 < bytes.len()
-                    && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
-                {
-                    index += 1;
-                }
-                index += 2;
-            }
-            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
-                let start = index;
-                while index < bytes.len()
-                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
-                {
-                    index += 1;
-                }
-                if text[start..index].eq_ignore_ascii_case(keyword) {
-                    return Some(start);
-                }
-            }
-            _ => index += 1,
+            label = format!("{title} {count}");
         }
+        labels.push(label);
     }
-    None
-}
-
-/// The last segment of the possibly quoted, possibly dotted identifier at
-/// the start of `text`: `users`, `"my table"`, and `` main.`orders` `` all
-/// land as their final name.
-fn last_identifier(text: &str) -> Option<String> {
-    let mut rest = text.trim_start();
-    loop {
-        let (segment, tail) = read_identifier(rest)?;
-        rest = tail.trim_start();
-        match rest.strip_prefix('.') {
-            Some(after) => rest = after.trim_start(),
-            None => return Some(segment),
-        }
-    }
-}
-
-/// One identifier at the start of `text` and the text after it, with the
-/// surrounding quotes or backticks removed.
-fn read_identifier(text: &str) -> Option<(String, &str)> {
-    let first = text.chars().next()?;
-    match first {
-        '"' | '\'' | '`' => {
-            let start = first.len_utf8();
-            let end = text[start..].find(first)? + start;
-            let segment = text[start..end].to_owned();
-            Some((segment, &text[end + first.len_utf8()..]))
-        }
-        _ if first.is_alphabetic() || first == '_' => {
-            let mut end = first.len_utf8();
-            for (index, character) in text.char_indices().skip(1) {
-                if character.is_alphanumeric() || character == '_' {
-                    end = index + character.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            Some((text[..end].to_owned(), &text[end..]))
-        }
-        _ => None,
-    }
+    labels
 }
 
 pub fn run_shortcut() -> egui::KeyboardShortcut {
@@ -765,6 +712,22 @@ mod tests {
     }
 
     #[test]
+    fn tab_title_ignores_a_from_inside_parentheses_or_a_later_statement() {
+        assert_eq!(
+            tab_title("SELECT EXTRACT(YEAR FROM created_at) FROM orders".to_owned()),
+            "orders"
+        );
+        assert_eq!(
+            tab_title("SELECT (SELECT count(*) FROM audit_log) AS m FROM users".to_owned()),
+            "users"
+        );
+        assert_eq!(tab_title("SELECT 1; DELETE FROM users".to_owned()), "SELECT 1; DELETE FROM us…");
+        assert_eq!(tab_title("-- pick\nSELECT * FROM users".to_owned()), "users");
+        assert_eq!(tab_title("SELECT * FROM \"my\"\"table\"".to_owned()), "my\"table");
+        assert_eq!(tab_title("SELECT * FROM \"users 2\"".to_owned()), "users 2");
+    }
+
+    #[test]
     fn tab_title_falls_back_to_the_trimmed_prefix() {
         assert_eq!(
             tab_title("WITH recent AS (SELECT * FROM users) SELECT * FROM recent".to_owned()),
@@ -786,6 +749,48 @@ mod tests {
             numbered_titles(&titles),
             ["users", "orders", "users 2", "users 3"].map(str::to_owned).to_vec()
         );
+    }
+
+    #[test]
+    fn numbered_titles_bump_past_a_suffix_a_literal_title_holds() {
+        let titles: Vec<String> =
+            ["users", "users 2", "users", "users"].map(str::to_owned).to_vec();
+        assert_eq!(
+            numbered_titles(&titles),
+            ["users", "users 2", "users 3", "users 4"].map(str::to_owned).to_vec()
+        );
+        let titles: Vec<String> = ["a", "a", "a 2"].map(str::to_owned).to_vec();
+        assert_eq!(
+            numbered_titles(&titles),
+            ["a", "a 2", "a 2 2"].map(str::to_owned).to_vec()
+        );
+    }
+
+    #[test]
+    fn autocommit_chip_carries_the_mode_and_the_reason_for_its_slot() {
+        use AutocommitSlot::{Offline, Running, Sqlite, Toggle};
+        assert_eq!(
+            Offline.chip(true),
+            Some(("Autocommit: on".to_owned(), "Connect to change autocommit"))
+        );
+        assert_eq!(
+            Offline.chip(false),
+            Some(("Autocommit: off".to_owned(), "Connect to change autocommit"))
+        );
+        assert_eq!(
+            Sqlite.chip(true),
+            Some(("Autocommit".to_owned(), "SQLite handles autocommit itself"))
+        );
+        assert_eq!(
+            Sqlite.chip(false),
+            Some(("Autocommit".to_owned(), "SQLite handles autocommit itself"))
+        );
+        assert_eq!(
+            Running.chip(false),
+            Some(("Autocommit: off".to_owned(), "Wait for the run to finish"))
+        );
+        assert_eq!(Toggle.chip(true), None);
+        assert_eq!(Toggle.chip(false), None);
     }
 }
 // Manual check: Ctrl+T creates a tab on default_connection and activates it

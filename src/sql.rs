@@ -293,20 +293,39 @@ const SCHEMA_KEYWORDS: [&str; 6] =
     ["CREATE", "ALTER", "DROP", "RENAME", "ATTACH", "DETACH"];
 
 /// True when any statement in `sql` begins, after whitespace and comments,
-/// with one of [`SCHEMA_KEYWORDS`]. Case-insensitive; the word only counts at
-/// the statement head, so `SELECT` text mentioning a keyword never does.
+/// with one of [`SCHEMA_KEYWORDS`].
 pub fn sql_changes_schema(sql: &str) -> bool {
-    split_statements(sql).iter().any(|statement| {
-        first_word_after_comments(statement).is_some_and(|word| {
-            SCHEMA_KEYWORDS.iter().any(|keyword| word.eq_ignore_ascii_case(keyword))
-        })
-    })
+    split_statements(sql)
+        .iter()
+        .any(|statement| statement_changes_schema(statement))
 }
 
-/// The leading ASCII word of `statement`, skipping whitespace, `--` line
-/// comments, and `/* */` block comments. None when only comments remain or
+/// True when `statement` begins, after whitespace and comments, with one of
+/// [`SCHEMA_KEYWORDS`]. Case-insensitive; the word only counts at the
+/// statement head, so `SELECT` text mentioning a keyword never does, and the
+/// head ends at the first byte that is not ASCII alphanumeric or underscore,
+/// so `CREATE_TABLE` is not `CREATE`.
+pub fn statement_changes_schema(statement: &str) -> bool {
+    let Some(range) = head_word(statement) else { return false };
+    let word = &statement[range];
+    SCHEMA_KEYWORDS.iter().any(|keyword| word.eq_ignore_ascii_case(keyword))
+}
+
+/// Byte range of `statement`'s leading word: the run of ASCII alphanumerics
+/// and underscores after leading trivia. None when only comments remain or
 /// the head is not a word.
-fn first_word_after_comments(statement: &str) -> Option<&str> {
+fn head_word(statement: &str) -> Option<Range<usize>> {
+    let rest = skip_leading_trivia(statement);
+    let start = statement.len() - rest.len();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    (end > 0).then_some(start..start + end)
+}
+
+/// `statement` past its leading whitespace, `--` line comments, and `/* */`
+/// block comments.
+fn skip_leading_trivia(statement: &str) -> &str {
     let mut rest = statement;
     loop {
         rest = rest.trim_start();
@@ -315,11 +334,144 @@ fn first_word_after_comments(statement: &str) -> Option<&str> {
         } else if let Some(tail) = rest.strip_prefix("/*") {
             rest = tail.split_once("*/").map_or("", |(_, after)| after);
         } else {
-            break;
+            return rest;
         }
     }
-    let end = rest.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(rest.len());
-    (end > 0).then(|| &rest[..end])
+}
+
+/// Characters a table-derived title keeps before its ellipsis, the same cap
+/// the editor's text fallback uses.
+pub const TITLE_CAP: usize = 24;
+
+/// `text` cut to [`TITLE_CAP`] characters, with an ellipsis when it ran over.
+pub fn capped_title(text: &str) -> String {
+    let mut title: String = text.chars().take(TITLE_CAP).collect();
+    if text.chars().count() > TITLE_CAP {
+        title.push('…');
+    }
+    title
+}
+
+/// The title for a script whose first statement is a SELECT: the identifier
+/// after the statement's top-level FROM, capped like the text fallback. None
+/// for anything else, so the caller falls back to the trimmed text: no
+/// SELECT head, no FROM outside parentheses, or no identifier after it.
+pub fn select_table_title(sql: &str) -> Option<String> {
+    let first = split_statements(sql).into_iter().next()?;
+    let head = head_word(&first)?;
+    if !first[head.clone()].eq_ignore_ascii_case("select") {
+        return None;
+    }
+    let from = top_level_from(&first[head.end..])?;
+    let table = last_identifier(&first[head.end + from + 4..])?;
+    if table.is_empty() {
+        return None;
+    }
+    Some(capped_title(&table))
+}
+
+/// Byte offset of the first `FROM` word in `text` outside parentheses,
+/// skipping strings, quoted identifiers, line comments, and block comments.
+/// None when there is none.
+fn top_level_from(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            quote @ (b'\'' | b'"' | b'`') => index = scan_quote(bytes, index, quote),
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index < bytes.len()
+                    && !(bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/'))
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            b'(' => {
+                depth += 1;
+                index += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            byte if depth == 0 && (byte.is_ascii_alphabetic() || byte == b'_') => {
+                let start = index;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                if text[start..index].eq_ignore_ascii_case("from") {
+                    return Some(start);
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// The last segment of the possibly quoted, possibly dotted identifier at
+/// the start of `text`: `users`, `"my table"`, and `` main.`orders` `` all
+/// land as their final name.
+fn last_identifier(text: &str) -> Option<String> {
+    let mut rest = text.trim_start();
+    loop {
+        let (segment, tail) = read_identifier(rest)?;
+        rest = tail.trim_start();
+        match rest.strip_prefix('.') {
+            Some(after) => rest = after.trim_start(),
+            None => return Some(segment),
+        }
+    }
+}
+
+/// One identifier at the start of `text` and the text after it, with the
+/// surrounding quotes or backticks removed and a doubled quote inside
+/// collapsed to one, the SQL standard escape.
+fn read_identifier(text: &str) -> Option<(String, &str)> {
+    let bytes = text.as_bytes();
+    let quote = match bytes.first().copied() {
+        Some(quote @ (b'"' | b'\'' | b'`')) => quote,
+        _ => {
+            let mut chars = text.char_indices();
+            let first = chars.next()?.1;
+            if !(first.is_alphabetic() || first == '_') {
+                return None;
+            }
+            let mut end = first.len_utf8();
+            for (index, character) in chars {
+                if !(character.is_alphanumeric() || character == '_') {
+                    break;
+                }
+                end = index + character.len_utf8();
+            }
+            return Some((text[..end].to_owned(), &text[end..]));
+        }
+    };
+    let end = scan_quote(bytes, 0, quote);
+    let inner_end = if end > 1 && bytes.get(end - 1) == Some(&quote) { end - 1 } else { end };
+    let inner = &text[1..inner_end];
+    let mut segment = String::with_capacity(inner.len());
+    let mut index = 0;
+    while index < inner.len() {
+        let character = inner[index..].chars().next().expect("non-empty slice");
+        segment.push(character);
+        index += character.len_utf8();
+        if character == char::from(quote) && inner[index..].starts_with(character) {
+            index += character.len_utf8();
+        }
+    }
+    Some((segment, &text[end..]))
 }
 
 /// Index into [`split_statements`] of the statement under `cursor_byte`. A
@@ -439,6 +591,88 @@ mod tests {
         assert!(sql_changes_schema("-- migrate\nCREATE TABLE t (id integer)"));
         assert!(sql_changes_schema("/* up */ ALTER TABLE t ADD COLUMN c TEXT"));
         assert!(sql_changes_schema("SELECT 1; -- make a table\nDROP TABLE t"));
+    }
+
+    #[test]
+    fn schema_change_classifier_ends_the_head_word_at_a_non_word_byte() {
+        assert!(statement_changes_schema("CREATE TABLE t (id integer)"));
+        assert!(statement_changes_schema("\tCREATE"));
+        assert!(!statement_changes_schema("CREATE_TABLE t (id integer)"));
+        assert!(!statement_changes_schema("creat2 table t"));
+        assert!(!statement_changes_schema("__create"));
+        assert!(!statement_changes_schema("DROPX TABLE t"));
+        assert!(!sql_changes_schema("SELECT 1; DROP_VIEW v"));
+    }
+
+    #[test]
+    fn table_title_reads_the_first_selects_top_level_from() {
+        assert_eq!(
+            select_table_title("SELECT id FROM users WHERE id = 1"),
+            Some("users".to_owned())
+        );
+        assert_eq!(select_table_title("select * from Public.Users"), Some("Users".to_owned()));
+        assert_eq!(
+            select_table_title("SELECT * FROM main.`orders`"),
+            Some("orders".to_owned())
+        );
+        assert_eq!(
+            select_table_title("SELECT /* from x */ * FROM users"),
+            Some("users".to_owned())
+        );
+        assert_eq!(
+            select_table_title("SELECT 1 -- from audit\nFROM users"),
+            Some("users".to_owned())
+        );
+    }
+
+    #[test]
+    fn table_title_ignores_from_inside_parentheses_and_comments() {
+        assert_eq!(
+            select_table_title("SELECT EXTRACT(YEAR FROM created_at) FROM orders"),
+            Some("orders".to_owned())
+        );
+        assert_eq!(
+            select_table_title("SELECT (SELECT count(*) FROM audit_log) AS m FROM users"),
+            Some("users".to_owned())
+        );
+        assert_eq!(select_table_title("SELECT 'from x' FROM users"), Some("users".to_owned()));
+        assert_eq!(
+            select_table_title("-- pick the table\nSELECT * FROM users"),
+            Some("users".to_owned())
+        );
+    }
+
+    #[test]
+    fn table_title_takes_only_the_first_statement_and_unquotes_identifiers() {
+        assert_eq!(select_table_title("SELECT 1; DELETE FROM users"), None);
+        assert_eq!(
+            select_table_title("SELECT * FROM \"my\"\"table\""),
+            Some("my\"table".to_owned())
+        );
+        assert_eq!(select_table_title("SELECT * FROM \"users 2\""), Some("users 2".to_owned()));
+        assert_eq!(select_table_title("SELECT * FROM \"\""), None);
+    }
+
+    #[test]
+    fn table_title_caps_a_long_name_like_the_text_fallback() {
+        assert_eq!(
+            select_table_title("SELECT * FROM \"a very long table name here\""),
+            Some("a very long table name h…".to_owned())
+        );
+        assert_eq!(capped_title("short"), "short".to_owned());
+        assert_eq!(capped_title(&"x".repeat(TITLE_CAP)), "x".repeat(TITLE_CAP));
+    }
+
+    #[test]
+    fn table_title_is_none_when_the_select_shape_is_missing() {
+        assert_eq!(select_table_title(""), None);
+        assert_eq!(select_table_title("SELECT 1"), None);
+        assert_eq!(select_table_title("SELECTED * FROM users"), None);
+        assert_eq!(select_table_title("WITH t AS (SELECT 1) SELECT * FROM t"), None);
+        assert_eq!(select_table_title("INSERT INTO users VALUES (1)"), None);
+        assert_eq!(select_table_title("SELECT * FROM (SELECT id FROM users) recent"), None);
+        assert_eq!(select_table_title("SELECT * FROM t, u"), Some("t".to_owned()));
+        assert_eq!(select_table_title("delete from users"), None);
     }
 
     #[test]
