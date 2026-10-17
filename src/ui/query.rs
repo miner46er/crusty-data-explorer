@@ -177,12 +177,12 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
             Some(RunOutcome::Running { .. })
         );
         let transaction_ready = state.transaction_ready(tab_id);
-        let autocommit = state
+        let (autocommit, sqlite) = state
             .tab(tab_id)
             .and_then(|t| t.conn)
             .and_then(|id| state.connections().iter().find(|c| c.id == id))
-            .map(|c| c.autocommit())
-            .unwrap_or(true);
+            .map(|c| (c.autocommit(), c.config.kind() == DbKind::Sqlite))
+            .unwrap_or((true, false));
         let slot = AutocommitSlot::of(state, tab_id);
         ui.horizontal(|ui| {
             if running {
@@ -222,7 +222,7 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                 }
             }
             ui.add_space(6.0);
-            let toggle = match slot.chip(autocommit) {
+            let toggle = match slot.chip(autocommit, sqlite) {
                 Some((label, reason)) => autocommit_chip(ui, &label, reason),
                 None => {
                     let mut shown = autocommit;
@@ -337,17 +337,25 @@ impl AutocommitSlot {
     }
 
     /// The chip's label and the reason on its tooltip, or None for the live
-    /// toggle. The mode rides the label wherever it is not SQLite's constant
-    /// to explain.
-    pub(crate) fn chip(self, on: bool) -> Option<(String, &'static str)> {
-        let mode = if on { "Autocommit: on" } else { "Autocommit: off" };
+    /// toggle. `on` is the observed mode; `sqlite` keeps the label plain,
+    /// since the mode there is constant whatever the state.
+    pub(crate) fn chip(
+        self,
+        on: bool,
+        sqlite: bool,
+    ) -> Option<(String, &'static str)> {
+        let label = if sqlite {
+            "Autocommit".to_owned()
+        } else if on {
+            "Autocommit: on".to_owned()
+        } else {
+            "Autocommit: off".to_owned()
+        };
         match self {
             Self::Toggle => None,
-            Self::Offline => Some((mode.to_owned(), "Connect to change autocommit")),
-            Self::Running => Some((mode.to_owned(), "Wait for the run to finish")),
-            Self::Sqlite => {
-                Some(("Autocommit".to_owned(), "SQLite handles autocommit itself"))
-            }
+            Self::Offline => Some((label, "Connect to change autocommit")),
+            Self::Running => Some((label, "Wait for the run to finish")),
+            Self::Sqlite => Some((label, "SQLite handles autocommit itself")),
         }
     }
 }
@@ -773,27 +781,33 @@ mod tests {
     fn autocommit_chip_carries_the_mode_and_the_reason_for_its_slot() {
         use AutocommitSlot::{Offline, Running, Sqlite, Toggle};
         assert_eq!(
-            Offline.chip(true),
+            Offline.chip(true, false),
             Some(("Autocommit: on".to_owned(), "Connect to change autocommit"))
         );
         assert_eq!(
-            Offline.chip(false),
+            Offline.chip(false, false),
             Some(("Autocommit: off".to_owned(), "Connect to change autocommit"))
         );
+        // SQLite's mode is constant, so its label never carries one, even
+        // while the connection is not live yet.
         assert_eq!(
-            Sqlite.chip(true),
+            Offline.chip(true, true),
+            Some(("Autocommit".to_owned(), "Connect to change autocommit"))
+        );
+        assert_eq!(
+            Sqlite.chip(true, true),
             Some(("Autocommit".to_owned(), "SQLite handles autocommit itself"))
         );
         assert_eq!(
-            Sqlite.chip(false),
+            Sqlite.chip(false, true),
             Some(("Autocommit".to_owned(), "SQLite handles autocommit itself"))
         );
         assert_eq!(
-            Running.chip(false),
+            Running.chip(false, false),
             Some(("Autocommit: off".to_owned(), "Wait for the run to finish"))
         );
-        assert_eq!(Toggle.chip(true), None);
-        assert_eq!(Toggle.chip(false), None);
+        assert_eq!(Toggle.chip(true, false), None);
+        assert_eq!(Toggle.chip(false, false), None);
     }
 }
 // Manual check: Ctrl+T creates a tab on default_connection and activates it

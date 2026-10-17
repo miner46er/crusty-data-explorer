@@ -11384,16 +11384,23 @@ mod tests {
     fn autocommit_chip_reason_follows_the_connection_state_and_engine() {
         use crate::ui::query::AutocommitSlot;
         with_isolated_state("autocommit-chip", |state| {
-            fn reason(slot: AutocommitSlot, on: bool) -> Option<&'static str> {
-                slot.chip(on).map(|(_, reason)| reason)
+            /// The chip for one real tab: the reason from its slot and the
+            /// label from its engine.
+            fn chip(state: &AppState, tab: TabId, on: bool) -> Option<(String, &'static str)> {
+                let sqlite = state
+                    .tab(tab)
+                    .and_then(|t| t.conn)
+                    .and_then(|id| state.connections().iter().find(|c| c.id == id))
+                    .is_some_and(|c| c.config.kind() == DbKind::Sqlite);
+                AutocommitSlot::of(state, tab).chip(on, sqlite)
             }
 
             // No connection at all.
             let unbound = state.push_tab(None, String::new());
             assert_eq!(AutocommitSlot::of(state, unbound), AutocommitSlot::Offline);
             assert_eq!(
-                reason(AutocommitSlot::of(state, unbound), true),
-                Some("Connect to change autocommit")
+                chip(state, unbound, true),
+                Some(("Autocommit: on".to_owned(), "Connect to change autocommit"))
             );
 
             let sqlite = add_sqlite_connection(state, "mem-chip");
@@ -11402,8 +11409,8 @@ mod tests {
             // Connecting, then failed: nothing to switch either way.
             attach_test_handle(state, sqlite);
             assert_eq!(
-                reason(AutocommitSlot::of(state, tab), true),
-                Some("Connect to change autocommit")
+                chip(state, tab, true),
+                Some(("Autocommit".to_owned(), "Connect to change autocommit"))
             );
             state
                 .connections
@@ -11412,20 +11419,20 @@ mod tests {
                 .expect("connection")
                 .state = ConnectionState::Error { message: "boom".to_owned() };
             assert_eq!(
-                reason(AutocommitSlot::of(state, tab), false),
-                Some("Connect to change autocommit")
+                chip(state, tab, false),
+                Some(("Autocommit".to_owned(), "Connect to change autocommit"))
             );
 
             // Live on SQLite: the engine explains the chip, run or not.
             let commands = attach_test_session(state, sqlite);
             assert_eq!(AutocommitSlot::of(state, tab), AutocommitSlot::Sqlite);
             assert_eq!(
-                AutocommitSlot::of(state, tab).chip(true),
+                chip(state, tab, true),
                 Some(("Autocommit".to_owned(), "SQLite handles autocommit itself"))
             );
             state.start_run(tab, "SELECT 1", 0, None);
             assert_eq!(
-                reason(AutocommitSlot::of(state, tab), true),
+                chip(state, tab, true).map(|(_, reason)| reason),
                 Some("SQLite handles autocommit itself"),
                 "a run in flight changes nothing on SQLite"
             );
@@ -11442,11 +11449,11 @@ mod tests {
             let pg_tab = state.new_tab(postgres);
             let _pg_commands = attach_test_session(state, postgres);
             assert_eq!(AutocommitSlot::of(state, pg_tab), AutocommitSlot::Toggle);
-            assert_eq!(AutocommitSlot::of(state, pg_tab).chip(false), None);
+            assert_eq!(chip(state, pg_tab, false), None);
             state.start_run(pg_tab, "SELECT 1", 0, None);
             assert_eq!(AutocommitSlot::of(state, pg_tab), AutocommitSlot::Running);
             assert_eq!(
-                AutocommitSlot::of(state, pg_tab).chip(false),
+                chip(state, pg_tab, false),
                 Some(("Autocommit: off".to_owned(), "Wait for the run to finish"))
             );
         });
