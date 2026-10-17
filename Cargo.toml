@@ -38,3 +38,7 @@ default = []
 postgres = ["dep:sqlx", "dep:tokio"]
 mysql = ["dep:sqlx", "dep:tokio"]
 ssh = ["dep:ssh2"]
+
+[dev-dependencies]
+egui_kittest = { version = "0.36.2", features = ["snapshot", "eframe", "wgpu"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
