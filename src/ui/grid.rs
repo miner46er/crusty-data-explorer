@@ -1714,6 +1714,9 @@ fn results_grid(
                 );
             }
             None => {
+                // The qualifier names what is read-only: this view, not the
+                // connection, which can be perfectly writable.
+                ui.label(egui::RichText::new("view:").small().weak());
                 ui.label(egui::RichText::new("read only").small().weak()).on_hover_text(
                     "Inline editing needs an idle connection and a single-table SELECT \
                      whose table has a primary key in the result.",
