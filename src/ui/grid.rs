@@ -1538,6 +1538,14 @@ fn row_detail(tab: &Tab, selection: &Selection, ui: &mut egui::Ui) {
     }
 }
 
+/// The text color a data cell's label carries: a selected cell switches to
+/// the selection text color so its value stays legible on the Console Blue
+/// fill, where the quiet text colors fall near 1.6 to 1. Deleted cells keep
+/// their weak treatment either way; the strikethrough carries the delete cue.
+fn cell_label_color(selected: bool, palette: &Palette) -> Option<egui::Color32> {
+    selected.then_some(palette.selection_text)
+}
+
 fn results_grid(
     tab: &mut Tab,
     target: Option<&EditTarget>,
@@ -1916,7 +1924,8 @@ fn results_grid(
                                     .unwrap_or_default(),
                             };
                             let cell_rect = ui.max_rect();
-                            if selection.is_selected(r) {
+                            let selected = selection.is_selected(r);
+                            if selected {
                                 ui.painter().rect_filled(
                                     cell_rect,
                                     egui::CornerRadius::ZERO,
@@ -1938,13 +1947,19 @@ fn results_grid(
                                     palette.edit_tint,
                                 );
                             }
-                            let label = if deleted {
-                                ui.monospace(
-                                    egui::RichText::new(text).strikethrough().weak(),
-                                )
+                            let rich = if deleted {
+                                egui::RichText::new(text).strikethrough()
                             } else {
-                                ui.monospace(text)
+                                egui::RichText::new(text)
                             };
+                            let rich = if let Some(color) = cell_label_color(selected, &palette) {
+                                rich.color(color)
+                            } else if deleted {
+                                rich.weak()
+                            } else {
+                                rich
+                            };
+                            let label = ui.monospace(rich);
                             let response = label.union(ui.interact(
                                 cell_rect,
                                 ui.id().with("edit_cell"),
@@ -3448,5 +3463,16 @@ mod tests {
             "dead00ff"
         );
         assert_eq!(detail_cell_text(Some(&Value::Integer(7))), "7");
+    }
+
+    #[test]
+    fn selected_cell_text_switches_to_the_selection_color() {
+        for palette in [Palette::dark(), Palette::light()] {
+            assert_eq!(
+                cell_label_color(true, &palette),
+                Some(egui::Color32::from_rgb(255, 255, 255))
+            );
+            assert_eq!(cell_label_color(false, &palette), None);
+        }
     }
 }

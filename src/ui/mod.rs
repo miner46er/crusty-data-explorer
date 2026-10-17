@@ -141,6 +141,10 @@ impl Theme {
 pub struct Palette {
     pub accent: egui::Color32,
     pub success: egui::Color32,
+    /// The text color on a selection fill. White in both themes: the fill is
+    /// Console Blue either way, and white holds 5.3 to 1 on it while the
+    /// quiet text colors fall near 1.6 to 1.
+    pub selection_text: egui::Color32,
     pub edit_tint: egui::Color32,
     pub keyword: egui::Color32,
     pub string: egui::Color32,
@@ -156,6 +160,7 @@ impl Palette {
         Self {
             accent: egui::Color32::from_rgb(58, 110, 165),
             success: egui::Color32::from_rgb(115, 180, 115),
+            selection_text: egui::Color32::from_rgb(255, 255, 255),
             edit_tint: egui::Color32::from_rgba_unmultiplied(227, 179, 65, 64),
             keyword: egui::Color32::from_rgb(120, 170, 220),
             string: egui::Color32::from_rgb(140, 200, 150),
@@ -170,6 +175,7 @@ impl Palette {
         Self {
             accent: egui::Color32::from_rgb(58, 110, 165),
             success: egui::Color32::from_rgb(56, 142, 60),
+            selection_text: egui::Color32::from_rgb(255, 255, 255),
             edit_tint: egui::Color32::from_rgba_unmultiplied(227, 179, 65, 64),
             keyword: egui::Color32::from_rgb(25, 118, 210),
             string: egui::Color32::from_rgb(46, 125, 50),
@@ -335,10 +341,12 @@ mod tests {
         assert_eq!(dark.accent, egui::Color32::from_rgb(58, 110, 165));
         assert_eq!(dark.success, egui::Color32::from_rgb(115, 180, 115));
         assert_eq!(dark.keyword, egui::Color32::from_rgb(120, 170, 220));
+        assert_eq!(dark.selection_text, egui::Color32::from_rgb(255, 255, 255));
         let light = Palette::of(egui::Theme::Light);
         assert_eq!(light.accent, egui::Color32::from_rgb(58, 110, 165));
         assert_eq!(light.success, egui::Color32::from_rgb(56, 142, 60));
         assert_eq!(light.keyword, egui::Color32::from_rgb(25, 118, 210));
+        assert_eq!(light.selection_text, egui::Color32::from_rgb(255, 255, 255));
         assert_ne!(dark.success, light.success);
         assert_ne!(dark.keyword, light.keyword);
     }
