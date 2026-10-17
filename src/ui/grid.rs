@@ -1654,7 +1654,7 @@ fn results_grid(
             // Every result set into one folder, one CSV per set; there is no
             // scope state here, so it fires as an action rather than a check.
             if ui
-                .add_enabled(can_export_all, egui::Button::new("Full table"))
+                .add_enabled(can_export_all, egui::Button::new("All result sets"))
                 .on_hover_text("Export every result set into one folder, one CSV per set")
                 .clicked()
             {
@@ -1714,10 +1714,9 @@ fn results_grid(
                 );
             }
             None => {
-                // The qualifier names what is read-only: this view, not the
-                // connection, which can be perfectly writable.
-                ui.label(egui::RichText::new("view:").small().weak());
-                ui.label(egui::RichText::new("read only").small().weak()).on_hover_text(
+                // "read-only view" names what is read-only: this view, not
+                // the connection, which can be perfectly writable.
+                ui.label(egui::RichText::new("read-only view").small().weak()).on_hover_text(
                     "Inline editing needs an idle connection and a single-table SELECT \
                      whose table has a primary key in the result.",
                 );

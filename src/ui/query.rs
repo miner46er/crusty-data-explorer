@@ -223,11 +223,7 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
             ui.add_space(6.0);
             let mut shown = autocommit;
             let toggle = if transaction_ready && !sqlite {
-                ui.add_enabled_ui(true, |ui| {
-                    ui.toggle_value(&mut shown, "Autocommit")
-                })
-                .inner
-                .on_hover_text(
+                ui.toggle_value(&mut shown, "Autocommit").on_hover_text(
                     "Off: every statement runs inside a transaction on one tagged \
                      connection until Commit or Rollback",
                 )

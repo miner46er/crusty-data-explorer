@@ -10291,7 +10291,7 @@ mod tests {
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
-            assert!(text.iter().any(|t| t == "read only"), "{text:?}");
+            assert!(text.iter().any(|t| t == "read-only view"), "{text:?}");
             assert!(!text.iter().any(|t| t.starts_with("Apply")), "{text:?}");
         });
     }
