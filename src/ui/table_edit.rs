@@ -19,7 +19,7 @@ use crate::db::ConnectionId;
 pub fn status_entry(state: &mut AppState, ui: &mut egui::Ui) {
     let conn = state.default_connection();
     let clicked = ui
-        .add_enabled(conn.is_some(), egui::Button::new("＋ Table").small())
+        .add_enabled(conn.is_some(), egui::Button::new("+ Table").small())
         .on_hover_text("Create a table with the visual editor")
         .clicked();
     if clicked
