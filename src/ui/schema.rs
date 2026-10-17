@@ -58,6 +58,9 @@ pub fn connection_schema(
                 }
                 return;
             };
+            if ui.small_button("Refresh").clicked() {
+                actions.push(SchemaAction::Refresh(conn));
+            }
             if schema.is_empty() {
                 ui.label(egui::RichText::new("No tables or views found.").small().weak());
                 return;
