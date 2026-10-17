@@ -319,6 +319,22 @@ fn drawn_tick_xs(kind: ChartKind, n: usize, lo: f32, hi: f32) -> Vec<f32> {
     tick_indices(n, 6).iter().map(|index| xs[*index]).collect()
 }
 
+/// The series index nearest `pointer_x` on the x mapping both chart kinds
+/// share. An exact tie (equal distance to two points) goes to the earlier
+/// point, so a hover between a bar and its left neighbour reads the left one.
+fn nearest_index(pointer_x: f32, xs: &[f32]) -> Option<usize> {
+    let mut nearest = None;
+    let mut best = f32::INFINITY;
+    for (index, x) in xs.iter().enumerate() {
+        let distance = (pointer_x - x).abs();
+        if distance < best {
+            best = distance;
+            nearest = Some(index);
+        }
+    }
+    nearest
+}
+
 /// One tick's x, the room its label may use on each side, and the total
 /// width those rooms allow.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -433,6 +449,16 @@ fn draw_series(kind: ChartKind, series: &Series, ui: &mut egui::Ui) {
             response.rect.bottom() - 2.0 - galley.size().y,
         );
         painter.galley(pos, galley, weak);
+    }
+    if let Some(pointer) = response.hover_pos()
+        && let Some(index) = nearest_index(pointer.x, &xs)
+    {
+        response.on_hover_ui_at_pointer(|ui| {
+            ui.set_max_width(ui.spacing().tooltip_width);
+            // The tick text elides to its room; the tooltip reads the whole
+            // label and the point's value.
+            ui.label(format!("{} · {}", series.labels[index], series.values[index]));
+        });
     }
 }
 
@@ -637,6 +663,45 @@ mod tests {
     fn tick_xs_are_empty_without_points() {
         assert_eq!(tick_xs(ChartKind::Bar, 0, 0.0, 100.0), Vec::<f32>::new());
         assert_eq!(tick_xs(ChartKind::Line, 0, 0.0, 100.0), Vec::<f32>::new());
+    }
+
+    #[test]
+    fn nearest_index_is_none_without_points() {
+        assert_eq!(nearest_index(12.0, &[]), None);
+    }
+
+    #[test]
+    fn nearest_index_clamps_to_the_ends() {
+        let xs = [0.0, 10.0, 20.0];
+        assert_eq!(nearest_index(0.0, &xs), Some(0));
+        assert_eq!(nearest_index(-5.0, &xs), Some(0));
+        assert_eq!(nearest_index(20.0, &xs), Some(2));
+        assert_eq!(nearest_index(40.0, &xs), Some(2));
+    }
+
+    #[test]
+    fn nearest_index_picks_the_closer_point() {
+        let xs = [0.0, 10.0, 20.0];
+        assert_eq!(nearest_index(4.0, &xs), Some(0));
+        assert_eq!(nearest_index(6.0, &xs), Some(1));
+        assert_eq!(nearest_index(19.0, &xs), Some(2));
+    }
+
+    #[test]
+    fn nearest_index_ties_go_to_the_earlier_point() {
+        let xs = [0.0, 10.0, 20.0];
+        assert_eq!(nearest_index(5.0, &xs), Some(0));
+        assert_eq!(nearest_index(15.0, &xs), Some(1));
+        let bars = tick_xs(ChartKind::Bar, 4, 0.0, 100.0);
+        assert_eq!(nearest_index(25.0, &bars), Some(0));
+    }
+
+    #[test]
+    fn nearest_index_reads_both_kind_mappings_alike() {
+        let bars = tick_xs(ChartKind::Bar, 4, 0.0, 100.0);
+        assert_eq!(nearest_index(30.0, &bars), Some(1));
+        let line = tick_xs(ChartKind::Line, 3, 0.0, 100.0);
+        assert_eq!(nearest_index(60.0, &line), Some(1));
     }
 
     /// Below this budget a tick label is a stub rather than a label; the
