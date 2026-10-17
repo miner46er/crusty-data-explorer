@@ -1619,7 +1619,7 @@ fn results_grid(
         store_cell_editor(ui.ctx(), tab.id, None);
     }
     let mut detail_open = detail_open_of(ui.ctx(), tab.id);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label("Filter");
         let mut text = tab.filter().to_owned();
         if ui.text_edit_singleline(&mut text).changed() {
@@ -2435,7 +2435,7 @@ fn copy_bar(
     ui: &mut egui::Ui,
 ) -> Vec<EditAction> {
     let mut actions = Vec::new();
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if tab.active_query_result().is_none_or(|result| result.columns().is_empty()) {
             return;
         }
@@ -3467,11 +3467,11 @@ mod tests {
 
     #[test]
     fn selected_cell_text_switches_to_the_selection_color() {
-        for palette in [Palette::dark(), Palette::light()] {
-            assert_eq!(
-                cell_label_color(true, &palette),
-                Some(egui::Color32::from_rgb(255, 255, 255))
-            );
+        for (palette, expected) in [
+            (Palette::dark(), egui::Color32::from_rgb(255, 255, 255)),
+            (Palette::light(), egui::Color32::from_rgb(30, 80, 140)),
+        ] {
+            assert_eq!(cell_label_color(true, &palette), Some(expected));
             assert_eq!(cell_label_color(false, &palette), None);
         }
     }

@@ -278,6 +278,29 @@ fn parked_list(result: &QueryResult, ui: &mut egui::Ui) {
     ui.label(egui::RichText::new(format!("Not plottable: {}", names.join(", "))).small().weak());
 }
 
+/// Below this width a tick label would be a stub, so it is skipped.
+const MIN_TICK_LABEL_WIDTH: f32 = 16.0;
+
+/// Evenly spaced tick positions that include both ends without repeats.
+fn tick_indices(n: usize, ticks: usize) -> Vec<usize> {
+    let last = n.saturating_sub(1);
+    let span = ticks.saturating_sub(1).max(1);
+    (0..ticks).map(|i| i * last / span).collect()
+}
+
+/// The label width each tick can use while keeping `gap` to its neighbours.
+fn tick_budgets(xs: &[f32], lo: f32, hi: f32, gap: f32) -> Vec<f32> {
+    xs.iter()
+        .enumerate()
+        .map(|(i, x)| {
+            let x = *x;
+            let before = if i == 0 { 2.0 * (x - lo) } else { x - xs[i - 1] };
+            let after = if i + 1 == xs.len() { 2.0 * (hi - x) } else { xs[i + 1] - x };
+            (before.min(after) - gap).max(0.0)
+        })
+        .collect()
+}
+
 /// One bar or line series drawn with rects, segments, and points.
 fn draw_series(kind: ChartKind, series: &Series, ui: &mut egui::Ui) {
     let width = ui.available_width().max(80.0);
@@ -349,19 +372,27 @@ fn draw_series(kind: ChartKind, series: &Series, ui: &mut egui::Ui) {
         font.clone(),
         weak,
     );
-    let ticks = 6usize.min(n);
-    for tick in 0..ticks {
-        let index = tick * (n - 1) / ticks.max(1);
-        let x = x_of(index);
-        let mut label: String = series.labels[index].chars().take(12).collect();
-        if series.labels[index].chars().count() > 12 {
-            label += "…";
+    let ticks = tick_indices(n, 6usize.min(n));
+    let xs: Vec<f32> = ticks.iter().map(|index| x_of(*index)).collect();
+    let budgets = tick_budgets(&xs, plot.left(), plot.right(), ui.spacing().item_spacing.x);
+    for (index, budget) in ticks.iter().zip(budgets) {
+        if budget < MIN_TICK_LABEL_WIDTH {
+            continue;
         }
-        painter.text(
-            egui::pos2(x, response.rect.bottom() - 2.0),
-            egui::Align2::CENTER_BOTTOM,
-            label,
-            font.clone(),
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            &series.labels[*index],
+            0.0,
+            egui::TextFormat { font_id: font.clone(), color: weak, ..Default::default() },
+        );
+        job.wrap = egui::text::TextWrapping::truncate_at_width(budget);
+        let galley = painter.layout_job(job);
+        painter.galley(
+            egui::pos2(
+                x_of(*index) - galley.size().x / 2.0,
+                response.rect.bottom() - 2.0 - galley.size().y,
+            ),
+            galley,
             weak,
         );
     }
@@ -516,5 +547,54 @@ mod tests {
         assert_eq!(numeric_value(&Value::Null), None);
         assert_eq!(numeric_value(&Value::Text("3".to_owned())), None);
         assert_eq!(numeric_value(&Value::Blob(vec![3])), None);
+    }
+
+    #[test]
+    fn tick_indices_label_a_single_point() {
+        assert_eq!(tick_indices(1, 1), vec![0]);
+    }
+
+    #[test]
+    fn tick_indices_label_both_ends_of_two_points() {
+        assert_eq!(tick_indices(2, 2), vec![0, 1]);
+    }
+
+    #[test]
+    fn tick_indices_label_every_point_when_ticks_match_points() {
+        assert_eq!(tick_indices(5, 5), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn tick_indices_spread_across_seven_points() {
+        assert_eq!(tick_indices(7, 6), vec![0, 1, 2, 3, 4, 6]);
+    }
+
+    #[test]
+    fn tick_indices_reach_the_last_point_of_a_long_series() {
+        assert_eq!(tick_indices(200, 6), vec![0, 39, 79, 119, 159, 199]);
+    }
+
+    #[test]
+    fn tick_budgets_split_even_spacing_symmetrically() {
+        let budgets = tick_budgets(&[10.0, 20.0, 30.0, 40.0], 0.0, 50.0, 2.0);
+        assert_eq!(budgets, vec![8.0, 8.0, 8.0, 8.0]);
+    }
+
+    #[test]
+    fn tick_budgets_follow_uneven_spacing() {
+        let budgets = tick_budgets(&[10.0, 20.0, 30.0, 40.0, 50.0, 70.0], 0.0, 80.0, 2.0);
+        assert_eq!(budgets, vec![8.0, 8.0, 8.0, 8.0, 8.0, 18.0]);
+    }
+
+    #[test]
+    fn tick_budgets_use_both_sides_for_a_single_tick() {
+        assert_eq!(tick_budgets(&[20.0], 0.0, 100.0, 5.0), vec![35.0]);
+    }
+
+    #[test]
+    fn tick_budgets_fall_under_the_skip_floor_for_tight_neighbours() {
+        let budgets = tick_budgets(&[10.0, 19.0], 0.0, 28.0, 6.0);
+        assert_eq!(budgets, vec![3.0, 3.0]);
+        assert!(budgets[0] < MIN_TICK_LABEL_WIDTH);
     }
 }

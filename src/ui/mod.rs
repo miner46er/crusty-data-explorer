@@ -141,9 +141,7 @@ impl Theme {
 pub struct Palette {
     pub accent: egui::Color32,
     pub success: egui::Color32,
-    /// The text color on a selection fill. White in both themes: the fill is
-    /// Console Blue either way, and white holds 5.3 to 1 on it while the
-    /// quiet text colors fall near 1.6 to 1.
+    /// Selected-cell text; each theme's selection stroke equals this color.
     pub selection_text: egui::Color32,
     pub edit_tint: egui::Color32,
     pub keyword: egui::Color32,
@@ -175,7 +173,7 @@ impl Palette {
         Self {
             accent: egui::Color32::from_rgb(58, 110, 165),
             success: egui::Color32::from_rgb(56, 142, 60),
-            selection_text: egui::Color32::from_rgb(255, 255, 255),
+            selection_text: egui::Color32::from_rgb(30, 80, 140),
             edit_tint: egui::Color32::from_rgba_unmultiplied(227, 179, 65, 64),
             keyword: egui::Color32::from_rgb(25, 118, 210),
             string: egui::Color32::from_rgb(46, 125, 50),
@@ -233,8 +231,7 @@ fn dark_visuals() -> egui::Visuals {
     visuals.extreme_bg_color = egui::Color32::from_rgb(18, 23, 30);
     visuals.code_bg_color = egui::Color32::from_rgb(40, 48, 60);
     visuals.selection.bg_fill = egui::Color32::from_rgb(58, 110, 165);
-    visuals.selection.stroke =
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(192, 222, 255));
+    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 255, 255));
     visuals.hyperlink_color = egui::Color32::from_rgb(120, 170, 220);
     visuals.window_corner_radius = egui::CornerRadius::same(6);
     visuals.menu_corner_radius = egui::CornerRadius::same(6);
@@ -260,9 +257,8 @@ fn light_visuals() -> egui::Visuals {
     visuals.faint_bg_color = egui::Color32::from_rgb(228, 231, 236);
     visuals.extreme_bg_color = egui::Color32::from_rgb(225, 228, 233);
     visuals.code_bg_color = egui::Color32::from_rgb(240, 242, 245);
-    visuals.selection.bg_fill = egui::Color32::from_rgb(58, 110, 165);
-    visuals.selection.stroke =
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(30, 80, 140));
+    visuals.selection.bg_fill = egui::Color32::from_rgb(207, 226, 247);
+    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(30, 80, 140));
     visuals.hyperlink_color = egui::Color32::from_rgb(25, 118, 210);
     visuals.window_corner_radius = egui::CornerRadius::same(6);
     visuals.menu_corner_radius = egui::CornerRadius::same(6);
@@ -312,27 +308,38 @@ pub fn install(ctx: &egui::Context) {
 mod tests {
     use super::*;
 
+    /// WCAG contrast for two sRGB colors, so the selection pair is measured.
+    fn contrast_ratio(a: eframe::egui::Color32, b: eframe::egui::Color32) -> f32 {
+        fn luminance(color: eframe::egui::Color32) -> f32 {
+            let channel = |value: u8| {
+                let value = value as f32 / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(color.r())
+                + 0.7152 * channel(color.g())
+                + 0.0722 * channel(color.b())
+        }
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
     #[test]
-    fn palette_apply_both_ways_paints_each_bucket() {
+    fn selection_stroke_matches_palette_text_with_contrast() {
         let ctx = egui::Context::default();
         apply_theme(&ctx, Theme::Dark);
-        assert_eq!(
-            ctx.style_of(egui::Theme::Dark).visuals.window_fill,
-            egui::Color32::from_rgb(24, 29, 37)
-        );
-        assert_eq!(
-            ctx.style_of(egui::Theme::Light).visuals.window_fill,
-            egui::Color32::from_rgb(242, 244, 247)
-        );
-        apply_theme(&ctx, Theme::Light);
-        assert_eq!(
-            ctx.style_of(egui::Theme::Dark).visuals.window_fill,
-            egui::Color32::from_rgb(24, 29, 37)
-        );
-        assert_eq!(
-            ctx.style_of(egui::Theme::Light).visuals.window_fill,
-            egui::Color32::from_rgb(242, 244, 247)
-        );
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            let visuals = &ctx.style_of(theme).visuals;
+            let text = Palette::of(theme).selection_text;
+            assert_eq!(visuals.selection.stroke.color, text);
+            assert!(
+                contrast_ratio(text, visuals.selection.bg_fill) >= 4.5,
+                "{theme:?} selection text holds 4.5 to 1 on its fill"
+            );
+        }
     }
 
     #[test]
@@ -346,7 +353,7 @@ mod tests {
         assert_eq!(light.accent, egui::Color32::from_rgb(58, 110, 165));
         assert_eq!(light.success, egui::Color32::from_rgb(56, 142, 60));
         assert_eq!(light.keyword, egui::Color32::from_rgb(25, 118, 210));
-        assert_eq!(light.selection_text, egui::Color32::from_rgb(255, 255, 255));
+        assert_eq!(light.selection_text, egui::Color32::from_rgb(30, 80, 140));
         assert_ne!(dark.success, light.success);
         assert_ne!(dark.keyword, light.keyword);
     }

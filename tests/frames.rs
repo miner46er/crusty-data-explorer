@@ -23,8 +23,24 @@ use crusty_data_explorer::ui;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// The screen the captures render at.
-const SIZE: [u32; 2] = [1440, 900];
+/// The screen the captures render at. `CDE_FRAME_SIZE=WxH` overrides it so
+/// width-dependent defects can be reproduced at the width where they bite.
+fn size() -> [u32; 2] {
+    let Some(value) = std::env::var_os("CDE_FRAME_SIZE") else {
+        return [1440, 900];
+    };
+    let text = value.to_string_lossy();
+    let parsed = text
+        .split_once('x')
+        .and_then(|(w, h)| Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?)))
+        .filter(|(w, h)| *w > 0 && *h > 0);
+    match parsed {
+        Some((w, h)) => [w, h],
+        None => panic!(
+            "CDE_FRAME_SIZE must be WxH with nonzero dimensions, got {text:?}"
+        ),
+    }
+}
 
 /// Points `XDG_CONFIG_HOME` at a scratch dir for the guard's lifetime and
 /// restores it on drop, so no real profile, tab, or settings file is read
@@ -55,8 +71,9 @@ impl Drop for Scratch {
 }
 
 fn build() -> Harness<'static, AppState> {
+    let [w, h] = size();
     Harness::builder()
-        .with_size(egui::vec2(SIZE[0] as f32, SIZE[1] as f32))
+        .with_size(egui::vec2(w as f32, h as f32))
         .build_eframe(|cc| {
             ui::install(&cc.egui_ctx);
             AppState::new(&cc.egui_ctx)
@@ -67,9 +84,10 @@ fn build() -> Harness<'static, AppState> {
 /// rendered at the requested size so a broken render fails the test.
 fn capture(harness: &mut Harness<AppState>, name: &str) {
     let image = harness.render().expect("render the frame");
+    let [w, h] = size();
     assert_eq!(
         image.dimensions(),
-        (SIZE[0], SIZE[1]),
+        (w, h),
         "capture {name} rendered at the requested size"
     );
     let dir = std::path::Path::new("target/frames");
@@ -180,6 +198,12 @@ fn grid_frames() {
     harness.run();
     capture(&mut harness, "grid-light");
 
+    harness.state_mut().open_palette();
+    harness.run();
+    assert!(harness.state().palette_open(), "the palette stays open for the capture");
+    capture(&mut harness, "palette-light");
+
+    harness.state_mut().close_palette();
     harness.state_mut().toggle_theme();
     harness.state_mut().open_palette();
     harness.run();
