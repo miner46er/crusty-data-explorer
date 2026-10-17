@@ -454,8 +454,7 @@ fn start_stream_export(
         StreamFormat::Markdown => ("Markdown", "md"),
         StreamFormat::Inserts => ("SQL", "sql"),
     };
-    let default_name =
-        format!("{}.{extension}", super::query::tab_title(tab.sql.clone()));
+    let default_name = default_export_name(&tab.sql, extension);
     let Some(path) = rfd::FileDialog::new()
         .add_filter(filter, &[extension])
         .set_file_name(&default_name)
@@ -2211,7 +2210,7 @@ fn export_current_view(tab: &mut Tab) {
             }
             let visible = visible_rows(result, tab.sort_col(), tab.sort_dir(), tab.filter());
             let csv = to_csv(result, &visible);
-            let name = format!("{}.csv", super::query::tab_title(tab.sql.clone()));
+            let name = default_export_name(&tab.sql, "csv");
             (csv, name, visible.len())
         }
         None => return,
@@ -2240,7 +2239,7 @@ fn export_json_view(tab: &mut Tab) {
             }
             let visible = visible_rows(result, tab.sort_col(), tab.sort_dir(), tab.filter());
             let json = to_json(result, &visible);
-            let name = format!("{}.json", super::query::tab_title(tab.sql.clone()));
+            let name = default_export_name(&tab.sql, "json");
             (json, name, visible.len())
         }
         None => return,
@@ -2269,7 +2268,7 @@ fn export_jsonl_view(tab: &mut Tab) {
             }
             let visible = visible_rows(result, tab.sort_col(), tab.sort_dir(), tab.filter());
             let jsonl = to_jsonl(result, &visible);
-            let name = format!("{}.jsonl", super::query::tab_title(tab.sql.clone()));
+            let name = default_export_name(&tab.sql, "jsonl");
             (jsonl, name, visible.len())
         }
         None => return,
@@ -2304,7 +2303,7 @@ fn export_xlsx_view(tab: &mut Tab) {
                     return;
                 }
             };
-            let name = format!("{}.xlsx", super::query::tab_title(tab.sql.clone()));
+            let name = default_export_name(&tab.sql, "xlsx");
             (bytes, name, visible.len())
         }
         None => return,
@@ -2345,6 +2344,13 @@ fn slug(text: &str) -> String {
     let capped: String = out.chars().take(40).collect();
     let capped = capped.trim_end_matches('-');
     if capped.is_empty() { "query".to_owned() } else { capped.to_owned() }
+}
+
+/// The default name for one export of `sql`: [`slug`] of its tab title plus
+/// the format's extension, so a table name with spaces or slashes never
+/// lands in a file dialog as a path.
+fn default_export_name(sql: &str, extension: &str) -> String {
+    format!("{}.{extension}", slug(&super::query::tab_title(sql.to_owned())))
 }
 
 /// One default file name per result set in run order: `<slug>-result-N.csv`,
@@ -2438,67 +2444,80 @@ fn copy_bar(
         let rows = selection.resolve(visible);
         let nrows = rows.len();
         let mut headers = tsv_headers_of(ui.ctx(), tab_id);
-        ui.menu_button("Copy", |ui| {
-            if ui
-                .button("TSV")
-                .on_hover_text("Copy the selection as tab-separated values")
-                .clicked()
-            {
-                let text = tab
-                    .active_query_result()
-                    .map(|result| to_tsv(result, &rows, headers))
-                    .unwrap_or_default();
-                ui.ctx().copy_text(text);
-                tab.set_export_notice(format!("Copied {nrows} rows as TSV"), false);
-            }
-            if ui.button("CSV").on_hover_text("Copy the selection as CSV").clicked() {
-                let text = tab
-                    .active_query_result()
-                    .map(|result| to_csv(result, &rows))
-                    .unwrap_or_default();
-                ui.ctx().copy_text(text);
-                tab.set_export_notice(format!("Copied {nrows} rows as CSV"), false);
-            }
-            if ui.button("JSON").on_hover_text("Copy the selection as JSON").clicked() {
-                let text = tab
-                    .active_query_result()
-                    .map(|result| to_json(result, &rows))
-                    .unwrap_or_default();
-                ui.ctx().copy_text(text);
-                tab.set_export_notice(format!("Copied {nrows} rows as JSON"), false);
-            }
-            if ui
-                .button("Markdown")
-                .on_hover_text("Copy the selection as a Markdown table")
-                .clicked()
-            {
-                let text = tab
-                    .active_query_result()
-                    .map(|result| to_markdown(result, &rows))
-                    .unwrap_or_default();
-                ui.ctx().copy_text(text);
-                tab.set_export_notice(format!("Copied {nrows} rows as Markdown"), false);
-            }
-            if ui
-                .button("INSERTs")
-                .on_hover_text("Copy the selection as SQL INSERTs")
-                .clicked()
-            {
-                let text = tab
-                    .active_query_result()
-                    .map(|result| to_inserts("result", result, &rows))
-                    .unwrap_or_default();
-                ui.ctx().copy_text(text);
-                tab.set_export_notice(format!("Copied {nrows} rows as INSERTs"), false);
-            }
-            if ui
-                .checkbox(&mut headers, "Headers")
-                .on_hover_text("Include the header row in TSV copies")
-                .changed()
-            {
-                ui.ctx().data_mut(|data| data.insert_temp(tsv_headers_id(tab_id), headers));
-            }
-        });
+        // A menu that closes on any click costs open, tick, reopen, click to
+        // get TSV with headers, so this one ignores inside clicks and each
+        // copy closes it; the checkbox leaves it standing.
+        egui::menu::MenuButton::new("Copy")
+            .config(
+                egui::menu::MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+            )
+            .ui(ui, |ui| {
+                if ui
+                    .button("TSV")
+                    .on_hover_text("Copy the selection as tab-separated values")
+                    .clicked()
+                {
+                    let text = tab
+                        .active_query_result()
+                        .map(|result| to_tsv(result, &rows, headers))
+                        .unwrap_or_default();
+                    ui.ctx().copy_text(text);
+                    tab.set_export_notice(format!("Copied {nrows} rows as TSV"), false);
+                    ui.close();
+                }
+                if ui.button("CSV").on_hover_text("Copy the selection as CSV").clicked() {
+                    let text = tab
+                        .active_query_result()
+                        .map(|result| to_csv(result, &rows))
+                        .unwrap_or_default();
+                    ui.ctx().copy_text(text);
+                    tab.set_export_notice(format!("Copied {nrows} rows as CSV"), false);
+                    ui.close();
+                }
+                if ui.button("JSON").on_hover_text("Copy the selection as JSON").clicked() {
+                    let text = tab
+                        .active_query_result()
+                        .map(|result| to_json(result, &rows))
+                        .unwrap_or_default();
+                    ui.ctx().copy_text(text);
+                    tab.set_export_notice(format!("Copied {nrows} rows as JSON"), false);
+                    ui.close();
+                }
+                if ui
+                    .button("Markdown")
+                    .on_hover_text("Copy the selection as a Markdown table")
+                    .clicked()
+                {
+                    let text = tab
+                        .active_query_result()
+                        .map(|result| to_markdown(result, &rows))
+                        .unwrap_or_default();
+                    ui.ctx().copy_text(text);
+                    tab.set_export_notice(format!("Copied {nrows} rows as Markdown"), false);
+                    ui.close();
+                }
+                if ui
+                    .button("INSERTs")
+                    .on_hover_text("Copy the selection as SQL INSERTs")
+                    .clicked()
+                {
+                    let text = tab
+                        .active_query_result()
+                        .map(|result| to_inserts("result", result, &rows))
+                        .unwrap_or_default();
+                    ui.ctx().copy_text(text);
+                    tab.set_export_notice(format!("Copied {nrows} rows as INSERTs"), false);
+                    ui.close();
+                }
+                if ui
+                    .checkbox(&mut headers, "Headers")
+                    .on_hover_text("Include the header row in TSV copies")
+                    .changed()
+                {
+                    ui.ctx().data_mut(|data| data.insert_temp(tsv_headers_id(tab_id), headers));
+                }
+            });
         // The IN list stays a button beside the menu: it needs a clicked cell
         // for its column, where the other copies fall back to the whole view.
         if ui
@@ -3159,6 +3178,24 @@ mod tests {
         assert_eq!(staged.len(), crate::import::ROW_CAP);
         assert_eq!(staged[0], vec!["0".to_owned()]);
         assert_eq!(staged[staged.len() - 1], vec!["999".to_owned()]);
+    }
+
+    #[test]
+    fn default_export_names_slug_the_table_title() {
+        assert_eq!(
+            default_export_name("SELECT * FROM users", "csv"),
+            "users.csv".to_owned()
+        );
+        // A quoted name with a space and a numbered twin steer clear of the
+        // dialog's path and of the tab numbering.
+        assert_eq!(
+            default_export_name("SELECT * FROM \"users 2\"", "json"),
+            "users-2.json".to_owned()
+        );
+        assert_eq!(
+            default_export_name("SELECT * FROM \"a/b\\\\c\"", "xlsx"),
+            "a-b-c.xlsx".to_owned()
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Guard for the embedded font stack.
 //!
-//! egui's bundled fonts carry no glyph for the fullwidth and halfwidth
-//! forms block (U+FF01..=U+FF60), so any character from that block paints
+//! egui's bundled fonts carry no glyph for the halfwidth and fullwidth
+//! forms block (U+FF01..=U+FFEF), so any character from that block paints
 //! as a hollow box in both themes. The ASCII forms do have glyphs, so the
 //! sources stay out of the block.
 
@@ -38,7 +38,7 @@ fn sources_stay_out_of_the_fullwidth_forms_block() {
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
         for (line, text) in text.lines().enumerate() {
             for (column, character) in text.chars().enumerate() {
-                if ('\u{FF01}'..='\u{FF60}').contains(&character) {
+                if ('\u{FF01}'..='\u{FFEF}').contains(&character) {
                     let shown = path.strip_prefix(manifest).unwrap_or(&path);
                     offenders.push(format!(
                         "{}:{}:{}: {character:?} (U+{:04X})",
@@ -53,9 +53,10 @@ fn sources_stay_out_of_the_fullwidth_forms_block() {
     }
     assert!(
         offenders.is_empty(),
-        "the embedded fonts have no glyph for the fullwidth and halfwidth \
-         forms block (U+FF01..=U+FF60), so these characters would render as \
-         hollow boxes; write the ASCII form instead:\n{}",
+        "the embedded fonts have no glyph for the halfwidth and fullwidth \
+         forms block (U+FF01..=U+FFEF, the whole block bar its unassigned \
+         first code point), so these characters would render as hollow \
+         boxes; write the ASCII form instead:\n{}",
         offenders.join("\n")
     );
 }

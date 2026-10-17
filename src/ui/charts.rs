@@ -45,6 +45,10 @@ pub struct ChartSpec {
 pub struct Series {
     pub labels: Vec<String>,
     pub values: Vec<f64>,
+    /// Each value's own display string, the text the grid shows, so the
+    /// tooltip reads an integer past 2^53 exactly instead of the rounded
+    /// f64 conversion.
+    pub value_labels: Vec<String>,
     pub dropped_nulls: usize,
     pub dropped_overflow: usize,
 }
@@ -126,11 +130,16 @@ pub fn series_points(
     let mut series = Series {
         labels: Vec::new(),
         values: Vec::new(),
+        value_labels: Vec::new(),
         dropped_nulls: 0,
         dropped_overflow: 0,
     };
     for row in 0..result.row_count() {
-        let Some(number) = values.values().get(row).and_then(numeric_value) else {
+        let Some(value) = values.values().get(row) else {
+            series.dropped_nulls += 1;
+            continue;
+        };
+        let Some(number) = numeric_value(value) else {
             series.dropped_nulls += 1;
             continue;
         };
@@ -145,6 +154,7 @@ pub fn series_points(
             .unwrap_or_default();
         series.labels.push(label);
         series.values.push(number);
+        series.value_labels.push(value.display(CELL_CAP).into_owned());
     }
     Some(series)
 }
@@ -455,9 +465,11 @@ fn draw_series(kind: ChartKind, series: &Series, ui: &mut egui::Ui) {
     {
         response.on_hover_ui_at_pointer(|ui| {
             ui.set_max_width(ui.spacing().tooltip_width);
-            // The tick text elides to its room; the tooltip reads the whole
-            // label and the point's value.
-            ui.label(format!("{} · {}", series.labels[index], series.values[index]));
+            // The tick text elides to its room; the tooltip shows the
+            // label at its 256-character cap and the value's own display
+            // string, so a large integer reads as the grid shows it rather
+            // than rounded through f64.
+            ui.label(format!("{} · {}", series.labels[index], series.value_labels[index]));
         });
     }
 }
@@ -566,6 +578,19 @@ mod tests {
         assert_eq!(series_points(&mixed_result(), 0, 0), None);
         assert_eq!(series_points(&mixed_result(), 0, 9), None);
         assert_eq!(series_points(&mixed_result(), 9, 1), None);
+    }
+
+    #[test]
+    fn series_keeps_each_values_own_display_text() {
+        let big = 9_007_199_254_740_993_i64; // 2^53 + 1, not an f64
+        let result = result(
+            &[("label", "TEXT"), ("n", "INTEGER")],
+            vec![vec![Value::Text("ada".to_owned())], vec![Value::Integer(big)]],
+        );
+        let series = series_points(&result, 0, 1).unwrap();
+        assert_eq!(series.values, vec![big as f64], "the plot still reads f64");
+        assert_eq!(series.value_labels, vec![big.to_string()], "the tooltip does not");
+        assert_eq!(series.value_labels[0], "9007199254740993");
     }
 
     #[test]

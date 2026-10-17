@@ -2,13 +2,16 @@
 //!
 //! These are not visual-regression tests. Each one renders a real frame
 //! through the eframe path and writes a PNG under `target/frames/` for a
-//! human or an agent to look at. The only assertion is that the frame
-//! rendered at the requested size, so the captures stay portable across
-//! platforms and font stacks. Committed goldens can grow from here once
-//! one machine owns the baselines.
+//! human or an agent to look at. Every capture asserts that the frame
+//! rendered at the requested size, and a test that covers one affordance
+//! also asserts the node or the pixel that affordance produced, so no
+//! capture is left assertion-free. The captures stay portable across
+//! platforms and font stacks: the assertions name text and sampled pixels,
+//! never a golden image. Committed goldens can grow from here once one
+//! machine owns the baselines.
 //!
-//! Run with `cargo test --test frames -- --nocapture`; the PNG paths print
-//! as the tests run.
+//! Run with `cargo test --test frames -- --nocapture`; the PNG paths and
+//! the sampled pixels print as the tests run.
 
 use std::ffi::OsString;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -16,7 +19,7 @@ use std::time::Duration;
 
 use eframe::egui;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 
 use crusty_data_explorer::app::{AppState, ConnectionState, Environment, RunOutcome};
 use crusty_data_explorer::db::{ConnectionConfig, ConnectionId, TabId};
@@ -107,9 +110,67 @@ fn capture(harness: &mut Harness<AppState>, name: &str) {
     println!("capture: {}", path.display());
 }
 
+/// One sampled row of the autocommit chip: the edge pixel, the fill behind
+/// the label, and the panel beside the chip, each as the capture painted it.
+#[derive(Debug)]
+struct ChipPixels {
+    edge: [u8; 4],
+    fill: [u8; 4],
+    panel: [u8; 4],
+}
+
+/// The greatest per-channel distance between two pixels.
+fn channel_distance(a: [u8; 4], b: [u8; 4]) -> u8 {
+    a.iter().zip(b).map(|(a, b)| a.abs_diff(b)).max().unwrap_or(0)
+}
+
+/// WCAG contrast for two sRGB pixels, so a sample answers a design review in
+/// the terms it was raised in.
+fn contrast_ratio(a: [u8; 4], b: [u8; 4]) -> f32 {
+    fn luminance(pixel: [u8; 4]) -> f32 {
+        let channel = |value: u8| {
+            let value = value as f32 / 255.0;
+            if value <= 0.04045 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * channel(pixel[0]) + 0.7152 * channel(pixel[1]) + 0.0722 * channel(pixel[2])
+    }
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// One pixel of a captured frame.
+fn pixel(image: &image::RgbaImage, x: u32, y: u32) -> [u8; 4] {
+    image.get_pixel(x.min(image.width() - 1), y.min(image.height() - 1)).0
+}
+
+/// Save the chip's capture and sample the pixels around its left edge: the
+/// fill inside the chip, the panel to the right of the row, and the strongest
+/// neighbour of the panel across the 1px stroke. All three print for the
+/// design record.
+fn sample_chip(harness: &mut Harness<AppState>, name: &str) -> ChipPixels {
+    capture(harness, name);
+    let chip = harness.get_by_label("Autocommit").rect();
+    let image = harness.render().expect("render the frame");
+    let y = chip.center().y.round() as u32;
+    let fill = pixel(&image, (chip.left() + 5.0).round() as u32, y);
+    let panel = pixel(&image, image.width() - 8, y);
+    let left = (chip.left().round() as i64 - 2).max(0) as u32;
+    let right = chip.left().round() as u32 + 2;
+    let edge = (left..=right)
+        .map(|x| pixel(&image, x, y))
+        .max_by_key(|sample| channel_distance(*sample, panel))
+        .expect("a sampling window");
+    println!(
+        "{name}: edge {edge:?} fill {fill:?} panel {panel:?} \
+         edge/panel {:.2}:1 fill/panel {:.2}:1",
+        contrast_ratio(edge, panel),
+        contrast_ratio(fill, panel),
+    );
+    ChipPixels { edge, fill, panel }
+}
+
 /// Step frames until `pred` holds, panicking after a bounded wait.
-fn step_until(harness: &mut Harness<AppState>, what: &str, pred: impl Fn(&AppState) -> bool) {
-    for _ in 0..600 {
+fn step_until(harness: &mut Harness<AppState>, what: &str, pred: impl Fn(&AppState) -> bool) {    for _ in 0..600 {
         if pred(harness.state()) {
             return;
         }
@@ -238,8 +299,9 @@ fn line_chart_frame() {
     capture(&mut harness, "chart-line-dark");
 }
 
-/// The results toolbar's two menus, one capture each: egui closes a menu on
-/// any click, so opening the second would close the first.
+/// The results toolbar's Export menu. The Copy menu is its own test
+/// (`copy_menu_frame`): egui closes a menu on any click, so opening the
+/// second would close the first.
 #[test]
 fn toolbar_menu_frames() {
     let _guard = env_lock();
@@ -248,6 +310,10 @@ fn toolbar_menu_frames() {
 
     harness.get_by_label("Export").click();
     harness.run_steps(6);
+    assert!(
+        harness.query_by_label("All result sets").is_some(),
+        "the export menu is open"
+    );
     capture(&mut harness, "export-menu-dark");
 }
 
@@ -259,7 +325,36 @@ fn copy_menu_frame() {
 
     harness.get_by_label("Copy").click();
     harness.run_steps(6);
+    assert!(harness.query_by_label("Markdown").is_some(), "the copy menu is open");
     capture(&mut harness, "copy-menu-dark");
+}
+
+/// Ticking Headers inside the Copy menu leaves the menu standing: the menu
+/// ignores inside clicks, so the capture after the tick still shows it.
+#[test]
+fn copy_menu_headers_frame() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, _tab) = demo_setup("copy-headers");
+    harness.run();
+
+    harness.get_by_label("Copy").click();
+    harness.run_steps(6);
+    assert!(harness.query_by_label("Headers").is_some(), "the copy menu is open");
+    let before = harness
+        .get_by_label("Headers")
+        .accesskit_node()
+        .toggled()
+        .expect("the Headers checkbox reports its state");
+    harness.get_by_label("Headers").click();
+    harness.run_steps(6);
+    let after = harness
+        .get_by_label("Headers")
+        .accesskit_node()
+        .toggled()
+        .expect("the Headers checkbox reports its state");
+    assert_ne!(before, after, "the tick landed");
+    assert!(harness.query_by_label("Markdown").is_some(), "the menu is still open");
+    capture(&mut harness, "copy-menu-headers-dark");
 }
 
 /// The chart hover tooltip. The pointer lands above the "N plotted" note,
@@ -275,6 +370,10 @@ fn chart_hover_frame() {
     let note = harness.get_by_label("5 plotted").rect();
     harness.hover_at(egui::pos2(note.center().x, note.top() - 110.0));
     harness.run_steps(4);
+    assert!(
+        harness.query_all_by_label_contains("@example.com · ").next().is_some(),
+        "the hover tooltip names the point"
+    );
     capture(&mut harness, "chart-hover-dark");
 
     harness.get_by_label("Bar").click();
@@ -282,5 +381,42 @@ fn chart_hover_frame() {
     let note = harness.get_by_label("5 plotted").rect();
     harness.hover_at(egui::pos2(note.center().x, note.top() - 110.0));
     harness.run_steps(4);
+    assert!(
+        harness.query_all_by_label_contains("@example.com · ").next().is_some(),
+        "the hover tooltip names the point"
+    );
     capture(&mut harness, "chart-hover-bar-dark");
+}
+
+/// The autocommit chip on a SQLite tab, where the mode is constant and the
+/// label stays plain. Each capture prints the sampled edge, fill, and panel
+/// pixels: the fill alone sits within a few percent of the panel, so the
+/// edge is what makes the chip read as a control slot.
+#[test]
+fn autocommit_chip_frames() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, _tab) = demo_setup("chip");
+    harness.run();
+
+    let dark = sample_chip(&mut harness, "autocommit-chip-dark");
+    assert!(
+        channel_distance(dark.edge, dark.panel) >= 16,
+        "the dark chip edge stands out from the panel: {dark:?}"
+    );
+    assert!(
+        channel_distance(dark.fill, dark.panel) < 16,
+        "the dark fill alone stays quiet against the panel: {dark:?}"
+    );
+
+    harness.state_mut().toggle_theme();
+    harness.run();
+    let light = sample_chip(&mut harness, "autocommit-chip-light");
+    assert!(
+        channel_distance(light.edge, light.panel) >= 16,
+        "the light chip edge stands out from the panel: {light:?}"
+    );
+    assert!(
+        channel_distance(light.fill, light.panel) < 16,
+        "the light fill alone stays quiet against the panel: {light:?}"
+    );
 }
