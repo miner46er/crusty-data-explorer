@@ -288,6 +288,41 @@ pub fn split_statements(sql: &str) -> Vec<String> {
         .collect()
 }
 
+/// Statement heads that may add, drop, or rename schema objects, so a run
+/// that begins with one is worth a navigator reload when it lands Ok.
+const SCHEMA_KEYWORDS: [&str; 6] =
+    ["CREATE", "ALTER", "DROP", "RENAME", "ATTACH", "DETACH"];
+
+/// True when any statement in `sql` begins, after whitespace and comments,
+/// with one of [`SCHEMA_KEYWORDS`]. Case-insensitive; the word only counts at
+/// the statement head, so `SELECT` text mentioning a keyword never does.
+pub fn sql_changes_schema(sql: &str) -> bool {
+    split_statements(sql).iter().any(|statement| {
+        first_word_after_comments(statement).is_some_and(|word| {
+            SCHEMA_KEYWORDS.iter().any(|keyword| word.eq_ignore_ascii_case(keyword))
+        })
+    })
+}
+
+/// The leading ASCII word of `statement`, skipping whitespace, `--` line
+/// comments, and `/* */` block comments. None when only comments remain or
+/// the head is not a word.
+fn first_word_after_comments(statement: &str) -> Option<&str> {
+    let mut rest = statement;
+    loop {
+        rest = rest.trim_start();
+        if let Some(tail) = rest.strip_prefix("--") {
+            rest = tail.split_once('\n').map_or("", |(_, after)| after);
+        } else if let Some(tail) = rest.strip_prefix("/*") {
+            rest = tail.split_once("*/").map_or("", |(_, after)| after);
+        } else {
+            break;
+        }
+    }
+    let end = rest.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(rest.len());
+    (end > 0).then(|| &rest[..end])
+}
+
 /// Index into [`split_statements`] of the statement under `cursor_byte`. A
 /// cursor in the whitespace between statements, or after the last one, belongs
 /// to the statement before it; leading whitespace belongs to the first.
@@ -373,6 +408,38 @@ mod tests {
         assert!(split_statements(" ; ; ").is_empty());
         assert!(current_statement("", 0).is_none());
         assert!(current_statement("  ;  ", 2).is_none());
+    }
+
+    #[test]
+    fn schema_change_classifier_reads_the_leading_keyword() {
+        assert!(!sql_changes_schema(""));
+        assert!(!sql_changes_schema("SELECT 1"));
+        assert!(!sql_changes_schema("EXPLAIN SELECT * FROM t"));
+        assert!(sql_changes_schema("create table t (id integer)"));
+        assert!(sql_changes_schema("  DROP  TABLE t"));
+        assert!(sql_changes_schema("Alter table t add column c text"));
+        assert!(sql_changes_schema("RENAME TABLE a TO b"));
+        assert!(sql_changes_schema("ATTACH DATABASE 'x.db' AS x"));
+        assert!(sql_changes_schema("DETACH DATABASE x"));
+    }
+
+    #[test]
+    fn schema_change_classifier_scans_every_statement() {
+        assert!(sql_changes_schema(
+            "SELECT 1;\nCREATE TABLE t (id integer);\nSELECT 2"
+        ));
+        assert!(!sql_changes_schema("SELECT 1; SELECT 2"));
+    }
+
+    #[test]
+    fn schema_change_classifier_skips_strings_and_comments() {
+        assert!(!sql_changes_schema("SELECT 'create table t'"));
+        assert!(!sql_changes_schema("SELECT 1 -- create table t"));
+        assert!(!sql_changes_schema("SELECT 1 /* drop table t */"));
+        assert!(!sql_changes_schema("-- migrate\nSELECT 1"));
+        assert!(sql_changes_schema("-- migrate\nCREATE TABLE t (id integer)"));
+        assert!(sql_changes_schema("/* up */ ALTER TABLE t ADD COLUMN c TEXT"));
+        assert!(sql_changes_schema("SELECT 1; -- make a table\nDROP TABLE t"));
     }
 
     #[test]
