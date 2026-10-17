@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-17T15:21:41Z",
+  "generatedAt": "2026-10-17T18:03:34Z",
   "title": "Design System: crusty-data-explorer",
   "extensions": {
     "colorMeta": {
@@ -227,6 +227,66 @@
           "#73a7ea",
           "#a7ceff",
           "#e4f0ff"
+        ]
+      },
+      "disabled-fill-dark": {
+        "role": "neutral",
+        "displayName": "Disabled Fill (Dark)",
+        "canonical": "#232933",
+        "tonalRamp": [
+          "#070b14",
+          "#1e242e",
+          "#3c434e",
+          "#5a616c",
+          "#7c8490",
+          "#9da5b2",
+          "#c3cbd8",
+          "#e7effd"
+        ]
+      },
+      "disabled-text-dark": {
+        "role": "neutral",
+        "displayName": "Disabled Text (Dark)",
+        "canonical": "#949ba6",
+        "tonalRamp": [
+          "#070b13",
+          "#1f242d",
+          "#3d434c",
+          "#5a616b",
+          "#7d848e",
+          "#9ea5b0",
+          "#c4cbd7",
+          "#e7effb"
+        ]
+      },
+      "disabled-fill-light": {
+        "role": "neutral",
+        "displayName": "Disabled Fill (Light)",
+        "canonical": "#eaedf1",
+        "tonalRamp": [
+          "#090b0e",
+          "#222427",
+          "#404346",
+          "#5e6164",
+          "#818387",
+          "#a2a5a8",
+          "#c8cbcf",
+          "#eceff3"
+        ]
+      },
+      "disabled-text-light": {
+        "role": "neutral",
+        "displayName": "Disabled Text (Light)",
+        "canonical": "#5f6973",
+        "tonalRamp": [
+          "#050c13",
+          "#1c252d",
+          "#3a444d",
+          "#58626c",
+          "#7a858f",
+          "#9ba6b1",
+          "#c1ccd7",
+          "#e4f0fc"
         ]
       },
       "commit-green-dark": {
@@ -751,6 +811,7 @@
       "Don't fill destructive buttons with red or style errors into field backgrounds; Fault Red is text-only, and it is never used for a standing identity (that is Guard Red's job).",
       "Don't add a second font family, a display face, or fluid type; the embedded Ubuntu-Light / Hack pairing is the identity.",
       "Don't uppercase anything except the sidebar section labels.",
+      "Don't use fullwidth or halfwidth forms (U+FF01 to U+FF60) in UI text; the embedded fonts lack them and they render as hollow boxes. Use the ASCII forms; tests/glyph_set.rs guards this.",
       "Don't spend Console Blue as decoration: it marks location (the active cell, the selected card's stroke, the dark theme's selection fill) and structure (create actions, heavy path), and it should read as rare on any given screen.",
       "Don't round grid cells or tint them for anything except staged state."
     ]

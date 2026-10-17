@@ -4,7 +4,9 @@
 
 ## Platform
 
-desktop
+adaptive
+
+<!-- Desktop-native window app (Rust/egui, macOS and Linux); no web markup and no web edition. `adaptive` is the closest recognized value: native and cross-platform. Do not route web or browser tooling here. -->
 
 ## Users
 
