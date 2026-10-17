@@ -237,3 +237,50 @@ fn line_chart_frame() {
     harness.run();
     capture(&mut harness, "chart-line-dark");
 }
+
+/// The results toolbar's two menus, one capture each: egui closes a menu on
+/// any click, so opening the second would close the first.
+#[test]
+fn toolbar_menu_frames() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, _tab) = demo_setup("menus");
+    harness.run();
+
+    harness.get_by_label("Export").click();
+    harness.run_steps(6);
+    capture(&mut harness, "export-menu-dark");
+}
+
+#[test]
+fn copy_menu_frame() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, _tab) = demo_setup("copy-menu");
+    harness.run();
+
+    harness.get_by_label("Copy").click();
+    harness.run_steps(6);
+    capture(&mut harness, "copy-menu-dark");
+}
+
+/// The chart hover tooltip. The pointer lands above the "N plotted" note,
+/// which sits under the plot, and the steps clear egui's tooltip delay.
+#[test]
+fn chart_hover_frame() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, _tab) = demo_setup("hover");
+    harness.run();
+
+    harness.get_by_label("Line").click();
+    harness.run();
+    let note = harness.get_by_label("5 plotted").rect();
+    harness.hover_at(egui::pos2(note.center().x, note.top() - 110.0));
+    harness.run_steps(4);
+    capture(&mut harness, "chart-hover-dark");
+
+    harness.get_by_label("Bar").click();
+    harness.run();
+    let note = harness.get_by_label("5 plotted").rect();
+    harness.hover_at(egui::pos2(note.center().x, note.top() - 110.0));
+    harness.run_steps(4);
+    capture(&mut harness, "chart-hover-bar-dark");
+}
