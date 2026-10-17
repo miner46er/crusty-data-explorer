@@ -149,6 +149,12 @@ pub struct Palette {
     /// fill as-is, which is lighter than the faint row but darker than the
     /// window.
     pub selected_card_fill: egui::Color32,
+    /// The fill of an unavailable control: a whisper-quiet neutral that
+    /// recedes into either panel and carries no trace of the selection blue.
+    pub disabled_fill: egui::Color32,
+    /// The label on `disabled_fill`, readable at 4.5 to 1 and still calmer
+    /// than any enabled neighbor.
+    pub disabled_text: egui::Color32,
     pub edit_tint: egui::Color32,
     pub keyword: egui::Color32,
     pub string: egui::Color32,
@@ -168,6 +174,8 @@ impl Palette {
             selection_text: egui::Color32::from_rgb(255, 255, 255),
             selection_fill,
             selected_card_fill: selection_fill.gamma_multiply(0.35),
+            disabled_fill: egui::Color32::from_rgb(35, 41, 51),
+            disabled_text: egui::Color32::from_rgb(148, 155, 166),
             edit_tint: egui::Color32::from_rgba_unmultiplied(227, 179, 65, 64),
             keyword: egui::Color32::from_rgb(120, 170, 220),
             string: egui::Color32::from_rgb(140, 200, 150),
@@ -186,6 +194,8 @@ impl Palette {
             selection_text: egui::Color32::from_rgb(30, 80, 140),
             selection_fill,
             selected_card_fill: selection_fill,
+            disabled_fill: egui::Color32::from_rgb(234, 237, 241),
+            disabled_text: egui::Color32::from_rgb(95, 105, 115),
             edit_tint: egui::Color32::from_rgba_unmultiplied(227, 179, 65, 64),
             keyword: egui::Color32::from_rgb(25, 118, 210),
             string: egui::Color32::from_rgb(46, 125, 50),
@@ -392,6 +402,8 @@ mod tests {
         assert_eq!(dark.selection_text, egui::Color32::from_rgb(255, 255, 255));
         assert_eq!(dark.selection_fill, egui::Color32::from_rgb(58, 110, 165));
         assert_eq!(dark.selected_card_fill, dark.selection_fill.gamma_multiply(0.35));
+        assert_eq!(dark.disabled_fill, egui::Color32::from_rgb(35, 41, 51));
+        assert_eq!(dark.disabled_text, egui::Color32::from_rgb(148, 155, 166));
         let light = Palette::of(egui::Theme::Light);
         assert_eq!(light.accent, egui::Color32::from_rgb(58, 110, 165));
         assert_eq!(light.success, egui::Color32::from_rgb(56, 142, 60));
@@ -399,7 +411,28 @@ mod tests {
         assert_eq!(light.selection_text, egui::Color32::from_rgb(30, 80, 140));
         assert_eq!(light.selection_fill, egui::Color32::from_rgb(207, 226, 247));
         assert_eq!(light.selected_card_fill, egui::Color32::from_rgb(207, 226, 247));
+        assert_eq!(light.disabled_fill, egui::Color32::from_rgb(234, 237, 241));
+        assert_eq!(light.disabled_text, egui::Color32::from_rgb(95, 105, 115));
         assert_ne!(dark.success, light.success);
         assert_ne!(dark.keyword, light.keyword);
+    }
+
+    #[test]
+    fn disabled_pair_holds_contrast_and_differs_from_selection() {
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            let palette = Palette::of(theme);
+            assert!(
+                contrast_ratio(palette.disabled_text, palette.disabled_fill) >= 4.5,
+                "{theme:?} disabled text holds 4.5 to 1 on its fill"
+            );
+            assert_ne!(
+                palette.disabled_text, palette.selection_text,
+                "{theme:?} disabled text is its own steel, not the selection text"
+            );
+            assert_ne!(
+                palette.disabled_fill, palette.selection_fill,
+                "{theme:?} disabled fill is its own quiet slate, not the selection fill"
+            );
+        }
     }
 }
