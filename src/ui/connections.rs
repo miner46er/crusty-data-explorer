@@ -773,11 +773,11 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                 let mut actions: Vec<SidebarAction> = Vec::new();
-                let first_run = state.connections().is_empty();
+                let no_connections = state.connections().is_empty();
                 let conn_header = ui
                     .horizontal(|ui| {
                         ui.label(egui::RichText::new("CONNECTIONS").small().weak());
-                        if !first_run
+                        if !no_connections
                             && ui.small_button("+ Folder").on_hover_text("New folder").clicked()
                         {
                             arm_folder_input(ui.ctx(), "conn", "");
@@ -799,7 +799,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                     folder_creation_editor(ui, "conn", "");
                 }
                 ui.add_space(4.0);
-                if !first_run {
+                if !no_connections {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Filter tables:").small().weak());
                         let mut filter = state.navigator_filter().to_owned();
@@ -817,7 +817,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                     ui.add_space(4.0);
                 }
 
-                if first_run {
+                if no_connections {
                     ui.label("No connections yet.");
                     ui.small("Add one below to start querying.");
                     ui.add_space(8.0);
@@ -917,7 +917,10 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                     ui.add_space(4.0);
                 }
 
-                if !first_run {
+                // A section hides with no connections only while it has
+                // nothing to show, so deleting the last connection never
+                // strands the rows that outlive it.
+                if !no_connections || !state.history().is_empty() {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("HISTORY").small().weak());
                         let scope_label =
@@ -1033,9 +1036,9 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                 }
 
                 // The saved rows and the action loop both gate on a modal, so
-                // the flag lives outside the first-run gate.
+                // the flag lives outside the section gate.
                 let modal_open = sidebar_modal_open(state);
-                if !first_run {
+                if !no_connections || !state.saved_queries().is_empty() {
                     let saved_header = ui
                         .horizontal(|ui| {
                             ui.label(egui::RichText::new("SAVED").small().weak());
@@ -1151,7 +1154,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                 }
                 ui.add_space(8.0);
 
-                if !first_run {
+                if !no_connections || !state.bookmarks().is_empty() {
                     ui.label(egui::RichText::new("BOOKMARKS").small().weak());
                     ui.add_space(4.0);
                     if state.bookmarks().is_empty() {

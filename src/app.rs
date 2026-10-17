@@ -24,8 +24,8 @@ use crate::import::{
     ColumnMap, ROW_CAP, dropped_rows, insert_batches, map_headers, parse_csv, parse_jsonl,
 };
 use crate::sql::{
-    collect_params, current_statement, split_statements, sql_changes_schema, statement_ranges,
-    substitute,
+    collect_params, current_statement, split_statements, statement_changes_schema,
+    statement_ranges, substitute,
 };
 use crate::ui::compare::{
     CompareError, CompareOutput, compare_select, diff_tables, parse_key_columns,
@@ -4774,14 +4774,16 @@ impl AppState {
                     t.outcome = outcome;
                     return;
                 };
+                let (started, statements) = match &t.outcome {
+                    RunOutcome::Running { started, statements, .. } => {
+                        (*started, statements.clone())
+                    }
+                    _ => (Instant::now(), Vec::new()),
+                };
                 // The run's own statements decide whether a successful
                 // landing should reload the navigator.
-                let schema_change = match &t.outcome {
-                    RunOutcome::Running { statements, .. } => {
-                        statements.iter().any(|statement| sql_changes_schema(statement))
-                    }
-                    _ => false,
-                };
+                let schema_change =
+                    statements.iter().any(|statement| statement_changes_schema(statement));
                 let ok = matches!(&outcome, RunOutcome::Ok { .. });
                 // An import landing behaves like an apply that adds no
                 // history entry and records its send-time notice.
@@ -4798,11 +4800,16 @@ impl AppState {
                 if t.silent_run == Some(run) {
                     t.silent_run = None;
                 }
-                let table_ddl = t.pending_table == Some(run);
-                if table_ddl {
+                if t.pending_table == Some(run) {
                     t.pending_table = None;
                 }
-                let schema_refresh = ok && (table_ddl || schema_change);
+                // Only an Ok landing moves the transaction flag, so a failed
+                // BEGIN, COMMIT, or ROLLBACK leaves it as it was.
+                let transaction = if ok { transaction_action(&statements) } else { None };
+                // A ROLLBACK can undo DDL the navigator has already listed,
+                // so its landing reloads the schema like a schema change.
+                let rollback = transaction == Some(TransactionAction::Rollback);
+                let schema_refresh = ok && (schema_change || rollback);
                 if ok {
                     t.edits.clear();
                     t.deleted_rows.clear();
@@ -4811,12 +4818,6 @@ impl AppState {
                         self.pending_edit_preview = None;
                     }
                 }
-                let (started, statements) = match &t.outcome {
-                    RunOutcome::Running { started, statements, .. } => {
-                        (*started, statements.clone())
-                    }
-                    _ => (Instant::now(), Vec::new()),
-                };
                 let sql = t.sql.clone();
                 let entries: Vec<HistoryEntry> = if silent {
                     Vec::new()
@@ -4858,9 +4859,6 @@ impl AppState {
                 if !silent || !ok {
                     t.clear_export_notice();
                 }
-                // Only an Ok landing moves the transaction flag, so a failed
-                // BEGIN, COMMIT, or ROLLBACK leaves it as it was.
-                let transaction = if ok { transaction_action(&statements) } else { None };
                 Some((tab_id, conn, entries, refresh, import_notice, transaction, schema_refresh))
             }
             None => None,
@@ -10290,6 +10288,66 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_sections_survive_the_last_connection_only_with_rows_to_show() {
+        with_isolated_state("sidebar-availability", |state| {
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let render = |state: &mut AppState| {
+                let mut output = ctx.run_ui(input.clone(), |ui| {
+                    crate::ui::connections::sidebar(state, ui);
+                    crate::ui::query::editor(state, ui);
+                });
+                output.textures_delta.clear();
+                rendered_text(&output)
+            };
+
+            // An empty profile hides the empty sections and the tables
+            // filter, and still offers the editor's first connection button.
+            let text = render(state);
+            assert!(!text.iter().any(|t| t == "HISTORY"), "{text:?}");
+            assert!(!text.iter().any(|t| t == "SAVED"), "{text:?}");
+            assert!(!text.iter().any(|t| t == "BOOKMARKS"), "{text:?}");
+            assert!(!text.iter().any(|t| t.contains("Filter tables")), "{text:?}");
+            assert!(text.iter().any(|t| t == "+ New connection"), "{text:?}");
+
+            // Rows that outlive the last connection keep their sections
+            // visible; an import lands in SAVED the same way.
+            state.saved.insert(
+                0,
+                SavedQuery::new(
+                    1,
+                    "keep".to_owned(),
+                    "SELECT 1".to_owned(),
+                    ConnectionId::from_raw(9),
+                    None,
+                    false,
+                )
+                .expect("named query"),
+            );
+            state.history.push(HistoryEntry {
+                conn: ConnectionId::from_raw(9),
+                sql: "SELECT 1".to_owned(),
+                succeeded: true,
+                rows: Some(1),
+                took: std::time::Duration::from_millis(1),
+                at: 0,
+            });
+            let text = render(state);
+            assert!(text.iter().any(|t| t == "SAVED"), "{text:?}");
+            assert!(text.iter().any(|t| t == "keep"), "{text:?}");
+            assert!(text.iter().any(|t| t == "HISTORY"), "{text:?}");
+            assert!(!text.iter().any(|t| t == "BOOKMARKS"), "nothing bookmarked");
+            assert!(!text.iter().any(|t| t.contains("Filter tables")), "{text:?}");
+        });
+    }
+
+    #[test]
     fn table_count_requests_once_caches_and_clears_with_the_session() {
         with_isolated_state("row-count-state", |state| {
             let conn = add_sqlite_connection(state, "mem-count");
@@ -11289,6 +11347,98 @@ mod tests {
 
             state.disconnect(conn);
             assert!(!state.transaction_ready(tab), "disconnected again");
+        });
+    }
+
+    #[test]
+    fn rollback_landing_reloads_the_schema_but_begin_and_commit_do_not() {
+        with_isolated_state("tx-rollback-reload", |state| {
+            let conn = add_sqlite_connection(state, "mem-rollback-reload");
+            let commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+
+            let run = send_transaction(state, &commands, tab, TransactionAction::Begin);
+            state.apply(DbEvent::BatchOk { run, results: vec![affected_result(0)] });
+            assert!(transaction_open(state, conn), "BEGIN Ok opens the flag");
+            assert!(commands.try_recv().is_err(), "a BEGIN landing sends nothing else");
+
+            let run = send_transaction(state, &commands, tab, TransactionAction::Commit);
+            state.apply(DbEvent::BatchOk { run, results: vec![affected_result(0)] });
+            assert!(!transaction_open(state, conn), "COMMIT Ok closes the flag");
+            assert!(commands.try_recv().is_err(), "a COMMIT landing sends nothing else");
+
+            // The rollback may have undone DDL the navigator already listed,
+            // so its landing reloads the schema.
+            let run = send_transaction(state, &commands, tab, TransactionAction::Rollback);
+            state.apply(DbEvent::BatchOk { run, results: vec![affected_result(0)] });
+            assert!(!transaction_open(state, conn), "ROLLBACK Ok closes the flag");
+            match commands.try_recv().expect("a ROLLBACK landing reloads") {
+                DbCommand::LoadSchema => {}
+                other => panic!("expected LoadSchema, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn autocommit_chip_reason_follows_the_connection_state_and_engine() {
+        use crate::ui::query::AutocommitSlot;
+        with_isolated_state("autocommit-chip", |state| {
+            fn reason(slot: AutocommitSlot, on: bool) -> Option<&'static str> {
+                slot.chip(on).map(|(_, reason)| reason)
+            }
+
+            // No connection at all.
+            let unbound = state.push_tab(None, String::new());
+            assert_eq!(AutocommitSlot::of(state, unbound), AutocommitSlot::Offline);
+            assert_eq!(reason(AutocommitSlot::of(state, unbound), true), Some("Connect to change autocommit"));
+
+            let sqlite = add_sqlite_connection(state, "mem-chip");
+            let tab = state.new_tab(sqlite);
+
+            // Connecting, then failed: nothing to switch either way.
+            attach_test_handle(state, sqlite);
+            assert_eq!(reason(AutocommitSlot::of(state, tab), true), Some("Connect to change autocommit"));
+            state
+                .connections
+                .iter_mut()
+                .find(|c| c.id == sqlite)
+                .expect("connection")
+                .state = ConnectionState::Error { message: "boom".to_owned() };
+            assert_eq!(reason(AutocommitSlot::of(state, tab), false), Some("Connect to change autocommit"));
+
+            // Live on SQLite: the engine explains the chip, run or not.
+            let commands = attach_test_session(state, sqlite);
+            assert_eq!(AutocommitSlot::of(state, tab), AutocommitSlot::Sqlite);
+            assert_eq!(
+                AutocommitSlot::of(state, tab).chip(true),
+                Some(("Autocommit".to_owned(), "SQLite handles autocommit itself"))
+            );
+            state.start_run(tab, "SELECT 1", 0, None);
+            assert_eq!(
+                reason(AutocommitSlot::of(state, tab), true),
+                Some("SQLite handles autocommit itself"),
+                "a run in flight changes nothing on SQLite"
+            );
+            match commands.try_recv().expect("a command was sent") {
+                DbCommand::QueryBatch { run, .. } => {
+                    state.apply(DbEvent::BatchOk { run, results: vec![rows_result(1)] });
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+
+            // Live on Postgres: idle keeps the toggle, a run in flight waits
+            // and the label carries the mode.
+            let postgres = add_postgres_connection(state, "pg-chip", "");
+            let pg_tab = state.new_tab(postgres);
+            let _pg_commands = attach_test_session(state, postgres);
+            assert_eq!(AutocommitSlot::of(state, pg_tab), AutocommitSlot::Toggle);
+            assert_eq!(AutocommitSlot::of(state, pg_tab).chip(false), None);
+            state.start_run(pg_tab, "SELECT 1", 0, None);
+            assert_eq!(AutocommitSlot::of(state, pg_tab), AutocommitSlot::Running);
+            assert_eq!(
+                AutocommitSlot::of(state, pg_tab).chip(false),
+                Some(("Autocommit: off".to_owned(), "Wait for the run to finish"))
+            );
         });
     }
 
