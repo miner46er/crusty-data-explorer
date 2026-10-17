@@ -1633,38 +1633,34 @@ fn results_grid(
             .is_some_and(|result| !result.columns().is_empty());
         let can_export_all =
             tab.results().iter().any(|result| !result.columns().is_empty());
-        if ui
-            .add_enabled(can_export, egui::Button::new("Export CSV"))
-            .clicked()
-        {
-            export_csv_streaming(tab, &grid_conn, ui);
-        }
-        if ui
-            .add_enabled(can_export, egui::Button::new("Export JSON"))
-            .clicked()
-        {
-            export_json_streaming(tab, &grid_conn, ui);
-        }
-        if ui
-            .add_enabled(can_export, egui::Button::new("Export JSONL"))
-            .clicked()
-        {
-            export_jsonl_streaming(tab, &grid_conn, ui);
-        }
-        if ui
-            .add_enabled(can_export, egui::Button::new("Export XLSX"))
-            .on_hover_text("Export this view as a spreadsheet workbook")
-            .clicked()
-        {
-            export_xlsx_streaming(tab, &grid_conn, ui);
-        }
-        if ui
-            .add_enabled(can_export_all, egui::Button::new("Export all"))
-            .on_hover_text("Export every result set into one folder, one CSV per set")
-            .clicked()
-        {
-            export_all_results(tab);
-        }
+        ui.menu_button("Export", |ui| {
+            if ui.add_enabled(can_export, egui::Button::new("CSV")).clicked() {
+                export_csv_streaming(tab, &grid_conn, ui);
+            }
+            if ui.add_enabled(can_export, egui::Button::new("JSON")).clicked() {
+                export_json_streaming(tab, &grid_conn, ui);
+            }
+            if ui.add_enabled(can_export, egui::Button::new("JSONL")).clicked() {
+                export_jsonl_streaming(tab, &grid_conn, ui);
+            }
+            if ui
+                .add_enabled(can_export, egui::Button::new("XLSX"))
+                .on_hover_text("Export this view as a spreadsheet workbook")
+                .clicked()
+            {
+                export_xlsx_streaming(tab, &grid_conn, ui);
+            }
+            ui.separator();
+            // Every result set into one folder, one CSV per set; there is no
+            // scope state here, so it fires as an action rather than a check.
+            if ui
+                .add_enabled(can_export_all, egui::Button::new("Full table"))
+                .on_hover_text("Export every result set into one folder, one CSV per set")
+                .clicked()
+            {
+                export_all_results(tab);
+            }
+        });
         ui.checkbox(&mut detail_open, "Row detail")
             .on_hover_text("Show the focused row as JSON and record beside the grid");
         ui.separator();
@@ -2421,11 +2417,11 @@ fn export_all_results(tab: &mut Tab) {
     }
 }
 
-/// The selection copy row: TSV with a headers option, CSV, JSON, Markdown,
-/// and SQL INSERTs from the selection (or the whole view when empty), the
-/// IN-list builder from the active column, fill down through the staged-edit
-/// path, and paste as new rows. Fill actions defer to the caller the way the
-/// grid key handler does, since the tab borrow is still live here.
+/// The selection copy row: one menu for TSV with a headers option, CSV, JSON,
+/// Markdown, and SQL INSERTs from the selection (or the whole view when
+/// empty), the IN-list builder from the active column, fill down through the
+/// staged-edit path, and paste as new rows. Fill actions defer to the caller
+/// the way the grid key handler does, since the tab borrow is still live here.
 fn copy_bar(
     tab: &mut Tab,
     editable: bool,
@@ -2442,67 +2438,70 @@ fn copy_bar(
         let tab_id = tab.id;
         let rows = selection.resolve(visible);
         let nrows = rows.len();
-        let headers = tsv_headers_of(ui.ctx(), tab_id);
-        if ui
-            .button("Copy TSV")
-            .on_hover_text("Copy the selection as tab-separated values")
-            .clicked()
-        {
-            let text = tab
-                .active_query_result()
-                .map(|result| to_tsv(result, &rows, headers))
-                .unwrap_or_default();
-            ui.ctx().copy_text(text);
-            tab.set_export_notice(format!("Copied {nrows} rows as TSV"), false);
-        }
-        let mut headers = headers;
-        if ui
-            .checkbox(&mut headers, "Headers")
-            .on_hover_text("Include the header row in TSV copies")
-            .changed()
-        {
-            ui.ctx().data_mut(|data| data.insert_temp(tsv_headers_id(tab_id), headers));
-        }
-        if ui.button("Copy CSV").on_hover_text("Copy the selection as CSV").clicked() {
-            let text = tab
-                .active_query_result()
-                .map(|result| to_csv(result, &rows))
-                .unwrap_or_default();
-            ui.ctx().copy_text(text);
-            tab.set_export_notice(format!("Copied {nrows} rows as CSV"), false);
-        }
-        if ui.button("Copy JSON").on_hover_text("Copy the selection as JSON").clicked() {
-            let text = tab
-                .active_query_result()
-                .map(|result| to_json(result, &rows))
-                .unwrap_or_default();
-            ui.ctx().copy_text(text);
-            tab.set_export_notice(format!("Copied {nrows} rows as JSON"), false);
-        }
-        if ui
-            .button("Copy Markdown")
-            .on_hover_text("Copy the selection as a Markdown table")
-            .clicked()
-        {
-            let text = tab
-                .active_query_result()
-                .map(|result| to_markdown(result, &rows))
-                .unwrap_or_default();
-            ui.ctx().copy_text(text);
-            tab.set_export_notice(format!("Copied {nrows} rows as Markdown"), false);
-        }
-        if ui
-            .button("Copy INSERTs")
-            .on_hover_text("Copy the selection as SQL INSERTs")
-            .clicked()
-        {
-            let text = tab
-                .active_query_result()
-                .map(|result| to_inserts("result", result, &rows))
-                .unwrap_or_default();
-            ui.ctx().copy_text(text);
-            tab.set_export_notice(format!("Copied {nrows} rows as INSERTs"), false);
-        }
+        let mut headers = tsv_headers_of(ui.ctx(), tab_id);
+        ui.menu_button("Copy", |ui| {
+            if ui
+                .button("TSV")
+                .on_hover_text("Copy the selection as tab-separated values")
+                .clicked()
+            {
+                let text = tab
+                    .active_query_result()
+                    .map(|result| to_tsv(result, &rows, headers))
+                    .unwrap_or_default();
+                ui.ctx().copy_text(text);
+                tab.set_export_notice(format!("Copied {nrows} rows as TSV"), false);
+            }
+            if ui.button("CSV").on_hover_text("Copy the selection as CSV").clicked() {
+                let text = tab
+                    .active_query_result()
+                    .map(|result| to_csv(result, &rows))
+                    .unwrap_or_default();
+                ui.ctx().copy_text(text);
+                tab.set_export_notice(format!("Copied {nrows} rows as CSV"), false);
+            }
+            if ui.button("JSON").on_hover_text("Copy the selection as JSON").clicked() {
+                let text = tab
+                    .active_query_result()
+                    .map(|result| to_json(result, &rows))
+                    .unwrap_or_default();
+                ui.ctx().copy_text(text);
+                tab.set_export_notice(format!("Copied {nrows} rows as JSON"), false);
+            }
+            if ui
+                .button("Markdown")
+                .on_hover_text("Copy the selection as a Markdown table")
+                .clicked()
+            {
+                let text = tab
+                    .active_query_result()
+                    .map(|result| to_markdown(result, &rows))
+                    .unwrap_or_default();
+                ui.ctx().copy_text(text);
+                tab.set_export_notice(format!("Copied {nrows} rows as Markdown"), false);
+            }
+            if ui
+                .button("INSERTs")
+                .on_hover_text("Copy the selection as SQL INSERTs")
+                .clicked()
+            {
+                let text = tab
+                    .active_query_result()
+                    .map(|result| to_inserts("result", result, &rows))
+                    .unwrap_or_default();
+                ui.ctx().copy_text(text);
+                tab.set_export_notice(format!("Copied {nrows} rows as INSERTs"), false);
+            }
+            if ui
+                .checkbox(&mut headers, "Headers")
+                .on_hover_text("Include the header row in TSV copies")
+                .changed()
+            {
+                ui.ctx().data_mut(|data| data.insert_temp(tsv_headers_id(tab_id), headers));
+            }
+        });
+        // The IN list stays a button beside the menu: it needs a clicked cell
+        // for its column, where the other copies fall back to the whole view.
         if ui
             .button("IN (...)")
             .on_hover_text("Copy a typed IN list from the active column")
