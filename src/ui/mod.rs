@@ -82,7 +82,6 @@ fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
         // their room; the backend name takes what remains and drops when
         // nothing is left. Both labels go through `elide`, so neither can
         // paint over the other.
-        let gap = ui.spacing().item_spacing.x;
         let mut budget = fit::Budget::new(ui);
         for control in [
             fit::button_w(ui, theme_label, false),
@@ -91,16 +90,16 @@ fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
         ] {
             budget.take(ui, control);
         }
-        let stats_text = fit::elide(ui, &stats, egui::TextStyle::Body, budget.leftover() - gap);
-        if !stats_text.is_empty() {
-            budget.take(ui, fit::text_w(ui, &stats_text, egui::TextStyle::Body));
-        }
-        let backend_text = fit::elide(
-            ui,
-            &backend,
-            egui::TextStyle::Small,
-            budget.leftover() - gap,
-        );
+        let stats_text = fit::elide(ui, &stats, egui::TextStyle::Body, budget.leftover());
+        // `take` reserves the label plus the gap that follows it: when even
+        // that does not fit, the row has room for the counts alone.
+        let stats_fit = stats_text.is_empty()
+            || budget.take(ui, fit::text_w(ui, &stats_text, egui::TextStyle::Body));
+        let backend_text = if stats_fit {
+            fit::elide(ui, &backend, egui::TextStyle::Small, budget.leftover())
+        } else {
+            String::new()
+        };
         if !stats_text.is_empty() {
             ui.add(
                 egui::Label::new(stats_text)
