@@ -95,10 +95,6 @@ impl Selection {
     fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.rows.len()
-    }
     fn active(&self) -> Option<(usize, usize)> {
         self.active
     }
