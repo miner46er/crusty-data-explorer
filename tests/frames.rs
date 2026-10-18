@@ -396,15 +396,32 @@ fn state_dot_frames() {
     }
 }
 
-/// Every listed node that rendered, as (label, rect) pairs. A narrow layout
-/// may drop an informational node, so absence is not an error here.
-fn rects_of(harness: &Harness<AppState>, labels: &[&str]) -> Vec<(String, egui::Rect)> {
+/// The first node with `label` that rendered inside `band`. A label two
+/// panels spell (the card's `Edit` beside the results toolbar's menu) answers
+/// for the row the band names, so no query here rests on label uniqueness.
+fn label_in_band(
+    harness: &Harness<AppState>,
+    label: &str,
+    band: egui::Rect,
+) -> Option<egui::Rect> {
+    harness
+        .query_all_by_label(label)
+        .map(|node| node.rect())
+        .find(|rect| band.intersects(*rect))
+}
+
+/// Every listed node that rendered inside `band`, as (label, rect) pairs. A
+/// narrow layout may drop an informational node, so absence is not an error
+/// here.
+fn rects_of(
+    harness: &Harness<AppState>,
+    labels: &[&str],
+    band: egui::Rect,
+) -> Vec<(String, egui::Rect)> {
     labels
         .iter()
         .filter_map(|label| {
-            harness
-                .query_by_label(label)
-                .map(|node| ((*label).to_owned(), node.rect()))
+            label_in_band(harness, label, band).map(|rect| ((*label).to_owned(), rect))
         })
         .collect()
 }
@@ -414,11 +431,11 @@ fn window_rect([w, h]: [u32; 2]) -> egui::Rect {
     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32, h as f32))
 }
 
-/// No two of the listed nodes may paint over each other: chrome covering
-/// chrome is the defect the screenshot shows. Only rendered pairs are
-/// compared, with a half-pixel tolerance so edge-touching reads as clear.
-fn assert_no_overlap(harness: &Harness<AppState>, labels: &[&str]) {
-    let found = rects_of(harness, labels);
+/// No two of the listed nodes in `band` may paint over each other: chrome
+/// covering chrome is the defect the screenshot shows. Only rendered pairs
+/// are compared, with a half-pixel tolerance so edge-touching reads as clear.
+fn assert_no_overlap(harness: &Harness<AppState>, labels: &[&str], band: egui::Rect) {
+    let found = rects_of(harness, labels, band);
     for (i, (a_label, a)) in found.iter().enumerate() {
         for (b_label, b) in &found[i + 1..] {
             let overlap = a.intersect(*b);
@@ -430,11 +447,17 @@ fn assert_no_overlap(harness: &Harness<AppState>, labels: &[&str]) {
     }
 }
 
-/// Every listed node that rendered must sit inside the window. A control
-/// painted past an edge is unreachable, the same defect from the other side.
-fn assert_inside_window(harness: &Harness<AppState>, labels: &[&str], size: [u32; 2]) {
+/// Every listed node that rendered inside `band` must sit inside the window.
+/// A control painted past an edge is unreachable, the same defect from the
+/// other side.
+fn assert_inside_window(
+    harness: &Harness<AppState>,
+    labels: &[&str],
+    size: [u32; 2],
+    band: egui::Rect,
+) {
     let window = window_rect(size);
-    for (label, rect) in rects_of(harness, labels) {
+    for (label, rect) in rects_of(harness, labels, band) {
         assert!(window.contains_rect(rect), "{label} {rect:?} paints outside {window:?}");
     }
 }
@@ -498,25 +521,44 @@ fn narrow_window_chrome_stays_clear() {
     let (_scratch, mut harness) = three_tabs_at(NARROW_WINDOW, "narrow");
     capture_at(&mut harness, "narrow-dark", NARROW_WINDOW);
 
+    // One band per chrome row, so a label the sidebar spells too (`Edit`)
+    // answers for the row under test.
+    let status_band = band_of(&harness, "Compare", NARROW_WINDOW);
+    let results_band = toolbar_band(&harness, &["Filters", "Copy"], NARROW_WINDOW);
+    let editor_band = toolbar_band(&harness, &["▶ Run"], NARROW_WINDOW);
+
     assert_no_overlap(
         &harness,
         &["1 connection, 1 live", "local · SQLite", "Compare", "+ Table", "☀ Light"],
+        status_band,
     );
     assert_inside_window(
         &harness,
-        &[
-            "Compare", "+ Table", "☀ Light", "Filters", "Copy", "Export", "Edit", "Detail",
-            "Chart", "▶ Run", "Explain", "Save", "Transaction", "Complete", "Format", "Find",
-        ],
+        &["Compare", "+ Table", "☀ Light"],
         NARROW_WINDOW,
+        status_band,
     );
     assert_no_overlap(
         &harness,
         &["Filters", "Copy", "Export", "Edit", "Detail", "Chart"],
+        results_band,
+    );
+    assert_inside_window(
+        &harness,
+        &["Filters", "Copy", "Export", "Edit", "Detail", "Chart"],
+        NARROW_WINDOW,
+        results_band,
     );
     assert_no_overlap(
         &harness,
         &["▶ Run", "Explain", "Save", "Transaction", "Complete", "Format", "Find"],
+        editor_band,
+    );
+    assert_inside_window(
+        &harness,
+        &["▶ Run", "Explain", "Save", "Transaction", "Complete", "Format", "Find"],
+        NARROW_WINDOW,
+        editor_band,
     );
 
     // Every control is inline or behind the row's one `…`, and the row stays
@@ -576,9 +618,9 @@ fn tab_close_buttons_stay_with_their_titles() {
     }
 }
 
-/// Every listed node shares one y band: one row, no wrap.
-fn assert_same_row(harness: &Harness<AppState>, labels: &[&str]) {
-    let found = rects_of(harness, labels);
+/// Every listed node in `band` shares one y band: one row, no wrap.
+fn assert_same_row(harness: &Harness<AppState>, labels: &[&str], band: egui::Rect) {
+    let found = rects_of(harness, labels, band);
     assert_eq!(found.len(), labels.len(), "every row node renders: {found:?}");
     let (first_label, first) = &found[0];
     for (label, rect) in &found[1..] {
@@ -659,14 +701,10 @@ fn assert_row_reachable(
     let missing: Vec<&str> = expected
         .iter()
         .copied()
-        .filter(|label| {
-            harness
-                .query_by_label(label)
-                .is_none_or(|node| !band.intersects(node.rect()))
-        })
+        .filter(|label| label_in_band(harness, label, band).is_none())
         .collect();
     let inline_overflow: Vec<egui::Rect> = harness
-        .query_all_by_label("\u{2026}")
+        .query_all_by_label("…")
         .map(|node| node.rect())
         .filter(|rect| band.intersects(*rect))
         .collect();
@@ -674,18 +712,29 @@ fn assert_row_reachable(
         assert!(inline_overflow.is_empty(), "a row with no tail shows no `…`");
         return;
     }
+    // The menu draws a node for each tail label; a label the sidebar spells
+    // too (`Edit`) is matched by the node that was not there before it opened.
+    let before: Vec<(&str, Vec<egui::Rect>)> = missing
+        .iter()
+        .map(|label| {
+            (*label, harness.query_all_by_label(label).map(|node| node.rect()).collect())
+        })
+        .collect();
     assert_eq!(inline_overflow.len(), 1, "the tail hides behind one `…`");
     harness
-        .query_all_by_label("\u{2026}")
+        .query_all_by_label("…")
         .find(|node| band.intersects(node.rect()))
         .expect("the row's overflow button")
         .click();
     harness.run_steps(6);
-    for label in &missing {
-        let node = harness.query_by_label(label).unwrap_or_else(|| {
-            panic!("{label} is drawn nowhere: not inline, and not inside the row's menu")
-        });
-        let rect = node.rect();
+    for (label, before) in &before {
+        let rect = harness
+            .query_all_by_label(label)
+            .map(|node| node.rect())
+            .find(|rect| !before.contains(rect))
+            .unwrap_or_else(|| {
+                panic!("{label} is drawn nowhere: not inline, and not inside the row's menu")
+            });
         assert!(
             window.contains_rect(rect),
             "{label} {rect:?} is reachable but leaves {window:?}"
@@ -693,9 +742,7 @@ fn assert_row_reachable(
     }
     harness.key_press(egui::Key::Escape);
     harness.run_steps(4);
-    let closed = harness
-        .query_by_label(missing[0])
-        .is_none_or(|node| !band.intersects(node.rect()));
+    let closed = label_in_band(harness, missing[0], band).is_none();
     assert!(closed, "Escape closes the menu holding {}", missing[0]);
 }
 
@@ -782,9 +829,11 @@ fn wide_layout_unchanged() {
     let gap = window.right() - chart.max.x;
     println!("wide: the action group ends {gap:.1}px from the window's right edge");
     assert!(gap <= 16.0, "the action group {chart:?} left the panel's right edge");
+    let results_band = band_of(&harness, "Chart", WIDE_WINDOW);
     let mut previous = f32::NEG_INFINITY;
     for label in ["Copy", "Export", "Edit", "Detail", "Chart"] {
-        let rect = harness.get_by_label(label).rect();
+        let rect = label_in_band(&harness, label, results_band)
+            .unwrap_or_else(|| panic!("{label} renders in the results row"));
         assert!(rect.min.x > previous, "{label} {rect:?} left the group's order");
         previous = rect.min.x;
     }
@@ -797,11 +846,14 @@ fn wide_layout_unchanged() {
     );
 
     // The editor tools and the tabs each hold one row.
+    let editor_band = band_of(&harness, "▶ Run", WIDE_WINDOW);
     assert_same_row(
         &harness,
         &["▶ Run", "Explain", "Save", "Transaction", "Complete", "Format", "Find"],
+        editor_band,
     );
-    assert_same_row(&harness, &["users", "users 2", "users 3"]);
+    let strip_band = band_of(&harness, "users", WIDE_WINDOW);
+    assert_same_row(&harness, &["users", "users 2", "users 3"], strip_band);
 }
 
 #[test]
