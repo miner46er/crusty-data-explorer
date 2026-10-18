@@ -57,6 +57,7 @@ pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
     // Wrapping, not scrolling: a narrow window puts the tail of the strip on
     // a second row so every tab and its close button stays one click away.
     ui.horizontal_wrapped(|ui| {
+        let strip_w = ui.available_width();
         let titles = numbered_titles(
             &state
                 .tabs()
@@ -68,27 +69,57 @@ pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
                 .collect::<Vec<_>>(),
         );
         for (tab, title) in state.tabs().iter().zip(titles) {
-            let is_active = Some(tab.id) == active;
-            let label = if is_active {
-                egui::RichText::new(title).strong()
-            } else {
-                egui::RichText::new(title).weak()
-            };
-            if ui.selectable_value(&mut active, Some(tab.id), label).clicked() {
-                activate = Some(tab.id);
-            }
             let transaction_open = state
                 .connections()
                 .iter()
                 .find(|c| Some(c.id) == tab.conn)
                 .is_some_and(|c| c.transaction().is_open());
-            if transaction_open {
-                ui.label(egui::RichText::new("tx").small().strong())
-                    .on_hover_text("Open transaction: commit or roll back to close it");
-            }
-            if ui.small_button("×").clicked() {
-                close.push(tab.id);
-            }
+            // One item per tab, measured before the strip lays it out: the
+            // wrapped row can then put the whole group on the next line, so
+            // the title never ends a row that its close button starts. A group
+            // wider than the row tightens its own gap first; the buttons keep
+            // their labels.
+            let gap = ui.spacing().item_spacing.x;
+            let title_w = fit::button_w(ui, &title, false);
+            let close_w = fit::button_w(ui, "×", false);
+            let tx_w = if transaction_open {
+                fit::text_w(ui, "tx", egui::TextStyle::Small)
+            } else {
+                0.0
+            };
+            let gaps = if transaction_open { 2.0 } else { 1.0 };
+            let content_w = title_w + close_w + tx_w;
+            let inner_gap = if content_w + gaps * gap <= strip_w {
+                gap
+            } else {
+                ((strip_w - 1.0 - content_w) / gaps).clamp(0.0, gap)
+            };
+            let group_w = content_w + gaps * inner_gap;
+            let title_h =
+                ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y;
+            ui.allocate_ui_with_layout(
+                egui::vec2(group_w, title_h),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = inner_gap;
+                    let is_active = Some(tab.id) == active;
+                    let label = if is_active {
+                        egui::RichText::new(title).strong()
+                    } else {
+                        egui::RichText::new(title).weak()
+                    };
+                    if ui.selectable_value(&mut active, Some(tab.id), label).clicked() {
+                        activate = Some(tab.id);
+                    }
+                    if transaction_open {
+                        ui.label(egui::RichText::new("tx").small().strong())
+                            .on_hover_text("Open transaction: commit or roll back to close it");
+                    }
+                    if ui.small_button("×").clicked() {
+                        close.push(tab.id);
+                    }
+                },
+            );
         }
         if ui
             .small_button("+")

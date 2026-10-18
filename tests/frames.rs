@@ -439,27 +439,11 @@ fn assert_inside_window(harness: &Harness<AppState>, labels: &[&str], size: [u32
     }
 }
 
-/// The close button belonging to the tab row that starts at `label`: the
-/// first one to its right on the same line.
-fn close_button_after(harness: &Harness<AppState>, label: &str) -> Option<egui::Rect> {
-    let row = harness.query_by_label(label)?.rect();
-    harness
-        .query_all_by_label("×")
-        .map(|node| node.rect())
-        .filter(|rect| {
-            rect.min.x >= row.max.x && rect.min.y <= row.max.y && rect.max.y >= row.min.y
-        })
-        .min_by(|a, b| a.min.x.total_cmp(&b.min.x))
-}
-
-/// Chrome at the width the operator reported, with three tabs, a folder and
-/// a result in the grid: status bar, both toolbars, and the tab strip keep
-/// their controls inside the window and never paint over each other.
-#[test]
-fn narrow_window_chrome_stays_clear() {
-    let _guard = env_lock();
-    let _scratch = Scratch::new("narrow");
-    let mut harness = build_at(NARROW_WINDOW);
+/// Three query tabs on one memory database, each with a result in the grid:
+/// the setup both narrow tab-strip tests share.
+fn three_tabs_at(size: [u32; 2], tag: &str) -> (Scratch, Harness<'static, AppState>) {
+    let scratch = Scratch::new(tag);
+    let mut harness = build_at(size);
     let conn = add_memory_database(harness.state_mut());
     harness.state_mut().move_connection(conn, Some("test folder"));
     connect_and_wait(&mut harness, conn);
@@ -483,6 +467,35 @@ fn narrow_window_chrome_stays_clear() {
     let active = *tabs.last().expect("three tabs");
     harness.state_mut().activate(active);
     harness.run();
+    (scratch, harness)
+}
+
+/// The close button belonging to the tab row that starts at `label`: the
+/// first one to its right on the same line.
+fn close_button_after(harness: &Harness<AppState>, label: &str) -> Option<egui::Rect> {
+    let row = harness.query_by_label(label)?.rect();
+    harness
+        .query_all_by_label("×")
+        .map(|node| node.rect())
+        .filter(|rect| {
+            rect.min.x >= row.max.x && rect.min.y <= row.max.y && rect.max.y >= row.min.y
+        })
+        .min_by(|a, b| a.min.x.total_cmp(&b.min.x))
+}
+
+/// The tab strip's close buttons, in draw order: the `×` nodes render in the
+/// same order as the titles, so one list pairs with the other by index.
+fn tab_close_buttons(harness: &Harness<AppState>) -> Vec<egui::Rect> {
+    harness.query_all_by_label("×").map(|node| node.rect()).collect()
+}
+
+/// Chrome at the width the operator reported, with three tabs, a folder and
+/// a result in the grid: status bar, both toolbars, and the tab strip keep
+/// their controls inside the window and never paint over each other.
+#[test]
+fn narrow_window_chrome_stays_clear() {
+    let _guard = env_lock();
+    let (_scratch, mut harness) = three_tabs_at(NARROW_WINDOW, "narrow");
     capture_at(&mut harness, "narrow-dark", NARROW_WINDOW);
 
     assert_no_overlap(
@@ -517,6 +530,35 @@ fn narrow_window_chrome_stays_clear() {
         window.contains_rect(close),
         "the third tab's close button {close:?} paints outside {window:?}"
     );
+}
+
+/// The tab strip at 460: each tab's close button shares its title's row and
+/// stays inside the window. A close button that wraps away from its title
+/// sits beside the next tab's title, and closing the wrong tab drops that
+/// tab's SQL and params with no confirmation.
+#[test]
+fn tab_close_buttons_stay_with_their_titles() {
+    const STRIP: [u32; 2] = [460, 640];
+    let _guard = env_lock();
+    let (_scratch, mut harness) = three_tabs_at(STRIP, "tab-close");
+    capture_at(&mut harness, "tabs-narrow-dark", STRIP);
+
+    let window = window_rect(STRIP);
+    let closes = tab_close_buttons(&harness);
+    let titles = ["persons", "persons 2", "persons 3"];
+    assert_eq!(closes.len(), titles.len(), "one close button per tab: {closes:?}");
+    for (title, close) in titles.iter().zip(&closes) {
+        let title_rect = harness.get_by_label(title).rect();
+        println!("{title}: title {title_rect:?} close {close:?}");
+        assert!(
+            title_rect.min.y <= close.max.y && close.min.y <= title_rect.max.y,
+            "{title} {title_rect:?} and its close button {close:?} sit on different rows"
+        );
+        assert!(
+            window.contains_rect(*close),
+            "{title}'s close button {close:?} paints outside {window:?}"
+        );
+    }
 }
 
 /// Every listed node shares one y band: one row, no wrap.
