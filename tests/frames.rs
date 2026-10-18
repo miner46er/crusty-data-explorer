@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use eframe::egui;
 use egui_kittest::Harness;
-use egui_kittest::kittest::{NodeT, Queryable};
+use egui_kittest::kittest::{By, NodeT, Queryable};
 
 use crusty_data_explorer::app::{AppState, ConnectionState, Environment, RunOutcome};
 use crusty_data_explorer::db::{ConnectionConfig, ConnectionId, TabId};
@@ -519,6 +519,21 @@ fn narrow_window_chrome_stays_clear() {
         &["▶ Run", "Explain", "Save", "Transaction", "Complete", "Format", "Find"],
     );
 
+    // Every control is inline or behind the row's one `…`, and the row stays
+    // in the window: a control that vanished would pass the checks above.
+    assert_row_reachable(
+        &mut harness,
+        &["Copy"],
+        &["Copy", "Export", "Edit", "Detail", "Chart"],
+        NARROW_WINDOW,
+    );
+    assert_row_reachable(
+        &mut harness,
+        &["▶ Run", "Save"],
+        &["▶ Run", "Explain", "Save", "Transaction", "Complete", "Format", "Find"],
+        NARROW_WINDOW,
+    );
+
     let window = window_rect(NARROW_WINDOW);
     let label = harness
         .query_by_label("persons 3")
@@ -591,6 +606,97 @@ fn overflow_buttons_in(harness: &Harness<AppState>, band: egui::Rect) -> usize {
         .query_all_by_label("\u{2026}")
         .filter(|node| band.intersects(node.rect()))
         .count()
+}
+
+/// The strip a toolbar occupies, across the whole window: from the top of its
+/// first line's anchor to the bottom of its last. A one-line toolbar's two
+/// anchors share a line, so the strip is that line.
+fn toolbar_band(harness: &Harness<AppState>, anchors: &[&str], [w, _]: [u32; 2]) -> egui::Rect {
+    let mut band: Option<egui::Rect> = None;
+    for anchor in anchors {
+        let node = harness
+            .query_by_label(anchor)
+            .unwrap_or_else(|| panic!("the toolbar anchor {anchor:?} renders"))
+            .rect();
+        let strip = egui::Rect::from_min_max(
+            egui::pos2(0.0, node.min.y),
+            egui::pos2(w as f32, node.max.y),
+        );
+        band = Some(match band {
+            Some(band) => band.union(strip),
+            None => strip,
+        });
+    }
+    band.expect("at least one anchor")
+}
+
+/// Every expected control of one toolbar is inline in its band or inside the
+/// toolbar's one `…` menu, which is opened and closed here; every node the
+/// band touches stays inside the window. A label that rendered nowhere would
+/// pass the frame's other assertions silently, so this one names it.
+fn assert_row_reachable(
+    harness: &mut Harness<'static, AppState>,
+    anchors: &[&str],
+    expected: &[&str],
+    size: [u32; 2],
+) {
+    let window = window_rect(size);
+    let band = toolbar_band(harness, anchors, size);
+    for node in harness.query_all(By::new()) {
+        if node.accesskit_node().bounding_box().is_none() {
+            continue;
+        }
+        let rect = node.rect();
+        if band.intersects(rect) {
+            assert!(
+                window.contains_rect(rect),
+                "{:?} {rect:?} paints outside {window:?}",
+                node.accesskit_node().label()
+            );
+        }
+    }
+
+    let missing: Vec<&str> = expected
+        .iter()
+        .copied()
+        .filter(|label| {
+            harness
+                .query_by_label(label)
+                .is_none_or(|node| !band.intersects(node.rect()))
+        })
+        .collect();
+    let inline_overflow: Vec<egui::Rect> = harness
+        .query_all_by_label("\u{2026}")
+        .map(|node| node.rect())
+        .filter(|rect| band.intersects(*rect))
+        .collect();
+    if missing.is_empty() {
+        assert!(inline_overflow.is_empty(), "a row with no tail shows no `…`");
+        return;
+    }
+    assert_eq!(inline_overflow.len(), 1, "the tail hides behind one `…`");
+    harness
+        .query_all_by_label("\u{2026}")
+        .find(|node| band.intersects(node.rect()))
+        .expect("the row's overflow button")
+        .click();
+    harness.run_steps(6);
+    for label in &missing {
+        let node = harness.query_by_label(label).unwrap_or_else(|| {
+            panic!("{label} is drawn nowhere: not inline, and not inside the row's menu")
+        });
+        let rect = node.rect();
+        assert!(
+            window.contains_rect(rect),
+            "{label} {rect:?} is reachable but leaves {window:?}"
+        );
+    }
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(4);
+    let closed = harness
+        .query_by_label(missing[0])
+        .is_none_or(|node| !band.intersects(node.rect()));
+    assert!(closed, "Escape closes the menu holding {}", missing[0]);
 }
 
 /// The results toolbar's row filter field. A text edit carries no label, so
