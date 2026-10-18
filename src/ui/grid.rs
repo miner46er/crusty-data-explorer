@@ -290,10 +290,11 @@ fn truncate_label(total: Option<u64>) -> String {
     }
 }
 
-/// One paging row under a truncated grid: the on-demand count beside the
-/// flag and the next page on demand. Pages append onto the loaded rows
-/// through [`DbEvent::PageOk`]; a stale page whose offset misses the loaded
-/// length is ignored, so a new run never gains old rows.
+/// The paging controls under a truncated grid, inline in the footer's row:
+/// the on-demand count beside the flag and the next page on demand. Pages
+/// append onto the loaded rows through [`DbEvent::PageOk`]; a stale page
+/// whose offset misses the loaded length is ignored, so a new run never
+/// gains old rows.
 fn paging_row(
     tab: &mut Tab,
     conn: &Option<GridConn>,
@@ -301,79 +302,77 @@ fn paging_row(
     loaded: usize,
     ui: &mut egui::Ui,
 ) {
-    ui.horizontal(|ui| {
-        if known_total.is_none()
-            && ui
-                .button("Count total")
-                .on_hover_text("Count every row behind the truncation flag")
-                .clicked()
-        {
-            match conn.as_ref().and_then(|c| c.handle.clone()) {
-                Some(handle) => {
-                    if is_single_statement(&tab.sql) {
-                        let run = paging_run_id(ui.ctx(), tab.id);
-                        let sql = tab.sql.clone();
-                        if handle
-                            .send(DbCommand::CountFor { run, tab: tab.id, sql })
-                            .is_err()
-                        {
-                            tab.set_export_notice(
-                                "Count failed: connection is gone".to_owned(),
-                                true,
-                            );
-                        }
-                    } else {
-                        tab.set_export_notice(
-                            "Counting needs a single SELECT".to_owned(),
-                            true,
-                        );
-                    }
-                }
-                None => tab.set_export_notice(
-                    "Counting needs a live connection".to_owned(),
-                    true,
-                ),
-            }
-        }
-        if ui
-            .button(format!("Load more ({loaded} loaded)"))
-            .on_hover_text("Fetch the next page past the row cap")
+    if known_total.is_none()
+        && ui
+            .button("Count total")
+            .on_hover_text("Count every row behind the truncation flag")
             .clicked()
-        {
-            match conn.as_ref().and_then(|c| c.handle.clone()) {
-                Some(handle) => {
-                    if is_single_statement(&tab.sql) {
-                        let run = paging_run_id(ui.ctx(), tab.id);
-                        let sql = tab.sql.clone();
-                        if handle
-                            .send(DbCommand::QueryPage {
-                                run,
-                                tab: tab.id,
-                                sql,
-                                offset: loaded as u64,
-                                limit: STREAM_PAGE_SIZE as u64,
-                            })
-                            .is_err()
-                        {
-                            tab.set_export_notice(
-                                "Page failed: connection is gone".to_owned(),
-                                true,
-                            );
-                        }
-                    } else {
+    {
+        match conn.as_ref().and_then(|c| c.handle.clone()) {
+            Some(handle) => {
+                if is_single_statement(&tab.sql) {
+                    let run = paging_run_id(ui.ctx(), tab.id);
+                    let sql = tab.sql.clone();
+                    if handle
+                        .send(DbCommand::CountFor { run, tab: tab.id, sql })
+                        .is_err()
+                    {
                         tab.set_export_notice(
-                            "Paging needs a single SELECT".to_owned(),
+                            "Count failed: connection is gone".to_owned(),
                             true,
                         );
                     }
+                } else {
+                    tab.set_export_notice(
+                        "Counting needs a single SELECT".to_owned(),
+                        true,
+                    );
                 }
-                None => tab.set_export_notice(
-                    "Paging needs a live connection".to_owned(),
-                    true,
-                ),
             }
+            None => tab.set_export_notice(
+                "Counting needs a live connection".to_owned(),
+                true,
+            ),
         }
-    });
+    }
+    if ui
+        .button(format!("Load more ({loaded} loaded)"))
+        .on_hover_text("Fetch the next page past the row cap")
+        .clicked()
+    {
+        match conn.as_ref().and_then(|c| c.handle.clone()) {
+            Some(handle) => {
+                if is_single_statement(&tab.sql) {
+                    let run = paging_run_id(ui.ctx(), tab.id);
+                    let sql = tab.sql.clone();
+                    if handle
+                        .send(DbCommand::QueryPage {
+                            run,
+                            tab: tab.id,
+                            sql,
+                            offset: loaded as u64,
+                            limit: STREAM_PAGE_SIZE as u64,
+                        })
+                        .is_err()
+                    {
+                        tab.set_export_notice(
+                            "Page failed: connection is gone".to_owned(),
+                            true,
+                        );
+                    }
+                } else {
+                    tab.set_export_notice(
+                        "Paging needs a single SELECT".to_owned(),
+                        true,
+                    );
+                }
+            }
+            None => tab.set_export_notice(
+                "Paging needs a live connection".to_owned(),
+                true,
+            ),
+        }
+    }
 }
 
 /// Poll one background streamed export: show its progress with a Cancel
