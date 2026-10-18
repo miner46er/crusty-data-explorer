@@ -77,7 +77,9 @@ fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
         .map(|c| format!("{} · {}", c.name, c.config.kind().label()))
         .unwrap_or_else(|| "no backend".to_owned());
     ui.horizontal(|ui| {
-        // Controls first, then the counts, then the backend name.
+        // Controls first, then the counts, then the backend name. Below the
+        // row's floor the controls clip at the panel edge: dropping one
+        // would move the others, and a clipped control stays reachable.
         let mut budget = fit::Budget::new(ui);
         for control in [
             fit::button_w(ui, theme_label),

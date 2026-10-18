@@ -109,7 +109,9 @@ impl Budget {
 
 /// One packed row: items in order while they fit, the contiguous tail
 /// behind one `…` menu whose hover text names what went in. `labels[i]`
-/// names item `i`, and `draw` draws the item's control.
+/// names item `i`, and `draw` draws the item's control. A row too narrow for
+/// the overflow button itself draws no menu: there is nothing to attach it
+/// to.
 pub(crate) fn packed_row(
     ui: &mut egui::Ui,
     widths: &[f32],
@@ -121,7 +123,7 @@ pub(crate) fn packed_row(
     for index in 0..spill {
         draw(ui, index);
     }
-    if spill < widths.len() {
+    if spill < widths.len() && overflow_fits(ui) {
         let tail = labels[spill..].join(", ");
         ui.menu_button(OVERFLOW_LABEL, |ui| {
             for index in spill..widths.len() {
@@ -131,6 +133,12 @@ pub(crate) fn packed_row(
         .response
         .on_hover_text(format!("More: {tail}"));
     }
+}
+
+/// Whether the row can hold the overflow button itself.
+fn overflow_fits(ui: &egui::Ui) -> bool {
+    let mut budget = Budget::new(ui);
+    budget.take(ui, button_w(ui, OVERFLOW_LABEL))
 }
 
 /// The spill index for a row of `widths` packed left to right: the first item
