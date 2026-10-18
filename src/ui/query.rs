@@ -80,8 +80,8 @@ pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
             // wider than the row tightens its own gap first; the buttons keep
             // their labels.
             let gap = ui.spacing().item_spacing.x;
-            let title_w = fit::button_w(ui, &title, false);
-            let close_w = fit::button_w(ui, "×", false);
+            let title_w = fit::button_w(ui, &title);
+            let close_w = fit::button_w(ui, "×");
             let tx_w = if transaction_open {
                 fit::text_w(ui, "tx", egui::TextStyle::Small)
             } else {

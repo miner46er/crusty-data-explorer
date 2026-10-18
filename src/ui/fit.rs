@@ -1,8 +1,9 @@
 //! Width arithmetic for the chrome rows that have to fit a narrow window.
 //!
 //! Pure measurement and reservation: every number is measured against what
-//! egui actually allocates, and [`Budget`] refuses a widget the row cannot
-//! hold, so two controls never paint over each other.
+//! egui actually allocates, and a row draws only what its [`Budget`] accepted,
+//! eliding the text into the room it reserved, so two controls never paint
+//! over each other.
 
 use eframe::egui;
 
@@ -21,10 +22,9 @@ fn button_pad(ui: &egui::Ui) -> f32 {
 }
 
 /// The width a button with `text` allocates: its galley plus the button
-/// padding. `small` measures in the Small text style.
-pub(crate) fn button_w(ui: &egui::Ui, text: &str, small: bool) -> f32 {
-    let style = if small { egui::TextStyle::Small } else { egui::TextStyle::Button };
-    text_w(ui, text, style) + button_pad(ui)
+/// padding.
+pub(crate) fn button_w(ui: &egui::Ui, text: &str) -> f32 {
+    text_w(ui, text, egui::TextStyle::Button) + button_pad(ui)
 }
 
 /// The width a combo box allocates: egui 0.36 frames the selected text as
@@ -126,7 +126,7 @@ pub(crate) fn packed_row(
 /// that does not fit, leaving room for the overflow button when a tail
 /// remains. `widths.len()` means everything fits inline.
 pub(crate) fn spill(ui: &egui::Ui, widths: &[f32]) -> usize {
-    let overflow_w = button_w(ui, OVERFLOW_LABEL, false);
+    let overflow_w = button_w(ui, OVERFLOW_LABEL);
     for inline in (0..=widths.len()).rev() {
         let mut budget = Budget::new(ui);
         let mut fits = widths[..inline].iter().all(|w| budget.take(ui, *w));
@@ -137,7 +137,8 @@ pub(crate) fn spill(ui: &egui::Ui, widths: &[f32]) -> usize {
             return inline;
         }
     }
-    // Even the overflow button alone does not fit: keep every item behind it.
+    // No inline prefix fits, not even one item behind the overflow button:
+    // keep every item behind it.
     0
 }
 
@@ -219,6 +220,8 @@ mod tests {
         frame(&ctx, [320.0, 200.0], |ui| {
             assert_eq!(spill(ui, &[100.0, 100.0, 100.0]), 2);
             assert_eq!(spill(ui, &[100.0, 100.0]), 2);
+            // The overflow button fits; the item does not, so it goes behind
+            // the button alone.
             assert_eq!(spill(ui, &[400.0]), 0);
         });
     }
@@ -230,16 +233,9 @@ mod tests {
         let ctx = context();
         let mut checked = 0;
         frame(&ctx, [720.0, 240.0], |ui| {
-            for (label, small) in [
-                ("Save", false),
-                ("Run", false),
-                ("+ Table", false),
-                ("Compare", false),
-                ("Copy", false),
-                ("Chart", false),
-            ] {
-                let measured = button_w(ui, label, small);
-                let response = ui.add(egui::Button::new(label).small());
+            for label in ["Save", "Run", "+ Table", "Compare", "Copy", "Chart"] {
+                let measured = button_w(ui, label);
+                let response = ui.add(egui::Button::new(label));
                 assert!(
                     (response.rect.width() - measured).abs() <= 1.0,
                     "button {label:?}: egui allocated {} but button_w measured {measured}",
@@ -247,23 +243,10 @@ mod tests {
                 );
                 checked += 1;
             }
-            // `Button::small()` only trims the vertical padding; a label that
-            // really renders in the Small text style carries it on the text.
-            for label in ["New query", "Delete"] {
-                let measured = button_w(ui, label, true);
-                let response =
-                    ui.add(egui::Button::new(egui::RichText::new(label).small()).small());
-                assert!(
-                    (response.rect.width() - measured).abs() <= 1.0,
-                    "small button {label:?}: egui allocated {} but button_w measured {measured}",
-                    response.rect.width()
-                );
-                checked += 1;
-            }
             // A menu button is a plain button in egui 0.36: the submenu arrow
             // belongs to `SubMenuButton`, which only appears inside a menu.
             for label in ["Export", "Transaction", "Complete"] {
-                let measured = button_w(ui, label, false);
+                let measured = button_w(ui, label);
                 let response = ui.menu_button(label, |_| {}).response;
                 assert!(
                     (response.rect.width() - measured).abs() <= 1.0,

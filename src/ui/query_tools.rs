@@ -46,8 +46,8 @@ impl Tool {
     fn width(self, ui: &egui::Ui, state: &ToolState) -> f32 {
         match self {
             Self::Autocommit => match state.slot.chip(state.autocommit, state.sqlite) {
-                Some((label, _)) => fit::button_w(ui, &label, false),
-                None => fit::button_w(ui, self.label(), false),
+                Some((label, _)) => fit::button_w(ui, &label),
+                None => fit::button_w(ui, self.label()),
             },
             Self::Save
             | Self::Commit
@@ -55,7 +55,7 @@ impl Tool {
             | Self::Transaction
             | Self::Complete
             | Self::Format
-            | Self::Find => fit::button_w(ui, self.label(), false),
+            | Self::Find => fit::button_w(ui, self.label()),
         }
     }
 }
@@ -178,8 +178,8 @@ fn fits_one_row(
 ) -> bool {
     let gap = ui.spacing().item_spacing.x;
     let leading = fit::combo_w(ui, scope_label)
-        + fit::button_w(ui, "▶ Run", false)
-        + fit::button_w(ui, "Explain", false);
+        + fit::button_w(ui, "▶ Run")
+        + fit::button_w(ui, "Explain");
     let hint_w = fit::text_w(ui, hint, egui::TextStyle::Small);
     let tools_w: f32 = tool_state
         .tools(false)

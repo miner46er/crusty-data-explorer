@@ -1716,15 +1716,15 @@ fn results_grid(
         "Filters".to_owned()
     };
     let clear_shown = !tab.filter().is_empty();
-    let clear_w = fit::button_w(ui, "Clear", false);
-    let filters_w = fit::button_w(ui, &filters_label, false);
+    let clear_w = fit::button_w(ui, "Clear");
+    let filters_w = fit::button_w(ui, &filters_label);
     let left_fixed = filters_w + if clear_shown { clear_w + gap } else { 0.0 };
     let tab_id = tab.id;
     let filter_before = tab.filter().to_owned();
     let mut filter_after: Option<String> = None;
     let action_w: Vec<f32> = action_items
         .iter()
-        .map(|item| fit::button_w(ui, item.label(), false))
+        .map(|item| fit::button_w(ui, item.label()))
         .collect();
     let actions_w: f32 = action_w.iter().map(|w| w + gap).sum();
     let avail = ui.available_width();

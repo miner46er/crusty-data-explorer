@@ -80,9 +80,9 @@ fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
         // Controls first, then the counts, then the backend name.
         let mut budget = fit::Budget::new(ui);
         for control in [
-            fit::button_w(ui, theme_label, false),
-            fit::button_w(ui, table_edit::STATUS_LABEL, false),
-            fit::button_w(ui, "Compare", false),
+            fit::button_w(ui, theme_label),
+            fit::button_w(ui, table_edit::STATUS_LABEL),
+            fit::button_w(ui, "Compare"),
         ] {
             budget.take(ui, control);
         }

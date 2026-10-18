@@ -123,7 +123,7 @@ The incumbent implementation is a Rust/egui desktop application. The tokens here
 - Monospace data everywhere a value can be copied, aliased, or diffed.
 - Flat panels, 1px strokes; shadow only on true floating layers.
 - Small, tight type (11px to 16px); emphasis through weight and brightness, never size.
-- Unicode glyphs as the icon set, plus painted state dots: `▶ Run`, `★` pin, `×` close and remove, `+` new, `⏷`/`⏵` folder marks and `⏶`/`⏷` sort marks, `»` a reference arrow, `✔` the saved-rows check, and the connection state painted as a disc, a ring, or a half-filled disc.
+- Unicode glyphs as the icon set, plus painted state dots: `▶ Run`, `★` pin, `×` close and remove, `+` new, `⏷`/`⏵` folder marks and `⏶`/`⏷` sort marks, `»` a reference arrow, `✔` the rows-affected readout, and the connection state painted as a disc, a ring, or a half-filled disc.
 
 ## Colors
 
