@@ -54,7 +54,9 @@ pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
     let mut activate: Option<TabId> = None;
     let mut close: Vec<TabId> = Vec::new();
     let mut new_tab = false;
-    ui.horizontal(|ui| {
+    // Wrapping, not scrolling: a narrow window puts the tail of the strip on
+    // a second row so every tab and its close button stays one click away.
+    ui.horizontal_wrapped(|ui| {
         let titles = numbered_titles(
             &state
                 .tabs()
