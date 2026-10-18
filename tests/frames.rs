@@ -282,6 +282,14 @@ fn grid_frames() {
         harness.query_by_label("Kind").is_none(),
         "the chart body stays closed until its toggle is on"
     );
+    assert!(
+        harness.query_by_label("History").is_some(),
+        "the sidebar view row offers History"
+    );
+    assert!(
+        harness.query_by_label("Rerun").is_none(),
+        "the default schema view hides the history rows"
+    );
     capture(&mut harness, "grid-dark");
 
     harness.state_mut().toggle_theme();

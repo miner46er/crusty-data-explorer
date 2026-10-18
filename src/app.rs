@@ -1681,6 +1681,28 @@ pub struct PendingTableDdl {
     pub statements: Vec<String>,
 }
 
+/// Which sidebar section is on display. Not persisted; a relaunch starts at
+/// the schema view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SidebarView {
+    #[default]
+    Schema,
+    History,
+    Saved,
+}
+
+impl SidebarView {
+    pub const ALL: [SidebarView; 3] = [Self::Schema, Self::History, Self::Saved];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SidebarView::Schema => "Schema",
+            SidebarView::History => "History",
+            SidebarView::Saved => "Saved",
+        }
+    }
+}
+
 /// The open visual table editor: the connection it builds for, the loaded
 /// table it edits (None for a create), and the live form the preview reads.
 #[derive(Debug, Clone)]
@@ -1757,6 +1779,8 @@ pub struct AppState {
     filter_history: Vec<SavedFilter>,
     bookmarks: Vec<TableBookmark>,
     navigator_filter: String,
+    /// Which sidebar section shows. Not persisted.
+    sidebar_view: SidebarView,
     search: Option<SearchPalette>,
     /// The table the palette asked the navigator to reveal; the schema tree
     /// consumes it on its next render.
@@ -1813,6 +1837,7 @@ impl AppState {
             filter_history: load_saved_filters(),
             bookmarks: load_bookmarks(),
             navigator_filter: String::new(),
+            sidebar_view: SidebarView::default(),
             search: None,
             navigator_reveal: None,
             save_prompt: None,
@@ -4212,6 +4237,16 @@ impl AppState {
     /// Replace the navigator tree filter text.
     pub fn set_navigator_filter(&mut self, filter: String) {
         self.navigator_filter = filter;
+    }
+
+    /// Which sidebar section is on display.
+    pub fn sidebar_view(&self) -> SidebarView {
+        self.sidebar_view
+    }
+
+    /// Switch the sidebar to one section.
+    pub fn set_sidebar_view(&mut self, view: SidebarView) {
+        self.sidebar_view = view;
     }
 
     /// Whether the palette is open.
@@ -7743,11 +7778,23 @@ mod tests {
                 crate::ui::connections::sidebar(state, ui);
             });
             output.textures_delta.clear();
-            let second = ctx.run_ui(input, |ui| {
+            let second = ctx.run_ui(input.clone(), |ui| {
                 crate::ui::connections::sidebar(state, ui);
             });
             let text = rendered_text(&second);
-            for wanted in ["CONNECTIONS", "SAVED", "mem", "other", "root-q", "nested-q", "ops", "db"] {
+            for wanted in ["CONNECTIONS", "mem", "other", "ops", "db"] {
+                assert!(text.iter().any(|t| t.contains(wanted)), "{wanted} paints in {text:?}");
+            }
+
+            // The saved tree lives in the Saved view.
+            state.set_sidebar_view(SidebarView::Saved);
+            output.textures_delta.clear();
+            let mut saved = ctx.run_ui(input, |ui| {
+                crate::ui::connections::sidebar(state, ui);
+            });
+            saved.textures_delta.clear();
+            let text = rendered_text(&saved);
+            for wanted in ["SAVED", "root-q", "nested-q", "ops", "db"] {
                 assert!(text.iter().any(|t| t.contains(wanted)), "{wanted} paints in {text:?}");
             }
         });
@@ -8739,6 +8786,51 @@ mod tests {
             let view = state.tab(tab).expect("tab");
             assert_eq!(view.kind, TabKind::Query);
             assert_eq!(view.sql, "SELECT * FROM \"main\".\"users\" LIMIT 100");
+        });
+    }
+
+    #[test]
+    fn table_header_paints_the_name_and_reruns_on_ctrl_enter() {
+        with_isolated_state("table-view-ctrl-enter", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let commands = attach_test_session(state, conn);
+            let tab = state.open_table_view(conn, "main", "users").expect("table view");
+            match commands.try_recv().expect("the first run") {
+                DbCommand::QueryBatch { run, .. } => {
+                    state.apply(DbEvent::BatchOk { run, results: vec![rows_result(1)] });
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(900.0, 200.0),
+                )),
+                events: vec![key_event(
+                    eframe::egui::Key::Enter,
+                    eframe::egui::Modifiers::CTRL,
+                )],
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                crate::ui::query::table_header(state, ui);
+            });
+            output.textures_delta.clear();
+            let text = rendered_text(&output);
+            assert!(text.iter().any(|t| t == "main.users"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Refresh"), "{text:?}");
+            assert!(text.iter().any(|t| t == "SQL"), "{text:?}");
+            match commands.try_recv().expect("Ctrl+Enter re-runs") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["SELECT * FROM \"main\".\"users\" LIMIT 100"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+            assert!(matches!(
+                state.tab(tab).expect("tab").outcome(),
+                RunOutcome::Running { .. }
+            ));
         });
     }
 
@@ -10455,7 +10547,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_sections_survive_the_last_connection_only_with_rows_to_show() {
+    fn sidebar_views_switch_between_schema_history_and_saved() {
         with_isolated_state("sidebar-availability", |state| {
             let ctx = eframe::egui::Context::default();
             let input = eframe::egui::RawInput {
@@ -10474,18 +10566,33 @@ mod tests {
                 rendered_text(&output)
             };
 
-            // An empty profile hides the empty sections and the tables
-            // filter, and still offers the editor's first connection button.
+            // The default Schema view shows the segmented row and the empty
+            // connection state, not the other sections.
             let text = render(state);
+            assert!(text.iter().any(|t| t == "Schema"), "{text:?}");
+            assert!(text.iter().any(|t| t == "History"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Saved"), "{text:?}");
+            assert!(text.iter().any(|t| t.contains("No connections yet")), "{text:?}");
             assert!(!text.iter().any(|t| t == "HISTORY"), "{text:?}");
             assert!(!text.iter().any(|t| t == "SAVED"), "{text:?}");
-            assert!(!text.iter().any(|t| t == "BOOKMARKS"), "{text:?}");
-            assert!(!text.iter().any(|t| t.contains("Filter tables")), "{text:?}");
-            assert!(text.iter().any(|t| t.contains("Import SQL")), "{text:?}");
+            assert!(!text.iter().any(|t| t.contains("Import SQL")), "{text:?}");
             assert!(text.iter().any(|t| t == "+ New connection"), "{text:?}");
 
-            // Rows that outlive the last connection keep their sections
-            // visible; an import lands in SAVED the same way.
+            // Each chosen view shows its section even when it is empty.
+            state.set_sidebar_view(SidebarView::History);
+            let text = render(state);
+            assert!(text.iter().any(|t| t == "HISTORY"), "{text:?}");
+            assert!(text.iter().any(|t| t == "No runs yet."), "{text:?}");
+            assert!(!text.iter().any(|t| t == "SAVED"), "{text:?}");
+
+            state.set_sidebar_view(SidebarView::Saved);
+            let text = render(state);
+            assert!(text.iter().any(|t| t == "SAVED"), "{text:?}");
+            assert!(text.iter().any(|t| t == "No saved queries."), "{text:?}");
+            assert!(text.iter().any(|t| t.contains("Import SQL")), "{text:?}");
+            assert!(!text.iter().any(|t| t == "HISTORY"), "{text:?}");
+
+            // Rows that outlive the last connection land in their views.
             state.saved.insert(
                 0,
                 SavedQuery::new(
@@ -10507,11 +10614,16 @@ mod tests {
                 at: 0,
             });
             let text = render(state);
-            assert!(text.iter().any(|t| t == "SAVED"), "{text:?}");
             assert!(text.iter().any(|t| t == "keep"), "{text:?}");
-            assert!(text.iter().any(|t| t == "HISTORY"), "{text:?}");
-            assert!(!text.iter().any(|t| t == "BOOKMARKS"), "nothing bookmarked");
-            assert!(!text.iter().any(|t| t.contains("Filter tables")), "{text:?}");
+
+            state.set_sidebar_view(SidebarView::History);
+            let text = render(state);
+            assert!(text.iter().any(|t| t == "SELECT 1"), "{text:?}");
+
+            state.set_sidebar_view(SidebarView::Schema);
+            let text = render(state);
+            assert!(!text.iter().any(|t| t == "SAVED"), "{text:?}");
+            assert!(!text.iter().any(|t| t.contains("Import SQL")), "{text:?}");
         });
     }
 
