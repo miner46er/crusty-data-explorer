@@ -462,25 +462,59 @@ fn assert_inside_window(
     }
 }
 
-/// Every node whose rect intersects `band`, as (label, rect) pairs. egui
-/// reports one widget as several nodes with the same rect, so those collapse.
+/// Whether a node belongs to the row its band names: it lies inside the
+/// band. A grid row the panel above clipped at the edge keeps its rect
+/// running under the row, and a panel edge can leave a sliver of a row above
+/// inside the band; neither is in the row the band names.
+fn in_row(rect: egui::Rect, band: egui::Rect) -> bool {
+    rect.min.y >= band.min.y - 1.0 && rect.max.y <= band.max.y + 1.0
+}
+
+/// The text a node carries: a button's label or a plain label's value, so
+/// the row's texts and its controls are named the same way.
+fn node_text(node: &egui_kittest::Node<'_>) -> String {
+    let access = node.accesskit_node();
+    access.label().or_else(|| access.value()).unwrap_or_default()
+}
+
+/// Every node whose rect shares pixels with `band`, as (text, rect) pairs.
+/// egui reports one widget as several nodes with the same rect, so those
+/// collapse; a node with no text is a container or a clipped grid row, not
+/// chrome the row drew.
 fn band_nodes(harness: &Harness<AppState>, band: egui::Rect) -> Vec<(String, egui::Rect)> {
     let mut found: Vec<(String, egui::Rect)> = Vec::new();
     for node in harness.query_all(By::new()) {
         if node.accesskit_node().bounding_box().is_none() {
             continue;
         }
+        let text = node_text(&node);
+        if text.is_empty() {
+            continue;
+        }
         let rect = node.rect();
-        if !band.intersects(rect) {
+        if !in_row(rect, band) {
             continue;
         }
-        let label = node.accesskit_node().label().unwrap_or_default();
-        if found.iter().any(|(seen, at)| *seen == label && *at == rect) {
+        if found
+            .iter()
+            .any(|(seen, at)| *seen == text && same_rect(*at, rect))
+        {
             continue;
         }
-        found.push((label, rect));
+        found.push((text, rect));
     }
     found
+}
+
+
+/// Whether two rects are one widget reported twice: egui's duplicate nodes
+/// for one label differ by a fraction of a pixel.
+fn same_rect(a: egui::Rect, b: egui::Rect) -> bool {
+    let near = |x: f32, y: f32| (x - y).abs() <= 1.0;
+    near(a.min.x, b.min.x)
+        && near(a.min.y, b.min.y)
+        && near(a.max.x, b.max.x)
+        && near(a.max.y, b.max.y)
 }
 
 /// Every node the band touches stays inside the window, and no two of them
@@ -569,7 +603,7 @@ fn narrow_window_chrome_stays_clear() {
 
     // One band per chrome row, so a label the sidebar spells too (`Edit`)
     // answers for the row under test.
-    let status_band = band_of(&harness, "Compare", NARROW_WINDOW);
+    let status_band = toolbar_band(&harness, &["Compare", "☀ Light"], NARROW_WINDOW);
     let results_band = toolbar_band(&harness, &["Filters", "Copy"], NARROW_WINDOW);
     let editor_band = toolbar_band(&harness, &["▶ Run"], NARROW_WINDOW);
 
@@ -636,6 +670,80 @@ fn narrow_window_chrome_stays_clear() {
     assert!(
         window.contains_rect(close),
         "the third tab's close button {close:?} paints outside {window:?}"
+    );
+}
+
+/// One row over `db::ROW_CAP`, so the result comes back truncated and the
+/// footer grows its paging controls.
+const TRUNCATED_SQL: &str = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c \
+                              WHERE x < 10001) SELECT x FROM c;";
+
+/// The grid footer at the reported width, with a truncated result and an
+/// export notice on it: the paging controls keep their place, the counts and
+/// the tab's own state elide into what is left, and nothing in the row paints
+/// over a neighbor or past the window edge.
+#[test]
+fn truncated_footer_band_stays_clear() {
+    let _guard = env_lock();
+    let (_scratch, mut harness) = three_tabs_at(NARROW_WINDOW, "footer");
+    let tab = harness.state().active().expect("the active tab");
+    run_sql(&mut harness, tab, TRUNCATED_SQL);
+    assert!(
+        harness
+            .state()
+            .tab(tab)
+            .and_then(|t| t.active_query_result())
+            .is_some_and(|result| result.is_truncated()),
+        "the recursive query fills the row cap"
+    );
+    // Set on the tab, so no export runs for the notice.
+    harness
+        .state_mut()
+        .tab_mut(tab)
+        .expect("the active tab")
+        .set_export_notice("Copied 10000 rows as TSV".to_owned(), false);
+    harness.run();
+    capture_at(&mut harness, "footer-truncated-dark", NARROW_WINDOW);
+
+    let band = band_of(&harness, "Count total", NARROW_WINDOW);
+    assert_band_clear(&harness, band, NARROW_WINDOW);
+    // The labels the row renders: both paging buttons, measured from the
+    // tab's own state (the paging label carries the loaded count). The
+    // counts, the truncation flag, and the notice have no room left and are
+    // dropped rather than drawn over the buttons.
+    let mut drawn: Vec<String> =
+        band_nodes(&harness, band).into_iter().map(|(label, _)| label).collect();
+    drawn.sort();
+    println!("footer band labels: {drawn:?}");
+    assert!(drawn.iter().any(|label| label == "Count total"), "the count button renders");
+    assert!(
+        drawn.iter().any(|label| label == "Load more (10000 loaded)"),
+        "the paging button carries the loaded count: {drawn:?}"
+    );
+
+    // Without the truncation the row has room for its texts: the counts elide
+    // into what the tab's own state leaves, and the notice keeps its place.
+    run_sql(&mut harness, tab, "SELECT personid FROM persons;");
+    harness
+        .state_mut()
+        .tab_mut(tab)
+        .expect("the active tab")
+        .set_export_notice("Copied 10000 rows as TSV".to_owned(), false);
+    harness.run();
+
+    let band = band_of(&harness, "editing persons", NARROW_WINDOW);
+    assert_band_clear(&harness, band, NARROW_WINDOW);
+    let mut drawn: Vec<String> =
+        band_nodes(&harness, band).into_iter().map(|(label, _)| label).collect();
+    drawn.sort();
+    println!("plain footer band labels: {drawn:?}");
+    assert!(
+        drawn.iter().any(|label| label.starts_with("1 of") && label.ends_with('…')),
+        "the counts elide into their share: {drawn:?}"
+    );
+    assert!(
+        drawn.iter().any(|label| label == "Copied 10000 rows as TSV"),
+        "the notice keeps its whole label at the row's right edge: {drawn:?}"
     );
 }
 

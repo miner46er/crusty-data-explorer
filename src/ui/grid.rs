@@ -292,20 +292,23 @@ fn truncate_label(total: Option<u64>) -> String {
 }
 
 /// The paging controls under a truncated grid, inline in the footer's row:
-/// the on-demand count beside the flag and the next page on demand. Pages
+/// the on-demand count beside the flag and the next page on demand. The
+/// footer measures each label into its budget first and passes only the
+/// buttons that fit, so a control the row cannot hold is never drawn. Pages
 /// append onto the loaded rows through [`DbEvent::PageOk`]; a stale page
 /// whose offset misses the loaded length is ignored, so a new run never
 /// gains old rows.
 fn paging_row(
     tab: &mut Tab,
     conn: &Option<GridConn>,
-    known_total: Option<u64>,
     loaded: usize,
+    count_label: Option<&str>,
+    more_label: Option<&str>,
     ui: &mut egui::Ui,
 ) {
-    if known_total.is_none()
+    if let Some(label) = count_label
         && ui
-            .button("Count total")
+            .button(label)
             .on_hover_text("Count every row behind the truncation flag")
             .clicked()
     {
@@ -336,10 +339,11 @@ fn paging_row(
             ),
         }
     }
-    if ui
-        .button(format!("Load more ({loaded} loaded)"))
-        .on_hover_text("Fetch the next page past the row cap")
-        .clicked()
+    if let Some(label) = more_label
+        && ui
+            .button(label)
+            .on_hover_text("Fetch the next page past the row cap")
+            .clicked()
     {
         match conn.as_ref().and_then(|c| c.handle.clone()) {
             Some(handle) => {
@@ -2084,46 +2088,78 @@ fn results_grid(
     let hidden = view.hidden_count(cols.len());
     egui::Panel::bottom("crusty_grid_footer").show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} of {} rows · {:.0} ms",
-                    visible.len(),
-                    total,
-                    ms
-                ))
-                .small()
-                .weak(),
+            // The row measures before it draws, so nothing paints over the
+            // window edge: the paging controls keep their place, the tab's
+            // own state on the right takes its share, and the counts elide
+            // into the rest.
+            let mut budget = fit::Budget::new(ui);
+            let count_label = "Count total";
+            let count_fits = truncated
+                && known_total.is_none()
+                && budget.take(ui, fit::button_w(ui, count_label));
+            let more_label = format!("Load more ({total} loaded)");
+            let more_fits = truncated
+                && budget.take(ui, fit::button_w(ui, &more_label));
+            let columns_label = format!("Show columns ({hidden})");
+            let columns_fits =
+                hidden > 0 && budget.take(ui, fit::button_w(ui, &columns_label));
+            let edit_text = match &edit_label {
+                Some(table) => {
+                    budget.elide(ui, &format!("editing {table}"), egui::TextStyle::Small)
+                }
+                None => budget.elide(ui, "read-only view", egui::TextStyle::Small),
+            };
+            let notice_text = tab
+                .export_notice()
+                .map(str::to_owned)
+                .map(|notice| budget.elide(ui, &notice, egui::TextStyle::Body))
+                .unwrap_or_default();
+            let stats_text = budget.elide(
+                ui,
+                &format!("{} of {} rows · {:.0} ms", visible.len(), total, ms),
+                egui::TextStyle::Small,
             );
-            if truncated {
+            let truncate_text = if truncated {
+                budget.elide(ui, &truncate_label(known_total), egui::TextStyle::Small)
+            } else {
+                String::new()
+            };
+
+            if !stats_text.is_empty() {
+                ui.label(egui::RichText::new(stats_text).small().weak());
+            }
+            if !truncate_text.is_empty() {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
-                    egui::RichText::new(truncate_label(known_total)).small().strong(),
+                    egui::RichText::new(truncate_text).small().strong(),
                 );
-                paging_row(tab, &grid_conn, known_total, total, ui);
             }
-            if hidden > 0 && ui.button(format!("Show columns ({hidden})")).clicked() {
+            paging_row(
+                tab,
+                &grid_conn,
+                total,
+                count_fits.then_some(count_label),
+                more_fits.then_some(more_label.as_str()),
+                ui,
+            );
+            if columns_fits && ui.button(columns_label).clicked() {
                 view.show_all();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                match &edit_label {
-                    Some(table) => {
-                        ui.label(
-                            egui::RichText::new(format!("editing {table}")).small().weak(),
+                if !edit_text.is_empty() {
+                    let label = ui.label(egui::RichText::new(&edit_text).small().weak());
+                    if edit_label.is_none() {
+                        label.on_hover_text(
+                            "Inline editing needs an idle connection and a single-table \
+                             SELECT whose table has a primary key in the result.",
                         );
                     }
-                    None => {
-                        ui.label(egui::RichText::new("read-only view").small().weak())
-                            .on_hover_text(
-                                "Inline editing needs an idle connection and a single-table \
-                                 SELECT whose table has a primary key in the result.",
-                            );
-                    }
                 }
-                if let Some(notice) = tab.export_notice().map(str::to_owned) {
+                if !notice_text.is_empty() {
                     if tab.export_failed() {
-                        ui.colored_label(ui.visuals().error_fg_color, notice);
+                        ui.colored_label(ui.visuals().error_fg_color, notice_text);
                     } else {
-                        ui.colored_label(palette.success, notice);
+                        ui.colored_label(palette.success, notice_text);
                     }
                 }
             });

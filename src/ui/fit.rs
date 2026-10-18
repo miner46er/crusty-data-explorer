@@ -94,6 +94,17 @@ impl Budget {
     pub(crate) fn leftover(&self) -> f32 {
         (self.available - self.used).max(0.0)
     }
+
+    /// The widest form of `text` the row can still hold, reserved in the same
+    /// step. Empty when the row cannot hold even the ellipsis, so the caller
+    /// draws nothing then.
+    pub(crate) fn elide(&mut self, ui: &egui::Ui, text: &str, style: egui::TextStyle) -> String {
+        let cut = elide(ui, text, style.clone(), self.leftover());
+        if !cut.is_empty() {
+            self.take(ui, text_w(ui, &cut, style));
+        }
+        cut
+    }
 }
 
 /// One packed row: items in order while they fit, the contiguous tail
