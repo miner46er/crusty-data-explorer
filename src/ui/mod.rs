@@ -85,7 +85,7 @@ fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
         let mut budget = fit::Budget::new(ui);
         for control in [
             fit::button_w(ui, theme_label, false),
-            fit::button_w(ui, "+ Table", false),
+            fit::button_w(ui, table_edit::STATUS_LABEL, false),
             fit::button_w(ui, "Compare", false),
         ] {
             budget.take(ui, control);

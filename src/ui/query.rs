@@ -265,7 +265,7 @@ impl Tool {
             Self::Rollback => "Rollback",
             Self::Transaction => "Transaction",
             Self::Autocommit => "Autocommit",
-            Self::Complete => "Complete",
+            Self::Complete => super::complete::COMPLETE_MENU_LABEL,
             Self::Format => "Format",
             Self::Find => "Find",
         }
@@ -337,7 +337,7 @@ struct ToolClicks {
 impl ToolClicks {
     fn draw(&mut self, ui: &mut egui::Ui, tool: Tool, state: &ToolState) {
         match tool {
-            Tool::Save => self.save |= ui.button("Save").clicked(),
+            Tool::Save => self.save |= ui.button(tool.label()).clicked(),
             Tool::Commit | Tool::Rollback => {
                 let action = if tool == Tool::Commit {
                     TransactionAction::Commit
@@ -345,7 +345,7 @@ impl ToolClicks {
                     TransactionAction::Rollback
                 };
                 if ui
-                    .add_enabled(state.transaction_ready, egui::Button::new(action.label()))
+                    .add_enabled(state.transaction_ready, egui::Button::new(tool.label()))
                     .on_hover_text(format!("Send {}", action.statement()))
                     .clicked()
                 {
@@ -353,7 +353,7 @@ impl ToolClicks {
                 }
             }
             Tool::Transaction => {
-                ui.menu_button("Transaction", |ui| {
+                ui.menu_button(tool.label(), |ui| {
                     if ui
                         .add_enabled(state.transaction_ready, egui::Button::new("Begin"))
                         .on_hover_text("Send BEGIN")
@@ -377,10 +377,10 @@ impl ToolClicks {
                 }
             }
             Tool::Complete => super::complete::complete_menu(ui),
-            Tool::Format => self.format |= ui.button("Format").clicked(),
+            Tool::Format => self.format |= ui.button(tool.label()).clicked(),
             Tool::Find => {
                 self.find |= ui
-                    .selectable_label(state.find_open, "Find")
+                    .selectable_label(state.find_open, tool.label())
                     .on_hover_text(format!(
                         "Find ({})",
                         ui.ctx().format_shortcut(&find_shortcut())

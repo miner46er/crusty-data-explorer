@@ -1748,7 +1748,7 @@ fn results_grid(
                 // click to get TSV with headers, so this one ignores inside
                 // clicks and each copy closes it; the checkbox leaves it
                 // standing.
-                egui::menu::MenuButton::new("Copy")
+                egui::menu::MenuButton::new(item.label())
                     .config(
                         egui::menu::MenuConfig::new()
                             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
@@ -1885,7 +1885,7 @@ fn results_grid(
                     });
             }
             ActionItem::Export => {
-                ui.menu_button("Export", |ui| {
+                ui.menu_button(item.label(), |ui| {
                     if ui.add_enabled(can_export, egui::Button::new("CSV")).clicked() {
                         export_csv_streaming(tab, &grid_conn, ui);
                     }
@@ -1914,7 +1914,7 @@ fn results_grid(
                 });
             }
             ActionItem::Edit => {
-                ui.menu_button("Edit", |ui| {
+                ui.menu_button(item.label(), |ui| {
                     if ui
                         .button("Add row")
                         .on_hover_text("Stage one empty row for INSERT")
@@ -1987,7 +1987,7 @@ fn results_grid(
             }
             ActionItem::Detail => {
                 if ui
-                    .selectable_label(side_pane == SidePane::Detail, "Detail")
+                    .selectable_label(side_pane == SidePane::Detail, item.label())
                     .on_hover_text("Show the focused row as JSON and record beside the grid")
                     .clicked()
                 {
@@ -2000,7 +2000,7 @@ fn results_grid(
             }
             ActionItem::Chart => {
                 if ui
-                    .selectable_label(side_pane == SidePane::Chart, "Chart")
+                    .selectable_label(side_pane == SidePane::Chart, item.label())
                     .on_hover_text("Plot the result beside the grid")
                     .clicked()
                 {

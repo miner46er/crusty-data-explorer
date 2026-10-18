@@ -14,12 +14,16 @@ use eframe::egui;
 use crate::app::AppState;
 use crate::db::ConnectionId;
 
+/// The status-bar entry's label, measured by the status bar before it draws:
+/// the entry and the measurement read one literal.
+pub(crate) const STATUS_LABEL: &str = "+ Table";
+
 /// The status-bar entry: opens a blank create form on the default
 /// connection. Disabled without one.
 pub fn status_entry(state: &mut AppState, ui: &mut egui::Ui) {
     let conn = state.default_connection();
     let clicked = ui
-        .add_enabled(conn.is_some(), egui::Button::new("+ Table").small())
+        .add_enabled(conn.is_some(), egui::Button::new(STATUS_LABEL).small())
         .on_hover_text("Create a table with the visual editor")
         .clicked();
     if clicked
