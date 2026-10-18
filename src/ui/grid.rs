@@ -1708,9 +1708,6 @@ fn results_grid(
         ActionItem::Export | ActionItem::Detail | ActionItem::Chart => true,
     })
     .collect();
-    // The row's width arithmetic: the field's desired width, the fixed group
-    // beside it, and every action with the gap that follows it. It is all
-    // measured before anything is drawn, so no control can paint over another.
     let gap = ui.spacing().item_spacing.x;
     let clauses = tab.filter_clauses().len();
     let filters_label = if clauses > 0 {
@@ -1731,8 +1728,6 @@ fn results_grid(
         .collect();
     let actions_w: f32 = action_w.iter().map(|w| w + gap).sum();
     let avail = ui.available_width();
-    // One row keeps today's shape; two rows give the field the full desired
-    // width and pack the actions left to right with the tail in one menu.
     let one_row = avail >= FIELD_W + left_fixed + 2.0 * gap + actions_w;
     let mut draw_action = |ui: &mut egui::Ui, item: ActionItem| {
         match item {

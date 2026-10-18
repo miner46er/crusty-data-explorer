@@ -77,11 +77,7 @@ fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
         .map(|c| format!("{} · {}", c.name, c.config.kind().label()))
         .unwrap_or_else(|| "no backend".to_owned());
     ui.horizontal(|ui| {
-        // The controls group never moves: its three buttons are reserved
-        // first. The left half of the bar reports next, so the counts keep
-        // their room; the backend name takes what remains and drops when
-        // nothing is left. Both labels go through `elide`, so neither can
-        // paint over the other.
+        // Controls first, then the counts, then the backend name.
         let mut budget = fit::Budget::new(ui);
         for control in [
             fit::button_w(ui, theme_label, false),

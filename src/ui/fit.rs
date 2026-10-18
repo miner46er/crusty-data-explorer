@@ -1,11 +1,8 @@
 //! Width arithmetic for the chrome rows that have to fit a narrow window.
 //!
-//! Pure measurement and reservation: no state, no painting. A row that has
-//! the width keeps today's layout; a row that does not elides its softest
-//! text, wraps to a second line, or moves its tail behind one overflow menu.
-//! Every number here is measured against what egui actually allocates, never
-//! a hand-tuned constant: [`Budget`] refuses a widget the row cannot hold, so
-//! two controls can never paint over each other.
+//! Pure measurement and reservation: every number is measured against what
+//! egui actually allocates, and [`Budget`] refuses a widget the row cannot
+//! hold, so two controls never paint over each other.
 
 use eframe::egui;
 
@@ -180,9 +177,7 @@ mod tests {
             assert!(cut.ends_with(OVERFLOW_LABEL), "{cut:?}");
             assert!(cut.chars().count() < text.chars().count(), "{cut:?}");
             assert!(text_w(ui, &cut, egui::TextStyle::Body) <= budget, "{cut:?}");
-            // A label that already fits comes back untouched.
             assert_eq!(elide(ui, "Save", egui::TextStyle::Button, budget), "Save");
-            // The cut respects char boundaries: no half of a multi-byte char.
             let accented = elide(ui, "éééééééééééééééééééé", egui::TextStyle::Body, budget);
             assert!(accented.ends_with(OVERFLOW_LABEL), "{accented:?}");
             assert!(text_w(ui, &accented, egui::TextStyle::Body) <= budget);
@@ -206,13 +201,10 @@ mod tests {
             let available = budget.available;
             let gap = ui.spacing().item_spacing.x;
             assert_eq!(available, 320.0);
-            // A reservation is the width plus the row's item spacing.
             assert!(budget.take(ui, available - gap));
             assert_eq!(budget.leftover(), 0.0);
-            // The next control, however small, no longer fits.
             assert!(!budget.take(ui, 1.0));
             assert_eq!(budget.leftover(), 0.0);
-            // Two items on a roomy row leave their widths and both gaps.
             let mut roomy = Budget::new(ui);
             assert!(roomy.take(ui, 100.0));
             assert!(roomy.take(ui, 100.0));
@@ -225,12 +217,8 @@ mod tests {
     fn spill_keeps_the_tail_behind_one_overflow_button() {
         let ctx = context();
         frame(&ctx, [320.0, 200.0], |ui| {
-            // Two 100px controls plus the overflow button and three gaps fit
-            // in 320; three of them do not.
             assert_eq!(spill(ui, &[100.0, 100.0, 100.0]), 2);
-            // Everything fits: nothing spills.
             assert_eq!(spill(ui, &[100.0, 100.0]), 2);
-            // A row that cannot hold even the overflow button spills all.
             assert_eq!(spill(ui, &[400.0]), 0);
         });
     }
