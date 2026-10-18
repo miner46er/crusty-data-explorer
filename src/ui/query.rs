@@ -263,7 +263,9 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                 save_clicked = ui.button("Save").clicked();
             }
             // Only the states that depart from the default get a control on
-            // the row; Begin and the autocommit mode wait in one menu.
+            // the row; Begin and the autocommit mode wait in one menu. Manual
+            // mode opens its transaction on the first statement, so Begin has
+            // no job there.
             if transaction_open {
                 for action in [TransactionAction::Commit, TransactionAction::Rollback] {
                     if ui
@@ -274,12 +276,13 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                         transaction_clicked = Some(action);
                     }
                 }
-            } else if !autocommit {
+            }
+            if !autocommit {
                 let toggle = autocommit_control(ui, &slot, autocommit, sqlite);
                 if toggle.clicked() {
                     autocommit_clicked = Some(!autocommit);
                 }
-            } else {
+            } else if !transaction_open {
                 ui.menu_button("Transaction", |ui| {
                     if ui
                         .add_enabled(transaction_ready, egui::Button::new("Begin"))

@@ -11969,6 +11969,47 @@ mod tests {
     }
 
     #[test]
+    fn transaction_row_shows_the_controls_each_mode_needs() {
+        with_isolated_state("tx-row", |state| {
+            let conn = add_postgres_connection(state, "pg-row", "");
+            let _commands = attach_test_session(state, conn);
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1600.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let row = |state: &mut AppState| {
+                let mut output = ctx.run_ui(input.clone(), |ui| {
+                    crate::ui::query::editor(state, ui);
+                });
+                output.textures_delta.clear();
+                let text = rendered_text(&output);
+                ["Transaction", "Commit", "Rollback", "Autocommit"]
+                    .into_iter()
+                    .filter(|label| text.iter().any(|t| t == label))
+                    .collect::<Vec<_>>()
+            };
+
+            assert_eq!(row(state), vec!["Transaction"]);
+
+            state.apply(DbEvent::AutocommitSet { conn, on: false, tx_open: false, error: None });
+            assert_eq!(row(state), vec!["Autocommit"]);
+
+            state.apply(DbEvent::TxState { conn, open: true });
+            assert_eq!(row(state), vec!["Commit", "Rollback", "Autocommit"]);
+
+            state.apply(DbEvent::AutocommitSet { conn, on: true, tx_open: false, error: None });
+            state.apply(DbEvent::TxState { conn, open: true });
+            assert_eq!(row(state), vec!["Commit", "Rollback"]);
+        });
+    }
+
+    #[test]
     fn sqlite_has_no_autocommit_toggle() {
         with_isolated_state("ac-sqlite", |state| {
             let conn = add_sqlite_connection(state, "mem-ac");
