@@ -18,10 +18,106 @@ use crate::ssh::{SshAuth, SshConfig};
 
 use super::{Palette, Theme};
 
-enum ConnectionStateKind {
-    Live,
+/// A connection's state as the card and the dot read it: one value that
+/// derives both the painted shape and the color, so a dot can never wear the
+/// wrong color for its state. `Error` keeps its own variant: a failed
+/// connection is a standing state, so it wears the softened Guard Red, never
+/// the raw Fault Red the design reserves for terminal text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionStatus {
+    Connected,
     Connecting,
+    Failed,
     Offline,
+}
+
+impl ConnectionStatus {
+    fn of(state: &ConnectionState) -> Self {
+        match state {
+            ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. } => {
+                Self::Connected
+            }
+            ConnectionState::Connecting { .. } => Self::Connecting,
+            ConnectionState::Error { .. } => Self::Failed,
+            ConnectionState::Disconnected => Self::Offline,
+        }
+    }
+
+    fn color(self, palette: &Palette) -> egui::Color32 {
+        match self {
+            Self::Connected => palette.success,
+            Self::Connecting => egui::Color32::YELLOW,
+            Self::Failed => palette.badge_prod,
+            Self::Offline => egui::Color32::GRAY,
+        }
+    }
+
+    /// The state's name, for the dot's node so a screen reader (and a frame
+    /// test) can name the mark.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Connecting => "connecting",
+            Self::Failed => "failed",
+            Self::Offline => "offline",
+        }
+    }
+}
+
+/// A plain filled disc, for the history rows: a run's outcome is not one of
+/// the connection states, so it carries its own color.
+fn filled_dot(ui: &mut egui::Ui, color: egui::Color32, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), size / 2.0, color);
+}
+
+/// The width of a state dot's ring, and the history row's dot size.
+const DOT_RING: f32 = 1.5;
+
+/// The painted connection state dot: a filled disc for a connected
+/// connection, a ring for an offline one, a half-filled disc for one that is
+/// connecting. The glyphs it replaces (`●`, `○`, `◌`) have no glyph in the
+/// embedded fonts and painted as epaint's replacement box.
+pub(crate) fn state_dot(
+    ui: &mut egui::Ui,
+    status: ConnectionStatus,
+    size: f32,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
+    let enabled = ui.is_enabled();
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Other, enabled, status.label())
+    });
+    let center = rect.center();
+    let radius = size / 2.0;
+    let color = status.color(&Palette::of(ui.ctx().theme()));
+    let painter = ui.painter();
+    let ring = egui::Stroke::new(DOT_RING, color);
+    // The ring is drawn inside the allocated square, so the dot never paints
+    // over the control beside it.
+    let ring_radius = radius - DOT_RING / 2.0;
+    match status {
+        ConnectionStatus::Connected => {
+            painter.circle_filled(center, radius, color);
+        }
+        ConnectionStatus::Offline | ConnectionStatus::Failed => {
+            painter.circle_stroke(center, ring_radius, ring);
+        }
+        ConnectionStatus::Connecting => {
+            painter.circle_stroke(center, ring_radius, ring);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    center + egui::vec2(0.0, -ring_radius),
+                    center + egui::vec2(0.0, ring_radius),
+                    center + egui::vec2(ring_radius, 0.0),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+    }
+    response
 }
 
 enum SidebarAction {
@@ -421,7 +517,7 @@ fn saved_row(
             }
             if !versions.is_empty() {
                 let open = saved_versions_open(ui.ctx(), query.id);
-                let arrow = if open { "▾" } else { "▸" };
+                let arrow = if open { "\u{23F7}" } else { "\u{23F5}" };
                 if ui
                     .small_button(format!("{arrow} History ({})", versions.len()))
                     .on_hover_text("Show per-save versions, newest first")
@@ -475,15 +571,11 @@ fn connection_card(
     conn_id: ConnectionId,
     conn_name: &str,
     env: Environment,
-    state_label: &str,
+    status: ConnectionStatus,
+    state_text: &str,
     selected: bool,
-    dot_color: egui::Color32,
     actions: &mut Vec<SidebarAction>,
 ) {
-    let (dot, state_text) = match state_label.split_once(' ') {
-        Some((d, t)) => (d.to_owned(), t.to_owned()),
-        None => ("○".to_owned(), state_label.to_owned()),
-    };
     let frame_fill =
         if selected { palette.selected_card_fill } else { ui.visuals().faint_bg_color };
     let frame_stroke = if selected {
@@ -491,23 +583,7 @@ fn connection_card(
     } else {
         ui.visuals().widgets.noninteractive.bg_stroke
     };
-    let kind: ConnectionStateKind = {
-        let conn = state
-            .connections()
-            .iter()
-            .find(|c| c.id == conn_id)
-            .map(|c| match c.state() {
-                ConnectionState::Connected { .. } => ConnectionStateKind::Live,
-                ConnectionState::QueryRunning { .. } => ConnectionStateKind::Live,
-                ConnectionState::Connecting { .. } => {
-                    ConnectionStateKind::Connecting
-                }
-                ConnectionState::Disconnected => ConnectionStateKind::Offline,
-                ConnectionState::Error { .. } => ConnectionStateKind::Offline,
-            })
-            .unwrap_or(ConnectionStateKind::Offline);
-        conn
-    };
+    let kind = status;
     let transaction_open = state
         .connections()
         .iter()
@@ -521,11 +597,12 @@ fn connection_card(
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width() - 16.0);
             ui.horizontal(|ui| {
+                let dot_size = ui.text_style_height(&egui::TextStyle::Body);
                 let _ = ui
                     .dnd_drag_source(
                         egui::Id::new(("crusty_conn_drag", conn_id.raw())),
                         ConnDrag { id: conn_id },
-                        |ui| ui.colored_label(dot_color, &dot),
+                        |ui| state_dot(ui, status, dot_size),
                     )
                     .inner
                     .on_hover_text("drag onto a folder to move");
@@ -534,9 +611,7 @@ fn connection_card(
                         ui.label(egui::RichText::new(conn_name).strong());
                         env_badge(ui, env);
                     });
-                    ui.label(
-                        egui::RichText::new(&state_text).small().weak(),
-                    );
+                    ui.label(egui::RichText::new(state_text).small().weak());
                     if transaction_open {
                         ui.label(
                             egui::RichText::new("transaction open")
@@ -549,7 +624,7 @@ fn connection_card(
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 match kind {
-                    ConnectionStateKind::Live => {
+                    ConnectionStatus::Connected => {
                         if ui
                             .add(
                                 egui::Button::new(
@@ -568,12 +643,12 @@ fn connection_card(
                             actions.push(SidebarAction::Disconnect(conn_id));
                         }
                     }
-                    ConnectionStateKind::Connecting => {
+                    ConnectionStatus::Connecting => {
                         if ui.small_button("Stop").clicked() {
                             actions.push(SidebarAction::Disconnect(conn_id));
                         }
                     }
-                    ConnectionStateKind::Offline => {
+                    ConnectionStatus::Failed | ConnectionStatus::Offline => {
                         if ui.small_button("Connect").clicked() {
                             actions.push(SidebarAction::Connect(conn_id));
                         }
@@ -590,7 +665,7 @@ fn connection_card(
                     actions.push(SidebarAction::Delete(conn_id));
                 }
             });
-            if matches!(kind, ConnectionStateKind::Live) {
+            if matches!(kind, ConnectionStatus::Connected) {
                 ui.add_space(4.0);
                 ui.separator();
                 ui.add_space(4.0);
@@ -691,7 +766,7 @@ fn conn_folder_header(
     indented(ui, depth, |ui| {
         let resp = ui
             .horizontal(|ui| {
-                let arrow = if open { "▾" } else { "▸" };
+                let arrow = if open { "\u{23F7}" } else { "\u{23F5}" };
                 if ui.small_button(format!("{arrow} {name}")).clicked() {
                     set_folder_open(ui.ctx(), "conn", path, !open);
                 }
@@ -736,7 +811,7 @@ fn saved_folder_header(
     indented(ui, depth, |ui| {
         let resp = ui
             .horizontal(|ui| {
-                let arrow = if open { "▾" } else { "▸" };
+                let arrow = if open { "\u{23F7}" } else { "\u{23F5}" };
                 if ui.small_button(format!("{arrow} {name}")).clicked() {
                     set_folder_open(ui.ctx(), "saved", path, !open);
                 }
@@ -850,43 +925,44 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                             .and_then(|id| state.tab(id))
                             .and_then(|tab| tab.conn);
 
-                        let snapshot: Vec<(ConnectionId, String, Environment, String, bool)> = state
+                        // The card takes the state and its text separately: the
+                        // dot is painted from the state, and the text is the
+                        // server version, the error, or the state's name.
+                        let snapshot: Vec<(
+                            ConnectionId,
+                            String,
+                            Environment,
+                            ConnectionStatus,
+                            String,
+                            bool,
+                        )> = state
                             .connections()
                             .iter()
                             .map(|c| {
-                                let (dot, text) = match c.state() {
-                                    ConnectionState::Disconnected => ("○", "disconnected".to_owned()),
-                                    ConnectionState::Connecting { .. } => {
-                                        ("◌", "connecting".to_owned())
-                                    }
+                                let text = match c.state() {
+                                    ConnectionState::Disconnected => "disconnected".to_owned(),
+                                    ConnectionState::Connecting { .. } => "connecting".to_owned(),
                                     ConnectionState::Connected { session } => {
-                                        ("●", session.server_version.clone())
+                                        session.server_version.clone()
                                     }
                                     ConnectionState::QueryRunning { session, .. } => {
-                                        ("●", session.server_version.clone())
+                                        session.server_version.clone()
                                     }
-                                    ConnectionState::Error { message } => ("●", message.clone()),
+                                    ConnectionState::Error { message } => message.clone(),
                                 };
                                 let live = matches!(
                                     c.state(),
                                     ConnectionState::Connected { .. }
                                         | ConnectionState::QueryRunning { .. }
                                 );
-                                (c.id, c.name.clone(), c.env, format!("{dot} {text}"), live)
-                            })
-                            .collect();
-                        let dot_colors: std::collections::HashMap<ConnectionId, egui::Color32> = state
-                            .connections()
-                            .iter()
-                            .map(|c| {
-                                let color = match c.state() {
-                                    ConnectionState::Disconnected => egui::Color32::GRAY,
-                                    ConnectionState::Connecting { .. } => egui::Color32::YELLOW,
-                                    ConnectionState::Connected { .. }
-                                    | ConnectionState::QueryRunning { .. } => palette.success,
-                                    ConnectionState::Error { .. } => egui::Color32::RED,
-                                };
-                                (c.id, color)
+                                (
+                                    c.id,
+                                    c.name.clone(),
+                                    c.env,
+                                    ConnectionStatus::of(c.state()),
+                                    text,
+                                    live,
+                                )
                             })
                             .collect();
                         let conn_plan: Vec<ConnPlan> = {
@@ -914,14 +990,12 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                                 }
                                 ConnPlan::Card { id, depth } => (*id, *depth),
                             };
-                            let Some((_, conn_name, env, state_label, _)) =
+                            let Some((_, conn_name, env, status, state_text, _)) =
                                 snapshot.iter().find(|(id, ..)| *id == conn_id)
                             else {
                                 continue;
                             };
                             let selected = Some(conn_id) == active_conn;
-                            let dot_color =
-                                dot_colors.get(&conn_id).copied().unwrap_or(egui::Color32::GRAY);
                             indented(ui, depth, |ui| {
                                 connection_card(
                                     state,
@@ -930,9 +1004,9 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                                     conn_id,
                                     conn_name,
                                     *env,
-                                    state_label,
+                                    *status,
+                                    state_text,
                                     selected,
-                                    dot_color,
                                     &mut actions,
                                 );
                             });
@@ -1074,7 +1148,11 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                                         .unwrap_or("deleted");
                                     let live = state.is_connection_live(conn);
                                     ui.horizontal(|ui| {
-                                        ui.colored_label(dot, "●");
+                                        filled_dot(
+                                            ui,
+                                            dot,
+                                            ui.text_style_height(&egui::TextStyle::Body),
+                                        );
                                         if ui.small_button(history_title(&sql)).clicked() {
                                             actions.push(SidebarAction::OpenHistory(
                                                 conn,

@@ -268,6 +268,134 @@ fn demo_setup(tag: &str) -> (Scratch, Harness<'static, AppState>, TabId) {
 /// leaves the right-hand panels under 320px wide.
 const NARROW_WINDOW: [u32; 2] = [640, 640];
 
+/// The default capture size: every row has room to keep today's shape.
+const WIDE_WINDOW: [u32; 2] = [1440, 900];
+
+/// The connection card's painted state dot, found by the drag source the dot
+/// is: the card drags by its dot, so that response's rect is the dot's.
+fn dot_rect(harness: &Harness<AppState>, conn: ConnectionId) -> egui::Rect {
+    harness
+        .ctx
+        .read_response(egui::Id::new(("crusty_conn_drag", conn.raw())))
+        .expect("the connection card's state dot")
+        .rect
+}
+
+/// The pixel closest to `color` in a small window around the expected edge of
+/// a ring, and its distance from the color. The ring's stroke is antialiased,
+/// so the test asks for its best-covered pixel rather than one exact index.
+fn best_pixel_near(
+    image: &image::RgbaImage,
+    center: egui::Pos2,
+    from: f32,
+    to: f32,
+    color: egui::Color32,
+) -> ([u8; 4], u8) {
+    let color = color.to_array();
+    let steps = ((to - from).abs().ceil() as i64).max(0) + 1;
+    let mut best: Option<([u8; 4], u8)> = None;
+    for step in 0..steps {
+        for dy in -1..=1 {
+            let x = (center.x + from + step as f32).round() as u32;
+            let y = (center.y + dy as f32).round() as u32;
+            let sample = pixel(image, x, y);
+            let distance = channel_distance(sample, color);
+            if best.is_none_or(|(_, previous)| distance < previous) {
+                best = Some((sample, distance));
+            }
+        }
+    }
+    best.expect("a sampling window")
+}
+
+/// The state dot is painted, not typed: a glyph in the embedded fonts has no
+/// disc, so the card and the history rows drew epaint's replacement box. This
+/// renders a connected card, an offline one, and one whose connect failed,
+/// then samples the pixels of all three dots: the disc's center is the live
+/// color and its corner is not, and each ring's center is not the color while
+/// its best-covered edge pixel is.
+#[test]
+fn state_dot_frames() {
+    let _guard = env_lock();
+    let _scratch = Scratch::new("dots");
+    let mut harness = build();
+    let live = add_memory_database(harness.state_mut());
+    connect_and_wait(&mut harness, live);
+    // A second connection that never connects: its card carries the gray ring.
+    let offline = add_memory_database(harness.state_mut());
+    // A third whose connect fails (no such directory): Guard Red ring.
+    harness.state_mut().open_draft(None);
+    {
+        let draft = harness.state_mut().draft_mut().expect("the open draft");
+        draft.name = "broken".to_owned();
+        draft.config = ConnectionConfig::Sqlite {
+            read_only: false,
+            path: "/nonexistent-cde-dir/dot-test.db".into(),
+        };
+    }
+    harness.state_mut().save_draft();
+    let failed = harness.state_mut().connections().last().expect("the failed connection").id;
+    connect_and_wait(&mut harness, failed);
+    assert!(
+        matches!(
+            harness.state().connections().iter().find(|c| c.id == failed).map(|c| c.state()),
+            Some(ConnectionState::Error { .. })
+        ),
+        "the bogus path must fail to connect, not connect"
+    );
+    harness.run();
+    capture(&mut harness, "state-dots-dark");
+
+    let image = harness.render().expect("render the frame");
+    let palette = ui::Palette::dark();
+    let live_color = palette.success;
+    let offline_color = egui::Color32::GRAY;
+    let failed_color = palette.badge_prod;
+
+    let disc = dot_rect(&harness, live);
+    let center = pixel(
+        &image,
+        disc.center().x.round() as u32,
+        disc.center().y.round() as u32,
+    );
+    let corner = pixel(
+        &image,
+        disc.left_top().x.round() as u32,
+        disc.left_top().y.round() as u32,
+    );
+    println!(
+        "disc {disc:?}: center {center:?} corner {corner:?} live {live_color:?}"
+    );
+    assert_eq!(center, live_color.to_array(), "the disc's center is the live color");
+    assert_ne!(corner, live_color.to_array(), "the disc's corner is not the color");
+
+    for (conn, color, what) in [
+        (offline, offline_color, "offline"),
+        (failed, failed_color, "failed"),
+    ] {
+        let ring = dot_rect(&harness, conn);
+        let radius = ring.width() / 2.0;
+        let hole = pixel(
+            &image,
+            ring.center().x.round() as u32,
+            ring.center().y.round() as u32,
+        );
+        let (edge, distance) =
+            best_pixel_near(&image, ring.center(), radius - 2.0, radius, color);
+        println!(
+            "{what} ring {ring:?}: center {hole:?} edge {edge:?} distance {distance} \
+             color {color:?}"
+        );
+        assert_ne!(hole, color.to_array(), "the {what} ring's center stays hollow");
+        // The best-covered edge pixel measured 7 of 255 from the color; the
+        // threshold leaves room for another font scale's antialiasing.
+        assert!(
+            distance <= 12,
+            "the {what} ring's edge carries its color: {edge:?} is {distance} from {color:?}"
+        );
+    }
+}
+
 /// Every listed node that rendered, as (label, rect) pairs. A narrow layout
 /// may drop an informational node, so absence is not an error here.
 fn rects_of(harness: &Harness<AppState>, labels: &[&str]) -> Vec<(String, egui::Rect)> {

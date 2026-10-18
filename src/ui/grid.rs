@@ -1611,7 +1611,7 @@ fn results_grid(
                 Some(n) => {
                     ui.colored_label(
                         palette.success,
-                        egui::RichText::new(format!("✓ {n} rows affected")).strong(),
+                        egui::RichText::new(format!("\u{2714} {n} rows affected")).strong(),
                     );
                 }
                 None => {
@@ -2189,8 +2189,8 @@ fn results_grid(
                     let active = sort_col == Some(i);
                     let marker = if active {
                         match sort_dir {
-                            SortDir::Asc => " ▲",
-                            SortDir::Desc => " ▼",
+                            SortDir::Asc => " \u{23F6}",
+                            SortDir::Desc => " \u{23F7}",
                         }
                     } else {
                         ""

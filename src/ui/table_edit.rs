@@ -216,7 +216,7 @@ pub fn table_editor_window(state: &mut AppState, ui: &mut egui::Ui) {
                             .hint_text("default SQL")
                             .desired_width(90.0),
                     );
-                    if ui.small_button("✕").on_hover_text("Remove column").clicked() {
+                    if ui.small_button("\u{00D7}").on_hover_text("Remove column").clicked() {
                         remove_col = Some(index);
                     }
                 });
@@ -249,7 +249,7 @@ pub fn table_editor_window(state: &mut AppState, ui: &mut egui::Ui) {
                             .desired_width(170.0),
                     );
                     ui.checkbox(&mut idx.unique, "UNIQUE");
-                    if ui.small_button("✕").on_hover_text("Remove index").clicked() {
+                    if ui.small_button("\u{00D7}").on_hover_text("Remove index").clicked() {
                         remove_idx = Some(index);
                     }
                 });
