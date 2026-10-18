@@ -400,11 +400,23 @@ impl EditTarget {
     }
 }
 
+/// What a tab is: a free-form query, or a plain table view opened from the
+/// navigator. A table tab keeps its SQL so refresh, filters, and edit
+/// transitions keep working, but shows the table header instead of the
+/// editor until `edit_as_query` flips it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum TabKind {
+    #[default]
+    Query,
+    Table { schema: String, table: String },
+}
+
 #[derive(Debug)]
 pub struct Tab {
     pub id: TabId,
     pub conn: Option<ConnectionId>,
     pub sql: String,
+    pub kind: TabKind,
     /// The saved entry the tab was opened from or last saved as, so the save
     /// prompt reopens with its name, folder, and pin. Not persisted.
     saved: Option<u64>,
@@ -1841,7 +1853,7 @@ impl AppState {
                 Some(_) => continue,
                 None => None,
             };
-            self.push_tab(conn, saved.sql);
+            self.push_tab(conn, saved.sql, saved.kind);
         }
     }
 
@@ -1936,17 +1948,18 @@ impl AppState {
     }
 
     pub fn new_tab(&mut self, conn: ConnectionId) -> TabId {
-        self.push_tab(Some(conn), String::new())
+        self.push_tab(Some(conn), String::new(), TabKind::Query)
     }
 
     /// The one tab constructor. Restore reuses it so a reloaded tab starts
     /// exactly like a fresh one: fresh id, `Never` outcome, empty display.
-    fn push_tab(&mut self, conn: Option<ConnectionId>, sql: String) -> TabId {
+    fn push_tab(&mut self, conn: Option<ConnectionId>, sql: String, kind: TabKind) -> TabId {
         let id = self.ids.tab();
         self.tabs.push(Tab {
             id,
             conn,
             sql,
+            kind,
             saved: None,
             outcome: RunOutcome::Never,
             run_scope: RunScope::All,
@@ -3547,25 +3560,42 @@ impl AppState {
         removed
     }
 
-    pub fn preview_table(&mut self, conn: ConnectionId, schema: &str, table: &str) {
+    /// Open a table view on its connection: an existing `Table` tab for the
+    /// same table activates as-is; otherwise a fresh `Table` tab loads the
+    /// capped SELECT and runs it at once, scope All, so the grid has data.
+    /// None for an unknown connection.
+    pub fn open_table_view(
+        &mut self,
+        conn: ConnectionId,
+        schema: &str,
+        table: &str,
+    ) -> Option<TabId> {
         if self.connections.iter().find(|c| c.id == conn).is_none() {
-            return;
+            return None;
+        }
+        let kind = TabKind::Table { schema: schema.to_owned(), table: table.to_owned() };
+        if let Some(existing) = self
+            .tabs
+            .iter()
+            .find(|t| t.conn == Some(conn) && t.kind == kind)
+            .map(|t| t.id)
+        {
+            self.activate(existing);
+            return Some(existing);
         }
         let sql = table_select(schema, table);
-        let existing = self.tabs.iter().find(|t| t.conn == Some(conn) && t.sql == sql).map(|t| t.id);
-        match existing {
-            Some(id) => {
-                self.activate(id);
-                self.start_run(id, &sql.clone(), sql.len(), None);
-            }
-            None => {
-                let id = self.new_tab(conn);
-                if let Some(slot) = self.tab_sql_mut(id) {
-                    *slot = sql.clone();
-                }
-                self.activate(id);
-                self.start_run(id, &sql, sql.len(), None);
-            }
+        let tab = self.push_tab(Some(conn), sql.clone(), kind);
+        self.activate(tab);
+        let len = sql.len();
+        self.start_run(tab, &sql, len, None);
+        Some(tab)
+    }
+
+    /// Turn a table tab back into a query tab, keeping its SQL, so the editor
+    /// takes over on the next frame.
+    pub fn edit_as_query(&mut self, tab: TabId) {
+        if let Some(current) = self.tabs.iter_mut().find(|t| t.id == tab) {
+            current.kind = TabKind::Query;
         }
     }
 
@@ -4270,15 +4300,14 @@ impl AppState {
     }
 
     /// Open one palette row: a connection activates (opening a tab when it
-    /// has none), a saved query opens like the sidebar, a table loads its
-    /// SELECT into a fresh tab, and a column reveals its table in the
-    /// navigator.
+    /// has none), a saved query opens like the sidebar, a table opens its
+    /// table view, and a column reveals its table in the navigator.
     pub fn open_search_result(&mut self, result: &SearchResult) {
         match result {
             SearchResult::Connection(conn) => self.select_connection(*conn),
             SearchResult::Saved(id) => self.open_saved(*id),
             SearchResult::Table { conn, schema, table } => {
-                self.open_table_query(*conn, schema, table)
+                let _ = self.open_table_view(*conn, schema, table);
             }
             SearchResult::Column { conn, schema, table, .. } => {
                 self.reveal_table(*conn, schema, table)
@@ -4300,20 +4329,6 @@ impl AppState {
                 self.activate(tab);
             }
         }
-    }
-
-    /// Load `schema.table`'s SELECT into a fresh tab on its connection,
-    /// unrun, so the user runs it.
-    pub fn open_table_query(&mut self, conn: ConnectionId, schema: &str, table: &str) {
-        if !self.connections.iter().any(|c| c.id == conn) {
-            return;
-        }
-        let sql = table_select(schema, table);
-        let tab = self.new_tab(conn);
-        if let Some(slot) = self.tab_sql_mut(tab) {
-            *slot = sql;
-        }
-        self.activate(tab);
     }
 
     /// Ask the navigator to open and show one table's entry, by exact schema
@@ -5211,14 +5226,17 @@ fn save_bookmarks(bookmarks: &[TableBookmark]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// One persisted tab row: the connection and the SQL, nothing else. Both
-/// fields default so a partial row still loads instead of failing the file.
+/// One persisted tab row: the connection, the SQL, and the kind. Every field
+/// defaults so a partial row still loads instead of failing the file; a row
+/// written before `kind` existed loads as a query tab.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedTab {
     #[serde(default)]
     conn: Option<ConnectionId>,
     #[serde(default)]
     sql: String,
+    #[serde(default)]
+    kind: TabKind,
 }
 
 fn tabs_path() -> std::path::PathBuf {
@@ -5258,7 +5276,7 @@ fn save_tabs(tabs: &[Tab]) -> std::io::Result<()> {
     }
     let persisted: Vec<PersistedTab> = tabs
         .iter()
-        .map(|t| PersistedTab { conn: t.conn, sql: t.sql.clone() })
+        .map(|t| PersistedTab { conn: t.conn, sql: t.sql.clone(), kind: t.kind.clone() })
         .collect();
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&persisted).unwrap_or_default())?;
@@ -8013,7 +8031,7 @@ mod tests {
     }
 
     #[test]
-    fn palette_table_row_opens_an_unrun_select() {
+    fn palette_table_row_opens_a_running_table_view() {
         with_isolated_state("palette-open-table", |state| {
             let conn = add_sqlite_connection(state, "prod");
             let commands = attach_test_session(state, conn);
@@ -8027,8 +8045,17 @@ mod tests {
             assert_ne!(opened.id, tab);
             assert_eq!(opened.sql, "SELECT * FROM \"main\".\"items\" LIMIT 100");
             assert_eq!(opened.conn, Some(conn));
-            assert!(matches!(opened.outcome(), RunOutcome::Never), "the SELECT waits");
-            assert!(commands.try_recv().is_err(), "opening a table sends nothing");
+            assert_eq!(
+                opened.kind,
+                TabKind::Table { schema: "main".to_owned(), table: "items".to_owned() }
+            );
+            assert!(matches!(opened.outcome(), RunOutcome::Running { .. }));
+            match commands.try_recv().expect("the table run was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["SELECT * FROM \"main\".\"items\" LIMIT 100"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
         });
     }
 
@@ -8608,9 +8635,10 @@ mod tests {
                     .keys()
                     .map(String::as_str)
                     .collect();
-                assert_eq!(keys.len(), 2);
+                assert_eq!(keys.len(), 3);
                 assert!(keys.contains(&"conn"));
                 assert!(keys.contains(&"sql"));
+                assert!(keys.contains(&"kind"));
             }
             let reloaded = AppState::new(&eframe::egui::Context::default());
             assert_eq!(reloaded.tabs().len(), 2);
@@ -8637,9 +8665,14 @@ mod tests {
                 PersistedTab {
                     conn: Some(ConnectionId::from_raw(999_999)),
                     sql: "SELECT gone".to_owned(),
+                    kind: TabKind::Query,
                 },
-                PersistedTab { conn: None, sql: "SELECT free".to_owned() },
-                PersistedTab { conn: Some(live), sql: "SELECT kept".to_owned() },
+                PersistedTab { conn: None, sql: "SELECT free".to_owned(), kind: TabKind::Query },
+                PersistedTab {
+                    conn: Some(live),
+                    sql: "SELECT kept".to_owned(),
+                    kind: TabKind::Query,
+                },
             ];
             std::fs::write(tabs_path(), serde_json::to_vec(&rows).unwrap()).unwrap();
             let reloaded = AppState::new(&eframe::egui::Context::default());
@@ -8650,6 +8683,95 @@ mod tests {
             assert_eq!(reloaded.tabs()[1].sql, "SELECT kept");
             assert!(matches!(reloaded.tabs()[1].outcome(), RunOutcome::Never));
             assert_eq!(reloaded.active(), Some(reloaded.tabs()[0].id));
+        });
+    }
+
+    #[test]
+    fn open_table_view_creates_a_running_table_tab() {
+        with_isolated_state("table-view-run", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let commands = attach_test_session(state, conn);
+            let tab = state.open_table_view(conn, "main", "users").expect("table view");
+            let view = state.tab(tab).expect("tab");
+            assert_eq!(
+                view.kind,
+                TabKind::Table { schema: "main".to_owned(), table: "users".to_owned() }
+            );
+            assert_eq!(view.sql, "SELECT * FROM \"main\".\"users\" LIMIT 100");
+            assert!(matches!(view.outcome(), RunOutcome::Running { .. }));
+            assert_eq!(state.active(), Some(tab));
+            match commands.try_recv().expect("the table run was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(
+                        statements,
+                        vec!["SELECT * FROM \"main\".\"users\" LIMIT 100"]
+                    );
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn opening_the_same_table_view_twice_reuses_its_tab() {
+        with_isolated_state("table-view-twice", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let commands = attach_test_session(state, conn);
+            let first = state.open_table_view(conn, "main", "users");
+            let _ = commands.try_recv().expect("the first run was sent");
+            let second = state.open_table_view(conn, "main", "users");
+            assert_eq!(first, second, "the existing tab is activated");
+            assert_eq!(state.tabs().len(), 1);
+            assert!(
+                commands.try_recv().is_err(),
+                "reactivating a table tab sends no second run"
+            );
+        });
+    }
+
+    #[test]
+    fn edit_as_query_flips_the_kind_and_keeps_the_sql() {
+        with_isolated_state("table-view-edit", |state| {
+            let conn = add_sqlite_connection(state, "mem");
+            let _commands = attach_test_session(state, conn);
+            let tab = state.open_table_view(conn, "main", "users").expect("table view");
+            state.edit_as_query(tab);
+            let view = state.tab(tab).expect("tab");
+            assert_eq!(view.kind, TabKind::Query);
+            assert_eq!(view.sql, "SELECT * FROM \"main\".\"users\" LIMIT 100");
+        });
+    }
+
+    #[test]
+    fn table_tab_kind_round_trips_through_save_and_load() {
+        with_isolated_state("table-view-roundtrip", |state| {
+            let conn = add_sqlite_connection(state, "live");
+            let _commands = attach_test_session(state, conn);
+            let _tab = state.open_table_view(conn, "main", "users");
+            save_tabs(state.tabs()).unwrap();
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.tabs().len(), 1);
+            assert_eq!(
+                reloaded.tabs()[0].kind,
+                TabKind::Table { schema: "main".to_owned(), table: "users".to_owned() }
+            );
+            assert_eq!(
+                reloaded.tabs()[0].sql,
+                "SELECT * FROM \"main\".\"users\" LIMIT 100"
+            );
+        });
+    }
+
+    #[test]
+    fn a_json_tab_row_without_kind_loads_as_query() {
+        with_isolated_state("table-view-old-row", |state| {
+            let live = add_sqlite_connection(state, "live");
+            let rows = serde_json::json!([{"conn": live.raw(), "sql": "SELECT 1"}]);
+            std::fs::write(tabs_path(), serde_json::to_vec(&rows).unwrap()).unwrap();
+            let reloaded = AppState::new(&eframe::egui::Context::default());
+            assert_eq!(reloaded.tabs().len(), 1);
+            assert_eq!(reloaded.tabs()[0].kind, TabKind::Query);
+            assert_eq!(reloaded.tabs()[0].sql, "SELECT 1");
         });
     }
 
@@ -11374,7 +11496,7 @@ mod tests {
         with_isolated_state("tx-ready", |state| {
             let conn = add_sqlite_connection(state, "mem-tx");
             let tab = state.new_tab(conn);
-            let unbound = state.push_tab(None, String::new());
+            let unbound = state.push_tab(None, String::new(), TabKind::Query);
             assert!(!state.transaction_ready(unbound), "no connection");
             assert!(!state.transaction_ready(tab), "disconnected");
             let _ = attach_test_handle(state, conn);
@@ -11442,7 +11564,7 @@ mod tests {
             }
 
             // No connection at all.
-            let unbound = state.push_tab(None, String::new());
+            let unbound = state.push_tab(None, String::new(), TabKind::Query);
             assert_eq!(AutocommitSlot::of(state, unbound), AutocommitSlot::Offline);
             assert_eq!(
                 chip(state, unbound, true),

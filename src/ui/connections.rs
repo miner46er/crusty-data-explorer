@@ -1219,7 +1219,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                         SidebarAction::Delete(id) => state.delete_connection(id),
                         SidebarAction::RefreshSchema(id) => state.refresh_schema(id),
                         SidebarAction::PreviewTable(id, schema, table) => {
-                            state.preview_table(id, &schema, &table)
+                            let _ = state.open_table_view(id, &schema, &table);
                         }
                         SidebarAction::RevealTable(id, schema, table) => {
                             state.reveal_table(id, &schema, &table)

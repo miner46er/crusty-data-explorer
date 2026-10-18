@@ -26,10 +26,19 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
         .default_size(240.0)
         .show(ui, |ui| connections::sidebar(state, ui));
     egui::Panel::bottom("status").show(ui, |ui| status_bar(state, ui));
-    egui::Panel::top("editor")
-        .resizable(true)
-        .default_size(210.0)
-        .show(ui, |ui| query::editor(state, ui));
+    egui::Panel::top("tabs").show(ui, |ui| query::tab_bar(state, ui));
+    let table_tab = state
+        .active()
+        .and_then(|id| state.tab(id))
+        .is_some_and(|tab| matches!(tab.kind, crate::app::TabKind::Table { .. }));
+    if table_tab {
+        egui::Panel::top("table").show(ui, |ui| query::table_header(state, ui));
+    } else {
+        egui::Panel::top("editor")
+            .resizable(true)
+            .default_size(210.0)
+            .show(ui, |ui| query::editor(state, ui));
+    }
     egui::CentralPanel::default().show(ui, |ui| grid::results(state, ui));
     compare::compare_window(state, ui);
     connections::draft_window(state, ui);

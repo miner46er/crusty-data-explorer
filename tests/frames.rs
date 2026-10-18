@@ -302,6 +302,44 @@ fn grid_frames() {
 }
 
 #[test]
+fn table_tab_frame() {
+    let _guard = env_lock();
+    let _scratch = Scratch::new("table-tab");
+    let mut harness = build();
+    let conn = add_memory_database(harness.state_mut());
+    connect_and_wait(&mut harness, conn);
+    let setup_tab = harness.state_mut().new_tab(conn);
+    harness.state_mut().activate(setup_tab);
+    run_sql(&mut harness, setup_tab, demo_sql());
+
+    let tab = harness
+        .state_mut()
+        .open_table_view(conn, "main", "users")
+        .expect("table view");
+    step_until(&mut harness, "the table run", |state| {
+        matches!(
+            state.tab(tab).map(|t| t.outcome()),
+            Some(RunOutcome::Ok { .. }) | Some(RunOutcome::Err(_))
+        )
+    });
+    if let Some(tab) = harness.state().tab(tab)
+        && let RunOutcome::Err(message) = tab.outcome()
+    {
+        panic!("the table run failed: {message}");
+    }
+    harness.run();
+    assert!(
+        harness.query_by_label("▶ Run").is_none(),
+        "a table tab has no editor toolbar"
+    );
+    assert!(
+        harness.query_by_label("email").is_some(),
+        "the table tab's grid carries the email header"
+    );
+    capture(&mut harness, "table-tab-dark");
+}
+
+#[test]
 fn line_chart_frame() {
     let _guard = env_lock();
     let (_scratch, mut harness, _tab) = demo_setup("line");

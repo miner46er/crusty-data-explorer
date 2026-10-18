@@ -13,9 +13,9 @@ use crate::db::{DbKind, TabId};
 
 use super::Palette;
 
-pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
-    prune_find(state, ui.ctx());
-    let modal_open = state.draft().is_some()
+/// True while any modal owns the screen, so the editor's shortcuts stay dead.
+pub(crate) fn any_modal_open(state: &AppState) -> bool {
+    state.draft().is_some()
         || state.save_prompt().is_some()
         || state.password_prompt().is_some()
         || state.import_draft().is_some()
@@ -24,15 +24,19 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
         || state.pending_edit_preview().is_some()
         || state.table_editor().is_some()
         || state.pending_table_ddl().is_some()
-        || state.palette_open();
-    let (new_tab_shortcut_pressed, close_tab_shortcut_pressed, find_shortcut_pressed) = ui
-        .input_mut(|i| {
-            (
-                i.consume_shortcut(&new_tab_shortcut()),
-                i.consume_shortcut(&close_tab_shortcut()),
-                i.consume_shortcut(&find_shortcut()),
-            )
-        });
+        || state.palette_open()
+}
+
+/// The tab strip, drawn by `root` for every tab whatever its kind. The new
+/// and close shortcuts live here so they work on a table tab too.
+pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
+    let modal_open = any_modal_open(state);
+    let (new_tab_shortcut_pressed, close_tab_shortcut_pressed) = ui.input_mut(|i| {
+        (
+            i.consume_shortcut(&new_tab_shortcut()),
+            i.consume_shortcut(&close_tab_shortcut()),
+        )
+    });
     if !modal_open {
         if new_tab_shortcut_pressed {
             if let Some(conn) = state.default_connection() {
@@ -46,8 +50,77 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
             }
         }
     }
-    tab_bar(state, ui);
-    ui.add_space(4.0);
+    let mut active = state.active();
+    let mut activate: Option<TabId> = None;
+    let mut close: Vec<TabId> = Vec::new();
+    let mut new_tab = false;
+    ui.horizontal(|ui| {
+        let titles = numbered_titles(
+            &state
+                .tabs()
+                .iter()
+                .map(|tab| match &tab.kind {
+                    crate::app::TabKind::Table { table, .. } => table.clone(),
+                    crate::app::TabKind::Query => tab_title(tab.sql.clone()),
+                })
+                .collect::<Vec<_>>(),
+        );
+        for (tab, title) in state.tabs().iter().zip(titles) {
+            let is_active = Some(tab.id) == active;
+            let label = if is_active {
+                egui::RichText::new(title).strong()
+            } else {
+                egui::RichText::new(title).weak()
+            };
+            if ui.selectable_value(&mut active, Some(tab.id), label).clicked() {
+                activate = Some(tab.id);
+            }
+            let transaction_open = state
+                .connections()
+                .iter()
+                .find(|c| Some(c.id) == tab.conn)
+                .is_some_and(|c| c.transaction().is_open());
+            if transaction_open {
+                ui.label(egui::RichText::new("tx").small().strong())
+                    .on_hover_text("Open transaction: commit or roll back to close it");
+            }
+            if ui.small_button("×").clicked() {
+                close.push(tab.id);
+            }
+        }
+        if ui
+            .small_button("+")
+            .on_hover_text("New tab (Ctrl+T)")
+            .clicked()
+        {
+            new_tab = true;
+        }
+    });
+    if active != state.active() {
+        if let Some(id) = active {
+            state.activate(id);
+        }
+    }
+    if let Some(id) = activate {
+        state.activate(id);
+    }
+    for id in close {
+        state.close_tab(id);
+    }
+    if new_tab {
+        if let Some(conn) = state.default_connection() {
+            let id = state.new_tab(conn);
+            state.activate(id);
+        }
+    }
+}
+
+/// The SQL editor panel: toolbar, find bar, and the editor well. Drawn by
+/// `root` for `Query` tabs only.
+pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
+    prune_find(state, ui.ctx());
+    let modal_open = any_modal_open(state);
+    let find_shortcut_pressed = ui.input_mut(|i| i.consume_shortcut(&find_shortcut()));
     let mut find_opened = false;
     if !modal_open && find_shortcut_pressed {
         if let Some(id) = state.active() {
@@ -97,62 +170,39 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     }
 }
 
-fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
-    let mut active = state.active();
-    let mut activate: Option<TabId> = None;
-    let mut close: Vec<TabId> = Vec::new();
-    let mut new_tab = false;
+/// The table tab's header, in place of the editor: the qualified name, a
+/// Refresh that re-runs the tab's current SQL, and SQL to take it over in the
+/// editor. Ctrl+Enter reruns, the table tab's Run.
+pub fn table_header(state: &mut AppState, ui: &mut egui::Ui) {
+    let Some(id) = state.active() else { return };
+    let Some((schema, table, sql)) = state.tab(id).and_then(|tab| match &tab.kind {
+        crate::app::TabKind::Table { schema, table } => {
+            Some((schema.clone(), table.clone(), tab.sql.clone()))
+        }
+        crate::app::TabKind::Query => None,
+    }) else {
+        return;
+    };
+    let modal_open = any_modal_open(state);
+    let mut edit = false;
+    let mut refresh = ui.input_mut(|i| i.consume_shortcut(&run_shortcut()));
     ui.horizontal(|ui| {
-        let titles = numbered_titles(
-            &state.tabs().iter().map(|tab| tab_title(tab.sql.clone())).collect::<Vec<_>>(),
-        );
-        for (tab, title) in state.tabs().iter().zip(titles) {
-            let is_active = Some(tab.id) == active;
-            let label = if is_active {
-                egui::RichText::new(title).strong()
-            } else {
-                egui::RichText::new(title).weak()
-            };
-            if ui.selectable_value(&mut active, Some(tab.id), label).clicked() {
-                activate = Some(tab.id);
-            }
-            let transaction_open = state
-                .connections()
-                .iter()
-                .find(|c| Some(c.id) == tab.conn)
-                .is_some_and(|c| c.transaction().is_open());
-            if transaction_open {
-                ui.label(egui::RichText::new("tx").small().strong())
-                    .on_hover_text("Open transaction: commit or roll back to close it");
-            }
-            if ui.small_button("×").clicked() {
-                close.push(tab.id);
-            }
-        }
-        if ui
-            .small_button("+")
-            .on_hover_text("New tab (Ctrl+T)")
-            .clicked()
-        {
-            new_tab = true;
-        }
+        ui.label(egui::RichText::new(format!("{schema}.{table}")).strong());
+        refresh |= ui
+            .button("Refresh")
+            .on_hover_text("Re-run this table's SELECT")
+            .clicked();
+        edit = ui
+            .button("SQL")
+            .on_hover_text("Edit this table's SELECT as a query")
+            .clicked();
     });
-    if active != state.active() {
-        if let Some(id) = active {
-            state.activate(id);
-        }
+    if refresh && !modal_open {
+        let len = sql.len();
+        state.start_run(id, &sql, len, None);
     }
-    if let Some(id) = activate {
-        state.activate(id);
-    }
-    for id in close {
-        state.close_tab(id);
-    }
-    if new_tab {
-        if let Some(conn) = state.default_connection() {
-            let id = state.new_tab(conn);
-            state.activate(id);
-        }
+    if edit {
+        state.edit_as_query(id);
     }
 }
 
