@@ -8163,6 +8163,39 @@ mod tests {
     }
 
     #[test]
+    fn compare_window_renders_over_the_root_when_opened() {
+        with_isolated_state("compare-render", |state| {
+            let conn = add_sqlite_connection(state, "prod");
+            let _commands = attach_test_session(state, conn);
+            state.apply(DbEvent::SchemaOk { conn, schema: items_schema() });
+            let tab = state.new_tab(conn);
+            state.activate(tab);
+            assert!(!state.compare_window_open());
+            state.open_compare();
+            let ctx = eframe::egui::Context::default();
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            // A fresh egui window paints from its second frame on.
+            let mut first = ctx.run_ui(input.clone(), |ui| crate::ui::root(state, ui));
+            first.textures_delta.clear();
+            let mut output = ctx.run_ui(input, |ui| crate::ui::root(state, ui));
+            output.textures_delta.clear();
+            let text = rendered_text(&output);
+            assert!(text.iter().any(|t| t == "Table compare"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Left"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Right"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Keys"), "{text:?}");
+            state.close_compare();
+            assert!(!state.compare_window_open());
+        });
+    }
+
+    #[test]
     fn palette_keyboard_flow_filters_moves_and_opens() {
         with_isolated_state("palette-keys", |state| {
             let conn = add_sqlite_connection(state, "prod");
