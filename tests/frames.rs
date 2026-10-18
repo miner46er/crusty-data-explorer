@@ -84,7 +84,12 @@ impl Drop for Scratch {
 }
 
 fn build() -> Harness<'static, AppState> {
-    let [w, h] = *FRAME_SIZE;
+    build_at(*FRAME_SIZE)
+}
+
+/// A harness rendering at an explicit size, for defects that only bite at
+/// one width.
+fn build_at([w, h]: [u32; 2]) -> Harness<'static, AppState> {
     Harness::builder()
         .with_size(egui::vec2(w as f32, h as f32))
         .build_eframe(|cc| {
@@ -96,8 +101,11 @@ fn build() -> Harness<'static, AppState> {
 /// Render the current frame to `target/frames/<name>.png`, asserting it
 /// rendered at the requested size so a broken render fails the test.
 fn capture(harness: &mut Harness<AppState>, name: &str) {
+    capture_at(harness, name, *FRAME_SIZE);
+}
+
+fn capture_at(harness: &mut Harness<AppState>, name: &str, [w, h]: [u32; 2]) {
     let image = harness.render().expect("render the frame");
-    let [w, h] = *FRAME_SIZE;
     assert_eq!(
         image.dimensions(),
         (w, h),
@@ -254,6 +262,133 @@ fn demo_setup(tag: &str) -> (Scratch, Harness<'static, AppState>, TabId) {
         "SELECT id, email, plan, active, joined FROM users ORDER BY id;",
     );
     (scratch, harness, tab)
+}
+
+/// The window size the operator's screenshot came from: the 240px sidebar
+/// leaves the right-hand panels under 320px wide.
+const NARROW_WINDOW: [u32; 2] = [640, 640];
+
+/// Every listed node that rendered, as (label, rect) pairs. A narrow layout
+/// may drop an informational node, so absence is not an error here.
+fn rects_of(harness: &Harness<AppState>, labels: &[&str]) -> Vec<(String, egui::Rect)> {
+    labels
+        .iter()
+        .filter_map(|label| {
+            harness
+                .query_by_label(label)
+                .map(|node| ((*label).to_owned(), node.rect()))
+        })
+        .collect()
+}
+
+/// The window rect of a capture, in the coordinates node rects use.
+fn window_rect([w, h]: [u32; 2]) -> egui::Rect {
+    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32, h as f32))
+}
+
+/// No two of the listed nodes may paint over each other: chrome covering
+/// chrome is the defect the screenshot shows. Only rendered pairs are
+/// compared, with a half-pixel tolerance so edge-touching reads as clear.
+fn assert_no_overlap(harness: &Harness<AppState>, labels: &[&str]) {
+    let found = rects_of(harness, labels);
+    for (i, (a_label, a)) in found.iter().enumerate() {
+        for (b_label, b) in &found[i + 1..] {
+            let overlap = a.intersect(*b);
+            assert!(
+                overlap.width() <= 0.5 || overlap.height() <= 0.5,
+                "{a_label} {a:?} paints over {b_label} {b:?}"
+            );
+        }
+    }
+}
+
+/// Every listed node that rendered must sit inside the window. A control
+/// painted past an edge is unreachable, the same defect from the other side.
+fn assert_inside_window(harness: &Harness<AppState>, labels: &[&str], size: [u32; 2]) {
+    let window = window_rect(size);
+    for (label, rect) in rects_of(harness, labels) {
+        assert!(window.contains_rect(rect), "{label} {rect:?} paints outside {window:?}");
+    }
+}
+
+/// The close button belonging to the tab row that starts at `label`: the
+/// first one to its right on the same line.
+fn close_button_after(harness: &Harness<AppState>, label: &str) -> Option<egui::Rect> {
+    let row = harness.query_by_label(label)?.rect();
+    harness
+        .query_all_by_label("×")
+        .map(|node| node.rect())
+        .filter(|rect| {
+            rect.min.x >= row.max.x && rect.min.y <= row.max.y && rect.max.y >= row.min.y
+        })
+        .min_by(|a, b| a.min.x.total_cmp(&b.min.x))
+}
+
+/// Chrome at the width the operator reported, with three tabs, a folder and
+/// a result in the grid: status bar, both toolbars, and the tab strip keep
+/// their controls inside the window and never paint over each other.
+#[test]
+fn narrow_window_chrome_stays_clear() {
+    let _guard = env_lock();
+    let _scratch = Scratch::new("narrow");
+    let mut harness = build_at(NARROW_WINDOW);
+    let conn = add_memory_database(harness.state_mut());
+    harness.state_mut().move_connection(conn, Some("test folder"));
+    connect_and_wait(&mut harness, conn);
+    let setup = harness.state_mut().new_tab(conn);
+    harness.state_mut().activate(setup);
+    run_sql(
+        &mut harness,
+        setup,
+        "CREATE TABLE persons (personid INTEGER PRIMARY KEY, lastname TEXT);\n\
+         INSERT INTO persons (lastname) VALUES ('test');",
+    );
+    let mut tabs = vec![setup];
+    for _ in 0..2 {
+        let tab = harness.state_mut().new_tab(conn);
+        harness.state_mut().activate(tab);
+        tabs.push(tab);
+    }
+    for tab in &tabs {
+        run_sql(&mut harness, *tab, "SELECT * FROM persons;");
+    }
+    let active = *tabs.last().expect("three tabs");
+    harness.state_mut().activate(active);
+    harness.run();
+    capture_at(&mut harness, "narrow-dark", NARROW_WINDOW);
+
+    assert_no_overlap(
+        &harness,
+        &["1 connection, 1 live", "local · SQLite", "Compare", "+ Table", "☀ Light"],
+    );
+    assert_inside_window(
+        &harness,
+        &[
+            "Compare", "+ Table", "☀ Light", "Filters", "Copy", "Export", "Edit", "Detail",
+            "Chart", "▶ Run", "Explain", "Save", "Transaction", "Complete", "Format", "Find",
+        ],
+        NARROW_WINDOW,
+    );
+    assert_no_overlap(
+        &harness,
+        &["Filters", "Copy", "Export", "Edit", "Detail", "Chart"],
+    );
+    assert_no_overlap(
+        &harness,
+        &["▶ Run", "Explain", "Save", "Transaction", "Complete", "Format", "Find"],
+    );
+
+    let window = window_rect(NARROW_WINDOW);
+    let label = harness
+        .query_by_label("persons 3")
+        .map(|node| node.rect())
+        .expect("the third tab renders");
+    assert!(window.contains_rect(label), "the active tab {label:?} leaves the window");
+    let close = close_button_after(&harness, "persons 3").expect("the tab's close button");
+    assert!(
+        window.contains_rect(close),
+        "the third tab's close button {close:?} paints outside {window:?}"
+    );
 }
 
 #[test]
