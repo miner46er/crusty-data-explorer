@@ -11,6 +11,7 @@ pub mod complete;
 pub mod connections;
 pub mod ddl;
 pub mod editor;
+pub mod fit;
 pub mod grid;
 pub mod plan;
 pub mod query;
