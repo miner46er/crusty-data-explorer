@@ -519,6 +519,143 @@ fn narrow_window_chrome_stays_clear() {
     );
 }
 
+/// Every listed node shares one y band: one row, no wrap.
+fn assert_same_row(harness: &Harness<AppState>, labels: &[&str]) {
+    let found = rects_of(harness, labels);
+    assert_eq!(found.len(), labels.len(), "every row node renders: {found:?}");
+    let (first_label, first) = &found[0];
+    for (label, rect) in &found[1..] {
+        assert!(
+            (rect.center().y - first.center().y).abs() <= 1.0,
+            "{label} {rect:?} left the row {first_label} {first:?} holds"
+        );
+    }
+}
+
+/// The full-width strip of window one toolbar occupies, taken from a node it
+/// holds: the strip runs from that node's top edge to its bottom edge across
+/// the whole window, so a node in any column of the same row lands in it.
+fn band_of(harness: &Harness<AppState>, label: &str, [w, _]: [u32; 2]) -> egui::Rect {
+    let node = harness.get_by_label(label).rect();
+    egui::Rect::from_min_max(
+        egui::pos2(0.0, node.min.y),
+        egui::pos2(w as f32, node.max.y),
+    )
+}
+
+/// How many overflow-menu buttons rendered inside `band`.
+fn overflow_buttons_in(harness: &Harness<AppState>, band: egui::Rect) -> usize {
+    harness
+        .query_all_by_label("\u{2026}")
+        .filter(|node| band.intersects(node.rect()))
+        .count()
+}
+
+/// The results toolbar's row filter field. A text edit carries no label, so
+/// the field is the text input immediately left of the Filters toggle.
+fn filter_field(harness: &Harness<AppState>) -> egui::Rect {
+    let filters = harness.get_by_label("Filters").rect();
+    harness
+        .query_all_by_role(egui::accesskit::Role::TextInput)
+        .map(|node| node.rect())
+        .filter(|rect| {
+            rect.max.x <= filters.min.x
+                && rect.max.y >= filters.min.y
+                && rect.min.y <= filters.max.y
+        })
+        .max_by(|a, b| a.min.x.total_cmp(&b.min.x))
+        .expect("the row filter field")
+}
+
+/// The width the toolbar's text field keeps at a wide window. The node's
+/// rect is the field's text area, which is the desired width exactly.
+const FIELD_RECT: f32 = 180.0;
+
+/// At a wide window every chrome row keeps today's single-row shape: nothing
+/// folds behind an overflow menu, the results actions stay right-aligned, the
+/// filter field keeps its full width, and the editor tools and the tabs each
+/// share one row.
+#[test]
+fn wide_layout_unchanged() {
+    let _guard = env_lock();
+    let _scratch = Scratch::new("wide");
+    let mut harness = build_at(WIDE_WINDOW);
+    let conn = add_memory_database(harness.state_mut());
+    connect_and_wait(&mut harness, conn);
+    let first = harness.state_mut().new_tab(conn);
+    harness.state_mut().activate(first);
+    run_sql(&mut harness, first, demo_sql());
+    let mut tabs = vec![first];
+    for _ in 0..2 {
+        let tab = harness.state_mut().new_tab(conn);
+        harness.state_mut().activate(tab);
+        tabs.push(tab);
+    }
+    for tab in &tabs {
+        run_sql(
+            &mut harness,
+            *tab,
+            "SELECT id, email, plan, active, joined FROM users ORDER BY id;",
+        );
+    }
+    harness.state_mut().activate(first);
+    harness.run();
+    capture_at(&mut harness, "wide-chrome-dark", WIDE_WINDOW);
+
+    // Both status-bar labels fit at this width.
+    assert!(
+        harness.query_by_label("1 connection, 1 live").is_some(),
+        "the status bar keeps its stats label"
+    );
+    assert!(
+        harness.query_by_label("local · SQLite").is_some(),
+        "the status bar keeps its backend label"
+    );
+
+    // No row folded anything behind the overflow menu.
+    for (name, anchor) in [
+        ("status bar", "Compare"),
+        ("results toolbar", "Chart"),
+        ("editor toolbar", "▶ Run"),
+    ] {
+        let band = band_of(&harness, anchor, WIDE_WINDOW);
+        assert!(band.height() > 0.0, "the {name} band is real");
+        assert_eq!(
+            overflow_buttons_in(&harness, band),
+            0,
+            "the {name} shows an overflow menu at 1440"
+        );
+    }
+
+    // The results actions sit at the panel's right edge, reading left to
+    // right as they always have, and the filter field keeps its width.
+    let window = window_rect(WIDE_WINDOW);
+    let chart = harness.get_by_label("Chart").rect();
+    let gap = window.right() - chart.max.x;
+    println!("wide: the action group ends {gap:.1}px from the window's right edge");
+    assert!(gap <= 16.0, "the action group {chart:?} left the panel's right edge");
+    let mut previous = f32::NEG_INFINITY;
+    for label in ["Copy", "Export", "Edit", "Detail", "Chart"] {
+        let rect = harness.get_by_label(label).rect();
+        assert!(rect.min.x > previous, "{label} {rect:?} left the group's order");
+        previous = rect.min.x;
+    }
+    let field = filter_field(&harness);
+    println!("wide: filter field {field:?}");
+    assert!(
+        (field.width() - FIELD_RECT).abs() <= 1.0,
+        "the filter field is {} wide, not {FIELD_RECT}",
+        field.width()
+    );
+
+    // The editor tools and the tabs each hold one row.
+    assert_same_row(
+        &harness,
+        &["▶ Run", "Explain", "Save", "Transaction", "Complete", "Format", "Find"],
+    );
+    assert_same_row(&harness, &["users", "users 2", "users 3"]);
+}
+
 #[test]
 fn empty_frame() {
     let _guard = env_lock();
