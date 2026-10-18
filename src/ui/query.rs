@@ -90,7 +90,7 @@ pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
         }
         if ui
             .small_button("+")
-            .on_hover_text("New tab (Ctrl+T)")
+            .on_hover_text(format!("New tab ({})", ui.ctx().format_shortcut(&new_tab_shortcut())))
             .clicked()
         {
             new_tab = true;
@@ -260,7 +260,11 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                     .on_hover_text("Query execution plan")
                     .clicked();
                 ui.label(
-                    egui::RichText::new(format!("{} · Ctrl+Enter", scope.hint()))
+                    egui::RichText::new(format!(
+                        "{} · {}",
+                        scope.hint(),
+                        ui.ctx().format_shortcut(&run_shortcut())
+                    ))
                         .small()
                         .weak(),
                 );
@@ -307,7 +311,7 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
             format_clicked = ui.button("Format").clicked();
             find_clicked = ui
                 .selectable_label(find_open, "Find")
-                .on_hover_text("Find (Ctrl+F)")
+                .on_hover_text(format!("Find ({})", ui.ctx().format_shortcut(&find_shortcut())))
                 .clicked();
             if let Some(RunOutcome::Running { started, .. }) =
                 state.tab(tab_id).map(|t| t.outcome())
@@ -482,19 +486,19 @@ fn numbered_titles(titles: &[String]) -> Vec<String> {
 }
 
 pub fn run_shortcut() -> egui::KeyboardShortcut {
-    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Enter)
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Enter)
 }
 
 pub fn new_tab_shortcut() -> egui::KeyboardShortcut {
-    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::T)
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::T)
 }
 
 pub fn close_tab_shortcut() -> egui::KeyboardShortcut {
-    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::W)
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W)
 }
 
 pub fn find_shortcut() -> egui::KeyboardShortcut {
-    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::F)
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::F)
 }
 
 /// Per-tab find bar state, kept in the egui context data keyed by tab id.
@@ -765,17 +769,34 @@ mod tests {
     #[test]
     fn shortcuts_carry_expected_modifiers_and_keys() {
         let run = run_shortcut();
-        assert_eq!(run.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(run.modifiers, egui::Modifiers::COMMAND);
         assert_eq!(run.logical_key, egui::Key::Enter);
         let new_tab = new_tab_shortcut();
-        assert_eq!(new_tab.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(new_tab.modifiers, egui::Modifiers::COMMAND);
         assert_eq!(new_tab.logical_key, egui::Key::T);
         let close_tab = close_tab_shortcut();
-        assert_eq!(close_tab.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(close_tab.modifiers, egui::Modifiers::COMMAND);
         assert_eq!(close_tab.logical_key, egui::Key::W);
         let find = find_shortcut();
-        assert_eq!(find.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(find.modifiers, egui::Modifiers::COMMAND);
         assert_eq!(find.logical_key, egui::Key::F);
+    }
+
+    #[test]
+    fn run_hint_names_the_platform_modifier() {
+        let hint = |os| {
+            let ctx = egui::Context::default();
+            ctx.set_os(os);
+            let mut text = String::new();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                text = ui.ctx().format_shortcut(&run_shortcut());
+            });
+            output.textures_delta.clear();
+            text
+        };
+        assert_eq!(hint(egui::os::OperatingSystem::Nix), "Ctrl+Enter");
+        assert_eq!(hint(egui::os::OperatingSystem::Windows), "Ctrl+Enter");
+        assert_eq!(hint(egui::os::OperatingSystem::Mac), "Cmd+Enter");
     }
 
     #[test]

@@ -468,6 +468,7 @@ pub fn apply_completion(
     (next, next_cursor)
 }
 
+/// Ctrl on every platform, since Cmd+Space opens Spotlight on macOS.
 pub fn completion_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Space)
 }

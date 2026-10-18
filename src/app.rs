@@ -8222,7 +8222,7 @@ mod tests {
             };
             frame(
                 state,
-                vec![key_event(eframe::egui::Key::K, eframe::egui::Modifiers::CTRL)],
+                vec![key_event(eframe::egui::Key::K, eframe::egui::Modifiers::COMMAND)],
             );
             assert!(state.palette_open(), "Ctrl+K opens");
             frame(state, vec![eframe::egui::Event::Text("item".to_owned())]);
@@ -8246,7 +8246,7 @@ mod tests {
 
             frame(
                 state,
-                vec![key_event(eframe::egui::Key::K, eframe::egui::Modifiers::CTRL)],
+                vec![key_event(eframe::egui::Key::K, eframe::egui::Modifiers::COMMAND)],
             );
             frame(state, vec![eframe::egui::Event::Text("e".to_owned())]);
             assert_eq!(state.palette().expect("palette").results.len(), 4);
@@ -8264,7 +8264,7 @@ mod tests {
 
             frame(
                 state,
-                vec![key_event(eframe::egui::Key::K, eframe::egui::Modifiers::CTRL)],
+                vec![key_event(eframe::egui::Key::K, eframe::egui::Modifiers::COMMAND)],
             );
             frame(state, vec![eframe::egui::Event::Text("e".to_owned())]);
             frame(
@@ -8842,7 +8842,7 @@ mod tests {
                 )),
                 events: vec![key_event(
                     eframe::egui::Key::Enter,
-                    eframe::egui::Modifiers::CTRL,
+                    eframe::egui::Modifiers::COMMAND,
                 )],
                 ..Default::default()
             };

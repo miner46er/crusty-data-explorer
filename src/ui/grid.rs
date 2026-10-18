@@ -811,7 +811,10 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
     match tab.outcome() {
         RunOutcome::Ok { .. } => {}
         RunOutcome::Never => {
-            ui.label("Type SQL above and press Run (Ctrl+Enter).");
+            ui.label(format!(
+                "Type SQL above and press Run ({}).",
+                ui.ctx().format_shortcut(&super::query::run_shortcut())
+            ));
             return;
         }
         RunOutcome::Running { .. } => {
@@ -1742,7 +1745,10 @@ fn results_grid(
                     });
                     if ui
                         .add_enabled(can_fill, egui::Button::new("Fill down"))
-                        .on_hover_text("Fill the focused cell down the selection (Ctrl+D)")
+                        .on_hover_text(format!(
+                            "Fill the focused cell down the selection ({})",
+                            ui.ctx().format_shortcut(&fill_shortcut())
+                        ))
                         .clicked()
                     {
                         if let Some((row, col)) = selection.active() {
@@ -2703,20 +2709,21 @@ fn export_all_results(tab: &mut Tab) {
 }
 
 pub fn copy_shortcut() -> egui::KeyboardShortcut {
-    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C)
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::C)
 }
 
 /// Ctrl+V pastes through the same mapping as the Paste rows button.
 pub fn paste_shortcut() -> egui::KeyboardShortcut {
-    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::V)
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::V)
 }
 
 /// Ctrl+D fills the focused cell down the selection.
 pub fn fill_shortcut() -> egui::KeyboardShortcut {
-    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::D)
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::D)
 }
 
-/// Ctrl+H hides the focused column; the Columns button restores.
+/// Ctrl+H hides the focused column; the Columns button restores. Ctrl on
+/// every platform, since Cmd+H hides the app on macOS.
 pub fn hide_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::H)
 }
@@ -3345,9 +3352,9 @@ mod tests {
     }
 
     #[test]
-    fn copy_shortcut_is_ctrl_c() {
+    fn copy_shortcut_is_command_c() {
         let shortcut = copy_shortcut();
-        assert_eq!(shortcut.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(shortcut.modifiers, egui::Modifiers::COMMAND);
         assert_eq!(shortcut.logical_key, egui::Key::C);
     }
 
@@ -3407,7 +3414,7 @@ mod tests {
     #[test]
     fn range_fill_marks_every_target_through_stage() {
         let shortcut = fill_shortcut();
-        assert_eq!(shortcut.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(shortcut.modifiers, egui::Modifiers::COMMAND);
         assert_eq!(shortcut.logical_key, egui::Key::D);
         let actions = fill_stages(0, 1, &[0, 1, 2], "ada".to_owned());
         assert_eq!(actions.len(), 2);
@@ -3436,7 +3443,7 @@ mod tests {
     #[test]
     fn keyboard_paste_maps_through_the_staged_rows() {
         let shortcut = paste_shortcut();
-        assert_eq!(shortcut.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(shortcut.modifiers, egui::Modifiers::COMMAND);
         assert_eq!(shortcut.logical_key, egui::Key::V);
         let hide = hide_shortcut();
         assert_eq!(hide.modifiers, egui::Modifiers::CTRL);

@@ -6,7 +6,7 @@ use eframe::egui;
 use crate::app::{AppState, SearchResult};
 
 pub fn search_shortcut() -> egui::KeyboardShortcut {
-    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::K)
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K)
 }
 
 /// The name and detail one palette row shows.
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn shortcut_carries_ctrl_k() {
         let search = search_shortcut();
-        assert_eq!(search.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(search.modifiers, egui::Modifiers::COMMAND);
         assert_eq!(search.logical_key, egui::Key::K);
     }
 }
