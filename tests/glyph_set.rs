@@ -16,9 +16,12 @@
 //!
 //! Each character is checked against the family that paints it: a literal on
 //! a line that names `monospace` must render in the monospace family, every
-//! other literal in the proportional family. The Control Pictures block
-//! (U+2400..=U+243F) is exempt: `edit.rs` uses U+241E as an out-of-band data
-//! sentinel that the UI translates before it paints.
+//! other literal in the proportional family. The family comes from the line
+//! that spells the literal, so a builder chain split across lines must keep
+//! `monospace` on the literal's own line. `#[cfg(test)]` items are skipped:
+//! a fixture glyph in a unit test is data, not chrome. The Control Pictures
+//! block (U+2400..=U+243F) is exempt: `edit.rs` uses U+241E as an out-of-band
+//! data sentinel that the UI translates before it paints.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -104,13 +107,20 @@ enum Scan {
 
 /// The non-ASCII characters inside string and char literals, in source
 /// order, with their 1-based line. Comments are skipped; `\u{..}` escapes in
-/// strings are resolved; raw strings (`r".."`, `r#".."#`) are read. A char
-/// literal is recognized as `'x'`; an escaped one such as `'\n'` is skipped.
+/// strings and char literals are resolved; raw strings (`r".."`, `r#".."#`)
+/// are read. A char literal is recognized as `'x'` or `'\u{..}'`; an escaped
+/// form such as `'\n'` is skipped. Items behind `#[cfg(test)]` are skipped
+/// whole, braces and contents.
 fn literal_glyphs(text: &str) -> Vec<(usize, char)> {
     let mut found = Vec::new();
     let mut scan = Scan::Code;
     let mut chars = text.chars().peekable();
     let mut line = 1;
+    // A `#[cfg(test)]` item being skipped: whether its body has opened, and
+    // the brace depth inside it.
+    let mut skip_item = false;
+    let mut skip_body = false;
+    let mut skip_depth = 0usize;
     while let Some(c) = chars.next() {
         if c == '\n' {
             line += 1;
@@ -134,30 +144,19 @@ fn literal_glyphs(text: &str) -> Vec<(usize, char)> {
                 '\\' => {
                     // A `\u{..}` escape names a character the source never
                     // spells out, so resolve it like a literal one.
-                    if chars.peek() == Some(&'u') {
-                        chars.next();
-                        if chars.peek() == Some(&'{') {
-                            chars.next();
-                            let mut hex = String::new();
-                            for digit in chars.by_ref() {
-                                if digit == '}' {
-                                    break;
-                                }
-                                hex.push(digit);
-                            }
-                            if let Some(resolved) =
-                                u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
-                                && !resolved.is_ascii()
-                            {
-                                found.push((line, resolved));
-                            }
-                        }
-                    } else {
-                        chars.next();
+                    if let Some(resolved) = escaped(&mut chars)
+                        && !resolved.is_ascii()
+                        && !skip_item
+                    {
+                        found.push((line, resolved));
                     }
                 }
                 '"' => scan = Scan::Code,
-                c if !c.is_ascii() => found.push((line, c)),
+                c if !c.is_ascii() => {
+                    if !skip_item {
+                        found.push((line, c));
+                    }
+                }
                 _ => {}
             },
             Scan::RawString(hashes) => {
@@ -166,7 +165,7 @@ fn literal_glyphs(text: &str) -> Vec<(usize, char)> {
                     if closes {
                         scan = Scan::Code;
                     }
-                } else if !c.is_ascii() {
+                } else if !c.is_ascii() && !skip_item {
                     found.push((line, c));
                 }
             }
@@ -190,27 +189,104 @@ fn literal_glyphs(text: &str) -> Vec<(usize, char)> {
                         scan = Scan::RawString(hashes);
                     }
                 } else if c == '\'' {
-                    // `'x'` is a char literal; an escaped form such as
-                    // `'\n'` is skipped, and anything else is a lifetime,
-                    // which carries no character.
+                    // `'x'` and `'\u{..}'` are char literals; an escaped
+                    // form such as `'\n'` carries no glyph, and anything
+                    // else is a lifetime, which carries none either.
                     let mut probe = chars.clone();
                     let middle = probe.next();
-                    let closing = probe.next();
-                    if middle.is_some() && closing == Some('\'') {
+                    if middle == Some('\\') {
+                        chars.next();
+                        let resolved = escaped(&mut chars);
+                        if chars.peek() == Some(&'\'') {
+                            chars.next();
+                            if let Some(resolved) = resolved
+                                && !resolved.is_ascii()
+                                && !skip_item
+                            {
+                                found.push((line, resolved));
+                            }
+                        }
+                    } else if middle.is_some() && probe.next() == Some('\'') {
                         chars.next();
                         chars.next();
                         if let Some(middle) = middle
                             && !middle.is_ascii()
-                            && middle != '\\'
+                            && !skip_item
                         {
                             found.push((line, middle));
                         }
+                    }
+                } else if c == '#' && !skip_item && chars.peek() == Some(&'[') {
+                    // A `#[cfg(test)]` item is a fixture, not chrome: skip
+                    // its body once the braces open. Other attributes stay in
+                    // the scan, so a glyph in one is still checked.
+                    let mut probe = chars.clone();
+                    probe.next();
+                    let mut attribute = String::new();
+                    let mut closed = false;
+                    for ch in probe.by_ref() {
+                        if ch == ']' {
+                            closed = true;
+                            break;
+                        }
+                        attribute.push(ch);
+                    }
+                    if closed && attribute.trim() == "cfg(test)" {
+                        chars.next();
+                        for ch in chars.by_ref() {
+                            if ch == ']' {
+                                break;
+                            }
+                        }
+                        skip_item = true;
+                        skip_body = false;
+                        skip_depth = 0;
+                    }
+                } else if skip_item {
+                    if skip_body {
+                        if c == '{' {
+                            skip_depth += 1;
+                        } else if c == '}' {
+                            skip_depth -= 1;
+                            if skip_depth == 0 {
+                                skip_item = false;
+                                skip_body = false;
+                            }
+                        }
+                    } else if c == '{' {
+                        skip_body = true;
+                        skip_depth = 1;
+                    } else if c == ';' {
+                        skip_item = false;
                     }
                 }
             }
         }
     }
     found
+}
+
+/// The character a backslash escape names, with the backslash already
+/// consumed. `\u{..}` resolves; the single-character escapes have no glyph.
+fn escaped(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<char> {
+    if chars.peek() == Some(&'u') {
+        chars.next();
+        if chars.peek() == Some(&'{') {
+            chars.next();
+            let mut hex = String::new();
+            for digit in chars.by_ref() {
+                if digit == '}' {
+                    break;
+                }
+                hex.push(digit);
+            }
+            return u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32);
+        }
+        None
+    } else {
+        chars.next();
+        None
+    }
 }
 
 /// Every non-ASCII character the sources put in a literal, mapped to the
@@ -354,5 +430,38 @@ mod tests {
         "##;
         let found: Vec<char> = literal_glyphs(source).into_iter().map(|(_, c)| c).collect();
         assert_eq!(found, ['●', '▾', '▸', '◌', '…', '·']);
+    }
+
+    #[test]
+    fn the_scan_resolves_escapes_inside_char_literals() {
+        let source = r#"
+            let a = '\u{00D7}';
+            let b = '\u{2026}';
+            let c = '●';
+            let d = '\n';
+            let e: &'static str = "ok";
+        "#;
+        let found: Vec<char> = literal_glyphs(source).into_iter().map(|(_, c)| c).collect();
+        assert_eq!(found, ['×', '…', '●']);
+    }
+
+    #[test]
+    fn the_scan_skips_cfg_test_items() {
+        let source = r#"
+            let kept = "●";
+            #[cfg(test)]
+            mod tests {
+                const FIXTURE: char = '×';
+                #[test]
+                fn one() {
+                    let sample = "◌ ▾";
+                    let escaped = '\u{2714}';
+                }
+            }
+            let also_kept = "→";
+            let other = "\u{25B8}";
+        "#;
+        let found: Vec<char> = literal_glyphs(source).into_iter().map(|(_, c)| c).collect();
+        assert_eq!(found, ['●', '→', '▸']);
     }
 }
