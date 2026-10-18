@@ -123,7 +123,7 @@ The incumbent implementation is a Rust/egui desktop application. The tokens here
 - Monospace data everywhere a value can be copied, aliased, or diffed.
 - Flat panels, 1px strokes; shadow only on true floating layers.
 - Small, tight type (11px to 16px); emphasis through weight and brightness, never size.
-- Unicode glyphs as the entire icon set: `▶ Run`, `★` pin, `×` close, `+` new, `●`/`○` connection state.
+- Unicode glyphs as the icon set, plus painted state dots: `▶ Run`, `★` pin, `×` close and remove, `+` new, `⏷`/`⏵` folder marks and `⏶`/`⏷` sort marks, `»` a reference arrow, `✔` the saved-rows check, and the connection state painted as a disc, a ring, or a half-filled disc.
 
 ## Colors
 
@@ -186,6 +186,8 @@ Density is deliberate: item spacing 8px horizontal by 4px vertical, button paddi
 
 **The Instrument Frame Rule.** The four panels are the cockpit. Work lands inside them; it does not reshape them.
 
+**The Chrome Row Rule.** A row's controls never paint over each other. Text elides first, then the row wraps to a second line, then its tail goes behind one `…` menu; the row's fixed controls never move. Every row measures its content before it draws, and a row that has the width keeps its one-row shape.
+
 ## Elevation & Depth
 
 Tonal-first. Panels are flat and separated by tone alone: window, panel, raised, and the recessed Ink Well, with 1px strokes (egui's gray-60 border dark / gray-190 light) marking group and card edges. There is no glow, no gradient, and no shadow vocabulary of the app's own. Depth appears only when a surface truly floats above the frame: dialogs, menus, the command palette, and tooltips carry egui's default window shadow (offset 10, 20; blur 15; black at 96 alpha) and its 6px corner radius. Hover feedback is tonal too: interactive surfaces step up 10 gray levels rather than lighting up.
@@ -217,7 +219,7 @@ Small and calm; the fill carries the meaning, never the shape.
 Six pixels of typography carrying the most important fact on the card. Fill is the badge color at 20% alpha, stroke is the same color at 60% (1px), text is the full color at 11px strong weight, corners 3px, padding 4px by 1px. `Dev` is Dev Steel, `Test` is Caution Amber, `Prod` is Guard Red. The badge never grows, animates, or gains a shadow; its restraint is its authority.
 
 ### Cards (Connection)
-6px radius, 8px inner margin, Raised Slate fill with a 1px neutral stroke; the selected card swaps to a tinted fill (35% Console Blue in dark, the full pale selection fill in light) with a full Console Blue stroke. Contains: state dot (`●` connected / `○` offline), name, environment badge, state text in `small().weak()`, then action buttons; the live schema tree nests inside with 16px indents.
+6px radius, 8px inner margin, Raised Slate fill with a 1px neutral stroke; the selected card swaps to a tinted fill (35% Console Blue in dark, the full pale selection fill in light) with a full Console Blue stroke. Contains: the state dot painted to the row's text height (a filled disc for connected, a ring for offline, a half-filled disc for connecting, and a Guard Red ring for a connection whose connect failed), name, environment badge, state text in `small().weak()`, then action buttons; the live schema tree nests inside with 16px indents. The dot's shape and its color come from one state value, so the pair can never disagree.
 
 ### Inputs / Fields
 Recessed Ink Well fill on the 4px widget radius with a 1px stroke (egui's window stroke) and 13px text. Focus is egui's automatic treatment; validation errors render as Fault Red text beside or above the field, never as recolored field fills.
@@ -231,7 +233,7 @@ The sidebar is a stack of uppercase 11px `weak()` section labels (`CONNECTIONS`,
 - **Heavy-path plan node:** plan trees render as bordered group frames; nodes on the heavy path take a 2px Console Blue stroke, and their operation name turns strong. Each node's cost share draws as a thin bar: Raised Slate track, Console Blue fill when heavy, weak text color otherwise.
 - **Command palette:** the floating layer done right: 460px wide, centered 60px from the top, recessed filter input, then a list of rows where the selection is egui's standard selectable highlight. No accent color is spent here beyond the platform's own selection fill.
 - **Diff rows (compare):** one-line labeled rows: kind label in 11px strong, colored by signal (`Added` weak, `Changed` Advisory Orange, `Removed` Fault Red), with `+n more` in weak text when truncated.
-- **Status bar:** the flight strip: left side reports connection and row counts in body text; right side holds the theme toggle and the backend name in `small().weak()`. It never grows taller than one line.
+- **Status bar:** the flight strip: left side reports connection and row counts in body text; right side holds the theme toggle, `+ Table`, `Compare`, and the backend name in `small().weak()`. It never grows taller than one line: the controls are reserved first, the backend label takes what is left of the row, and both labels elide into their share.
 
 ## Do's and Don'ts
 
@@ -243,7 +245,7 @@ The sidebar is a stack of uppercase 11px `weak()` section labels (`CONNECTIONS`,
 - **Do** carry depth with the four tonal steps and 1px strokes; reserve shadow for dialogs, menus, the palette, and tooltips.
 - **Do** keep text quiet (`weak()` at 60% for anything ignorable) so the semaphore and the data own the contrast budget.
 - **Do** keep badges at 20% fill / 60% stroke with full-color 11px strong text, and keep Prod red softened (Guard Red), not raw.
-- **Do** use the Unicode glyph set (`▶`, `★`, `×`, `+`, `●`, `○`) instead of introducing an icon font or SVG sprite.
+- **Do** use the Unicode glyph set (`▶`, `★`, `×`, `+`, `⏷`, `⏵`, `⏶`, `»`, `✔`) and paint state dots with the Painter instead of introducing an icon font or SVG sprite.
 - **Do** keep destructive actions understated, and put danger into environment badges, read-only flags, and confirm modals instead.
 
 ### Don't:
