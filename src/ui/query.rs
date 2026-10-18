@@ -665,13 +665,10 @@ mod tests {
         );
     }
 }
+
 // Manual check: Ctrl+T creates a tab on default_connection and activates it
 // (no-op with no connection), Ctrl+W closes the active tab (no-op with none),
 // Ctrl+F toggles the find bar for the active tab, and all three stay off with
 // a draft, save, or password modal open, using the same new_tab/activate/
 // close_tab/default_connection transitions as the plus and cross buttons
-// covered by AppState tests. Explain runs start_explain with the same offsets
-// Run passes, and Format and the find bar's Next/Prev selection are manual
-// too. The Autocommit toggle beside Begin/Commit/Rollback sends one
-// `SetAutocommit` through `set_autocommit` (disabled for SQLite and while a
-// run is in flight) and shows the landed state, covered by AppState tests.
+// covered by AppState tests. The find bar's Next/Prev selection is manual too.

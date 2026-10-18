@@ -508,3 +508,9 @@ mod tests {
         assert_eq!(Toggle.chip(false, false), None);
     }
 }
+
+// Manual check: Explain runs start_explain with the same offsets Run passes,
+// Format rewrites the editor's SQL, and the Autocommit toggle beside
+// Begin/Commit/Rollback sends one `SetAutocommit` through `set_autocommit`
+// (disabled for SQLite and while a run is in flight) and shows the landed
+// state, covered by AppState tests.
