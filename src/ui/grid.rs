@@ -1455,6 +1455,19 @@ fn store_side_pane(ctx: &egui::Context, tab: TabId, pane: SidePane) {
     ctx.data_mut(|data| data.insert_temp(side_pane_id(tab), pane));
 }
 
+fn filter_focus_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_filter_focus", tab))
+}
+
+/// Ask the grid to focus `tab`'s row filter on its next draw.
+pub(crate) fn focus_filter(ctx: &egui::Context, tab: TabId) {
+    ctx.data_mut(|data| data.insert_temp(filter_focus_id(tab), true));
+}
+
+fn take_filter_focus(ctx: &egui::Context, tab: TabId) -> bool {
+    ctx.data_mut(|data| data.remove_temp::<bool>(filter_focus_id(tab))).unwrap_or(false)
+}
+
 /// The structured filter body's open state for one tab: stored in temp data
 /// and defaulting open when clauses exist, so a recalled filter is visible.
 fn filters_open_id(tab: TabId) -> egui::Id {
@@ -1647,14 +1660,15 @@ fn results_grid(
     let edit_label = target.map(|target| target.table.clone());
     ui.horizontal(|ui| {
         let mut text = tab.filter().to_owned();
-        if ui
-            .add(
-                egui::TextEdit::singleline(&mut text)
-                    .hint_text("Filter rows")
-                    .desired_width(180.0),
-            )
-            .changed()
-        {
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .hint_text("Filter rows")
+                .desired_width(180.0),
+        );
+        if take_filter_focus(ui.ctx(), tab.id) {
+            field.request_focus();
+        }
+        if field.changed() {
             tab.set_filter(text);
         }
         if !tab.filter().is_empty() && ui.button("Clear").clicked() {

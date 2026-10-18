@@ -186,6 +186,10 @@ pub fn table_header(state: &mut AppState, ui: &mut egui::Ui) {
     let modal_open = any_modal_open(state);
     let mut edit = false;
     let mut refresh = ui.input_mut(|i| i.consume_shortcut(&run_shortcut()));
+    // A table tab has no editor to search, so find lands in the row filter.
+    if ui.input_mut(|i| i.consume_shortcut(&find_shortcut())) && !modal_open {
+        super::grid::focus_filter(ui.ctx(), id);
+    }
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(format!("{schema}.{table}")).strong());
         refresh |= ui
