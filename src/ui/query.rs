@@ -11,7 +11,7 @@ use super::editor::{char_range, format_sql, FindState};
 use crate::app::{AppState, ConnectionState, RunOutcome, RunScope, TransactionAction};
 use crate::db::{DbKind, TabId};
 
-use super::Palette;
+use super::{Palette, fit};
 
 /// True while any modal owns the screen, so the editor's shortcuts stay dead.
 pub(crate) fn any_modal_open(state: &AppState) -> bool {
@@ -210,20 +210,175 @@ pub fn table_header(state: &mut AppState, ui: &mut egui::Ui) {
     }
 }
 
+/// One editor-toolbar tool. The inline row and the overflow menu both draw
+/// through [`ToolClicks::draw`], so a tool is drawn once whatever the width.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    Save,
+    Commit,
+    Rollback,
+    Transaction,
+    Autocommit,
+    Complete,
+    Format,
+    Find,
+}
+
+impl Tool {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Save => "Save",
+            Self::Commit => "Commit",
+            Self::Rollback => "Rollback",
+            Self::Transaction => "Transaction",
+            Self::Autocommit => "Autocommit",
+            Self::Complete => "Complete",
+            Self::Format => "Format",
+            Self::Find => "Find",
+        }
+    }
+
+    /// The width this tool allocates, measured before the row draws, so the
+    /// row can reserve it.
+    fn width(self, ui: &egui::Ui, state: &ToolState) -> f32 {
+        match self {
+            Self::Transaction | Self::Complete => fit::menu_w(ui, self.label()),
+            Self::Autocommit => match state.slot.chip(state.autocommit, state.sqlite) {
+                Some((label, _)) => fit::button_w(ui, &label, false),
+                None => fit::button_w(ui, self.label(), false),
+            },
+            Self::Save | Self::Commit | Self::Rollback | Self::Format | Self::Find => {
+                fit::button_w(ui, self.label(), false)
+            }
+        }
+    }
+}
+
+/// What the tools read from the tab's connection and from the find bar.
+struct ToolState<'a> {
+    slot: &'a AutocommitSlot,
+    autocommit: bool,
+    sqlite: bool,
+    transaction_open: bool,
+    transaction_ready: bool,
+    find_open: bool,
+}
+
+impl ToolState<'_> {
+    /// The tools the row carries, in the order they read left to right. The
+    /// transaction block is Commit and Rollback, or the autocommit control,
+    /// or the Transaction menu while the mode is on and no transaction is
+    /// open.
+    fn tools(&self, running: bool) -> Vec<Tool> {
+        let mut tools = Vec::new();
+        if !running {
+            tools.push(Tool::Save);
+        }
+        if self.transaction_open {
+            tools.push(Tool::Commit);
+            tools.push(Tool::Rollback);
+        }
+        if !self.autocommit {
+            tools.push(Tool::Autocommit);
+        } else if !self.transaction_open {
+            tools.push(Tool::Transaction);
+        }
+        tools.push(Tool::Complete);
+        tools.push(Tool::Format);
+        tools.push(Tool::Find);
+        tools
+    }
+}
+
+/// What the tools on the row produced, so the inline row and the overflow
+/// menu can share one drawer without an action landing twice.
+#[derive(Default)]
+struct ToolClicks {
+    save: bool,
+    transaction: Option<TransactionAction>,
+    autocommit: Option<bool>,
+    format: bool,
+    find: bool,
+}
+
+impl ToolClicks {
+    fn draw(&mut self, ui: &mut egui::Ui, tool: Tool, state: &ToolState) {
+        match tool {
+            Tool::Save => self.save |= ui.button("Save").clicked(),
+            Tool::Commit | Tool::Rollback => {
+                let action = if tool == Tool::Commit {
+                    TransactionAction::Commit
+                } else {
+                    TransactionAction::Rollback
+                };
+                if ui
+                    .add_enabled(state.transaction_ready, egui::Button::new(action.label()))
+                    .on_hover_text(format!("Send {}", action.statement()))
+                    .clicked()
+                {
+                    self.transaction = Some(action);
+                }
+            }
+            Tool::Transaction => {
+                ui.menu_button("Transaction", |ui| {
+                    if ui
+                        .add_enabled(state.transaction_ready, egui::Button::new("Begin"))
+                        .on_hover_text("Send BEGIN")
+                        .clicked()
+                    {
+                        self.transaction = Some(TransactionAction::Begin);
+                        ui.close();
+                    }
+                    ui.separator();
+                    let toggle =
+                        autocommit_control(ui, state.slot, state.autocommit, state.sqlite);
+                    if toggle.clicked() {
+                        self.autocommit = Some(!state.autocommit);
+                    }
+                });
+            }
+            Tool::Autocommit => {
+                let toggle = autocommit_control(ui, state.slot, state.autocommit, state.sqlite);
+                if toggle.clicked() {
+                    self.autocommit = Some(!state.autocommit);
+                }
+            }
+            Tool::Complete => super::complete::complete_menu(ui),
+            Tool::Format => self.format |= ui.button("Format").clicked(),
+            Tool::Find => {
+                self.find |= ui
+                    .selectable_label(state.find_open, "Find")
+                    .on_hover_text(format!(
+                        "Find ({})",
+                        ui.ctx().format_shortcut(&find_shortcut())
+                    ))
+                    .clicked();
+            }
+        }
+    }
+}
+
+/// The narrowest a hint may be elided to before it is dropped: the hint is
+/// the softest text on the row, so it goes first.
+const HINT_MIN: f32 = 24.0;
+
 fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
     let Some(tab_id) = state.active() else { return false };
     let find_open = find_bar_of(ui.ctx(), tab_id).open;
-    let (mut run_clicked, mut explain_clicked, mut cancel_clicked, mut save_clicked) =
-        (false, false, false, false);
-    let (mut format_clicked, mut find_clicked) = (false, false);
-    let mut transaction_clicked: Option<TransactionAction> = None;
-    let mut autocommit_clicked: Option<bool> = None;
+    let (mut run_clicked, mut explain_clicked, mut cancel_clicked) = (false, false, false);
+    let mut clicks = ToolClicks::default();
     let mut scope = state.tab(tab_id).map(|t| t.run_scope()).unwrap_or_default();
     if state.tab(tab_id).is_some() {
         let running = matches!(
             state.tab(tab_id).map(|t| t.outcome()),
             Some(RunOutcome::Running { .. })
         );
+        let elapsed = match state.tab(tab_id).map(|t| t.outcome()) {
+            Some(RunOutcome::Running { started, .. }) => {
+                Some(format!("{:.1}s", started.elapsed().as_secs_f32()))
+            }
+            _ => None,
+        };
         let transaction_ready = state.transaction_ready(tab_id);
         let (transaction_open, autocommit, sqlite) = state
             .tab(tab_id)
@@ -237,8 +392,24 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                 )
             })
             .unwrap_or((false, true, false));
-        let slot = AutocommitSlot::of(state, tab_id);
+        let tool_state = ToolState {
+            slot: &AutocommitSlot::of(state, tab_id),
+            autocommit,
+            sqlite,
+            transaction_open,
+            transaction_ready,
+            find_open,
+        };
+        let hint = format!(
+            "{} · {}",
+            scope.hint(),
+            ui.ctx().format_shortcut(&run_shortcut())
+        );
+        let tools = tool_state.tools(running);
+        let tool_w: Vec<f32> = tools.iter().map(|tool| tool.width(ui, &tool_state)).collect();
+        let mut two_rows = false;
         ui.horizontal(|ui| {
+            let gap = ui.spacing().item_spacing.x;
             if running {
                 cancel_clicked = ui.button("Cancel").clicked();
             } else {
@@ -259,67 +430,61 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                     .button("Explain")
                     .on_hover_text("Query execution plan")
                     .clicked();
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} · {}",
-                        scope.hint(),
-                        ui.ctx().format_shortcut(&run_shortcut())
-                    ))
-                        .small()
-                        .weak(),
-                );
-                save_clicked = ui.button("Save").clicked();
             }
-            // Only the states that depart from the default get a control on
-            // the row; Begin and the autocommit mode wait in one menu. Manual
-            // mode opens its transaction on the first statement, so Begin has
-            // no job there.
-            if transaction_open {
-                for action in [TransactionAction::Commit, TransactionAction::Rollback] {
-                    if ui
-                        .add_enabled(transaction_ready, egui::Button::new(action.label()))
-                        .on_hover_text(format!("Send {}", action.statement()))
-                        .clicked()
-                    {
-                        transaction_clicked = Some(action);
-                    }
+            // Everything the row would carry, measured before the hint draws:
+            // one row keeps today's order; otherwise the tools take their own
+            // row and the hint elides into this row's leftover.
+            let tools_w: f32 = tool_w.iter().map(|w| w + gap).sum();
+            let hint_w = fit::text_w(ui, &hint, egui::TextStyle::Small);
+            let one_row = ui.available_width() >= hint_w + gap + tools_w;
+            if !running {
+                let budget = if one_row {
+                    ui.available_width() - gap - tools_w
+                } else {
+                    ui.available_width()
+                };
+                let text = fit::elide(ui, &hint, egui::TextStyle::Small, budget);
+                if fit::text_w(ui, &text, egui::TextStyle::Small) >= HINT_MIN {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(text).small().weak())
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
                 }
             }
-            if !autocommit {
-                let toggle = autocommit_control(ui, &slot, autocommit, sqlite);
-                if toggle.clicked() {
-                    autocommit_clicked = Some(!autocommit);
+            if one_row {
+                for tool in &tools {
+                    clicks.draw(ui, *tool, &tool_state);
                 }
-            } else if !transaction_open {
-                ui.menu_button("Transaction", |ui| {
-                    if ui
-                        .add_enabled(transaction_ready, egui::Button::new("Begin"))
-                        .on_hover_text("Send BEGIN")
-                        .clicked()
-                    {
-                        transaction_clicked = Some(TransactionAction::Begin);
-                        ui.close();
-                    }
-                    ui.separator();
-                    let toggle = autocommit_control(ui, &slot, autocommit, sqlite);
-                    if toggle.clicked() {
-                        autocommit_clicked = Some(!autocommit);
-                    }
-                });
+            } else {
+                two_rows = true;
             }
-            super::complete::complete_menu(ui);
-            format_clicked = ui.button("Format").clicked();
-            find_clicked = ui
-                .selectable_label(find_open, "Find")
-                .on_hover_text(format!("Find ({})", ui.ctx().format_shortcut(&find_shortcut())))
-                .clicked();
-            if let Some(RunOutcome::Running { started, .. }) =
-                state.tab(tab_id).map(|t| t.outcome())
+            // The elapsed time closes the row as it always has when the tools
+            // share it, and rides beside Cancel when they moved down.
+            if running
+                && let Some(elapsed) = &elapsed
             {
                 ui.spinner();
-                ui.label(format!("{:.1}s", started.elapsed().as_secs_f32()));
+                ui.label(elapsed);
             }
         });
+        if two_rows {
+            ui.horizontal(|ui| {
+                let spill = fit::spill(ui, &tool_w);
+                for tool in &tools[..spill] {
+                    clicks.draw(ui, *tool, &tool_state);
+                }
+                if spill < tools.len() {
+                    let tail: Vec<&str> =
+                        tools[spill..].iter().map(|tool| tool.label()).collect();
+                    fit::overflow_menu(ui, |ui| {
+                        for tool in &tools[spill..] {
+                            clicks.draw(ui, *tool, &tool_state);
+                        }
+                    })
+                    .on_hover_text(format!("More: {}", tail.join(", ")));
+                }
+            });
+        }
     }
     if scope != state.tab(tab_id).map(|t| t.run_scope()).unwrap_or_default() {
         if let Some(tab) = state.tab_mut(tab_id) {
@@ -330,22 +495,22 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
     if cancel_clicked {
         state.cancel_run(tab_id);
     }
-    if let Some(action) = transaction_clicked {
+    if let Some(action) = clicks.transaction {
         state.start_transaction(tab_id, action);
     }
-    if let Some(on) = autocommit_clicked {
+    if let Some(on) = clicks.autocommit {
         state.set_autocommit(tab_id, on);
     }
-    if save_clicked {
+    if clicks.save {
         state.open_save_prompt();
     }
-    if format_clicked {
-        if let Some(sql) = state.tab_sql_mut(tab_id) {
-            *sql = format_sql(sql);
-        }
+    if clicks.format
+        && let Some(sql) = state.tab_sql_mut(tab_id)
+    {
+        *sql = format_sql(sql);
     }
     let mut find_opened = false;
-    if find_clicked {
+    if clicks.find {
         find_opened = toggle_find(ui.ctx(), tab_id);
     }
     if run_clicked {
