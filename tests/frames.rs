@@ -349,7 +349,7 @@ fn state_dot_frames() {
     let image = harness.render().expect("render the frame");
     let palette = ui::Palette::dark();
     let live_color = palette.success;
-    let offline_color = egui::Color32::GRAY;
+    let offline_color = palette.badge_dev;
     let failed_color = palette.badge_prod;
 
     let disc = dot_rect(&harness, live);

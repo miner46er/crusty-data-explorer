@@ -20,7 +20,7 @@ use super::{Palette, Theme};
 
 /// A connection's state as the card and the dot read it: one value that
 /// derives both the painted shape and the color, so a dot can never wear the
-/// wrong color for its state. `Error` keeps its own variant: a failed
+/// wrong color for its state. `Failed` keeps its own variant: a failed
 /// connection is a standing state, so it wears the softened Guard Red, never
 /// the raw Fault Red the design reserves for terminal text.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,9 +46,9 @@ impl ConnectionStatus {
     fn color(self, palette: &Palette) -> egui::Color32 {
         match self {
             Self::Connected => palette.success,
-            Self::Connecting => egui::Color32::YELLOW,
+            Self::Connecting => palette.badge_test,
             Self::Failed => palette.badge_prod,
-            Self::Offline => egui::Color32::GRAY,
+            Self::Offline => palette.badge_dev,
         }
     }
 
@@ -2094,6 +2094,44 @@ mod tests {
             Err(DbError::Config("invalid connection JSON".to_owned()))
         );
     }
+    /// The connecting dot paints a ring with its right half filled, and the
+    /// fill comes from the palette: the pixel right of center carries the
+    /// color, the pixel left of center stays hollow.
+    #[test]
+    fn connecting_dot_fills_its_right_half() {
+        use egui_kittest::kittest::Queryable;
+        let size = 24.0;
+        let palette = Palette::dark();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(64.0, 64.0))
+            .build_ui(|ui| {
+                state_dot(ui, ConnectionStatus::Connecting, size, &palette);
+            });
+        harness.run();
+        let dot = harness.get_by_label("connecting").rect();
+        println!("connecting dot {dot:?} color {:?}", palette.badge_test);
+        let image = harness.render().expect("render the dot");
+        let y = dot.center().y.round() as u32;
+        let sample = |dx: f32| {
+            image
+                .get_pixel((dot.center().x + dx).round() as u32, y)
+                .0
+        };
+        let right = sample(4.0);
+        let left = sample(-4.0);
+        println!("connecting dot: right {right:?} left {left:?}");
+        assert_eq!(
+            right,
+            palette.badge_test.to_array(),
+            "the right half carries the palette's color"
+        );
+        assert_ne!(
+            left,
+            palette.badge_test.to_array(),
+            "the left half stays open"
+        );
+    }
+
 }
 // Manual check: save SELECT 1 then SELECT 2 under one name, expand History on
 // the saved row, press Restore on v2, and a new tab opens with SELECT 1.
