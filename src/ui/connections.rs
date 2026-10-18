@@ -82,6 +82,7 @@ pub(crate) fn state_dot(
     ui: &mut egui::Ui,
     status: ConnectionStatus,
     size: f32,
+    palette: &Palette,
 ) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
@@ -91,7 +92,7 @@ pub(crate) fn state_dot(
     });
     let center = rect.center();
     let radius = size / 2.0;
-    let color = status.color(&Palette::of(ui.ctx().theme()));
+    let color = status.color(palette);
     let painter = ui.painter();
     let ring = egui::Stroke::new(DOT_RING, color);
     // The ring is drawn inside the allocated square, so the dot never paints
@@ -612,7 +613,7 @@ fn connection_card(
                     .dnd_drag_source(
                         egui::Id::new(("crusty_conn_drag", conn_id.raw())),
                         ConnDrag { id: conn_id },
-                        |ui| state_dot(ui, status, dot_size),
+                        |ui| state_dot(ui, status, dot_size, palette),
                     )
                     .inner
                     .on_hover_text("drag onto a folder to move");
