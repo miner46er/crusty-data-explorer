@@ -39,6 +39,17 @@ pub(crate) fn menu_w(ui: &egui::Ui, text: &str) -> f32 {
     button_w(ui, text, false)
 }
 
+/// The width a combo box allocates: egui 0.36 frames the selected text as
+/// the wider of the galley plus the dropdown icon and its spacing, or the
+/// style's `combo_width`, plus the frame's button padding on both sides.
+pub(crate) fn combo_w(ui: &egui::Ui, selected_text: &str) -> f32 {
+    let spacing = &ui.style().spacing;
+    let galley = text_w(ui, selected_text, egui::TextStyle::Button);
+    (galley + spacing.icon_spacing + spacing.icon_width)
+        .max(spacing.combo_width - 2.0 * spacing.button_padding.x)
+        + 2.0 * spacing.button_padding.x
+}
+
 /// The single ellipsis the overflow menu is labelled with.
 pub(crate) const OVERFLOW_LABEL: &str = "\u{2026}";
 
@@ -260,6 +271,19 @@ mod tests {
                 assert!(
                     (response.rect.width() - measured).abs() <= 1.0,
                     "menu {label:?}: egui allocated {} but menu_w measured {measured}",
+                    response.rect.width()
+                );
+                checked += 1;
+            }
+            for label in ["All", "Current statement"] {
+                let measured = combo_w(ui, label);
+                let response = egui::ComboBox::from_id_salt(("combo_probe", label))
+                    .selected_text(label)
+                    .show_ui(ui, |_| {})
+                    .response;
+                assert!(
+                    (response.rect.width() - measured).abs() <= 1.0,
+                    "combo {label:?}: egui allocated {} but combo_w measured {measured}",
                     response.rect.width()
                 );
                 checked += 1;

@@ -395,6 +395,27 @@ impl ToolClicks {
 /// the softest text on the row, so it goes first.
 const HINT_MIN: f32 = 24.0;
 
+/// Whether the editor toolbar fits one row. Decided from the idle content
+/// only, so a run starting or finishing never changes the row count.
+fn fits_one_row(
+    ui: &egui::Ui,
+    tool_state: &ToolState<'_>,
+    scope_label: &str,
+    hint: &str,
+) -> bool {
+    let gap = ui.spacing().item_spacing.x;
+    let leading = fit::combo_w(ui, scope_label)
+        + fit::button_w(ui, "▶ Run", false)
+        + fit::button_w(ui, "Explain", false);
+    let hint_w = fit::text_w(ui, hint, egui::TextStyle::Small);
+    let tools_w: f32 = tool_state
+        .tools(false)
+        .iter()
+        .map(|tool| tool.width(ui, tool_state) + gap)
+        .sum();
+    ui.available_width() >= leading + 4.0 * gap + hint_w + tools_w
+}
+
 fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
     let Some(tab_id) = state.active() else { return false };
     let find_open = find_bar_of(ui.ctx(), tab_id).open;
@@ -440,6 +461,8 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
         );
         let tools = tool_state.tools(running);
         let tool_w: Vec<f32> = tools.iter().map(|tool| tool.width(ui, &tool_state)).collect();
+        // The row count is fixed before anything draws, from the idle content.
+        let one_row = fits_one_row(ui, &tool_state, scope.label(), &hint);
         let mut two_rows = false;
         ui.horizontal(|ui| {
             let gap = ui.spacing().item_spacing.x;
@@ -464,13 +487,8 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                     .on_hover_text("Query execution plan")
                     .clicked();
             }
-            // Everything the row would carry, measured before the hint draws:
-            // one row keeps today's order; otherwise the tools take their own
-            // row and the hint elides into this row's leftover.
-            let tools_w: f32 = tool_w.iter().map(|w| w + gap).sum();
-            let hint_w = fit::text_w(ui, &hint, egui::TextStyle::Small);
-            let one_row = ui.available_width() >= hint_w + gap + tools_w;
             if !running {
+                let tools_w: f32 = tool_w.iter().map(|w| w + gap).sum();
                 let budget = if one_row {
                     ui.available_width() - gap - tools_w
                 } else {
@@ -1070,6 +1088,43 @@ mod tests {
             numbered_titles(&titles),
             ["a", "a 2", "a 2 2"].map(str::to_owned).to_vec()
         );
+    }
+
+    #[test]
+    fn the_toolbar_row_count_comes_from_the_idle_content() {
+        let fits = |width: f32| {
+            let ctx = egui::Context::default();
+            crate::ui::install(&ctx);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 200.0),
+                )),
+                ..Default::default()
+            };
+            let mut answer = None;
+            let mut output = ctx.run_ui(input, |ui| {
+                let slot = AutocommitSlot::Toggle;
+                let state = ToolState {
+                    slot: &slot,
+                    autocommit: true,
+                    sqlite: false,
+                    transaction_open: false,
+                    transaction_ready: true,
+                    find_open: false,
+                };
+                answer = Some(fits_one_row(
+                    ui,
+                    &state,
+                    RunScope::All.label(),
+                    "all statements · Ctrl+Enter",
+                ));
+            });
+            output.textures_delta.clear();
+            answer.expect("the frame ran the check")
+        };
+        assert!(!fits(364.0), "the idle toolbar takes two rows at 364");
+        assert!(fits(1200.0), "the idle toolbar fits one row at 1200");
     }
 
     #[test]
