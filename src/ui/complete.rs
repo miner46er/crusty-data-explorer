@@ -527,9 +527,26 @@ struct CompleteState {
     selected: usize,
 }
 
+/// The completion toggles, as a toolbar menu. The state lives in the egui
+/// context the way the popup's does, so the editor and the menu agree.
+pub fn complete_menu(ui: &mut egui::Ui) {
+    let toggles_id = egui::Id::new("crusty_complete_toggles");
+    let mut toggles: CompletionToggles =
+        ui.ctx().data_mut(|data| data.get_temp(toggles_id).unwrap_or_default());
+    ui.menu_button("Complete", |ui| {
+        ui.checkbox(&mut toggles.keywords, "Keywords");
+        ui.checkbox(&mut toggles.tables, "Tables");
+        ui.checkbox(&mut toggles.columns, "Columns");
+        ui.checkbox(&mut toggles.templates, "Templates");
+    });
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(toggles_id, toggles);
+    });
+}
+
 /// SQL editor with autocomplete. Ctrl+Space opens the popup, Enter applies
-/// the selected row, Esc closes it. The checkboxes above the editor switch
-/// each completion source independently.
+/// the selected row, Esc closes it. The Complete menu switches each
+/// completion source independently.
 pub fn editor_with_completion(
     tab: TabId,
     schema: Option<&SchemaInfo>,
@@ -542,15 +559,8 @@ pub fn editor_with_completion(
     let mut state: CompleteState =
         ui.ctx().data_mut(|data| data.get_temp(id).unwrap_or_default());
     let toggles_id = egui::Id::new("crusty_complete_toggles");
-    let mut toggles: CompletionToggles =
+    let toggles: CompletionToggles =
         ui.ctx().data_mut(|data| data.get_temp(toggles_id).unwrap_or_default());
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Complete").small().weak());
-        ui.checkbox(&mut toggles.keywords, "Keywords");
-        ui.checkbox(&mut toggles.tables, "Tables");
-        ui.checkbox(&mut toggles.columns, "Columns");
-        ui.checkbox(&mut toggles.templates, "Templates");
-    });
 
     if ui.input_mut(|input| input.consume_shortcut(&completion_shortcut())) {
         state.open = true;
@@ -608,7 +618,7 @@ pub fn editor_with_completion(
     let out = egui::TextEdit::multiline(sql)
         .code_editor()
         .id(editor_id(tab))
-        .desired_rows(8)
+        .desired_rows(9)
         .desired_width(f32::INFINITY)
         .layouter(&mut layouter)
         .show(ui);
@@ -666,7 +676,6 @@ pub fn editor_with_completion(
 
     ui.ctx().data_mut(|data| {
         data.insert_temp(id, state);
-        data.insert_temp(toggles_id, toggles);
     });
 }
 

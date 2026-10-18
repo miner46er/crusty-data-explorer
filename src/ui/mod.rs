@@ -28,6 +28,7 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     egui::Panel::bottom("status").show(ui, |ui| status_bar(state, ui));
     egui::Panel::top("editor")
         .resizable(true)
+        .default_size(210.0)
         .show(ui, |ui| query::editor(state, ui));
     egui::CentralPanel::default().show(ui, |ui| grid::results(state, ui));
     compare::compare_window(state, ui);
@@ -105,8 +106,8 @@ fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
                 .active()
                 .and_then(|id| state.tab(id))
                 .and_then(|tab| state.connections().iter().find(|c| Some(c.id) == tab.conn))
-                .map(|c| c.config.kind().label())
-                .unwrap_or("no backend");
+                .map(|c| format!("{} · {}", c.name, c.config.kind().label()))
+                .unwrap_or_else(|| "no backend".to_owned());
             ui.label(egui::RichText::new(backend).small().weak());
         });
     });

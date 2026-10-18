@@ -417,6 +417,13 @@ fn autocommit_chip_frames() {
     let (_scratch, mut harness, _tab) = demo_setup("chip");
     harness.run();
 
+    // On SQLite the autocommit control waits inside the Transaction menu.
+    harness.get_by_label("Transaction").click();
+    harness.run_steps(6);
+    assert!(
+        harness.query_by_label("Autocommit").is_some(),
+        "the transaction menu is open"
+    );
     let dark = sample_chip(&mut harness, "autocommit-chip-dark");
     assert!(
         channel_distance(dark.edge, dark.panel) >= 16,
@@ -429,6 +436,10 @@ fn autocommit_chip_frames() {
 
     harness.state_mut().toggle_theme();
     harness.run();
+    assert!(
+        harness.query_by_label("Autocommit").is_some(),
+        "the transaction menu survives the theme flip"
+    );
     let light = sample_chip(&mut harness, "autocommit-chip-light");
     assert!(
         channel_distance(light.edge, light.panel) >= 16,

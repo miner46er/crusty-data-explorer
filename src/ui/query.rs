@@ -61,12 +61,6 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     edit_preview_window(state, ui);
     params_window(state, ui);
     if let Some(id) = state.active() {
-        let hint = state
-            .tab(id)
-            .and_then(|tab| state.connections().iter().find(|c| Some(c.id) == tab.conn))
-            .map(|c| format!("{} · {}", c.name, c.config.kind().label()))
-            .unwrap_or_else(|| "no connection".to_owned());
-        ui.label(egui::RichText::new(hint).small().weak());
         let schema = state
             .tab(id)
             .and_then(|tab| tab.conn)
@@ -177,12 +171,18 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
             Some(RunOutcome::Running { .. })
         );
         let transaction_ready = state.transaction_ready(tab_id);
-        let (autocommit, sqlite) = state
+        let (transaction_open, autocommit, sqlite) = state
             .tab(tab_id)
             .and_then(|t| t.conn)
             .and_then(|id| state.connections().iter().find(|c| c.id == id))
-            .map(|c| (c.autocommit(), c.config.kind() == DbKind::Sqlite))
-            .unwrap_or((true, false));
+            .map(|c| {
+                (
+                    c.transaction().is_open(),
+                    c.autocommit(),
+                    c.config.kind() == DbKind::Sqlite,
+                )
+            })
+            .unwrap_or((false, true, false));
         let slot = AutocommitSlot::of(state, tab_id);
         ui.horizontal(|ui| {
             if running {
@@ -212,53 +212,51 @@ fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                 );
                 save_clicked = ui.button("Save").clicked();
             }
-            for action in TransactionAction::ALL {
-                if ui
-                    .add_enabled(transaction_ready, egui::Button::new(action.label()))
-                    .on_hover_text(format!("Send {}", action.statement()))
-                    .clicked()
-                {
-                    transaction_clicked = Some(action);
+            // Only the states that depart from the default get a control on
+            // the row; Begin and the autocommit mode wait in one menu.
+            if transaction_open {
+                for action in [TransactionAction::Commit, TransactionAction::Rollback] {
+                    if ui
+                        .add_enabled(transaction_ready, egui::Button::new(action.label()))
+                        .on_hover_text(format!("Send {}", action.statement()))
+                        .clicked()
+                    {
+                        transaction_clicked = Some(action);
+                    }
                 }
-            }
-            ui.add_space(6.0);
-            let toggle = match slot.chip(autocommit, sqlite) {
-                Some((label, reason)) => autocommit_chip(ui, &label, reason),
-                None => {
-                    let mut shown = autocommit;
-                    ui.toggle_value(&mut shown, "Autocommit").on_hover_text(
-                        "Off: every statement runs inside a transaction on one tagged \
-                         connection until Commit or Rollback",
-                    )
+            } else if !autocommit {
+                let toggle = autocommit_control(ui, &slot, autocommit, sqlite);
+                if toggle.clicked() {
+                    autocommit_clicked = Some(!autocommit);
                 }
-            };
-            if toggle.clicked() {
-                autocommit_clicked = Some(!autocommit);
+            } else {
+                ui.menu_button("Transaction", |ui| {
+                    if ui
+                        .add_enabled(transaction_ready, egui::Button::new("Begin"))
+                        .on_hover_text("Send BEGIN")
+                        .clicked()
+                    {
+                        transaction_clicked = Some(TransactionAction::Begin);
+                        ui.close();
+                    }
+                    ui.separator();
+                    let toggle = autocommit_control(ui, &slot, autocommit, sqlite);
+                    if toggle.clicked() {
+                        autocommit_clicked = Some(!autocommit);
+                    }
+                });
             }
+            super::complete::complete_menu(ui);
             format_clicked = ui.button("Format").clicked();
             find_clicked = ui
                 .selectable_label(find_open, "Find")
                 .on_hover_text("Find (Ctrl+F)")
                 .clicked();
-            match state.tab(tab_id).map(|t| t.outcome()) {
-                Some(RunOutcome::Running { started, .. }) => {
-                    ui.spinner();
-                    ui.label(format!("{:.1}s", started.elapsed().as_secs_f32()));
-                }
-                Some(RunOutcome::Err(msg)) => {
-                    ui.colored_label(ui.visuals().error_fg_color, msg);
-                }
-                Some(RunOutcome::Ok { .. }) => {
-                    let (rows, ms) = state
-                        .tab(tab_id)
-                        .and_then(|t| t.active_query_result())
-                        .map(|r| (r.row_count(), r.took().as_secs_f64() * 1000.0))
-                        .unwrap_or((0, 0.0));
-                    ui.label(
-                        egui::RichText::new(format!("{rows} rows · {ms:.0} ms")).small().weak(),
-                    );
-                }
-                Some(RunOutcome::Never) | None => {}
+            if let Some(RunOutcome::Running { started, .. }) =
+                state.tab(tab_id).map(|t| t.outcome())
+            {
+                ui.spinner();
+                ui.label(format!("{:.1}s", started.elapsed().as_secs_f32()));
             }
         });
     }
@@ -356,6 +354,27 @@ impl AutocommitSlot {
             Self::Offline => Some((label, "Connect to change autocommit")),
             Self::Running => Some((label, "Wait for the run to finish")),
             Self::Sqlite => Some((label, "SQLite handles autocommit itself")),
+        }
+    }
+}
+
+/// The Autocommit control for one slot: the chip for states that cannot act,
+/// the live toggle otherwise. Shared by the inline control and the
+/// Transaction menu so both read the same logic.
+fn autocommit_control(
+    ui: &mut egui::Ui,
+    slot: &AutocommitSlot,
+    autocommit: bool,
+    sqlite: bool,
+) -> egui::Response {
+    match slot.chip(autocommit, sqlite) {
+        Some((label, reason)) => autocommit_chip(ui, &label, reason),
+        None => {
+            let mut shown = autocommit;
+            ui.toggle_value(&mut shown, "Autocommit").on_hover_text(
+                "Off: every statement runs inside a transaction on one tagged \
+                 connection until Commit or Rollback",
+            )
         }
     }
 }
