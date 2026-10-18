@@ -1732,7 +1732,7 @@ fn results_grid(
         .collect();
     let actions_w: f32 = action_w.iter().map(|w| w + gap).sum();
     let avail = ui.available_width();
-    let one_row = avail >= FIELD_W + left_fixed + 2.0 * gap + actions_w;
+    let one_row = avail >= FIELD_MIN + left_fixed + 2.0 * gap + actions_w;
     let mut draw_action = |ui: &mut egui::Ui, item: ActionItem| {
         match item {
             ActionItem::Copy => {
@@ -2010,7 +2010,7 @@ fn results_grid(
     ui.horizontal(|ui| {
         let mut text = filter_before;
         let field_w = if one_row {
-            FIELD_W.min(avail - left_fixed - 2.0 * gap - actions_w)
+            (avail - left_fixed - 2.0 * gap - actions_w).clamp(FIELD_MIN, FIELD_W)
         } else {
             (avail - left_fixed - gap).clamp(FIELD_MIN, FIELD_W)
         };

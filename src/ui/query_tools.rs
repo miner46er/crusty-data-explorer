@@ -169,24 +169,25 @@ impl ToolClicks {
 const HINT_MIN: f32 = 24.0;
 
 /// Whether the editor toolbar fits one row. Decided from the idle content
-/// only, so a run starting or finishing never changes the row count.
+/// only, so a run starting or finishing never changes the row count. The
+/// hint is not part of the decision: it is the softest text on the row, so it
+/// elides into what the leading group and the tools leave, and the row wraps
+/// only when those cannot share a line.
 fn fits_one_row(
     ui: &egui::Ui,
     tool_state: &ToolState<'_>,
     scope_label: &str,
-    hint: &str,
 ) -> bool {
     let gap = ui.spacing().item_spacing.x;
     let leading = fit::combo_w(ui, scope_label)
         + fit::button_w(ui, "▶ Run")
         + fit::button_w(ui, "Explain");
-    let hint_w = fit::text_w(ui, hint, egui::TextStyle::Small);
     let tools_w: f32 = tool_state
         .tools(false)
         .iter()
         .map(|tool| tool.width(ui, tool_state) + gap)
         .sum();
-    ui.available_width() >= leading + 4.0 * gap + hint_w + tools_w
+    ui.available_width() >= leading + 3.0 * gap + tools_w
 }
 
 pub(crate) fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
@@ -235,7 +236,7 @@ pub(crate) fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
         let tools = tool_state.tools(running);
         let tool_w: Vec<f32> = tools.iter().map(|tool| tool.width(ui, &tool_state)).collect();
         // The row count is fixed before anything draws, from the idle content.
-        let one_row = fits_one_row(ui, &tool_state, scope.label(), &hint);
+        let one_row = fits_one_row(ui, &tool_state, scope.label());
         let mut two_rows = false;
         ui.horizontal(|ui| {
             let gap = ui.spacing().item_spacing.x;
@@ -461,12 +462,7 @@ mod tests {
                     transaction_ready: true,
                     find_open: false,
                 };
-                answer = Some(fits_one_row(
-                    ui,
-                    &state,
-                    RunScope::All.label(),
-                    "all statements · Ctrl+Enter",
-                ));
+                answer = Some(fits_one_row(ui, &state, RunScope::All.label()));
             });
             output.textures_delta.clear();
             answer.expect("the frame ran the check")

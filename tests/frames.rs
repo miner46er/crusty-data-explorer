@@ -747,6 +747,61 @@ fn truncated_footer_band_stays_clear() {
     );
 }
 
+/// The editor row at about 670px of row width and the results row at about
+/// 490px: the band where the old rule wrapped before the hint or the filter
+/// field had elided. With the hint out of the one-row decision the editor
+/// tools stay inline and the hint elides; the results row sizes the field
+/// from the leftover, clamped to its own range, so it keeps one row too.
+#[test]
+fn toolbars_elide_before_wrapping() {
+    const EDITOR_ROW: [u32; 2] = [1024, 700];
+    const RESULTS_ROW: [u32; 2] = [840, 700];
+    let _guard = env_lock();
+
+    // The editor tools share one line with the run controls, no tail, and
+    // the hint is cut rather than pushed onto a second row.
+    let (_scratch, mut harness) = three_tabs_at(EDITOR_ROW, "editor-elide");
+    capture_at(&mut harness, "editor-row-elided-dark", EDITOR_ROW);
+    let editor_band = toolbar_band(&harness, &["▶ Run"], EDITOR_ROW);
+    assert_band_clear(&harness, editor_band, EDITOR_ROW);
+    assert_same_row(
+        &harness,
+        &["▶ Run", "Explain", "Save", "Transaction", "Complete", "Format", "Find"],
+        editor_band,
+    );
+    // The hint elides into the row: its label keeps the head of the scope
+    // text and stays narrower than the whole "all statements · Ctrl+Enter".
+    let hint = band_nodes(&harness, editor_band)
+        .into_iter()
+        .find(|(text, _)| text.starts_with("all"))
+        .expect("the hint stays on the editor row, elided");
+    println!("editor row: hint {hint:?} band {editor_band:?}");
+    assert!(hint.1.width() < 120.0, "the hint is elided, not whole: {hint:?}");
+
+    // The results row: one line, the actions inline, and the filter field
+    // narrower than its full width.
+    let (_scratch, mut harness) = three_tabs_at(RESULTS_ROW, "results-elide");
+    capture_at(&mut harness, "results-row-elided-dark", RESULTS_ROW);
+    let results_band = toolbar_band(&harness, &["Copy", "Filters"], RESULTS_ROW);
+    assert_band_clear(&harness, results_band, RESULTS_ROW);
+    assert_eq!(
+        overflow_buttons_in(&harness, results_band),
+        0,
+        "the one-row results toolbar shows no `…`"
+    );
+    assert_same_row(
+        &harness,
+        &["Copy", "Export", "Edit", "Detail", "Chart"],
+        results_band,
+    );
+    let field = filter_field(&harness);
+    println!("results row: field {field:?}");
+    assert!(
+        field.width() < FIELD_RECT && field.width() >= 64.0,
+        "the field is sized from the leftover, clamped to its own range: {field:?}"
+    );
+}
+
 /// The tab strip at 460: each tab's close button shares its title's row and
 /// stays inside the window. A close button that wraps away from its title
 /// sits beside the next tab's title, and closing the wrong tab drops that
