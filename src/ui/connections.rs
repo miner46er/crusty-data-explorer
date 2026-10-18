@@ -71,7 +71,7 @@ fn filled_dot(ui: &mut egui::Ui, color: egui::Color32, size: f32) {
     ui.painter().circle_filled(rect.center(), size / 2.0, color);
 }
 
-/// The width of a state dot's ring, and the history row's dot size.
+/// The stroke width of the ring a state dot paints, in points.
 const DOT_RING: f32 = 1.5;
 
 /// The painted connection state dot: a filled disc for a connected
@@ -248,6 +248,17 @@ fn flatten_saved<'s>(
             flatten_saved(ctx, child, depth + 1, plan);
         }
     }
+}
+
+/// One connection as the sidebar card reads it: the status the dot paints
+/// and the text beside it, which is the server version, the error, or the
+/// state's name.
+struct CardEntry {
+    id: ConnectionId,
+    name: String,
+    env: Environment,
+    status: ConnectionStatus,
+    state_text: String,
 }
 
 /// One flattened connection row in display order, mirroring [`SavedPlan`].
@@ -583,7 +594,6 @@ fn connection_card(
     } else {
         ui.visuals().widgets.noninteractive.bg_stroke
     };
-    let kind = status;
     let transaction_open = state
         .connections()
         .iter()
@@ -623,7 +633,7 @@ fn connection_card(
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                match kind {
+                match status {
                     ConnectionStatus::Connected => {
                         if ui
                             .add(
@@ -665,7 +675,7 @@ fn connection_card(
                     actions.push(SidebarAction::Delete(conn_id));
                 }
             });
-            if matches!(kind, ConnectionStatus::Connected) {
+            if matches!(status, ConnectionStatus::Connected) {
                 ui.add_space(4.0);
                 ui.separator();
                 ui.add_space(4.0);
@@ -925,21 +935,11 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                             .and_then(|id| state.tab(id))
                             .and_then(|tab| tab.conn);
 
-                        // The card takes the state and its text separately: the
-                        // dot is painted from the state, and the text is the
-                        // server version, the error, or the state's name.
-                        let snapshot: Vec<(
-                            ConnectionId,
-                            String,
-                            Environment,
-                            ConnectionStatus,
-                            String,
-                            bool,
-                        )> = state
+                        let snapshot: Vec<CardEntry> = state
                             .connections()
                             .iter()
                             .map(|c| {
-                                let text = match c.state() {
+                                let state_text = match c.state() {
                                     ConnectionState::Disconnected => "disconnected".to_owned(),
                                     ConnectionState::Connecting { .. } => "connecting".to_owned(),
                                     ConnectionState::Connected { session } => {
@@ -950,19 +950,13 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                                     }
                                     ConnectionState::Error { message } => message.clone(),
                                 };
-                                let live = matches!(
-                                    c.state(),
-                                    ConnectionState::Connected { .. }
-                                        | ConnectionState::QueryRunning { .. }
-                                );
-                                (
-                                    c.id,
-                                    c.name.clone(),
-                                    c.env,
-                                    ConnectionStatus::of(c.state()),
-                                    text,
-                                    live,
-                                )
+                                CardEntry {
+                                    id: c.id,
+                                    name: c.name.clone(),
+                                    env: c.env,
+                                    status: ConnectionStatus::of(c.state()),
+                                    state_text,
+                                }
                             })
                             .collect();
                         let conn_plan: Vec<ConnPlan> = {
@@ -990,8 +984,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                                 }
                                 ConnPlan::Card { id, depth } => (*id, *depth),
                             };
-                            let Some((_, conn_name, env, status, state_text, _)) =
-                                snapshot.iter().find(|(id, ..)| *id == conn_id)
+                            let Some(card) = snapshot.iter().find(|card| card.id == conn_id)
                             else {
                                 continue;
                             };
@@ -1002,10 +995,10 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
                                     ui,
                                     &palette,
                                     conn_id,
-                                    conn_name,
-                                    *env,
-                                    *status,
-                                    state_text,
+                                    &card.name,
+                                    card.env,
+                                    card.status,
+                                    &card.state_text,
                                     selected,
                                     &mut actions,
                                 );
