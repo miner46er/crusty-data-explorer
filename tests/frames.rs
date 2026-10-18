@@ -462,6 +462,52 @@ fn assert_inside_window(
     }
 }
 
+/// Every node whose rect intersects `band`, as (label, rect) pairs. egui
+/// reports one widget as several nodes with the same rect, so those collapse.
+fn band_nodes(harness: &Harness<AppState>, band: egui::Rect) -> Vec<(String, egui::Rect)> {
+    let mut found: Vec<(String, egui::Rect)> = Vec::new();
+    for node in harness.query_all(By::new()) {
+        if node.accesskit_node().bounding_box().is_none() {
+            continue;
+        }
+        let rect = node.rect();
+        if !band.intersects(rect) {
+            continue;
+        }
+        let label = node.accesskit_node().label().unwrap_or_default();
+        if found.iter().any(|(seen, at)| *seen == label && *at == rect) {
+            continue;
+        }
+        found.push((label, rect));
+    }
+    found
+}
+
+/// Every node the band touches stays inside the window, and no two of them
+/// paint over each other. A label a query can name is checked beside this
+/// (`assert_inside_window`); the walk is what sees an elided label no query
+/// matches.
+fn assert_band_clear(harness: &Harness<AppState>, band: egui::Rect, size: [u32; 2]) {
+    let window = window_rect(size);
+    let nodes = band_nodes(harness, band);
+    assert!(!nodes.is_empty(), "the band {band:?} holds a node");
+    for (label, rect) in &nodes {
+        assert!(
+            window.contains_rect(*rect),
+            "{label:?} {rect:?} paints outside {window:?}"
+        );
+    }
+    for (i, (a_label, a)) in nodes.iter().enumerate() {
+        for (b_label, b) in &nodes[i + 1..] {
+            let overlap = a.intersect(*b);
+            assert!(
+                overlap.width() <= 0.5 || overlap.height() <= 0.5,
+                "{a_label:?} {a:?} paints over {b_label:?} {b:?} in {band:?}"
+            );
+        }
+    }
+}
+
 /// Three query tabs on one memory database, each with a result in the grid:
 /// the setup both narrow tab-strip tests share.
 fn three_tabs_at(size: [u32; 2], tag: &str) -> (Scratch, Harness<'static, AppState>) {
@@ -560,6 +606,10 @@ fn narrow_window_chrome_stays_clear() {
         NARROW_WINDOW,
         editor_band,
     );
+
+    // The status bar's own band: its labels elide to text no query here
+    // matches, so the band is walked whole.
+    assert_band_clear(&harness, status_band, NARROW_WINDOW);
 
     // Every control is inline or behind the row's one `…`, and the row stays
     // in the window: a control that vanished would pass the checks above.
