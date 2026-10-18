@@ -107,15 +107,17 @@ pub(crate) fn state_dot(
         }
         ConnectionStatus::Connecting => {
             painter.circle_stroke(center, ring_radius, ring);
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    center + egui::vec2(0.0, -ring_radius),
-                    center + egui::vec2(0.0, ring_radius),
-                    center + egui::vec2(ring_radius, 0.0),
-                ],
-                color,
-                egui::Stroke::NONE,
-            ));
+            // The right half of the disc, sampled along the arc so the fill
+            // meets the ring instead of cutting a chord through it.
+            let steps = 20;
+            let mut points = Vec::with_capacity(steps + 2);
+            points.push(center + egui::vec2(0.0, -ring_radius));
+            for step in 0..=steps {
+                let angle = -std::f32::consts::FRAC_PI_2
+                    + std::f32::consts::PI * step as f32 / steps as f32;
+                points.push(center + ring_radius * egui::vec2(angle.cos(), angle.sin()));
+            }
+            painter.add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
         }
     }
     response
