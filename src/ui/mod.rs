@@ -49,29 +49,65 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
 }
 
 fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
+    let live = state
+        .connections()
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.state(),
+                ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
+            )
+        })
+        .count();
+    let stats = format!(
+        "{} connection{}, {} live",
+        state.connections().len(),
+        if state.connections().len() == 1 { "" } else { "s" },
+        live
+    );
+    let theme_label = match state.theme() {
+        Theme::Dark => "☀ Light",
+        Theme::Light => "🌙 Dark",
+    };
+    let backend = state
+        .active()
+        .and_then(|id| state.tab(id))
+        .and_then(|tab| state.connections().iter().find(|c| Some(c.id) == tab.conn))
+        .map(|c| format!("{} · {}", c.name, c.config.kind().label()))
+        .unwrap_or_else(|| "no backend".to_owned());
     ui.horizontal(|ui| {
-        let live = state
-            .connections()
-            .iter()
-            .filter(|c| {
-                matches!(
-                    c.state(),
-                    ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
-                )
-            })
-            .count();
-        ui.label(format!(
-            "{} connection{}, {} live",
-            state.connections().len(),
-            if state.connections().len() == 1 { "" } else { "s" },
-            live
-        ));
+        // The controls group never moves: its three buttons are reserved
+        // first. The left half of the bar reports next, so the counts keep
+        // their room; the backend name takes what remains and drops when
+        // nothing is left. Both labels go through `elide`, so neither can
+        // paint over the other.
+        let gap = ui.spacing().item_spacing.x;
+        let mut budget = fit::Budget::new(ui);
+        for control in [
+            fit::button_w(ui, theme_label, false),
+            fit::button_w(ui, "+ Table", false),
+            fit::button_w(ui, "Compare", false),
+        ] {
+            budget.take(ui, control);
+        }
+        let stats_text = fit::elide(ui, &stats, egui::TextStyle::Body, budget.leftover() - gap);
+        if !stats_text.is_empty() {
+            budget.take(ui, fit::text_w(ui, &stats_text, egui::TextStyle::Body));
+        }
+        let backend_text = fit::elide(
+            ui,
+            &backend,
+            egui::TextStyle::Small,
+            budget.leftover() - gap,
+        );
+        if !stats_text.is_empty() {
+            ui.add(
+                egui::Label::new(stats_text)
+                    .wrap_mode(egui::TextWrapMode::Extend),
+            );
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let label = match state.theme() {
-                Theme::Dark => "☀ Light",
-                Theme::Light => "🌙 Dark",
-            };
-            if ui.button(label).on_hover_text("Flip the app theme").clicked() {
+            if ui.button(theme_label).on_hover_text("Flip the app theme").clicked() {
                 state.toggle_theme();
             }
             table_edit::status_entry(state, ui);
@@ -82,13 +118,12 @@ fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
             {
                 state.open_compare();
             }
-            let backend = state
-                .active()
-                .and_then(|id| state.tab(id))
-                .and_then(|tab| state.connections().iter().find(|c| Some(c.id) == tab.conn))
-                .map(|c| format!("{} · {}", c.name, c.config.kind().label()))
-                .unwrap_or_else(|| "no backend".to_owned());
-            ui.label(egui::RichText::new(backend).small().weak());
+            if !backend_text.is_empty() {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(backend_text).small().weak())
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
+            }
         });
     });
 }
