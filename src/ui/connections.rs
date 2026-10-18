@@ -579,7 +579,11 @@ fn connection_card(
                         }
                     }
                 }
-                if ui.small_button("Edit").clicked() {
+                // The ellipsis marks the one button here that opens a modal,
+                // the way "Edit cell…" does in the grid; it also keeps this
+                // button's label distinct from the results toolbar's Edit
+                // menu, which the narrow-window frame test names by label.
+                if ui.small_button("Edit…").clicked() {
                     actions.push(SidebarAction::Edit(conn_id));
                 }
                 if ui.small_button("Delete").clicked() {
