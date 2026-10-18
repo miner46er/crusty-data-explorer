@@ -65,36 +65,6 @@ fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
             if state.connections().len() == 1 { "" } else { "s" },
             live
         ));
-        ui.separator();
-        match state.active().and_then(|id| state.tab(id)) {
-            Some(tab) => match tab.outcome() {
-                crate::app::RunOutcome::Ok { .. } => {
-                    let mut text = "0 rows".to_owned();
-                    if let Some(result) = tab.active_query_result() {
-                        text = format!("{} rows", result.row_count());
-                        if result.is_truncated() {
-                            text += " (truncated)";
-                        }
-                        if let Some(affected) = result.affected() {
-                            text = format!("{affected} rows affected");
-                        }
-                    }
-                    ui.label(text);
-                }
-                crate::app::RunOutcome::Err(_) => {
-                    ui.colored_label(ui.visuals().error_fg_color, "query failed");
-                }
-                crate::app::RunOutcome::Running { .. } => {
-                    ui.label("running…");
-                }
-                crate::app::RunOutcome::Never => {
-                    ui.label("no query yet");
-                }
-            },
-            None => {
-                ui.label("no tab");
-            }
-        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let label = match state.theme() {
                 Theme::Dark => "☀ Light",
