@@ -660,6 +660,23 @@ fn narrow_window_chrome_stays_clear() {
         NARROW_WINDOW,
     );
 
+    // The results row's tail: opening the `…` shows its items inside the
+    // window, and a tail toggle both opens the pane and closes the menu.
+    let overflow = harness
+        .query_all_by_label("…")
+        .find(|node| results_band.intersects(node.rect()))
+        .expect("the results row's overflow button");
+    overflow.click();
+    harness.run_steps(6);
+    let tail = harness
+        .query_by_label("Chart")
+        .expect("the tail holds Chart at this width")
+        .rect();
+    assert!(window_rect(NARROW_WINDOW).contains_rect(tail), "the tail's Chart {tail:?} leaves the window");
+    harness.get_by_label("Chart").click();
+    harness.run_steps(6);
+    assert!(harness.query_by_label("Kind").is_some(), "the chart pane opened from the tail");
+
     let window = window_rect(NARROW_WINDOW);
     let label = harness
         .query_by_label("persons 3")
@@ -797,7 +814,7 @@ fn toolbars_elide_before_wrapping() {
     let field = filter_field(&harness);
     println!("results row: field {field:?}");
     assert!(
-        field.width() < FIELD_RECT && field.width() >= 64.0,
+        field.width() < FIELD_W && field.width() >= 64.0,
         "the field is sized from the leftover, clamped to its own range: {field:?}"
     );
 }
@@ -858,7 +875,7 @@ fn band_of(harness: &Harness<AppState>, label: &str, [w, _]: [u32; 2]) -> egui::
 /// How many overflow-menu buttons rendered inside `band`.
 fn overflow_buttons_in(harness: &Harness<AppState>, band: egui::Rect) -> usize {
     harness
-        .query_all_by_label("\u{2026}")
+        .query_all_by_label("…")
         .filter(|node| band.intersects(node.rect()))
         .count()
 }
@@ -977,7 +994,7 @@ fn filter_field(harness: &Harness<AppState>) -> egui::Rect {
 
 /// The width the toolbar's text field keeps at a wide window. The node's
 /// rect is the field's text area, which is the desired width exactly.
-const FIELD_RECT: f32 = 180.0;
+const FIELD_W: f32 = 180.0;
 
 /// At a wide window every chrome row keeps today's single-row shape: nothing
 /// folds behind an overflow menu, the results actions stay right-aligned, the
@@ -1053,8 +1070,8 @@ fn wide_layout_unchanged() {
     let field = filter_field(&harness);
     println!("wide: filter field {field:?}");
     assert!(
-        (field.width() - FIELD_RECT).abs() <= 1.0,
-        "the filter field is {} wide, not {FIELD_RECT}",
+        (field.width() - FIELD_W).abs() <= 1.0,
+        "the filter field is {} wide, not {FIELD_W}",
         field.width()
     );
 

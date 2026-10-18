@@ -1455,6 +1455,30 @@ pub(crate) enum SidePane {
     Chart,
 }
 
+/// The result actions, in the order they read left to right. The inline row
+/// and the overflow menu both draw through the same drawer, so an action is
+/// drawn once whatever the width.
+#[derive(Clone, Copy)]
+enum ActionItem {
+    Copy,
+    Export,
+    Edit,
+    Detail,
+    Chart,
+}
+
+impl ActionItem {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Copy => "Copy",
+            Self::Export => "Export",
+            Self::Edit => "Edit",
+            Self::Detail => "Detail",
+            Self::Chart => "Chart",
+        }
+    }
+}
+
 fn side_pane_id(tab: TabId) -> egui::Id {
     egui::Id::new(("crusty_side_pane", tab))
 }
@@ -1615,7 +1639,7 @@ fn results_grid(
                 Some(n) => {
                     ui.colored_label(
                         palette.success,
-                        egui::RichText::new(format!("\u{2714} {n} rows affected")).strong(),
+                        egui::RichText::new(format!("✔ {n} rows affected")).strong(),
                     );
                 }
                 None => {
@@ -1670,30 +1694,6 @@ fn results_grid(
     let rows = selection.resolve(&visible);
     let nrows = rows.len();
     let edit_label = target.map(|target| target.table.clone());
-    // The result actions, in the order they read left to right. The inline
-    // row and the overflow menu both draw through `draw_action`, so an action
-    // is drawn once whatever the width.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum ActionItem {
-        Copy,
-        Export,
-        Edit,
-        Detail,
-        Chart,
-    }
-
-    impl ActionItem {
-        fn label(self) -> &'static str {
-            match self {
-                Self::Copy => "Copy",
-                Self::Export => "Export",
-                Self::Edit => "Edit",
-                Self::Detail => "Detail",
-                Self::Chart => "Chart",
-            }
-        }
-    }
-
     let can_export = tab
         .active_query_result()
         .is_some_and(|result| !result.columns().is_empty());
@@ -1739,15 +1739,11 @@ fn results_grid(
                 let tab_id = tab.id;
                 let mut headers = tsv_headers_of(ui.ctx(), tab_id);
                 // A menu that closes on any click costs open, tick, reopen,
-                // click to get TSV with headers, so this one ignores inside
-                // clicks and each copy closes it; the checkbox leaves it
-                // standing.
-                egui::menu::MenuButton::new(item.label())
-                    .config(
-                        egui::menu::MenuConfig::new()
-                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
-                    )
-                    .ui(ui, |ui| {
+                // click to get TSV with headers, so the inline row keeps one
+                // that ignores inside clicks and leaves the checkbox standing.
+                // Inside the row's `…` menu every tail item is a plain menu
+                // button, so the tail draws that instead of a nested popup.
+                let mut copy_menu = |ui: &mut egui::Ui| {
                         if ui
                             .button("TSV")
                             .on_hover_text("Copy the selection as tab-separated values")
@@ -1876,7 +1872,16 @@ fn results_grid(
                                 data.insert_temp(tsv_headers_id(tab_id), headers)
                             });
                         }
-                    });
+                };
+                if egui::menu::is_in_menu(ui) {
+                    ui.menu_button(item.label(), &mut copy_menu);
+                } else {
+                    egui::menu::MenuButton::new(item.label())
+                        .config(egui::menu::MenuConfig::new().close_behavior(
+                            egui::PopupCloseBehavior::CloseOnClickOutside,
+                        ))
+                        .ui(ui, &mut copy_menu);
+                }
             }
             ActionItem::Export => {
                 ui.menu_button(item.label(), |ui| {
@@ -1990,6 +1995,11 @@ fn results_grid(
                     } else {
                         SidePane::Detail
                     };
+                    // A tail toggle ends like the tail's other items: the
+                    // menu it was opened from closes.
+                    if egui::menu::is_in_menu(ui) {
+                        ui.close();
+                    }
                 }
             }
             ActionItem::Chart => {
@@ -2003,6 +2013,11 @@ fn results_grid(
                     } else {
                         SidePane::Chart
                     };
+                    // A tail toggle ends like the tail's other items: the
+                    // menu it was opened from closes.
+                    if egui::menu::is_in_menu(ui) {
+                        ui.close();
+                    }
                 }
             }
         }
@@ -2206,8 +2221,8 @@ fn results_grid(
                     let active = sort_col == Some(i);
                     let marker = if active {
                         match sort_dir {
-                            SortDir::Asc => " \u{23F6}",
-                            SortDir::Desc => " \u{23F7}",
+                            SortDir::Asc => " ⏶",
+                            SortDir::Desc => " ⏷",
                         }
                     } else {
                         ""
