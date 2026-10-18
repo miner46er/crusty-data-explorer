@@ -30,15 +30,6 @@ pub(crate) fn button_w(ui: &egui::Ui, text: &str, small: bool) -> f32 {
     text_w(ui, text, style) + button_pad(ui)
 }
 
-/// The width a menu button with `text` allocates. egui 0.36's `menu_button`
-/// draws a plain button (the submenu arrow belongs to `SubMenuButton`, which
-/// only appears inside a menu), so this is the button width. It keeps its own
-/// name because the rows budget in "menus", and a future egui that adds the
-/// arrow changes one function.
-pub(crate) fn menu_w(ui: &egui::Ui, text: &str) -> f32 {
-    button_w(ui, text, false)
-}
-
 /// The width a combo box allocates: egui 0.36 frames the selected text as
 /// the wider of the galley plus the dropdown icon and its spacing, or the
 /// style's `combo_width`, plus the frame's button padding on both sides.
@@ -108,14 +99,30 @@ impl Budget {
     }
 }
 
-/// The `...` menu that holds a row's tail when the row is too narrow. The
-/// caller names the tail on the returned response's hover text, since only it
-/// knows which controls went in.
-pub(crate) fn overflow_menu<R>(
+/// One packed row: items in order while they fit, the contiguous tail
+/// behind one `…` menu whose hover text names what went in. `labels[i]`
+/// names item `i`, and `draw` draws the item's control.
+pub(crate) fn packed_row(
     ui: &mut egui::Ui,
-    body: impl FnOnce(&mut egui::Ui) -> R,
-) -> egui::Response {
-    ui.menu_button(OVERFLOW_LABEL, body).response
+    widths: &[f32],
+    labels: &[&'static str],
+    mut draw: impl FnMut(&mut egui::Ui, usize),
+) {
+    debug_assert_eq!(widths.len(), labels.len(), "one label per packed item");
+    let spill = spill(ui, widths);
+    for index in 0..spill {
+        draw(ui, index);
+    }
+    if spill < widths.len() {
+        let tail = labels[spill..].join(", ");
+        ui.menu_button(OVERFLOW_LABEL, |ui| {
+            for index in spill..widths.len() {
+                draw(ui, index);
+            }
+        })
+        .response
+        .on_hover_text(format!("More: {tail}"));
+    }
 }
 
 /// The spill index for a row of `widths` packed left to right: the first item
@@ -265,12 +272,14 @@ mod tests {
                 );
                 checked += 1;
             }
+            // A menu button is a plain button in egui 0.36: the submenu arrow
+            // belongs to `SubMenuButton`, which only appears inside a menu.
             for label in ["Export", "Transaction", "Complete"] {
-                let measured = menu_w(ui, label);
+                let measured = button_w(ui, label, false);
                 let response = ui.menu_button(label, |_| {}).response;
                 assert!(
                     (response.rect.width() - measured).abs() <= 1.0,
-                    "menu {label:?}: egui allocated {} but menu_w measured {measured}",
+                    "menu {label:?}: egui allocated {} but button_w measured {measured}",
                     response.rect.width()
                 );
                 checked += 1;

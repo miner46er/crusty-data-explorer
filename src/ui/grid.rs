@@ -1727,12 +1727,7 @@ fn results_grid(
     let mut filter_after: Option<String> = None;
     let action_w: Vec<f32> = action_items
         .iter()
-        .map(|item| match item {
-            ActionItem::Copy | ActionItem::Export | ActionItem::Edit => {
-                fit::menu_w(ui, item.label())
-            }
-            ActionItem::Detail | ActionItem::Chart => fit::button_w(ui, item.label(), false),
-        })
+        .map(|item| fit::button_w(ui, item.label(), false))
         .collect();
     let actions_w: f32 = action_w.iter().map(|w| w + gap).sum();
     let avail = ui.available_width();
@@ -2052,20 +2047,11 @@ fn results_grid(
     });
     if !one_row {
         ui.horizontal(|ui| {
-            let spill = fit::spill(ui, &action_w);
-            for item in &action_items[..spill] {
-                draw_action(ui, *item);
-            }
-            if spill < action_items.len() {
-                let tail: Vec<&str> =
-                    action_items[spill..].iter().map(|item| item.label()).collect();
-                fit::overflow_menu(ui, |ui| {
-                    for item in &action_items[spill..] {
-                        draw_action(ui, *item);
-                    }
-                })
-                .on_hover_text(format!("More: {}", tail.join(", ")));
-            }
+            let labels: Vec<&str> =
+                action_items.iter().map(|item| item.label()).collect();
+            fit::packed_row(ui, &action_w, &labels, |ui, index| {
+                draw_action(ui, action_items[index]);
+            });
         });
     }
     if let Some(filter) = filter_after {

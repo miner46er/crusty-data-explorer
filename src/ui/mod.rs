@@ -15,6 +15,7 @@ pub mod fit;
 pub mod grid;
 pub mod plan;
 pub mod query;
+pub mod query_tools;
 pub mod schema;
 pub mod search;
 pub mod table_edit;
