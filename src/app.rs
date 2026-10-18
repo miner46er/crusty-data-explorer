@@ -1733,6 +1733,8 @@ pub struct AppState {
     pending_terminate: Option<PendingTerminate>,
     /// The open visual table editor, if any. Not persisted.
     table_editor: Option<TableEditorState>,
+    /// The table compare window's open flag. Not persisted.
+    compare_open: bool,
     /// The table DDL batch awaiting its prod confirmation, if any.
     pending_table_confirm: Option<PendingTableDdl>,
     history: Vec<HistoryEntry>,
@@ -1791,6 +1793,7 @@ impl AppState {
             sessions_errors: HashMap::new(),
             pending_terminate: None,
             table_editor: None,
+            compare_open: false,
             pending_table_confirm: None,
             history: load_history(),
             history_current_only: false,
@@ -3569,6 +3572,21 @@ impl AppState {
     /// The table data compare state, for the compare view.
     pub fn compare(&self) -> &CompareState {
         &self.compare
+    }
+
+    /// True while the Table compare window is open.
+    pub fn compare_window_open(&self) -> bool {
+        self.compare_open
+    }
+
+    /// Open the Table compare window.
+    pub fn open_compare(&mut self) {
+        self.compare_open = true;
+    }
+
+    /// Close the Table compare window without clearing its picks or diff.
+    pub fn close_compare(&mut self) {
+        self.compare_open = false;
     }
 
     /// Retarget the left pick. Drops loaded rows and runs, so stale results
@@ -6759,12 +6777,27 @@ mod tests {
                 )),
                 ..Default::default()
             };
+            let mut output = ctx.run_ui(input.clone(), |ui| {
+                crate::ui::grid::results(state, ui);
+            });
+            output.textures_delta.clear();
+            let text = rendered_text(&output);
+            assert!(text.iter().any(|t| t == "Filters"), "{text:?}");
+            assert!(!text.iter().any(|t| t == "Add clause"), "{text:?}");
+
+            // A clause opens the structured filter body by default.
+            state.tab_mut(tab).expect("tab").add_filter_clause(FilterClause {
+                column: "name".to_owned(),
+                op: FilterOp::Eq,
+                value: String::new(),
+            });
             let mut output = ctx.run_ui(input, |ui| {
                 crate::ui::grid::results(state, ui);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
-            assert!(text.iter().any(|t| t == "Structured filter"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Filters (1)"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Add clause"), "{text:?}");
         });
     }
 
@@ -6794,7 +6827,10 @@ mod tests {
             let grid_text = rendered_text(&grid);
             assert!(grid_text.iter().any(|t| t == "Result 1"), "{grid_text:?}");
             assert!(grid_text.iter().any(|t| t == "Result 2"), "{grid_text:?}");
-            assert!(grid_text.iter().any(|t| t == "2 rows · 2 ms"), "{grid_text:?}");
+            assert!(
+                grid_text.iter().any(|t| t == "2 of 2 rows · 2 ms"),
+                "{grid_text:?}"
+            );
 
             let mut toolbar = ctx.run_ui(input.clone(), |ui| {
                 crate::ui::query::editor(state, ui);
@@ -6816,9 +6852,14 @@ mod tests {
             });
             switched.textures_delta.clear();
             let switched_text = rendered_text(&switched);
-            assert!(switched_text.iter().any(|t| t == "3 rows · 2 ms"), "{switched_text:?}");
-            assert!(switched_text.iter().any(|t| t == "3 of 3 rows"), "{switched_text:?}");
-            assert!(!switched_text.iter().any(|t| t == "2 rows · 2 ms"), "{switched_text:?}");
+            assert!(
+                switched_text.iter().any(|t| t == "3 of 3 rows · 2 ms"),
+                "{switched_text:?}"
+            );
+            assert!(
+                !switched_text.iter().any(|t| t == "2 of 2 rows · 2 ms"),
+                "{switched_text:?}"
+            );
         });
     }
 
@@ -10260,10 +10301,11 @@ mod tests {
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
-            assert!(text.iter().any(|t| t == "Apply (0)"), "{text:?}");
-            assert!(text.iter().any(|t| t == "Discard"), "{text:?}");
-            assert!(text.iter().any(|t| t == "Add row"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Edit"), "{text:?}");
             assert!(text.iter().any(|t| t == "editing items"), "{text:?}");
+            assert!(!text.iter().any(|t| t.starts_with("Apply (")), "{text:?}");
+            assert!(!text.iter().any(|t| t == "Discard"), "{text:?}");
+            assert!(!text.iter().any(|t| t.ends_with(" staged")), "{text:?}");
 
             state.stage_edit(tab, 0, 2, "Ada".to_owned());
             state.add_row(tab);
@@ -10272,7 +10314,9 @@ mod tests {
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
+            assert!(text.iter().any(|t| t == "2 staged"), "{text:?}");
             assert!(text.iter().any(|t| t == "Apply (2)"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Discard"), "{text:?}");
 
             if let Some(slot) = state.tab_sql_mut(tab) {
                 *slot = "SELECT i.id FROM items i JOIN items o ON o.id = i.id".to_owned();
@@ -10283,6 +10327,7 @@ mod tests {
             output.textures_delta.clear();
             let text = rendered_text(&output);
             assert!(text.iter().any(|t| t == "read-only view"), "{text:?}");
+            assert!(!text.iter().any(|t| t == "Edit"), "{text:?}");
             assert!(!text.iter().any(|t| t.starts_with("Apply")), "{text:?}");
         });
     }
@@ -10948,7 +10993,7 @@ mod tests {
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
-            assert!(text.iter().any(|t| t == "Import file"), "{text:?}");
+            assert!(text.iter().any(|t| t == "Edit"), "{text:?}");
 
             let path = write_csv("render", "tenant,id,extra\nacme,1,x\n");
             state.begin_import(tab, &path);
@@ -10980,6 +11025,7 @@ mod tests {
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
+            assert!(!text.iter().any(|t| t == "Edit"), "{text:?}");
             assert!(!text.iter().any(|t| t == "Import file"), "{text:?}");
             let _ = std::fs::remove_file(&path);
         });

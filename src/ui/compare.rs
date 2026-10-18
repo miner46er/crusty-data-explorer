@@ -311,14 +311,23 @@ fn key_label(
         .join(" | ")
 }
 
-/// The table compare above the grid rows: left and right picks from the
-/// loaded schema, key columns, the Compare button, and the cached diff with
-/// its counts. Closed by default, so the grid keeps its full height until
-/// asked. Reads state and sends through transitions only.
-pub fn compare_section(state: &mut AppState, ui: &mut egui::Ui) {
-    egui::CollapsingHeader::new("Table compare").default_open(false).show(ui, |ui| {
-        compare_body(state, ui);
-    });
+/// The table compare window: left and right picks from the loaded schema, key
+/// columns, the Compare button, and the cached diff with its counts. Closed by
+/// default, so the grid keeps its full height until asked. Reads state and
+/// sends through transitions only.
+pub fn compare_window(state: &mut AppState, ui: &mut egui::Ui) {
+    if !state.compare_window_open() {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("Table compare")
+        .open(&mut open)
+        .resizable(true)
+        .default_width(520.0)
+        .show(ui.ctx(), |ui| compare_body(state, ui));
+    if !open {
+        state.close_compare();
+    }
 }
 
 fn compare_body(state: &mut AppState, ui: &mut egui::Ui) {

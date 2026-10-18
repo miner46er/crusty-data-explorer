@@ -30,6 +30,7 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
         .resizable(true)
         .show(ui, |ui| query::editor(state, ui));
     egui::CentralPanel::default().show(ui, |ui| grid::results(state, ui));
+    compare::compare_window(state, ui);
     connections::draft_window(state, ui);
     connections::password_window(state, ui);
     table_edit::table_editor_window(state, ui);
@@ -93,6 +94,13 @@ fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
                 state.toggle_theme();
             }
             table_edit::status_entry(state, ui);
+            if ui
+                .add(egui::Button::new("Compare").small())
+                .on_hover_text("Compare two tables row by row")
+                .clicked()
+            {
+                state.open_compare();
+            }
             let backend = state
                 .active()
                 .and_then(|id| state.tab(id))

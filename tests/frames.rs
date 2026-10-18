@@ -270,6 +270,18 @@ fn grid_frames() {
     let _guard = env_lock();
     let (_scratch, mut harness, _tab) = demo_setup("grid");
     harness.run();
+    assert!(
+        harness.query_by_label("Table compare").is_none(),
+        "table compare lives in a window, not in the results area"
+    );
+    assert!(
+        harness.query_by_label("Chart").is_some(),
+        "the Chart toggle is in the results toolbar"
+    );
+    assert!(
+        harness.query_by_label("Kind").is_none(),
+        "the chart body stays closed until its toggle is on"
+    );
     capture(&mut harness, "grid-dark");
 
     harness.state_mut().toggle_theme();
@@ -295,6 +307,8 @@ fn line_chart_frame() {
     let (_scratch, mut harness, _tab) = demo_setup("line");
     harness.run();
 
+    harness.get_by_label("Chart").click();
+    harness.run();
     harness.get_by_label("Line").click();
     harness.run();
     capture(&mut harness, "chart-line-dark");
@@ -366,6 +380,8 @@ fn chart_hover_frame() {
     let (_scratch, mut harness, _tab) = demo_setup("hover");
     harness.run();
 
+    harness.get_by_label("Chart").click();
+    harness.run();
     harness.get_by_label("Line").click();
     harness.run();
     let note = harness.get_by_label("5 plotted").rect();

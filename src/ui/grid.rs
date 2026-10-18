@@ -91,9 +91,11 @@ impl Selection {
     fn is_selected(&self, row: usize) -> bool {
         self.rows.contains(&row)
     }
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.rows.len()
     }
@@ -796,7 +798,6 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
     import_window(state, ui);
     prune_selection(state, ui.ctx());
     prune_grid_views(state, ui.ctx());
-    super::compare::compare_section(state, ui);
     let modal_open = state.draft().is_some()
         || state.save_prompt().is_some()
         || state.password_prompt().is_some()
@@ -1435,13 +1436,42 @@ fn result_tabs(tab: &mut Tab, ui: &mut egui::Ui) {
     }
 }
 
-/// The row detail toggle for one tab, kept beside the selection.
-fn detail_open_id(tab: TabId) -> egui::Id {
-    egui::Id::new(("crusty_row_detail_open", tab))
+/// The one right-side pane a tab can show beside the grid: the row detail or
+/// the chart. Kept beside the selection in egui temp data, so it lasts the
+/// session and dies with the tab. Default is no pane; the two never share the
+/// right side.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum SidePane {
+    #[default]
+    None,
+    Detail,
+    Chart,
 }
 
-fn detail_open_of(ctx: &egui::Context, tab: TabId) -> bool {
-    ctx.data(|data| data.get_temp(detail_open_id(tab))).unwrap_or(false)
+fn side_pane_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_side_pane", tab))
+}
+
+pub(crate) fn side_pane_of(ctx: &egui::Context, tab: TabId) -> SidePane {
+    ctx.data(|data| data.get_temp(side_pane_id(tab))).unwrap_or_default()
+}
+
+fn store_side_pane(ctx: &egui::Context, tab: TabId, pane: SidePane) {
+    ctx.data_mut(|data| data.insert_temp(side_pane_id(tab), pane));
+}
+
+/// The structured filter body's open state for one tab: stored in temp data
+/// and defaulting open when clauses exist, so a recalled filter is visible.
+fn filters_open_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_filters_open", tab))
+}
+
+fn filters_open_of(ctx: &egui::Context, tab: TabId, clauses: usize) -> bool {
+    ctx.data(|data| data.get_temp(filters_open_id(tab))).unwrap_or(clauses > 0)
+}
+
+fn store_filters_open(ctx: &egui::Context, tab: TabId, open: bool) {
+    ctx.data_mut(|data| data.insert_temp(filters_open_id(tab), open));
 }
 
 /// Pretty JSON for one result row in the exported [`to_json`] shape, so the
@@ -1556,10 +1586,9 @@ fn results_grid(
     let mut actions = Vec::new();
     result_tabs(tab, ui);
     let palette = Palette::of(ui.ctx().theme());
-    super::charts::chart_side_panel(tab, ui);
     super::plan::plan_section(tab, ui);
     poll_export_job(tab, ui);
-    let (cols, total) = {
+    let (cols, total, ms, truncated, known_total) = {
         let Some(result) = tab.active_query_result() else { return actions };
         if result.columns().is_empty() {
             match result.affected() {
@@ -1584,32 +1613,11 @@ fn results_grid(
         let ms = result.took().as_secs_f64() * 1000.0;
         let truncated = result.is_truncated();
         let known_total = result.total();
-        ui.horizontal(|ui| {
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(8, 4))
-                .corner_radius(egui::CornerRadius::same(4))
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{} rows · {:.0} ms", total, ms))
-                            .small()
-                            .strong(),
-                    );
-                });
-            if truncated {
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    egui::RichText::new(truncate_label(known_total)).small().strong(),
-                );
-            }
-        });
-        if truncated {
-            paging_row(tab, &grid_conn, known_total, total, ui);
-        }
         if total == 0 && tab.added_rows().is_empty() {
             ui.label(egui::RichText::new("No rows returned.").weak());
             return actions;
         }
-        (cols, total)
+        (cols, total, ms, truncated, known_total)
     };
     let editable = target.is_some();
     if !editable {
@@ -1617,118 +1625,6 @@ fn results_grid(
         store_edit_field(ui.ctx(), tab.id, None);
         store_cell_editor(ui.ctx(), tab.id, None);
     }
-    let mut detail_open = detail_open_of(ui.ctx(), tab.id);
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Filter");
-        let mut text = tab.filter().to_owned();
-        if ui.text_edit_singleline(&mut text).changed() {
-            tab.set_filter(text);
-        }
-        if ui.button("Clear").clicked() {
-            tab.set_filter(String::new());
-        }
-        let can_export = tab
-            .active_query_result()
-            .is_some_and(|result| !result.columns().is_empty());
-        let can_export_all =
-            tab.results().iter().any(|result| !result.columns().is_empty());
-        ui.menu_button("Export", |ui| {
-            if ui.add_enabled(can_export, egui::Button::new("CSV")).clicked() {
-                export_csv_streaming(tab, &grid_conn, ui);
-            }
-            if ui.add_enabled(can_export, egui::Button::new("JSON")).clicked() {
-                export_json_streaming(tab, &grid_conn, ui);
-            }
-            if ui.add_enabled(can_export, egui::Button::new("JSONL")).clicked() {
-                export_jsonl_streaming(tab, &grid_conn, ui);
-            }
-            if ui
-                .add_enabled(can_export, egui::Button::new("XLSX"))
-                .on_hover_text("Export this view as a spreadsheet workbook")
-                .clicked()
-            {
-                export_xlsx_streaming(tab, &grid_conn, ui);
-            }
-            ui.separator();
-            // No scope state here, so it fires as an action rather than a check.
-            if ui
-                .add_enabled(can_export_all, egui::Button::new("All result sets"))
-                .on_hover_text("Export every result set into one folder, one CSV per set")
-                .clicked()
-            {
-                export_all_results(tab);
-            }
-        });
-        ui.checkbox(&mut detail_open, "Row detail")
-            .on_hover_text("Show the focused row as JSON and record beside the grid");
-        ui.separator();
-        match target {
-            Some(target) => {
-                let staged = tab.staged_count();
-                if ui
-                    .add_enabled(staged > 0, egui::Button::new(format!("Apply ({staged})")))
-                    .on_hover_text("Send the staged changes")
-                    .clicked()
-                {
-                    actions.push(EditAction::Apply);
-                }
-                if ui
-                    .button("Import file")
-                    .on_hover_text("Load a CSV or JSONL file into this table")
-                    .clicked()
-                {
-                    actions.push(EditAction::ImportCsv);
-                }
-                if ui
-                    .button("Import JSONL")
-                    .on_hover_text("Load a JSONL file as new rows for review")
-                    .clicked()
-                {
-                    actions.push(EditAction::ImportJsonl);
-                }
-                if ui
-                    .button("Import XLSX")
-                    .on_hover_text("Load the first sheet of an XLSX file as new rows for review")
-                    .clicked()
-                {
-                    actions.push(EditAction::ImportXlsx);
-                }
-                if ui
-                    .add_enabled(staged > 0, egui::Button::new("Discard"))
-                    .on_hover_text("Drop every staged change")
-                    .clicked()
-                {
-                    actions.push(EditAction::Discard);
-                }
-                if ui
-                    .button("Add row")
-                    .on_hover_text("Stage one empty row for INSERT")
-                    .clicked()
-                {
-                    actions.push(EditAction::AddRow);
-                }
-                ui.label(
-                    egui::RichText::new(format!("editing {}", target.table)).small().weak(),
-                );
-            }
-            None => {
-                ui.label(egui::RichText::new("read-only view").small().weak()).on_hover_text(
-                    "Inline editing needs an idle connection and a single-table SELECT \
-                     whose table has a primary key in the result.",
-                );
-            }
-        }
-    });
-    ui.ctx().data_mut(|data| data.insert_temp(detail_open_id(tab.id), detail_open));
-    if let Some(notice) = tab.export_notice().map(str::to_owned) {
-        if tab.export_failed() {
-            ui.colored_label(ui.visuals().error_fg_color, notice);
-        } else {
-            ui.colored_label(palette.success, notice);
-        }
-    }
-    let mut filter_actions = structured_filter_panel(tab, &cols, filter_history, ui);
-    actions.append(&mut filter_actions);
     let (sort_col, sort_dir, filter) = (tab.sort_col(), tab.sort_dir(), tab.filter().to_owned());
     let mut selection = match result_id_of(tab) {
         Some(id) => {
@@ -1747,23 +1643,398 @@ fn results_grid(
         None => return actions,
     };
     let mut view = grid_view_of(ui.ctx(), tab.id);
+    let mut side_pane = side_pane_of(ui.ctx(), tab.id);
+    let mut filters_open =
+        filters_open_of(ui.ctx(), tab.id, tab.filter_clauses().len());
+    let mut filters_toggled = false;
+    let rows = selection.resolve(&visible);
+    let nrows = rows.len();
+    let edit_label = target.map(|target| target.table.clone());
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(format!("{} of {} rows", visible.len(), total)).small().weak(),
-        );
-        let hidden = view.hidden_count(cols.len());
-        if hidden > 0 && ui.button(format!("Show columns ({hidden})")).clicked() {
-            view.show_all();
+        let mut text = tab.filter().to_owned();
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut text)
+                    .hint_text("Filter rows")
+                    .desired_width(180.0),
+            )
+            .changed()
+        {
+            tab.set_filter(text);
         }
-    });
-    let mut copied = copy_bar(tab, editable, &selection, &visible, total, ui);
-    actions.append(&mut copied);
-    if detail_open {
-        // A nested right panel reserves its side before the grid's scroll area
-        // draws, so the grid keeps the leftover width. Read-only content only.
-        egui::Panel::right("crusty_row_detail").default_size(360.0).show(ui, |ui| {
-            row_detail(tab, &selection, ui);
+        if !tab.filter().is_empty() && ui.button("Clear").clicked() {
+            tab.set_filter(String::new());
+        }
+        let clauses = tab.filter_clauses().len();
+        let label = if clauses > 0 {
+            format!("Filters ({clauses})")
+        } else {
+            "Filters".to_owned()
+        };
+        if ui
+            .selectable_label(filters_open, label)
+            .on_hover_text("Show the structured filter builder")
+            .clicked()
+        {
+            filters_open = !filters_open;
+            filters_toggled = true;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .selectable_label(side_pane == SidePane::Chart, "Chart")
+                .on_hover_text("Plot the result beside the grid")
+                .clicked()
+            {
+                side_pane = if side_pane == SidePane::Chart {
+                    SidePane::None
+                } else {
+                    SidePane::Chart
+                };
+            }
+            if ui
+                .selectable_label(side_pane == SidePane::Detail, "Detail")
+                .on_hover_text("Show the focused row as JSON and record beside the grid")
+                .clicked()
+            {
+                side_pane = if side_pane == SidePane::Detail {
+                    SidePane::None
+                } else {
+                    SidePane::Detail
+                };
+            }
+            if editable {
+                ui.menu_button("Edit", |ui| {
+                    if ui
+                        .button("Add row")
+                        .on_hover_text("Stage one empty row for INSERT")
+                        .clicked()
+                    {
+                        actions.push(EditAction::AddRow);
+                        ui.close();
+                    }
+                    if ui
+                        .button("Paste rows")
+                        .on_hover_text(
+                            "Paste TSV or CSV from the clipboard as new rows for review",
+                        )
+                        .clicked()
+                    {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                        ui.ctx()
+                            .data_mut(|data| data.insert_temp(paste_armed_id(tab.id), true));
+                        ui.close();
+                    }
+                    let can_fill = selection.active().is_some_and(|(row, col)| {
+                        row < total
+                            && tab
+                                .active_query_result()
+                                .is_some_and(|result| col < result.columns().len())
+                            && !tab.is_row_deleted(row)
+                    });
+                    if ui
+                        .add_enabled(can_fill, egui::Button::new("Fill down"))
+                        .on_hover_text("Fill the focused cell down the selection (Ctrl+D)")
+                        .clicked()
+                    {
+                        if let Some((row, col)) = selection.active() {
+                            let targets: Vec<usize> = selection.resolve(&visible);
+                            actions.extend(fill_from(tab, row, col, &targets));
+                        }
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .button("Import file")
+                        .on_hover_text("Load a CSV or JSONL file into this table")
+                        .clicked()
+                    {
+                        actions.push(EditAction::ImportCsv);
+                        ui.close();
+                    }
+                    if ui
+                        .button("Import JSONL")
+                        .on_hover_text("Load a JSONL file as new rows for review")
+                        .clicked()
+                    {
+                        actions.push(EditAction::ImportJsonl);
+                        ui.close();
+                    }
+                    if ui
+                        .button("Import XLSX")
+                        .on_hover_text(
+                            "Load the first sheet of an XLSX file as new rows for review",
+                        )
+                        .clicked()
+                    {
+                        actions.push(EditAction::ImportXlsx);
+                        ui.close();
+                    }
+                });
+            }
+            let can_export = tab
+                .active_query_result()
+                .is_some_and(|result| !result.columns().is_empty());
+            let can_export_all =
+                tab.results().iter().any(|result| !result.columns().is_empty());
+            ui.menu_button("Export", |ui| {
+                if ui.add_enabled(can_export, egui::Button::new("CSV")).clicked() {
+                    export_csv_streaming(tab, &grid_conn, ui);
+                }
+                if ui.add_enabled(can_export, egui::Button::new("JSON")).clicked() {
+                    export_json_streaming(tab, &grid_conn, ui);
+                }
+                if ui.add_enabled(can_export, egui::Button::new("JSONL")).clicked() {
+                    export_jsonl_streaming(tab, &grid_conn, ui);
+                }
+                if ui
+                    .add_enabled(can_export, egui::Button::new("XLSX"))
+                    .on_hover_text("Export this view as a spreadsheet workbook")
+                    .clicked()
+                {
+                    export_xlsx_streaming(tab, &grid_conn, ui);
+                }
+                ui.separator();
+                // No scope state here, so it fires as an action rather than a check.
+                if ui
+                    .add_enabled(can_export_all, egui::Button::new("All result sets"))
+                    .on_hover_text("Export every result set into one folder, one CSV per set")
+                    .clicked()
+                {
+                    export_all_results(tab);
+                }
+            });
+            if can_export {
+                let tab_id = tab.id;
+                let mut headers = tsv_headers_of(ui.ctx(), tab_id);
+                // A menu that closes on any click costs open, tick, reopen,
+                // click to get TSV with headers, so this one ignores inside
+                // clicks and each copy closes it; the checkbox leaves it
+                // standing.
+                egui::menu::MenuButton::new("Copy")
+                    .config(
+                        egui::menu::MenuConfig::new()
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                    )
+                    .ui(ui, |ui| {
+                        if ui
+                            .button("TSV")
+                            .on_hover_text("Copy the selection as tab-separated values")
+                            .clicked()
+                        {
+                            let text = tab
+                                .active_query_result()
+                                .map(|result| to_tsv(result, &rows, headers))
+                                .unwrap_or_default();
+                            ui.ctx().copy_text(text);
+                            tab.set_export_notice(
+                                format!("Copied {nrows} rows as TSV"),
+                                false,
+                            );
+                            ui.close();
+                        }
+                        if ui
+                            .button("CSV")
+                            .on_hover_text("Copy the selection as CSV")
+                            .clicked()
+                        {
+                            let text = tab
+                                .active_query_result()
+                                .map(|result| to_csv(result, &rows))
+                                .unwrap_or_default();
+                            ui.ctx().copy_text(text);
+                            tab.set_export_notice(
+                                format!("Copied {nrows} rows as CSV"),
+                                false,
+                            );
+                            ui.close();
+                        }
+                        if ui
+                            .button("JSON")
+                            .on_hover_text("Copy the selection as JSON")
+                            .clicked()
+                        {
+                            let text = tab
+                                .active_query_result()
+                                .map(|result| to_json(result, &rows))
+                                .unwrap_or_default();
+                            ui.ctx().copy_text(text);
+                            tab.set_export_notice(
+                                format!("Copied {nrows} rows as JSON"),
+                                false,
+                            );
+                            ui.close();
+                        }
+                        if ui
+                            .button("Markdown")
+                            .on_hover_text("Copy the selection as a Markdown table")
+                            .clicked()
+                        {
+                            let text = tab
+                                .active_query_result()
+                                .map(|result| to_markdown(result, &rows))
+                                .unwrap_or_default();
+                            ui.ctx().copy_text(text);
+                            tab.set_export_notice(
+                                format!("Copied {nrows} rows as Markdown"),
+                                false,
+                            );
+                            ui.close();
+                        }
+                        if ui
+                            .button("INSERTs")
+                            .on_hover_text("Copy the selection as SQL INSERTs")
+                            .clicked()
+                        {
+                            let text = tab
+                                .active_query_result()
+                                .map(|result| to_inserts("result", result, &rows))
+                                .unwrap_or_default();
+                            ui.ctx().copy_text(text);
+                            tab.set_export_notice(
+                                format!("Copied {nrows} rows as INSERTs"),
+                                false,
+                            );
+                            ui.close();
+                        }
+                        if ui
+                            .button("IN (...)")
+                            .on_hover_text("Copy a typed IN list from the active column")
+                            .clicked()
+                        {
+                            let pick = selection.active().and_then(|(_, col)| {
+                                column_names(tab)
+                                    .get(col)
+                                    .cloned()
+                                    .map(|name| (col, name))
+                            });
+                            match pick {
+                                None => tab.set_export_notice(
+                                    "Click a cell to choose the IN column".to_owned(),
+                                    true,
+                                ),
+                                Some((col, name)) => {
+                                    let clause = tab
+                                        .active_query_result()
+                                        .and_then(|result| to_in_list(result, &rows, col));
+                                    match clause {
+                                        Some(text) => {
+                                            ui.ctx().copy_text(text);
+                                            tab.set_export_notice(
+                                                format!(
+                                                    "Copied {name} IN list ({nrows} rows)"
+                                                ),
+                                                false,
+                                            );
+                                        }
+                                        None => tab.set_export_notice(
+                                            format!("No non-NULL values in {name}"),
+                                            true,
+                                        ),
+                                    }
+                                }
+                            }
+                            ui.close();
+                        }
+                        if ui
+                            .checkbox(&mut headers, "Headers")
+                            .on_hover_text("Include the header row in TSV copies")
+                            .changed()
+                        {
+                            ui.ctx().data_mut(|data| {
+                                data.insert_temp(tsv_headers_id(tab_id), headers)
+                            });
+                        }
+                    });
+            }
         });
+    });
+    store_side_pane(ui.ctx(), tab.id, side_pane);
+    if filters_toggled {
+        store_filters_open(ui.ctx(), tab.id, filters_open);
+    }
+    if editable && tab.staged_count() > 0 {
+        let staged = tab.staged_count();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("{staged} staged")).small().strong());
+            if ui
+                .button(format!("Apply ({staged})"))
+                .on_hover_text("Send the staged changes")
+                .clicked()
+            {
+                actions.push(EditAction::Apply);
+            }
+            if ui
+                .button("Discard")
+                .on_hover_text("Drop every staged change")
+                .clicked()
+            {
+                actions.push(EditAction::Discard);
+            }
+        });
+    }
+    if filters_open {
+        let mut filter_actions = structured_filter_body(tab, &cols, filter_history, ui);
+        actions.append(&mut filter_actions);
+    }
+    let hidden = view.hidden_count(cols.len());
+    egui::Panel::bottom("crusty_grid_footer").show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} of {} rows · {:.0} ms",
+                    visible.len(),
+                    total,
+                    ms
+                ))
+                .small()
+                .weak(),
+            );
+            if truncated {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    egui::RichText::new(truncate_label(known_total)).small().strong(),
+                );
+                paging_row(tab, &grid_conn, known_total, total, ui);
+            }
+            if hidden > 0 && ui.button(format!("Show columns ({hidden})")).clicked() {
+                view.show_all();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                match &edit_label {
+                    Some(table) => {
+                        ui.label(
+                            egui::RichText::new(format!("editing {table}")).small().weak(),
+                        );
+                    }
+                    None => {
+                        ui.label(egui::RichText::new("read-only view").small().weak())
+                            .on_hover_text(
+                                "Inline editing needs an idle connection and a single-table \
+                                 SELECT whose table has a primary key in the result.",
+                            );
+                    }
+                }
+                if let Some(notice) = tab.export_notice().map(str::to_owned) {
+                    if tab.export_failed() {
+                        ui.colored_label(ui.visuals().error_fg_color, notice);
+                    } else {
+                        ui.colored_label(palette.success, notice);
+                    }
+                }
+            });
+        });
+    });
+    match side_pane {
+        SidePane::Chart => super::charts::chart_side_panel(tab, ui),
+        SidePane::Detail => {
+            // A nested right panel reserves its side before the grid's scroll
+            // area draws, so the grid keeps the leftover width. Read-only
+            // content only.
+            egui::Panel::right("crusty_row_detail").default_size(360.0).show(ui, |ui| {
+                row_detail(tab, &selection, ui);
+            });
+        }
+        SidePane::None => {}
     }
     let ncols = cols.len();
     let active_result = tab.active_result();
@@ -2054,12 +2325,12 @@ fn filter_name_id(tab: TabId) -> egui::Id {
     egui::Id::new(("crusty_filter_name", tab))
 }
 
-/// The clause editor, raw WHERE box, and named history under one collapsed
-/// header. Clause and raw edits mutate the tab in place; apply, clear, save,
+/// The clause editor, raw WHERE box, and named history under the Filters
+/// toggle. Clause and raw edits mutate the tab in place; apply, clear, save,
 /// and recall defer through [`EditAction`] so the batch send runs after the
 /// tab borrow ends. No shortcuts are added, so the existing modal and focus
 /// gates hold: typing in a box keeps focus and the grid copy key stays dead.
-fn structured_filter_panel(
+fn structured_filter_body(
     tab: &mut Tab,
     columns: &[(String, String)],
     history: &[SavedFilter],
@@ -2067,7 +2338,7 @@ fn structured_filter_panel(
 ) -> Vec<EditAction> {
     let mut actions = Vec::new();
     let tab_id = tab.id;
-    egui::CollapsingHeader::new("Structured filter").show(ui, |ui| {
+    {
         let mut remove: Option<usize> = None;
         for (index, clause) in tab.filter_clauses_mut().iter_mut().enumerate() {
             ui.horizontal(|ui| {
@@ -2182,7 +2453,7 @@ fn structured_filter_panel(
                 }
             });
         }
-    });
+    }
     actions
 }
 
@@ -2420,181 +2691,6 @@ fn export_all_results(tab: &mut Tab) {
             tab.set_export_notice(format!("Export failed after {written} files: {error}"), true);
         }
     }
-}
-
-/// The selection copy row: one menu for TSV with a headers option, CSV, JSON,
-/// Markdown, and SQL INSERTs from the selection (or the whole view when
-/// empty), the IN-list builder from the active column, fill down through the
-/// staged-edit path, and paste as new rows. Fill actions defer to the caller
-/// the way the grid key handler does, since the tab borrow is still live here.
-fn copy_bar(
-    tab: &mut Tab,
-    editable: bool,
-    selection: &Selection,
-    visible: &[usize],
-    total: usize,
-    ui: &mut egui::Ui,
-) -> Vec<EditAction> {
-    let mut actions = Vec::new();
-    ui.horizontal_wrapped(|ui| {
-        if tab.active_query_result().is_none_or(|result| result.columns().is_empty()) {
-            return;
-        }
-        let tab_id = tab.id;
-        let rows = selection.resolve(visible);
-        let nrows = rows.len();
-        let mut headers = tsv_headers_of(ui.ctx(), tab_id);
-        // A menu that closes on any click costs open, tick, reopen, click to
-        // get TSV with headers, so this one ignores inside clicks and each
-        // copy closes it; the checkbox leaves it standing.
-        egui::menu::MenuButton::new("Copy")
-            .config(
-                egui::menu::MenuConfig::new()
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
-            )
-            .ui(ui, |ui| {
-                if ui
-                    .button("TSV")
-                    .on_hover_text("Copy the selection as tab-separated values")
-                    .clicked()
-                {
-                    let text = tab
-                        .active_query_result()
-                        .map(|result| to_tsv(result, &rows, headers))
-                        .unwrap_or_default();
-                    ui.ctx().copy_text(text);
-                    tab.set_export_notice(format!("Copied {nrows} rows as TSV"), false);
-                    ui.close();
-                }
-                if ui.button("CSV").on_hover_text("Copy the selection as CSV").clicked() {
-                    let text = tab
-                        .active_query_result()
-                        .map(|result| to_csv(result, &rows))
-                        .unwrap_or_default();
-                    ui.ctx().copy_text(text);
-                    tab.set_export_notice(format!("Copied {nrows} rows as CSV"), false);
-                    ui.close();
-                }
-                if ui.button("JSON").on_hover_text("Copy the selection as JSON").clicked() {
-                    let text = tab
-                        .active_query_result()
-                        .map(|result| to_json(result, &rows))
-                        .unwrap_or_default();
-                    ui.ctx().copy_text(text);
-                    tab.set_export_notice(format!("Copied {nrows} rows as JSON"), false);
-                    ui.close();
-                }
-                if ui
-                    .button("Markdown")
-                    .on_hover_text("Copy the selection as a Markdown table")
-                    .clicked()
-                {
-                    let text = tab
-                        .active_query_result()
-                        .map(|result| to_markdown(result, &rows))
-                        .unwrap_or_default();
-                    ui.ctx().copy_text(text);
-                    tab.set_export_notice(format!("Copied {nrows} rows as Markdown"), false);
-                    ui.close();
-                }
-                if ui
-                    .button("INSERTs")
-                    .on_hover_text("Copy the selection as SQL INSERTs")
-                    .clicked()
-                {
-                    let text = tab
-                        .active_query_result()
-                        .map(|result| to_inserts("result", result, &rows))
-                        .unwrap_or_default();
-                    ui.ctx().copy_text(text);
-                    tab.set_export_notice(format!("Copied {nrows} rows as INSERTs"), false);
-                    ui.close();
-                }
-                if ui
-                    .checkbox(&mut headers, "Headers")
-                    .on_hover_text("Include the header row in TSV copies")
-                    .changed()
-                {
-                    ui.ctx().data_mut(|data| data.insert_temp(tsv_headers_id(tab_id), headers));
-                }
-            });
-        // The IN list stays a button beside the menu: it needs a clicked cell
-        // for its column, where the other copies fall back to the whole view.
-        if ui
-            .button("IN (...)")
-            .on_hover_text("Copy a typed IN list from the active column")
-            .clicked()
-        {
-            let pick = selection
-                .active()
-                .and_then(|(_, col)| column_names(tab).get(col).cloned().map(|name| (col, name)));
-            match pick {
-                None => tab.set_export_notice(
-                    "Click a cell to choose the IN column".to_owned(),
-                    true,
-                ),
-                Some((col, name)) => {
-                    let clause = tab
-                        .active_query_result()
-                        .and_then(|result| to_in_list(result, &rows, col));
-                    match clause {
-                        Some(text) => {
-                            ui.ctx().copy_text(text);
-                            tab.set_export_notice(
-                                format!("Copied {name} IN list ({nrows} rows)"),
-                                false,
-                            );
-                        }
-                        None => tab.set_export_notice(
-                            format!("No non-NULL values in {name}"),
-                            true,
-                        ),
-                    }
-                }
-            }
-        }
-        let can_fill = selection.active().is_some_and(|(row, col)| {
-            row < total
-                && tab
-                    .active_query_result()
-                    .is_some_and(|result| col < result.columns().len())
-                && !tab.is_row_deleted(row)
-        });
-        if editable
-            && ui
-                .add_enabled(can_fill, egui::Button::new("Fill down"))
-                .on_hover_text("Fill the focused cell down the selection (Ctrl+D)")
-                .clicked()
-            && let Some((row, col)) = selection.active()
-        {
-            let targets: Vec<usize> = selection.resolve(visible);
-            actions.extend(fill_from(tab, row, col, &targets));
-        }
-        if editable
-            && ui
-                .button("Paste rows")
-                .on_hover_text("Paste TSV or CSV from the clipboard as new rows for review")
-                .clicked()
-        {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
-            ui.ctx().data_mut(|data| data.insert_temp(paste_armed_id(tab_id), true));
-        }
-        if selection.is_empty() {
-            ui.label(egui::RichText::new("whole view").small().weak());
-        } else if let Some((_, col)) = selection.active() {
-            let name = column_names(tab).get(col).cloned().unwrap_or_default();
-            ui.label(
-                egui::RichText::new(format!("{} selected · {}", selection.len(), name))
-                    .small()
-                    .weak(),
-            );
-        } else {
-            ui.label(
-                egui::RichText::new(format!("{} selected", selection.len())).small().weak(),
-            );
-        }
-    });
-    actions
 }
 
 pub fn copy_shortcut() -> egui::KeyboardShortcut {

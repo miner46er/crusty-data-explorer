@@ -196,9 +196,13 @@ fn store_chart_view(ctx: &egui::Context, tab: TabId, view: ChartView) {
 }
 
 /// The read-only chart beside the grid: series pickers, a plain-shape canvas,
-/// and the empty state for results with nothing to plot. Skips DDL-style
-/// results with no columns entirely, so they keep the full width.
+/// and the empty state for results with nothing to plot. Renders only while
+/// the tab's side pane is Chart, so the grid keeps the full width otherwise;
+/// skips DDL-style results with no columns.
 pub fn chart_side_panel(tab: &Tab, ui: &mut egui::Ui) {
+    if super::grid::side_pane_of(ui.ctx(), tab.id) != super::grid::SidePane::Chart {
+        return;
+    }
     let Some(result) = tab.active_query_result() else { return };
     if result.columns().is_empty() {
         return;
