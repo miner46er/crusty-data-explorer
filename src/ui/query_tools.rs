@@ -283,9 +283,7 @@ pub(crate) fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
             } else {
                 two_rows = true;
             }
-            if running
-                && let Some(elapsed) = &elapsed
-            {
+            if let Some(elapsed) = &elapsed {
                 ui.spinner();
                 ui.label(elapsed);
             }

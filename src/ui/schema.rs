@@ -551,7 +551,7 @@ fn show_table(
                         ui.label(
                             egui::RichText::new(fk.columns().join(", ")).monospace().small(),
                         );
-                        ui.label(egui::RichText::new("\u{00BB}").small().weak());
+                        ui.label(egui::RichText::new("»").small().weak());
                         let target = state
                             .schema(conn)
                             .and_then(|schema| fk_reveal_target(schema, schema_owned.as_str(), &name, fk));
@@ -629,7 +629,7 @@ fn show_table(
                                 .small()
                                 .weak(),
                         );
-                        ui.label(egui::RichText::new("\u{00BB}").small().weak());
+                        ui.label(egui::RichText::new("»").small().weak());
                         ui.label(
                             egui::RichText::new(fk.columns().join(", ")).monospace().small(),
                         );

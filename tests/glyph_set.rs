@@ -52,7 +52,7 @@ fn render_lock() -> MutexGuard<'static, ()> {
 }
 
 /// The font family a literal paints in.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy)]
 enum Family {
     Proportional,
     Monospace,

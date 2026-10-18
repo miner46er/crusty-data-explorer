@@ -24,7 +24,7 @@ use super::{Palette, Theme};
 /// connection is a standing state, so it wears the softened Guard Red, never
 /// the raw Fault Red the design reserves for terminal text.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConnectionStatus {
+enum ConnectionStatus {
     Connected,
     Connecting,
     Failed,
@@ -78,7 +78,7 @@ const DOT_RING: f32 = 1.5;
 /// connection, a ring for an offline one, a half-filled disc for one that is
 /// connecting. The glyphs it replaces (`●`, `○`, `◌`) have no glyph in the
 /// embedded fonts and painted as epaint's replacement box.
-pub(crate) fn state_dot(
+fn state_dot(
     ui: &mut egui::Ui,
     status: ConnectionStatus,
     size: f32,
@@ -531,7 +531,7 @@ fn saved_row(
             }
             if !versions.is_empty() {
                 let open = saved_versions_open(ui.ctx(), query.id);
-                let arrow = if open { "\u{23F7}" } else { "\u{23F5}" };
+                let arrow = if open { "⏷" } else { "⏵" };
                 if ui
                     .small_button(format!("{arrow} History ({})", versions.len()))
                     .on_hover_text("Show per-save versions, newest first")
@@ -775,7 +775,7 @@ fn conn_folder_header(
     indented(ui, depth, |ui| {
         let resp = ui
             .horizontal(|ui| {
-                let arrow = if open { "\u{23F7}" } else { "\u{23F5}" };
+                let arrow = if open { "⏷" } else { "⏵" };
                 if ui.small_button(format!("{arrow} {name}")).clicked() {
                     set_folder_open(ui.ctx(), "conn", path, !open);
                 }
@@ -820,7 +820,7 @@ fn saved_folder_header(
     indented(ui, depth, |ui| {
         let resp = ui
             .horizontal(|ui| {
-                let arrow = if open { "\u{23F7}" } else { "\u{23F5}" };
+                let arrow = if open { "⏷" } else { "⏵" };
                 if ui.small_button(format!("{arrow} {name}")).clicked() {
                     set_folder_open(ui.ctx(), "saved", path, !open);
                 }

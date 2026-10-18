@@ -39,7 +39,7 @@ pub(crate) fn combo_w(ui: &egui::Ui, selected_text: &str) -> f32 {
 }
 
 /// The single ellipsis the overflow menu is labelled with.
-pub(crate) const OVERFLOW_LABEL: &str = "\u{2026}";
+pub(crate) const OVERFLOW_LABEL: &str = "…";
 
 /// `text` cut with an ellipsis so its measured width fits `budget`; empty
 /// when even the ellipsis does not fit.
