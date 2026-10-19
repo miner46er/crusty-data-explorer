@@ -3365,28 +3365,26 @@ fn grid_cursor_keys(
     let mut armed = grid_armed(ui.ctx(), tab);
     let (shift, alt) = ui.input(|input| (input.modifiers.shift, input.modifiers.alt));
     let tab_pressed = ui.input(|input| input.key_pressed(egui::Key::Tab));
+    let typing = edit_field_of(ui.ctx(), tab).is_some();
+    let takes_tab = armed && !visible.is_empty() && cols > 0 && !typing;
     let focused = ui.ctx().memory(|memory| memory.focused());
     if let Some(focused) = focused {
         let newly_focused =
             !ui.ctx().memory(|memory| memory.had_focus_last_frame(focused));
-        // Tab traversal runs before this handler. While the grid is armed it
-        // took a widget the operator did not ask for, so drop that focus and
-        // keep the press for the grid.
-        if armed && tab_pressed && newly_focused {
-            ui.ctx().memory_mut(|memory| memory.surrender_focus(focused));
-        } else {
+        // Tab traversal runs before this handler. Only a Tab the grid can
+        // step on drops the focus traversal gave it; every other focus means
+        // the chrome owns the keyboard and the press stays with it.
+        if !(tab_pressed && takes_tab && newly_focused) {
             set_grid_armed(ui.ctx(), tab, false);
             return None;
         }
+        ui.ctx().memory_mut(|memory| memory.surrender_focus(focused));
     }
-    let typing = edit_field_of(ui.ctx(), tab).is_some();
     if typing {
         return None;
     }
     if tab_pressed {
-        if armed
-            && !visible.is_empty()
-            && cols > 0
+        if takes_tab
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
         {
             selection.tab_step(shift, visible, cols, page);

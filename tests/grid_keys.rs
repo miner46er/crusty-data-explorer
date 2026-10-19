@@ -380,6 +380,48 @@ fn shift_command_c_copies_the_active_cell() {
     );
 }
 
+/// An armed grid takes Tab only when it can step. A filtered view with no
+/// rows leaves egui's traversal focus alone instead of stranding it.
+#[test]
+fn tab_on_an_empty_filtered_view_keeps_focus() {
+    let _lock = env_lock();
+    let (_scratch, mut harness, tab) = grid_setup("tab-empty-filter");
+    harness
+        .state_mut()
+        .tab_mut(tab)
+        .expect("the tab")
+        .set_filter("no such row".to_owned());
+    harness.run();
+    press_key(&mut harness, egui::Key::ArrowDown);
+    press_key(&mut harness, egui::Key::Tab);
+    assert!(
+        harness.ctx.memory(|memory| memory.focused()).is_some(),
+        "Tab leaves focus with the chrome when the view cannot step"
+    );
+}
+
+/// A cold Tab belongs to egui's traversal. It lands on a chrome widget and
+/// leaves the grid cursor on no row at all.
+#[test]
+fn cold_tab_moves_chrome_focus_without_moving_the_cursor() {
+    let _lock = env_lock();
+    let (_scratch, mut harness, _tab) = grid_setup("cold-tab");
+    open_detail(&mut harness);
+    assert!(
+        harness.ctx.memory(|memory| memory.focused()).is_none(),
+        "the grid starts with no focus"
+    );
+    press_key(&mut harness, egui::Key::Tab);
+    assert!(
+        harness.ctx.memory(|memory| memory.focused()).is_some(),
+        "Tab lands on a chrome widget"
+    );
+    assert!(
+        harness.query_by_label("Click a cell to inspect its row.").is_some(),
+        "the grid cursor did not move"
+    );
+}
+
 /// Steps that keep the cursor inside the viewport leave the scroll alone. A
 /// re-centre on every step walked the first visible row off screen.
 #[test]
