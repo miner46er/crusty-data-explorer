@@ -241,7 +241,10 @@ fn store_selection(ctx: &egui::Context, tab: TabId, selection: &Selection) {
 }
 
 fn clear_selection(ctx: &egui::Context, tab: TabId) {
-    ctx.data_mut(|data| data.remove::<Selection>(selection_id(tab)));
+    ctx.data_mut(|data| {
+        data.remove::<Selection>(selection_id(tab));
+        data.remove::<bool>(grid_armed_id(tab));
+    });
 }
 
 /// Drop grid selection for closed tabs. Diffs against the live tab list, the
@@ -374,15 +377,11 @@ const GRID_ROW_H: f32 = 20.0;
 const GRID_PAGE_FALLBACK: usize = 10;
 
 fn page_rows(available_height: f32, row_spacing: f32) -> usize {
-    let row = GRID_ROW_H + row_spacing;
-    if !available_height.is_finite() || available_height <= 0.0 || !row.is_finite() || row <= 0.0
-    {
+    if !available_height.is_finite() || available_height <= 0.0 {
         return GRID_PAGE_FALLBACK;
     }
-    let body = available_height - (GRID_ROW_H + row_spacing);
-    if body <= 0.0 {
-        return 1;
-    }
+    let row = GRID_ROW_H + row_spacing;
+    let body = available_height - row;
     ((body / row).floor() as usize).max(1)
 }
 
@@ -3362,7 +3361,7 @@ fn grid_cursor_keys(
         set_grid_armed(ui.ctx(), tab, false);
         return None;
     }
-    let mut armed = grid_armed(ui.ctx(), tab);
+    let armed = grid_armed(ui.ctx(), tab);
     let (shift, alt) = ui.input(|input| (input.modifiers.shift, input.modifiers.alt));
     let tab_pressed = ui.input(|input| input.key_pressed(egui::Key::Tab));
     let typing = edit_field_of(ui.ctx(), tab).is_some();
@@ -3388,7 +3387,6 @@ fn grid_cursor_keys(
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
         {
             selection.tab_step(shift, visible, cols, page);
-            set_grid_armed(ui.ctx(), tab, true);
             return selection.position(visible);
         }
         return None;
@@ -3415,8 +3413,7 @@ fn grid_cursor_keys(
     }
     let step = cursor?;
     selection.step(step, shift, visible, cols, page);
-    armed = true;
-    set_grid_armed(ui.ctx(), tab, armed);
+    set_grid_armed(ui.ctx(), tab, true);
     selection.position(visible)
 }
 
