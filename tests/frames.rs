@@ -467,7 +467,9 @@ fn assert_inside_window(
 /// running under the row, and a panel edge can leave a sliver of a row above
 /// inside the band; neither is in the row the band names.
 fn in_row(rect: egui::Rect, band: egui::Rect) -> bool {
-    rect.min.y >= band.min.y - 1.0 && rect.max.y <= band.max.y + 1.0
+    // The centre line decides: a control taller than the band's anchor (a
+    // Small label) still belongs to that row, and containment would drop it.
+    rect.center().y >= band.min.y && rect.center().y <= band.max.y
 }
 
 /// The text a node carries: a button's label or a plain label's value, so
@@ -605,7 +607,9 @@ fn narrow_window_chrome_stays_clear() {
     // answers for the row under test.
     let status_band = toolbar_band(&harness, &["Compare", "☀ Light"], NARROW_WINDOW);
     let results_band = toolbar_band(&harness, &["Filters", "Copy"], NARROW_WINDOW);
-    let editor_band = toolbar_band(&harness, &["▶ Run"], NARROW_WINDOW);
+    // Both editor rows: the run controls sit on the first, the tools on the
+    // second when the row wraps.
+    let editor_band = toolbar_band(&harness, &["▶ Run", "Save"], NARROW_WINDOW);
 
     assert_no_overlap(
         &harness,
@@ -649,6 +653,12 @@ fn narrow_window_chrome_stays_clear() {
     // in the window: a control that vanished would pass the checks above.
     assert_row_reachable(
         &mut harness,
+        &["Compare"],
+        &["Compare", "+ Table", "☀ Light"],
+        NARROW_WINDOW,
+    );
+    assert_row_reachable(
+        &mut harness,
         &["Copy"],
         &["Copy", "Export", "Edit", "Detail", "Chart"],
         NARROW_WINDOW,
@@ -676,11 +686,31 @@ fn narrow_window_chrome_stays_clear() {
     harness.get_by_label("Chart").click();
     harness.run_steps(6);
     assert!(harness.query_by_label("Kind").is_some(), "the chart pane opened from the tail");
+    // The popup lays out below the row, so the row's band cannot see whether
+    // it closed. The item's own rect can: nothing may occupy it any more.
     assert!(
         !harness
             .query_all_by_label("Chart")
-            .any(|node| results_band.intersects(node.rect())),
+            .any(|node| node.rect().intersects(tail)),
         "a tail tick closes the menu it fired from"
+    );
+
+    // The editor row's tail closes its menu the same way. Format is not the
+    // item clicked, so its popup node is the witness that the menu is gone.
+    harness
+        .query_all_by_label("…")
+        .find(|node| editor_band.intersects(node.rect()))
+        .expect("the editor row's overflow button")
+        .click();
+    harness.run_steps(6);
+    let format = harness.get_by_label("Format").rect();
+    harness.get_by_label("Find").click();
+    harness.run_steps(6);
+    assert!(
+        !harness
+            .query_all_by_label("Format")
+            .any(|node| node.rect().intersects(format)),
+        "an editor tail tick closes its menu too"
     );
 
     let window = window_rect(NARROW_WINDOW);
@@ -911,6 +941,31 @@ fn toolbars_elide_before_wrapping() {
     );
 }
 
+/// At the floor width the editor toolbar overflows its panel: the row's own
+/// controls clip by design, but the tools row must keep its one `…` inside
+/// the window. The budget must measure the panel, not the width egui grew for
+/// the row above it, or the `…` is laid out past the edge and lost.
+#[test]
+fn the_editor_overflow_stays_reachable_at_the_floor_width() {
+    const FLOOR: [u32; 2] = [460, 640];
+    let _guard = env_lock();
+    let (_scratch, mut harness) = three_tabs_at(FLOOR, "editor-floor");
+    capture_at(&mut harness, "editor-floor-dark", FLOOR);
+
+    let band = toolbar_band(&harness, &["▶ Run", "Save"], FLOOR);
+    let overflow: Vec<egui::Rect> = harness
+        .query_all_by_label("…")
+        .map(|node| node.rect())
+        .filter(|rect| band.intersects(*rect))
+        .collect();
+    assert_eq!(overflow.len(), 1, "the overflowing tools row keeps one overflow button");
+    assert!(
+        window_rect(FLOOR).contains_rect(overflow[0]),
+        "the overflow button {} leaves the window",
+        overflow[0]
+    );
+}
+
 /// The tab strip at 460: each tab's close button shares its title's row and
 /// stays inside the window. A close button that wraps away from its title
 /// sits beside the next tab's title, and closing the wrong tab drops that
@@ -1064,8 +1119,16 @@ fn assert_row_reachable(
     }
     harness.key_press(egui::Key::Escape);
     harness.run_steps(4);
-    let closed = label_in_band(harness, missing[0], band).is_none();
-    assert!(closed, "Escape closes the menu holding {}", missing[0]);
+    // The menu's nodes sit below the band, so re-checking the band says
+    // nothing. Diff against the snapshot instead: every node for the label
+    // must be one the row already had, or the popup is still up.
+    let (first_label, first_before) = before.first().expect("at least one tail label");
+    assert!(
+        harness
+            .query_all_by_label(first_label)
+            .all(|node| first_before.contains(&node.rect())),
+        "Escape closes the menu holding {first_label}"
+    );
 }
 
 /// The results toolbar's row filter field. A text edit carries no label, so
