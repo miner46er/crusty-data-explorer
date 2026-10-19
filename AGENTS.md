@@ -42,7 +42,8 @@ Unit tests live in `#[cfg(test)] mod tests` blocks inside each source file. `tes
 
 ## Conventions
 
-- Commit messages are short, lowercase, imperative sentences with no type prefix. Example: `keep the paging controls inline in the footer row`.
+- Commit messages and pull request titles use Conventional Commits: `type(scope): subject`, lowercase subject, no trailing period. Types are `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `perf`. Example: `fix(ui): keep the small-window chrome inside the frame`.
+- Pull requests open ready, never as drafts, with `gh` (there is no `origin` CLI installed). The body follows Why / What changed / Scope / Tradeoffs / Blast Radius / Verification and embeds screenshots or recordings whenever the change has a visual surface. GitHub cannot render files under the gitignored `target/`, so push captures on a throwaway `captures/<branch>` branch and embed `https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>`.
 - Work is planned in waves of T-numbered units in `todo.md`. Each unit lists its owned files, tests, and evidence, and lands only after it is verified. `.audit/` holds findings and critique backlogs.
 - Scope changes (a new engine, or anything on PRODUCT.md's out-of-scope list such as ERD, plugins, or vim mode) need an explicit operator decision. Do not add them on your own initiative.
 - App shortcuts bind to Cmd on macOS and Ctrl elsewhere. Keep both platforms working.
