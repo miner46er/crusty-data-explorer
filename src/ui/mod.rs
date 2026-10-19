@@ -185,6 +185,13 @@ pub(crate) fn modal_open(state: &AppState, ctx: &egui::Context) -> bool {
     state.modal().is_some() || grid::cell_editor_open(state, ctx)
 }
 
+/// A destructive dialog's approve button: it senses the pointer but not
+/// keyboard focus, so Enter and Space can never approve. Cancel keeps the
+/// first focus, and Escape cancels.
+pub(crate) fn approve_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(egui::Button::new(label).sense(egui::Sense::CLICK))
+}
+
 /// A key a modal dialog answers. Public because the routed key crosses the
 /// UI module's window signatures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

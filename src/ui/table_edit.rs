@@ -14,7 +14,7 @@ use eframe::egui;
 use crate::app::AppState;
 use crate::db::ConnectionId;
 
-use super::{ModalKey, autofocus, own_modal_layer};
+use super::{ModalKey, approve_button, autofocus, own_modal_layer};
 
 /// The status-bar entry's label, measured by the status bar before it draws:
 /// the entry and the measurement read one literal.
@@ -63,7 +63,7 @@ pub fn table_prod_confirm_window(
             }
         });
         ui.horizontal(|ui| {
-            if ui.button("Apply").clicked() {
+            if approve_button(ui, "Apply").clicked() {
                 confirm = true;
             }
             let cancel_button = ui.button("Cancel");

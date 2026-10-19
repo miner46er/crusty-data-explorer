@@ -22,7 +22,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::{By, NodeT, Queryable};
 
 use crusty_data_explorer::app::{AppState, ConnectionState, Environment, Modal, RunOutcome};
-use crusty_data_explorer::db::{ConnectionConfig, ConnectionId, PostgresSslMode, TabId};
+use crusty_data_explorer::db::{ConnectionConfig, ConnectionId, PostgresSslMode, TabId, Value};
 use crusty_data_explorer::ui;
 use crusty_data_explorer::ui::complete::editor_id;
 
@@ -1749,6 +1749,16 @@ impl Destructive {
         Self::Ddl,
     ];
 
+    fn name(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Edits => "edits",
+            Self::ProdConnect => "prod-connect",
+            Self::Terminate => "terminate",
+            Self::Ddl => "ddl",
+        }
+    }
+
     fn approve_label(self) -> &'static str {
         match self {
             Self::Write | Self::Edits => "Confirm",
@@ -1774,6 +1784,7 @@ fn arm_destructive(
     harness: &mut Harness<AppState>,
     tab: TabId,
     prod: ConnectionId,
+    prod_tab: TabId,
     case: Destructive,
 ) {
     match case {
@@ -1784,6 +1795,7 @@ fn arm_destructive(
             let conn =
                 harness.state().tab(tab).and_then(|tab| tab.conn).expect("the tab connection");
             step_until(harness, "the schema", |state| state.schema(conn).is_some());
+            run_sql(harness, tab, "SELECT id, email, plan FROM users ORDER BY id;");
             harness
                 .state_mut()
                 .stage_edit(tab, 0, 1, "changed@example.com".to_owned());
@@ -1799,12 +1811,16 @@ fn arm_destructive(
                 editor.form.columns[0].name = "id".to_owned();
                 editor.form.columns[0].data_type = "INTEGER".to_owned();
             }
-            let prod_tab = harness.state_mut().new_tab(prod);
             harness.state_mut().apply_table_ddl(prod_tab);
         }
     }
     harness.run();
-    assert!(case.shown(harness.state()), "{} arms", approve_label(case));
+    assert!(
+        case.shown(harness.state()),
+        "{} arms (modal {:?})",
+        case.name(),
+        harness.state().modal()
+    );
 }
 
 fn approve_label(case: Destructive) -> &'static str {
@@ -1830,13 +1846,87 @@ fn focus_stays_in_dialog(harness: &Harness<AppState>) -> bool {
     layer.is_some() && layer == harness.ctx.memory(|memory| memory.top_modal_layer())
 }
 
+/// The one cell the staged-edit guard would write.
+fn first_email(harness: &mut Harness<AppState>, tab: TabId) -> String {
+    run_sql(harness, tab, "SELECT email FROM users WHERE id = 1;");
+    match harness.state().tab(tab).and_then(|tab| tab.active_query_result()).and_then(|result| {
+        result.cell(0, 0)
+    }) {
+        Some(Value::Text(text)) => text.clone(),
+        other => panic!("email query returned {other:?}"),
+    }
+}
+
+fn user_count(harness: &mut Harness<AppState>, tab: TabId) -> i64 {
+    run_sql(harness, tab, "SELECT COUNT(*) AS n FROM users;");
+    match harness.state().tab(tab).and_then(|tab| tab.active_query_result()).and_then(|result| {
+        result.cell(0, 0)
+    }) {
+        Some(Value::Integer(n)) => *n,
+        other => panic!("COUNT query returned {other:?}"),
+    }
+}
+
+/// Approval is read from the fact it would change, never from `Running`:
+/// a fast SQLite DELETE or UPDATE finishes before the test looks.
+fn assert_not_approved(
+    harness: &mut Harness<AppState>,
+    tab: TabId,
+    prod: ConnectionId,
+    prod_tab: TabId,
+    case: Destructive,
+) {
+    harness.run();
+    match case {
+        Destructive::Write => {
+            assert_eq!(user_count(harness, tab), 5, "the DELETE without WHERE never ran");
+        }
+        Destructive::Edits => {
+            assert_eq!(
+                first_email(harness, tab),
+                "ada@example.com",
+                "the staged edit never reached the table"
+            );
+        }
+        Destructive::ProdConnect => {
+            let state = harness
+                .state()
+                .connections()
+                .iter()
+                .find(|conn| conn.id == prod)
+                .map(|conn| conn.state());
+            assert!(
+                matches!(state, Some(ConnectionState::Disconnected)),
+                "the prod confirmation never connected: {state:?}"
+            );
+        }
+        Destructive::Terminate => {
+            assert!(
+                harness.state().sessions_error(prod).is_none(),
+                "the terminate confirmation sent nothing"
+            );
+        }
+        Destructive::Ddl => {
+            assert!(
+                matches!(
+                    harness.state().tab(prod_tab).map(|tab| tab.outcome()),
+                    Some(RunOutcome::Never)
+                ),
+                "the prod DDL confirmation sent nothing: {:?}",
+                harness.state().tab(prod_tab).map(|tab| tab.outcome())
+            );
+        }
+    }
+}
+
 #[test]
 fn a_destructive_confirm_owns_tab_focus() {
     let _guard = env_lock();
     let (_scratch, mut harness, tab) = demo_setup("dialog-containment");
     let prod = add_prod_sqlite(harness.state_mut());
+    let prod_tab = harness.state_mut().new_tab(prod);
     for case in Destructive::ALL {
-        arm_destructive(&mut harness, tab, prod, case);
+        arm_destructive(&mut harness, tab, prod, prod_tab, case);
         for _ in 0..5 {
             harness.key_press(egui::Key::Tab);
             harness.run();
@@ -1868,7 +1958,8 @@ fn a_click_behind_a_dialog_does_nothing() {
     let _guard = env_lock();
     let (_scratch, mut harness, tab) = demo_setup("dialog-click");
     let prod = add_prod_sqlite(harness.state_mut());
-    arm_destructive(&mut harness, tab, prod, Destructive::Write);
+    let prod_tab = harness.state_mut().new_tab(prod);
+    arm_destructive(&mut harness, tab, prod, prod_tab, Destructive::Write);
     harness.get_by_label("+ New connection").click();
     harness.run();
     assert_eq!(
@@ -1929,6 +2020,45 @@ fn the_first_frame_of_a_dialog_keeps_focus_inside_it() {
         harness.get_by_label("Cancel").is_focused(),
         "the first frame starts on the dialog's Cancel"
     );
+}
+
+#[test]
+fn destructive_confirms_never_approve_from_the_keyboard() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("confirm-approval");
+    let prod = add_prod_sqlite(harness.state_mut());
+    let prod_tab = harness.state_mut().new_tab(prod);
+    for case in Destructive::ALL {
+        for sequence in 0..3 {
+            arm_destructive(&mut harness, tab, prod, prod_tab, case);
+            assert!(
+                harness.get_by_label("Cancel").is_focused(),
+                "{} sequence {sequence}: Cancel takes the first focus",
+                case.name()
+            );
+            match sequence {
+                0 => {
+                    harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Tab);
+                    harness.run();
+                    harness.key_press(egui::Key::Enter);
+                }
+                1 => {
+                    for _ in 0..3 {
+                        harness.key_press(egui::Key::Tab);
+                        harness.run();
+                    }
+                    harness.key_press(egui::Key::Enter);
+                }
+                _ => harness.key_press(egui::Key::Space),
+            }
+            assert_not_approved(&mut harness, tab, prod, prod_tab, case);
+            if case.shown(harness.state()) {
+                harness.key_press(egui::Key::Escape);
+                harness.run();
+            }
+            assert!(!case.shown(harness.state()), "{}: Escape clears it", approve_label(case));
+        }
+    }
 }
 
 #[test]

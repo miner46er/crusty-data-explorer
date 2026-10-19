@@ -16,7 +16,7 @@ use crate::db::{
 };
 use crate::ssh::{SshAuth, SshConfig};
 
-use super::{ModalKey, Palette, Theme, autofocus, own_modal_layer};
+use super::{ModalKey, Palette, Theme, approve_button, autofocus, own_modal_layer};
 
 /// A connection's state as the card and the dot read it: one value that
 /// derives both the painted shape and the color, so a dot can never wear the
@@ -1555,7 +1555,7 @@ pub fn prod_confirm_window(
     let window = egui::Window::new("Connect to prod?").show(ui.ctx(), |ui| {
         ui.label(format!("Connect to {name}?"));
         ui.horizontal(|ui| {
-            if ui.button("Connect").clicked() {
+            if approve_button(ui, "Connect").clicked() {
                 confirm = true;
             }
             let cancel_button = ui.button("Cancel");
@@ -1600,7 +1600,7 @@ pub fn terminate_confirm_window(
     let window = egui::Window::new("Terminate session?").show(ui.ctx(), |ui| {
         ui.label(format!("Terminate backend {} on {name}?", pending.backend));
         ui.label("The backend's running query stops and its connection drops.");
-        if ui.button("Terminate").clicked() {
+        if approve_button(ui, "Terminate").clicked() {
             confirm = true;
         }
         let cancel_button = ui.button("Cancel");

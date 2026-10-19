@@ -11,7 +11,7 @@ use super::editor::{char_range, FindState};
 use crate::app::AppState;
 use crate::db::TabId;
 
-use super::{ModalKey, Palette, autofocus, fit, own_modal_layer};
+use super::{ModalKey, Palette, approve_button, autofocus, fit, own_modal_layer};
 
 /// The tab strip, drawn by `root` for every tab whatever its kind. The new
 /// and close shortcuts live here so they work on a table tab too.
@@ -573,7 +573,7 @@ pub fn write_confirm_window(
             pending.kind, pending.table
         ));
         ui.horizontal(|ui| {
-            if ui.button("Confirm").clicked() {
+            if approve_button(ui, "Confirm").clicked() {
                 confirm = true;
             }
             let cancel_button = ui.button("Cancel");
@@ -622,7 +622,7 @@ pub fn edit_preview_window(
             }
         });
         ui.horizontal(|ui| {
-            if ui.button("Confirm").clicked() {
+            if approve_button(ui, "Confirm").clicked() {
                 confirm = true;
             }
             let cancel_button = ui.button("Cancel");
