@@ -68,6 +68,9 @@ struct ToolState<'a> {
     transaction_open: bool,
     transaction_ready: bool,
     find_open: bool,
+    /// A dialog owns the keyboard: the tools draw disabled, and the dispatch
+    /// drops any click that still lands.
+    modal_open: bool,
 }
 
 impl ToolState<'_> {
@@ -117,7 +120,11 @@ fn close_in_menu(ui: &egui::Ui) {
 
 impl ToolClicks {
     fn draw(&mut self, ui: &mut egui::Ui, tool: Tool, state: &ToolState) {        match tool {
-            Tool::Save => self.save |= ui.button(tool.label()).clicked(),
+            Tool::Save => {
+                self.save |= ui
+                    .add_enabled(!state.modal_open, egui::Button::new(tool.label()))
+                    .clicked();
+            }
             Tool::Commit | Tool::Rollback => {
                 let action = if tool == Tool::Commit {
                     TransactionAction::Commit
@@ -125,7 +132,10 @@ impl ToolClicks {
                     TransactionAction::Rollback
                 };
                 if ui
-                    .add_enabled(state.transaction_ready, egui::Button::new(tool.label()))
+                    .add_enabled(
+                        state.transaction_ready && !state.modal_open,
+                        egui::Button::new(tool.label()),
+                    )
                     .on_hover_text(format!("Send {}", action.statement()))
                     .clicked()
                 {
@@ -133,16 +143,28 @@ impl ToolClicks {
                 }
             }
             Tool::Transaction => {
-                ui.menu_button(tool.label(), |ui| {
-                    if ui
-                        .add_enabled(state.transaction_ready, egui::Button::new("Begin"))
-                        .on_hover_text("Send BEGIN")
-                        .clicked()
-                    {
-                        self.transaction = Some(TransactionAction::Begin);
-                        ui.close();
-                    }
-                    ui.separator();
+                ui.add_enabled_ui(!state.modal_open, |ui| {
+                    ui.menu_button(tool.label(), |ui| {
+                        if ui
+                            .add_enabled(state.transaction_ready, egui::Button::new("Begin"))
+                            .on_hover_text("Send BEGIN")
+                            .clicked()
+                        {
+                            self.transaction = Some(TransactionAction::Begin);
+                            ui.close();
+                        }
+                        ui.separator();
+                        let toggle =
+                            autocommit_control(ui, state.slot, state.autocommit, state.sqlite);
+                        if toggle.clicked() {
+                            self.autocommit = Some(!state.autocommit);
+                            close_in_menu(ui);
+                        }
+                    });
+                });
+            }
+            Tool::Autocommit => {
+                ui.add_enabled_ui(!state.modal_open, |ui| {
                     let toggle =
                         autocommit_control(ui, state.slot, state.autocommit, state.sqlite);
                     if toggle.clicked() {
@@ -151,18 +173,22 @@ impl ToolClicks {
                     }
                 });
             }
-            Tool::Autocommit => {
-                let toggle = autocommit_control(ui, state.slot, state.autocommit, state.sqlite);
-                if toggle.clicked() {
-                    self.autocommit = Some(!state.autocommit);
-                    close_in_menu(ui);
-                }
+            Tool::Complete => {
+                ui.add_enabled_ui(!state.modal_open, |ui| {
+                    super::complete::complete_menu(ui);
+                });
             }
-            Tool::Complete => super::complete::complete_menu(ui),
-            Tool::Format => self.format |= ui.button(tool.label()).clicked(),
+            Tool::Format => {
+                self.format |= ui
+                    .add_enabled(!state.modal_open, egui::Button::new(tool.label()))
+                    .clicked();
+            }
             Tool::Find => {
                 if ui
-                    .selectable_label(state.find_open, tool.label())
+                    .add_enabled(
+                        !state.modal_open,
+                        egui::Button::selectable(state.find_open, tool.label()),
+                    )
                     .on_hover_text(format!(
                         "Find ({})",
                         ui.ctx().format_shortcut(&find_shortcut())
@@ -216,6 +242,7 @@ fn fits_one_row(
 
 pub(crate) fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
     let Some(tab_id) = state.active() else { return false };
+    let modal_open = super::modal_open(state, ui.ctx());
     let find_shown = find_open(ui.ctx(), tab_id);
     let (mut run_clicked, mut explain_clicked, mut cancel_clicked) = (false, false, false);
     let mut clicks = ToolClicks::default();
@@ -251,6 +278,7 @@ pub(crate) fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
             transaction_open,
             transaction_ready,
             find_open: find_shown,
+            modal_open,
         };
         let hint = format!(
             "{} · {}",
@@ -275,13 +303,14 @@ pub(crate) fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                         }
                     });
                 run_clicked = ui
-                    .add(
+                    .add_enabled(
+                        !modal_open,
                         egui::Button::new(egui::RichText::new(RUN_LABEL).strong())
                             .fill(Palette::of(ui.ctx().theme()).success),
                     )
                     .clicked();
                 explain_clicked = ui
-                    .button(EXPLAIN_LABEL)
+                    .add_enabled(!modal_open, egui::Button::new(EXPLAIN_LABEL))
                     .on_hover_text("Query execution plan")
                     .clicked();
             }
@@ -321,39 +350,46 @@ pub(crate) fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
             });
         }
     }
-    if scope != state.tab(tab_id).map(|t| t.run_scope()).unwrap_or_default() {
+    if !modal_open && scope != state.tab(tab_id).map(|t| t.run_scope()).unwrap_or_default() {
         if let Some(tab) = state.tab_mut(tab_id) {
             tab.set_run_scope(scope);
         }
     }
-    run_clicked |= ui.input_mut(|i| i.consume_shortcut(&run_shortcut()));
+    if !modal_open {
+        run_clicked |= ui.input_mut(|i| i.consume_shortcut(&run_shortcut()));
+    }
     if cancel_clicked {
         state.cancel_run(tab_id);
     }
-    if let Some(action) = clicks.transaction {
+    if !modal_open
+        && let Some(action) = clicks.transaction
+    {
         state.start_transaction(tab_id, action);
     }
-    if let Some(on) = clicks.autocommit {
+    if !modal_open
+        && let Some(on) = clicks.autocommit
+    {
         state.set_autocommit(tab_id, on);
     }
-    if clicks.save {
+    if clicks.save && !modal_open {
         state.open_save_prompt();
     }
     if clicks.format
+        && !modal_open
         && let Some(sql) = state.tab_sql_mut(tab_id)
     {
         *sql = format_sql(sql);
     }
     let mut find_opened = false;
-    if clicks.find {
+    if clicks.find && !modal_open {
         find_opened = toggle_find(ui.ctx(), tab_id);
     }
-    if run_clicked {
+    if run_clicked && !modal_open {
         let sql = state.tab(tab_id).map(|t| t.sql.clone()).unwrap_or_default();
         let (cursor, selection) = super::complete::editor_offsets(ui.ctx(), tab_id, &sql);
         state.start_run(tab_id, &sql, cursor, selection);
     }
-    if explain_clicked {
+    if explain_clicked && !modal_open {
         let sql = state.tab(tab_id).map(|t| t.sql.clone()).unwrap_or_default();
         let (cursor, selection) = super::complete::editor_offsets(ui.ctx(), tab_id, &sql);
         state.start_explain(tab_id, &sql, cursor, selection);
@@ -494,6 +530,7 @@ mod tests {
                     transaction_open: false,
                     transaction_ready: true,
                     find_open: false,
+                    modal_open: false,
                 };
                 answer = Some(fits_one_row(ui, &state, RunScope::All.label()));
             });
@@ -529,6 +566,7 @@ mod tests {
                     transaction_open: false,
                     transaction_ready: true,
                     find_open: false,
+                    modal_open: false,
                 };
                 let running_slot = AutocommitSlot::Running;
                 let running = ToolState { slot: &running_slot, ..idle };

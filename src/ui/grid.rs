@@ -27,7 +27,7 @@ use crate::export::{
 use crate::edit::{STAGED_DEFAULT, editable_table};
 use crate::import::{ParsedCsv, parse_csv, parse_jsonl, parse_xlsx};
 
-use super::{Palette, fit};
+use super::{ModalKey, Palette, autofocus, fit};
 
 /// The row filter's desired width, and the narrowest it shrinks to before
 /// the results toolbar wraps to a second row.
@@ -80,19 +80,37 @@ impl Selection {
         self.active = Some((row, col));
         self.anchor = Some(row);
     }
-    fn extend(&mut self, row: usize, col: usize) {
+    /// Extend from the anchor to `row` over the view order, so a sorted view
+    /// selects the rows the operator passed rather than a raw index range. An
+    /// anchor that is not displayed selects only `row`.
+    fn extend(&mut self, row: usize, col: usize, visible: &[usize]) {
         let origin =
             self.anchor.or_else(|| self.active.map(|(row, _)| row)).unwrap_or(row);
         self.rows.clear();
-        self.rows.extend(origin.min(row)..=origin.max(row));
+        let (Some(from), Some(to)) = (
+            visible.iter().position(|visible_row| *visible_row == origin),
+            visible.iter().position(|visible_row| *visible_row == row),
+        ) else {
+            self.rows.insert(row);
+            self.active = Some((row, col));
+            return;
+        };
+        self.rows.extend(visible[from.min(to)..=from.max(to)].iter().copied());
         self.active = Some((row, col));
     }
     /// One cell gesture: ctrl toggles, shift extends, else selects.
-    fn gesture(&mut self, row: usize, col: usize, shift: bool, ctrl: bool) {
+    fn gesture(
+        &mut self,
+        row: usize,
+        col: usize,
+        shift: bool,
+        ctrl: bool,
+        visible: &[usize],
+    ) {
         if ctrl {
             self.toggle(row, col);
         } else if shift {
-            self.extend(row, col);
+            self.extend(row, col, visible);
         } else {
             self.click(row, col);
         }
@@ -115,6 +133,99 @@ impl Selection {
         }
         visible.iter().copied().filter(|row| self.rows.contains(row)).collect()
     }
+
+    /// Where the cursor sits in the view order, when it sits on a displayed
+    /// row at all. A filter or sort can leave it off the view.
+    fn position(&self, visible: &[usize]) -> Option<usize> {
+        let (row, _) = self.active?;
+        visible.iter().position(|visible_row| *visible_row == row)
+    }
+
+    /// One cursor move over `visible`, the view order: the active cell moves,
+    /// edges clamp, and a plain step selects the row it lands on while a
+    /// Shift step onto another row extends the row range from the anchor.
+    /// `cols` counts the result columns the cursor may occupy, `page` the
+    /// rows PageUp and PageDown travel. A step with no cursor on a displayed
+    /// row lands on the first displayed row, column 0, and an empty view
+    /// moves nothing.
+    fn step(&mut self, step: Step, extend: bool, visible: &[usize], cols: usize, page: usize) {
+        if visible.is_empty() || cols == 0 {
+            return;
+        }
+        let Some(position) = self.position(visible) else {
+            self.click(visible[0], 0);
+            return;
+        };
+        let last = visible.len() - 1;
+        let (active_row, active_col) = self.active.expect("a positioned cursor");
+        let mut position = position;
+        let mut col = active_col.min(cols - 1);
+        match step {
+            Step::Up => position = position.saturating_sub(1),
+            Step::Down => position = (position + 1).min(last),
+            Step::Left => col = col.saturating_sub(1),
+            Step::Right => col = (col + 1).min(cols - 1),
+            Step::PageUp => position = position.saturating_sub(page),
+            Step::PageDown => position = (position + page).min(last),
+            Step::RowStart => col = 0,
+            Step::RowEnd => col = cols - 1,
+            Step::First => position = 0,
+            Step::Last => position = last,
+        }
+        let row = visible[position];
+        if !extend {
+            self.rows.clear();
+            self.rows.insert(row);
+            self.anchor = Some(row);
+            self.active = Some((row, col));
+        } else if row != active_row {
+            self.extend(row, col, visible);
+        } else {
+            self.active = Some((row, col));
+        }
+    }
+
+    /// Tab and Shift+Tab: a column step inside the row, wrapping onto the
+    /// next or previous row at the row's ends. The wrap takes two [`Step`]s,
+    /// since a single one can only move within a row.
+    fn tab_step(&mut self, back: bool, visible: &[usize], cols: usize, page: usize) {
+        if visible.is_empty() || cols == 0 {
+            return;
+        }
+        let col = match self.position(visible) {
+            Some(_) => self.active.expect("a positioned cursor").1.min(cols - 1),
+            None => {
+                self.step(Step::Right, false, visible, cols, page);
+                return;
+            }
+        };
+        if !back && col + 1 < cols {
+            self.step(Step::Right, false, visible, cols, page);
+        } else if !back {
+            self.step(Step::RowStart, false, visible, cols, page);
+            self.step(Step::Down, false, visible, cols, page);
+        } else if col > 0 {
+            self.step(Step::Left, false, visible, cols, page);
+        } else {
+            self.step(Step::RowEnd, false, visible, cols, page);
+            self.step(Step::Up, false, visible, cols, page);
+        }
+    }
+}
+
+/// One keyboard cursor move over the grid's displayed rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Up,
+    Down,
+    Left,
+    Right,
+    PageUp,
+    PageDown,
+    RowStart,
+    RowEnd,
+    First,
+    Last,
 }
 
 fn selection_id(tab: TabId) -> egui::Id {
@@ -130,7 +241,10 @@ fn store_selection(ctx: &egui::Context, tab: TabId, selection: &Selection) {
 }
 
 fn clear_selection(ctx: &egui::Context, tab: TabId) {
-    ctx.data_mut(|data| data.remove::<Selection>(selection_id(tab)));
+    ctx.data_mut(|data| {
+        data.remove::<Selection>(selection_id(tab));
+        data.remove::<bool>(grid_armed_id(tab));
+    });
 }
 
 /// Drop grid selection for closed tabs. Diffs against the live tab list, the
@@ -225,6 +339,50 @@ fn prune_grid_views(state: &AppState, ctx: &egui::Context) {
     if known != live {
         ctx.data_mut(|data| data.insert_temp(id, live));
     }
+}
+
+/// The table row index a keyboard step wants on screen. The key handler runs
+/// after the table has drawn for the frame and outside its scroll area, so
+/// the row is stored here and the next frame's scroll area consumes it.
+fn grid_scroll_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_grid_scroll", tab))
+}
+
+fn request_grid_scroll(ctx: &egui::Context, tab: TabId, row: usize) {
+    ctx.data_mut(|data| data.insert_temp(grid_scroll_id(tab), row));
+}
+
+fn take_grid_scroll(ctx: &egui::Context, tab: TabId) -> Option<usize> {
+    ctx.data_mut(|data| data.remove_temp::<usize>(grid_scroll_id(tab)))
+}
+
+/// Whether the grid, rather than the chrome, owns the keyboard for one tab.
+/// Armed by a cell click or a cursor key with nothing else focused; disarmed
+/// when any widget takes focus, so Tab never runs the grid behind a field.
+fn grid_armed_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_grid_armed", tab))
+}
+
+fn grid_armed(ctx: &egui::Context, tab: TabId) -> bool {
+    ctx.data(|data| data.get_temp(grid_armed_id(tab))).unwrap_or(false)
+}
+
+fn set_grid_armed(ctx: &egui::Context, tab: TabId, armed: bool) {
+    ctx.data_mut(|data| data.insert_temp(grid_armed_id(tab), armed));
+}
+
+const GRID_ROW_H: f32 = 20.0;
+
+/// The page a PageUp or PageDown moves when the viewport cannot be measured.
+const GRID_PAGE_FALLBACK: usize = 10;
+
+fn page_rows(available_height: f32, row_spacing: f32) -> usize {
+    if !available_height.is_finite() || available_height <= 0.0 {
+        return GRID_PAGE_FALLBACK;
+    }
+    let row = GRID_ROW_H + row_spacing;
+    let body = available_height - row;
+    ((body / row).floor() as usize).max(1)
 }
 
 /// The worker and connection pieces the grid needs past the tab borrow: a
@@ -833,17 +991,14 @@ fn column_names(tab: &Tab) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
-    import_window(state, ui);
+pub fn results(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    cell_editor_key: Option<ModalKey>,
+) {
     prune_selection(state, ui.ctx());
     prune_grid_views(state, ui.ctx());
-    let modal_open = state.draft().is_some()
-        || state.save_prompt().is_some()
-        || state.password_prompt().is_some()
-        || state.import_draft().is_some()
-        || state.pending_write().is_some()
-        || state.palette_open()
-        || state.active().is_some_and(|id| cell_editor_of(ui.ctx(), id).is_some());
+    let modal_open = super::modal_open(state, ui.ctx());
     let Some(tab_id) = state.active() else {
         ui.label("No query tab.");
         return;
@@ -890,6 +1045,10 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
     }
     let target = state.edit_target(tab_id);
     let filter_history = state.filter_history().to_vec();
+    // Whether a dialog backs the grid this frame, read live. The cell editor
+    // draws its shield on exactly the frames no dialog does, the way `root`
+    // gates it, but a pre-panel read would lag the creation frame.
+    let dialog_open = state.modal().is_some();
     let grid_conn = state
         .tab(tab_id)
         .and_then(|t| t.conn)
@@ -903,7 +1062,16 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
             }
         });
     let Some(tab) = state.tab_mut(tab_id) else { return };
-    let actions = results_grid(tab, target.as_ref(), &filter_history, modal_open, grid_conn, ui);
+    let actions = results_grid(
+        tab,
+        target.as_ref(),
+        &filter_history,
+        modal_open,
+        dialog_open,
+        grid_conn,
+        cell_editor_key,
+        ui,
+    );
     apply_edit_actions(state, tab_id, actions);
 }
 
@@ -1091,12 +1259,16 @@ fn stage_rows_into(
 /// The confirmation modal for a pending import: every mapped header beside
 /// the table column it writes, the skipped headers, the truncation count,
 /// and the Import and Cancel buttons.
-pub fn import_window(state: &mut AppState, ui: &mut egui::Ui) {
-    let Some(draft) = state.import_draft() else { return };
+pub fn import_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) -> Option<egui::LayerId> {
+    let draft = state.import_draft()?;
     let title = format!("Import into {}", draft.table);
     let mut confirm = false;
     let mut cancel = false;
-    egui::Window::new(title).show(ui.ctx(), |ui| {
+    let window = egui::Window::new(title).show(ui.ctx(), |ui| {
         let Some(draft) = state.import_draft() else { return };
         ui.label(format!("{} rows", draft.rows.len()));
         egui::Grid::new("import_columns").striped(true).show(ui, |ui| {
@@ -1129,16 +1301,19 @@ pub fn import_window(state: &mut AppState, ui: &mut egui::Ui) {
             if ui.button("Import").clicked() {
                 confirm = true;
             }
-            if ui.button("Cancel").clicked() {
+            let cancel_button = ui.button("Cancel");
+            autofocus(ui, "import-cancel", &cancel_button);
+            if cancel_button.clicked() {
                 cancel = true;
             }
         });
     });
     if confirm {
         state.commit_import();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_import();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 /// The in-place cell editor, kept in the egui context data keyed by tab, the
@@ -1206,6 +1381,20 @@ fn cell_editor_id(tab: TabId) -> egui::Id {
 
 fn cell_editor_of(ctx: &egui::Context, tab: TabId) -> Option<CellEditor> {
     ctx.data(|d| d.get_temp(cell_editor_id(tab)))
+}
+
+/// Whether the active tab's cell editor owns the keyboard. The editor itself
+/// stays in egui temp data because it carries a UI text buffer; this is the
+/// piece the shared [`super::modal_open`] gate reads.
+pub(crate) fn cell_editor_open(state: &AppState, ctx: &egui::Context) -> bool {
+    state.active().is_some_and(|tab| cell_editor_of(ctx, tab).is_some())
+}
+
+/// Whether the cell editor may claim the modal layer this frame. `root` sets
+/// it before the panels draw; the editor window reads it after, so a dialog
+/// that owns the keyboard keeps its layer.
+pub(crate) fn cell_editor_owns_id() -> egui::Id {
+    egui::Id::new("crusty_cell_editor_owns")
 }
 
 fn store_cell_editor(ctx: &egui::Context, tab: TabId, editor: Option<CellEditor>) {
@@ -1317,6 +1506,8 @@ fn cell_editor_window(
     cols: &[(String, String)],
     editable: bool,
     active_result: usize,
+    key: Option<ModalKey>,
+    dialog_open: bool,
     ui: &mut egui::Ui,
 ) -> Vec<EditAction> {
     let mut actions = Vec::new();
@@ -1332,7 +1523,13 @@ fn cell_editor_window(
     let mut set_null = false;
     let mut set_default = false;
     let mut cancel = false;
-    egui::Window::new(title).collapsible(false).resizable(true).show(ui.ctx(), |ui| {
+    // The click shield goes down immediately before the window, the dialog
+    // pattern, so the window lands on top. `dialog_open` reads live, so the
+    // creation frame already draws both together.
+    if !dialog_open {
+        super::cell_editor_shield(ui.ctx());
+    }
+    let window = egui::Window::new(title).collapsible(false).resizable(true).show(ui.ctx(), |ui| {
         ui.label(egui::RichText::new(format!("{name} · {type_name}")).small().weak());
         ui.label(egui::RichText::new(status).small().weak());
         if editor.is_blob {
@@ -1350,6 +1547,10 @@ fn cell_editor_window(
         );
         if editor.fresh {
             response.request_focus();
+            // The window's modal layer only applies next frame. Drop this
+            // frame's Tab direction so the fresh field is not stepped over
+            // before the layer takes hold.
+            ui.ctx().memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
             editor.fresh = false;
         }
         if editor_size_ok(&editor.text) {
@@ -1388,11 +1589,18 @@ fn cell_editor_window(
                 cancel = true;
             }
         });
-        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        if key == Some(ModalKey::Cancel) {
             cancel = true;
         }
         store_cell_editor(ui.ctx(), tab.id, Some(editor.clone()));
     });
+    if let Some(window) = &window {
+        let owns: bool =
+            ui.ctx().data_mut(|data| data.get_temp(cell_editor_owns_id()).unwrap_or(false));
+        if owns {
+            ui.ctx().memory_mut(|memory| memory.set_modal_layer(window.response.layer_id));
+        }
+    }
     let (row, col) = (editor.row, editor.col);
     if save {
         actions.push(EditAction::Stage { row, col, text: editor.text.clone() });
@@ -1405,6 +1613,9 @@ fn cell_editor_window(
         store_cell_editor(ui.ctx(), tab.id, None);
     } else if cancel {
         store_cell_editor(ui.ctx(), tab.id, None);
+    }
+    if cell_editor_of(ui.ctx(), tab.id).is_none() {
+        set_grid_armed(ui.ctx(), tab.id, true);
     }
     actions
 }
@@ -1654,12 +1865,15 @@ fn cell_label_color(selected: bool, palette: &Palette) -> Option<egui::Color32> 
     selected.then_some(palette.selection_text)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn results_grid(
     tab: &mut Tab,
     target: Option<&EditTarget>,
     filter_history: &[SavedFilter],
     modal_open: bool,
+    dialog_open: bool,
     grid_conn: Option<GridConn>,
+    cell_editor_key: Option<ModalKey>,
     ui: &mut egui::Ui,
 ) -> Vec<EditAction> {
     let mut actions = Vec::new();
@@ -2285,8 +2499,13 @@ fn results_grid(
     let mut pending_sort: Option<usize> = None;
     let shown = view.visible(ncols);
     let widths: Vec<Option<f32>> = shown.iter().map(|col| view.width(*col)).collect();
+    let page = page_rows(ui.available_height(), ui.spacing().item_spacing.y);
+    let scroll_row = take_grid_scroll(ui.ctx(), tab.id);
     egui::ScrollArea::both().show(ui, |ui| {
         let mut table = TableBuilder::new(ui).striped(true);
+        if let Some(row) = scroll_row {
+            table = table.scroll_to_row(row, None);
+        }
         for width in &widths {
             table = table.column(match width {
                 Some(width) => Column::initial(*width).resizable(true),
@@ -2294,7 +2513,7 @@ fn results_grid(
             });
         }
         table
-            .header(20.0, |mut header| {
+            .header(GRID_ROW_H, |mut header| {
                 for (i, (name, type_name)) in cols.iter().enumerate() {
                     if view.is_hidden(i) {
                         continue;
@@ -2346,7 +2565,7 @@ fn results_grid(
                 }
             })
             .body(|body| {
-                body.rows(20.0, visible.len() + added, |mut row| {
+                body.rows(GRID_ROW_H, visible.len() + added, |mut row| {
                     let index = row.index();
                     if let Some(added_index) = index.checked_sub(visible.len()) {
                         for c in 0..ncols {
@@ -2539,14 +2758,27 @@ fn results_grid(
                 });
             });
     });
+    let clicked_cell = !gestures.is_empty();
     for (row, col, shift, ctrl) in gestures {
-        selection.gesture(row, col, shift, ctrl);
+        selection.gesture(row, col, shift, ctrl, &visible);
+    }
+    if clicked_cell {
+        if let Some(focused) = ui.ctx().memory(|memory| memory.focused()) {
+            ui.ctx().memory_mut(|memory| memory.surrender_focus(focused));
+        }
+        set_grid_armed(ui.ctx(), tab.id, true);
     }
     let mut keyed = grid_edit_keys(tab, editable, &selection, &visible, &mut view, modal_open, ui);
     actions.append(&mut keyed);
+    if let Some(row) =
+        grid_cursor_keys(tab.id, &mut selection, &visible, ncols, page, modal_open, ui)
+    {
+        request_grid_scroll(ui.ctx(), tab.id, row);
+    }
     let mut clipboard = grid_clipboard_keys(tab, editable, &selection, &visible, modal_open, ui);
     actions.append(&mut clipboard);
-    let mut editor_modal = cell_editor_window(tab, &cols, editable, active_result, ui);
+    let mut editor_modal =
+        cell_editor_window(tab, &cols, editable, active_result, cell_editor_key, dialog_open, ui);
     actions.append(&mut editor_modal);
     store_selection(ui.ctx(), tab.id, &selection);
     store_grid_view(ui.ctx(), tab.id, &view);
@@ -2935,6 +3167,22 @@ pub fn copy_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::C)
 }
 
+/// Ctrl+Shift+C copies the active cell as plain text; Ctrl+C alone copies the
+/// selected rows as TSV.
+pub fn copy_cell_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::C)
+}
+
+/// One cell as plain text for the clipboard: the whole value, blobs as size
+/// tags, and NULL empty, the way a TSV field renders one without the escapes
+/// a single cell does not need.
+fn cell_text(cell: Option<&Value>) -> String {
+    match cell {
+        None | Some(Value::Null) => String::new(),
+        Some(value) => value.display(usize::MAX).into_owned(),
+    }
+}
+
 /// Ctrl+V pastes through the same mapping as the Paste rows button.
 pub fn paste_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::V)
@@ -3001,19 +3249,31 @@ fn grid_clipboard_keys(
     }
     let typing = edit_field_of(ui.ctx(), tab.id).is_some()
         || ui.ctx().memory(|memory| memory.focused().is_some());
-    if !modal_open
-        && !typing
-        && ui.input_mut(|i| i.consume_shortcut(&copy_shortcut()))
-    {
-        let rows = selection.resolve(visible);
-        let headers = tsv_headers_of(ui.ctx(), tab.id);
-        let text = tab
-            .active_query_result()
-            .map(|result| to_tsv(result, &rows, headers))
-            .unwrap_or_default();
-        let nrows = rows.len();
-        ui.ctx().copy_text(text);
-        tab.set_export_notice(format!("Copied {nrows} rows as TSV"), false);
+    if !modal_open && !typing {
+        // The Shift chord goes first: `consume_shortcut` matches an event
+        // with extra Shift, so the plain pattern would swallow it and copy
+        // the selected rows instead of the one cell.
+        if ui.input_mut(|i| i.consume_shortcut(&copy_cell_shortcut())) {
+            match selection.active().and_then(|(row, col)| {
+                tab.active_query_result().and_then(|result| result.cell(row, col))
+            }) {
+                Some(cell) => {
+                    ui.ctx().copy_text(cell_text(Some(cell)));
+                    tab.set_export_notice("Copied 1 cell".to_owned(), false);
+                }
+                None => tab.set_export_notice("Click a cell to copy it".to_owned(), true),
+            }
+        } else if ui.input_mut(|i| i.consume_shortcut(&copy_shortcut())) {
+            let rows = selection.resolve(visible);
+            let headers = tsv_headers_of(ui.ctx(), tab.id);
+            let text = tab
+                .active_query_result()
+                .map(|result| to_tsv(result, &rows, headers))
+                .unwrap_or_default();
+            let nrows = rows.len();
+            ui.ctx().copy_text(text);
+            tab.set_export_notice(format!("Copied {nrows} rows as TSV"), false);
+        }
     }
     actions
 }
@@ -3118,6 +3378,79 @@ fn grid_edit_keys(
         }
     }
     actions
+}
+
+/// Arrow, Home/End, Page, and Tab movement of the grid cursor. The grid only
+/// owns those keys while [`grid_armed`] says so, which a cell click or a
+/// cursor key with nothing focused arms. Returns the table row the view
+/// should scroll to.
+fn grid_cursor_keys(
+    tab: TabId,
+    selection: &mut Selection,
+    visible: &[usize],
+    cols: usize,
+    page: usize,
+    modal_open: bool,
+    ui: &egui::Ui,
+) -> Option<usize> {
+    if modal_open {
+        set_grid_armed(ui.ctx(), tab, false);
+        return None;
+    }
+    let armed = grid_armed(ui.ctx(), tab);
+    let (shift, alt) = ui.input(|input| (input.modifiers.shift, input.modifiers.alt));
+    let tab_pressed = ui.input(|input| input.key_pressed(egui::Key::Tab));
+    let typing = edit_field_of(ui.ctx(), tab).is_some();
+    let takes_tab = armed && !visible.is_empty() && cols > 0 && !typing;
+    let focused = ui.ctx().memory(|memory| memory.focused());
+    if let Some(focused) = focused {
+        let newly_focused =
+            !ui.ctx().memory(|memory| memory.had_focus_last_frame(focused));
+        // Tab traversal runs before this handler. Only a Tab the grid can
+        // step on drops the focus traversal gave it; every other focus means
+        // the chrome owns the keyboard and the press stays with it.
+        if !(tab_pressed && takes_tab && newly_focused) {
+            set_grid_armed(ui.ctx(), tab, false);
+            return None;
+        }
+        ui.ctx().memory_mut(|memory| memory.surrender_focus(focused));
+    }
+    if typing {
+        return None;
+    }
+    if tab_pressed {
+        if takes_tab
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+        {
+            selection.tab_step(shift, visible, cols, page);
+            return selection.position(visible);
+        }
+        return None;
+    }
+    let mut cursor: Option<Step> = None;
+    let mut take = |modifiers: egui::Modifiers, key: egui::Key, step: Step| {
+        if cursor.is_none() && ui.input_mut(|input| input.consume_key(modifiers, key)) {
+            cursor = Some(step);
+        }
+    };
+    // Alt stays with the resize keys `grid_edit_keys` takes first; a plain
+    // pattern would match Alt+Arrow too once no column is active.
+    if !alt {
+        take(egui::Modifiers::COMMAND, egui::Key::Home, Step::First);
+        take(egui::Modifiers::COMMAND, egui::Key::End, Step::Last);
+        take(egui::Modifiers::NONE, egui::Key::Home, Step::RowStart);
+        take(egui::Modifiers::NONE, egui::Key::End, Step::RowEnd);
+        take(egui::Modifiers::NONE, egui::Key::PageUp, Step::PageUp);
+        take(egui::Modifiers::NONE, egui::Key::PageDown, Step::PageDown);
+        take(egui::Modifiers::NONE, egui::Key::ArrowUp, Step::Up);
+        take(egui::Modifiers::NONE, egui::Key::ArrowDown, Step::Down);
+        take(egui::Modifiers::NONE, egui::Key::ArrowLeft, Step::Left);
+        take(egui::Modifiers::NONE, egui::Key::ArrowRight, Step::Right);
+    }
+    let step = cursor?;
+    selection.step(step, shift, visible, cols, page);
+    set_grid_armed(ui.ctx(), tab, true);
+    selection.position(visible)
 }
 
 #[cfg(test)]
@@ -3333,25 +3666,64 @@ mod tests {
     #[test]
     fn click_shift_and_ctrl_gestures_shape_the_selection() {
         let mut selection = Selection::default();
-        selection.gesture(1, 0, false, false);
+        selection.gesture(1, 0, false, false, &[0, 1, 2]);
         assert_eq!(selection.resolve(&[0, 1, 2]), vec![1]);
         assert_eq!(selection.active(), Some((1, 0)));
-        selection.gesture(2, 1, true, false);
+        selection.gesture(2, 1, true, false, &[0, 1, 2]);
         assert_eq!(selection.resolve(&[0, 1, 2]), vec![1, 2]);
         assert_eq!(selection.active(), Some((2, 1)));
-        selection.gesture(0, 0, false, true);
+        selection.gesture(0, 0, false, true, &[0, 1, 2]);
         assert_eq!(selection.resolve(&[2, 0, 1]), vec![2, 0, 1]);
         assert_eq!(selection.active(), Some((0, 0)));
-        selection.gesture(1, 0, false, true);
+        selection.gesture(1, 0, false, true, &[0, 1, 2]);
         assert_eq!(selection.resolve(&[0, 1, 2]), vec![0, 2]);
     }
 
     #[test]
     fn shift_without_an_anchor_selects_one_row() {
         let mut selection = Selection::default();
-        selection.gesture(2, 1, true, false);
+        selection.gesture(2, 1, true, false, &[0, 1, 2]);
         assert_eq!(selection.resolve(&[0, 1, 2]), vec![2]);
         assert_eq!(selection.active(), Some((2, 1)));
+    }
+
+    #[test]
+    fn a_shift_step_extends_over_view_positions_not_raw_rows() {
+        let visible = [5, 1, 9, 3];
+        let mut selection = Selection::default();
+        selection.click(5, 0);
+        selection.step(Step::Down, true, &visible, 2, 1);
+        assert_eq!(
+            selection.resolve(&visible),
+            vec![5, 1],
+            "the step selects the two view positions it passed"
+        );
+    }
+
+    #[test]
+    fn a_shift_click_extends_over_view_positions_not_raw_rows() {
+        let visible = [5, 1, 9, 3];
+        let mut selection = Selection::default();
+        selection.gesture(5, 0, false, false, &visible);
+        selection.gesture(9, 1, true, false, &visible);
+        assert_eq!(
+            selection.resolve(&visible),
+            vec![5, 1, 9],
+            "the click selects the three displayed rows it passed"
+        );
+    }
+
+    #[test]
+    fn a_shift_click_with_an_off_view_anchor_selects_one_row() {
+        let visible = [5, 1, 9, 3];
+        let mut selection = Selection::default();
+        selection.click(2, 0);
+        selection.gesture(9, 1, true, false, &visible);
+        assert_eq!(
+            selection.resolve(&visible),
+            vec![9],
+            "an anchor the filter hid never selects rows between raw indices"
+        );
     }
 
     #[test]
@@ -3370,7 +3742,7 @@ mod tests {
             ResultId { active: 0, rows: 2, cols: 2, took: Duration::from_millis(2) };
         let mut selection = Selection::default();
         selection.sync(first);
-        selection.gesture(0, 0, false, false);
+        selection.gesture(0, 0, false, false, &[0, 1, 2]);
         selection.sync(first);
         assert_eq!(selection.resolve(&[0, 1]), vec![0]);
         selection.sync(rerun);
@@ -3579,6 +3951,33 @@ mod tests {
         let shortcut = copy_shortcut();
         assert_eq!(shortcut.modifiers, egui::Modifiers::COMMAND);
         assert_eq!(shortcut.logical_key, egui::Key::C);
+    }
+
+    #[test]
+    fn copy_cell_shortcut_is_command_shift_c() {
+        let shortcut = copy_cell_shortcut();
+        assert_eq!(shortcut.modifiers, egui::Modifiers::COMMAND | egui::Modifiers::SHIFT);
+        assert_eq!(shortcut.logical_key, egui::Key::C);
+    }
+
+    #[test]
+    fn a_copied_cell_is_plain_text_with_null_empty() {
+        assert_eq!(cell_text(None), String::new());
+        assert_eq!(cell_text(Some(&Value::Null)), String::new());
+        assert_eq!(cell_text(Some(&Value::Integer(7))), "7");
+        assert_eq!(cell_text(Some(&Value::Real(2.5))), "2.5");
+        assert_eq!(
+            cell_text(Some(&Value::Text("a\tb".to_owned()))),
+            "a\tb",
+            "a single cell keeps the tab a TSV field would flatten"
+        );
+        assert_eq!(cell_text(Some(&Value::Blob(vec![0x01, 0x02]))), "[BLOB 2 B]");
+    }
+
+    #[test]
+    fn a_copied_cell_keeps_text_past_the_display_cap() {
+        let long = "x".repeat(CELL_CAP + 50);
+        assert_eq!(cell_text(Some(&Value::Text(long.clone()))), long);
     }
 
     #[test]
@@ -3841,5 +4240,164 @@ mod tests {
             assert_eq!(cell_label_color(true, &palette), Some(palette.selection_text));
             assert_eq!(cell_label_color(false, &palette), None);
         }
+    }
+
+    #[test]
+    fn a_step_with_no_cursor_lands_on_the_first_displayed_row() {
+        let visible = [3, 8];
+        for step in [Step::Up, Step::Down, Step::PageDown, Step::Last, Step::Right] {
+            let mut selection = Selection::default();
+            selection.step(step, false, &visible, 2, 4);
+            assert_eq!(selection.active(), Some((3, 0)), "{step:?} starts at the top left");
+            assert_eq!(selection.resolve(&visible), vec![3]);
+        }
+        let mut selection = Selection::default();
+        selection.click(7, 1);
+        selection.step(Step::Right, false, &visible, 2, 4);
+        assert_eq!(selection.active(), Some((3, 0)));
+    }
+
+    #[test]
+    fn steps_move_through_the_view_order_not_the_row_indices() {
+        let visible = [5, 1, 9];
+        let mut selection = Selection::default();
+        selection.step(Step::Down, false, &visible, 2, 1);
+        assert_eq!(selection.active(), Some((5, 0)));
+        selection.step(Step::Down, false, &visible, 2, 1);
+        assert_eq!(selection.active(), Some((1, 0)));
+        selection.step(Step::Up, false, &visible, 2, 1);
+        assert_eq!(selection.active(), Some((5, 0)));
+        assert_eq!(selection.resolve(&visible), vec![5]);
+    }
+
+    #[test]
+    fn steps_clamp_at_the_view_edges() {
+        let visible = [3, 8];
+        let mut selection = Selection::default();
+        selection.click(3, 0);
+        selection.step(Step::Up, false, &visible, 2, 5);
+        selection.step(Step::Left, false, &visible, 2, 5);
+        assert_eq!(selection.active(), Some((3, 0)));
+        selection.step(Step::Down, false, &visible, 2, 5);
+        selection.step(Step::Down, false, &visible, 2, 5);
+        selection.step(Step::Right, false, &visible, 2, 5);
+        selection.step(Step::Right, false, &visible, 2, 5);
+        assert_eq!(selection.active(), Some((8, 1)));
+        selection.step(Step::RowStart, false, &visible, 2, 5);
+        assert_eq!(selection.active(), Some((8, 0)));
+        selection.step(Step::RowEnd, false, &visible, 2, 5);
+        assert_eq!(selection.active(), Some((8, 1)));
+        selection.step(Step::First, false, &visible, 2, 5);
+        assert_eq!(selection.active(), Some((3, 1)));
+        selection.step(Step::Last, false, &visible, 2, 5);
+        assert_eq!(selection.active(), Some((8, 1)));
+        selection.step(Step::Right, false, &visible, 2, 5);
+        assert_eq!(selection.active(), Some((8, 1)), "the last column holds");
+    }
+
+    #[test]
+    fn a_step_that_cannot_move_leaves_no_cursor() {
+        let mut selection = Selection::default();
+        selection.step(Step::Down, false, &[], 3, 2);
+        assert_eq!(selection.active(), None);
+        selection.step(Step::Right, false, &[0, 1], 0, 2);
+        assert_eq!(selection.active(), None);
+        selection.tab_step(false, &[], 3, 2);
+        assert_eq!(selection.active(), None);
+        selection.tab_step(false, &[0], 0, 2);
+        assert_eq!(selection.active(), None);
+    }
+
+    #[test]
+    fn a_cursor_column_past_the_end_is_pulled_back_in() {
+        let visible = [0, 1];
+        let mut selection = Selection::default();
+        selection.click(0, 5);
+        selection.step(Step::RowEnd, false, &visible, 2, 1);
+        assert_eq!(selection.active(), Some((0, 1)));
+        selection.click(0, 5);
+        selection.step(Step::Left, false, &visible, 2, 1);
+        assert_eq!(selection.active(), Some((0, 0)), "the stale column clamps, then steps");
+    }
+
+    #[test]
+    fn a_shift_step_extends_the_row_range_from_the_anchor() {
+        let visible: Vec<usize> = (0..6).collect();
+        let mut selection = Selection::default();
+        selection.step(Step::Down, false, &visible, 2, 2);
+        selection.step(Step::Down, false, &visible, 2, 2);
+        selection.step(Step::Down, false, &visible, 2, 2);
+        assert_eq!(selection.active(), Some((2, 0)));
+        selection.step(Step::Down, true, &visible, 2, 2);
+        assert_eq!(selection.active(), Some((3, 0)));
+        assert_eq!(selection.resolve(&visible), vec![2, 3]);
+        selection.step(Step::Down, true, &visible, 2, 2);
+        assert_eq!(selection.resolve(&visible), vec![2, 3, 4]);
+        assert_eq!(selection.active(), Some((4, 0)));
+        selection.step(Step::Up, true, &visible, 2, 2);
+        assert_eq!(selection.resolve(&visible), vec![2, 3]);
+        assert_eq!(selection.active(), Some((3, 0)));
+        selection.step(Step::Right, true, &visible, 2, 2);
+        assert_eq!(selection.active(), Some((3, 1)));
+        assert_eq!(selection.resolve(&visible), vec![2, 3]);
+        // A plain step collapses the range onto the row it lands on.
+        selection.step(Step::Left, false, &visible, 2, 2);
+        assert_eq!(selection.active(), Some((3, 0)));
+        assert_eq!(selection.resolve(&visible), vec![3]);
+    }
+
+    #[test]
+    fn page_steps_travel_the_viewport_worth_of_rows() {
+        let visible: Vec<usize> = (0..10).collect();
+        let mut selection = Selection::default();
+        selection.step(Step::PageDown, false, &visible, 1, 3);
+        assert_eq!(selection.active(), Some((0, 0)));
+        selection.step(Step::PageDown, false, &visible, 1, 3);
+        assert_eq!(selection.active(), Some((3, 0)));
+        selection.step(Step::PageDown, false, &visible, 1, 3);
+        assert_eq!(selection.active(), Some((6, 0)));
+        selection.step(Step::PageDown, false, &visible, 1, 3);
+        assert_eq!(selection.active(), Some((9, 0)));
+        selection.step(Step::PageUp, false, &visible, 1, 3);
+        assert_eq!(selection.active(), Some((6, 0)));
+    }
+
+    #[test]
+    fn tab_wraps_onto_the_next_or_previous_row() {
+        let visible: Vec<usize> = (0..3).collect();
+        let mut selection = Selection::default();
+        selection.tab_step(false, &visible, 3, 2);
+        assert_eq!(selection.active(), Some((0, 0)));
+        selection.tab_step(false, &visible, 3, 2);
+        selection.tab_step(false, &visible, 3, 2);
+        assert_eq!(selection.active(), Some((0, 2)));
+        selection.tab_step(false, &visible, 3, 2);
+        assert_eq!(selection.active(), Some((1, 0)));
+        selection.tab_step(true, &visible, 3, 2);
+        assert_eq!(selection.active(), Some((0, 2)));
+        selection.click(2, 2);
+        selection.tab_step(false, &visible, 3, 2);
+        assert_eq!(selection.active(), Some((2, 0)));
+        selection.click(0, 0);
+        selection.tab_step(true, &visible, 3, 2);
+        assert_eq!(selection.active(), Some((0, 2)));
+    }
+
+    #[test]
+    fn tab_from_no_cursor_lands_like_any_step() {
+        let mut selection = Selection::default();
+        selection.tab_step(true, &[4, 9], 2, 2);
+        assert_eq!(selection.active(), Some((4, 0)));
+    }
+
+    #[test]
+    fn page_rows_measures_the_viewport_and_falls_back() {
+        assert_eq!(page_rows(400.0, 0.0), 19, "the header takes one row");
+        assert_eq!(page_rows(400.0, 4.0), 15, "row spacing and the header are excluded");
+        assert_eq!(page_rows(19.0, 4.0), 1);
+        assert_eq!(page_rows(0.0, 4.0), GRID_PAGE_FALLBACK);
+        assert_eq!(page_rows(-20.0, 4.0), GRID_PAGE_FALLBACK);
+        assert_eq!(page_rows(f32::INFINITY, 4.0), GRID_PAGE_FALLBACK);
+        assert_eq!(page_rows(f32::NAN, 4.0), GRID_PAGE_FALLBACK);
     }
 }

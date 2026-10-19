@@ -11,32 +11,47 @@ use super::editor::{char_range, FindState};
 use crate::app::AppState;
 use crate::db::TabId;
 
-use super::{Palette, fit};
-
-/// True while any modal owns the screen, so the editor's shortcuts stay dead.
-pub(crate) fn any_modal_open(state: &AppState) -> bool {
-    state.draft().is_some()
-        || state.save_prompt().is_some()
-        || state.password_prompt().is_some()
-        || state.import_draft().is_some()
-        || state.pending_write().is_some()
-        || state.pending_params().is_some()
-        || state.pending_edit_preview().is_some()
-        || state.table_editor().is_some()
-        || state.pending_table_ddl().is_some()
-        || state.palette_open()
-}
+use super::{
+    ModalKey, Palette, approve_button, autofocus, fit, note_dialog_field,
+};
 
 /// The tab strip, drawn by `root` for every tab whatever its kind. The new
 /// and close shortcuts live here so they work on a table tab too.
 pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
-    let modal_open = any_modal_open(state);
+    let modal_open = super::modal_open(state, ui.ctx());
     let (new_tab_shortcut_pressed, close_tab_shortcut_pressed) = ui.input_mut(|i| {
         (
             i.consume_shortcut(&new_tab_shortcut()),
             i.consume_shortcut(&close_tab_shortcut()),
         )
     });
+    // Tab switching claims its chords before the TextEdit sees them, so
+    // Ctrl+Tab never inserts a tab character and plain Tab stays focus
+    // traversal. Previous-tab is checked first: `consume_shortcut` matches
+    // logically, so CTRL would also eat Ctrl+Shift+Tab.
+    let mut switch: Option<isize> = None;
+    let mut switch_nth: Option<usize> = None;
+    if !modal_open {
+        ui.input_mut(|i| {
+            if i.consume_shortcut(&previous_tab_shortcut())
+                || i.consume_shortcut(&previous_page_shortcut())
+            {
+                switch = Some(-1);
+            } else if i.consume_shortcut(&next_tab_shortcut())
+                || i.consume_shortcut(&next_page_shortcut())
+            {
+                switch = Some(1);
+            } else {
+                switch_nth = (1..=9).find(|n| i.consume_shortcut(&tab_nth_shortcut(*n)));
+            }
+        });
+        if let Some(step) = switch {
+            state.activate_relative(step);
+        }
+        if let Some(n) = switch_nth {
+            state.activate_nth(n);
+        }
+    }
     if !modal_open {
         if new_tab_shortcut_pressed {
             if let Some(conn) = state.default_connection() {
@@ -152,7 +167,7 @@ pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
 /// `root` for `Query` tabs only.
 pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     prune_find(state, ui.ctx());
-    let modal_open = any_modal_open(state);
+    let modal_open = super::modal_open(state, ui.ctx());
     let find_shortcut_pressed = ui.input_mut(|i| i.consume_shortcut(&find_shortcut()));
     let mut find_opened = false;
     if !modal_open && find_shortcut_pressed {
@@ -162,30 +177,52 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     }
     find_opened |= super::query_tools::toolbar(state, ui);
     ui.add_space(4.0);
-    save_window(state, ui);
-    write_confirm_window(state, ui);
-    edit_preview_window(state, ui);
-    params_window(state, ui);
     if let Some(id) = state.active() {
+        // Snapshot the settled focus for the find bar's Escape handler: a
+        // plain Escape clears focus before the UI runs, so a frame carrying
+        // one can no longer report where the caret sat.
+        if ui.input(|i| !i.key_pressed(egui::Key::Escape)) {
+            let mut bar = find_bar_of(ui.ctx(), id);
+            bar.focus_was_empty = ui.ctx().memory(|m| m.focused()).is_none();
+            store_find_bar(ui.ctx(), id, bar);
+        }
+        // A dialog owns the keyboard: a stale editor caret would still take
+        // its text, Enter, and Tab, and the completion popup its Enter and
+        // Escape. Drop the caret and draw the well without an input.
+        if modal_open
+            && ui.ctx().memory(|memory| memory.focused())
+                == Some(super::complete::editor_id(id))
+        {
+            ui.ctx()
+                .memory_mut(|memory| memory.surrender_focus(super::complete::editor_id(id)));
+        }
         let schema = state
             .tab(id)
             .and_then(|tab| tab.conn)
             .and_then(|conn| state.schema(conn))
             .cloned();
-        find_bar(state, ui, find_opened);
+        ui.add_enabled_ui(!modal_open, |ui| find_bar(state, ui, find_opened));
         if let Some(sql) = state.tab_sql_mut(id) {
             egui::Frame::canvas(ui.style())
                 .inner_margin(egui::Margin::same(6))
                 .show(ui, |ui| {
-                    super::complete::editor_with_completion(id, schema.as_ref(), sql, ui);
+                    if modal_open {
+                        super::complete::editor_paused(id, sql, ui);
+                    } else {
+                        super::complete::editor_with_completion(id, schema.as_ref(), sql, ui);
+                    }
                 });
         }
-        // The completion popup gets first claim on Esc; close find only if free.
+        // The completion popup gets first claim on Esc; close find only if
+        // free, and hand the caret back to the editor either way.
         if !modal_open
             && find_bar_of(ui.ctx(), id).open
-            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            && find_owns_escape(ui.ctx(), id)
+            && ui.input_mut(|i| super::consume_plain_key(i, egui::Key::Escape))
         {
             close_find(ui.ctx(), id);
+            ui.ctx()
+                .memory_mut(|m| m.request_focus(super::complete::editor_id(id)));
         }
     } else if state.connections().is_empty() {
         let palette = Palette::of(ui.ctx().theme());
@@ -216,7 +253,7 @@ pub fn table_header(state: &mut AppState, ui: &mut egui::Ui) {
     }) else {
         return;
     };
-    let modal_open = any_modal_open(state);
+    let modal_open = super::modal_open(state, ui.ctx());
     let mut edit = false;
     let mut refresh = ui.input_mut(|i| i.consume_shortcut(&run_shortcut()));
     // A table tab has no editor to search, so find lands in the row filter.
@@ -238,7 +275,7 @@ pub fn table_header(state: &mut AppState, ui: &mut egui::Ui) {
         let len = sql.len();
         state.start_run(id, &sql, len, None);
     }
-    if edit {
+    if edit && !modal_open {
         state.edit_as_query(id);
     }
 }
@@ -287,12 +324,65 @@ pub fn find_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::F)
 }
 
+/// Ctrl+Tab on every platform: Cmd+Tab is the macOS app switcher.
+pub fn next_tab_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Tab)
+}
+
+/// Ctrl+Shift+Tab, the reverse of [`next_tab_shortcut`]. Checked first,
+/// because `consume_shortcut` matches logically and Ctrl alone would eat it.
+pub fn previous_tab_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Tab)
+}
+
+pub fn next_page_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::PageDown)
+}
+
+pub fn previous_page_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::PageUp)
+}
+
+/// The Cmd/Ctrl+N tab chord, 1 through 9. Nine selects the last tab.
+pub fn tab_nth_shortcut(n: usize) -> egui::KeyboardShortcut {
+    const KEYS: [egui::Key; 9] = [
+        egui::Key::Num1,
+        egui::Key::Num2,
+        egui::Key::Num3,
+        egui::Key::Num4,
+        egui::Key::Num5,
+        egui::Key::Num6,
+        egui::Key::Num7,
+        egui::Key::Num8,
+        egui::Key::Num9,
+    ];
+    let key = *KEYS.get(n - 1).expect("tab numbers are 1 through 9");
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key)
+}
+
 /// Per-tab find bar state, kept in the egui context data keyed by tab id.
 #[derive(Clone, Default)]
 struct FindBar {
     open: bool,
     selected: Option<usize>,
     state: FindState,
+    /// Whether the find field held focus at the end of last frame. egui
+    /// clears focus on a plain Escape before the UI runs, so the bar cannot
+    /// ask the live memory while deciding who owns Escape.
+    field_focused: bool,
+    /// Whether focus sat nowhere at the start of the most recent frame
+    /// without a plain Escape: the settled focus from the frame before.
+    /// Read by the Escape handler, which runs on a frame whose focus egui
+    /// already cleared.
+    focus_was_empty: bool,
+}
+
+/// The find field's stable id for one tab. Read through
+/// [`egui::Memory::had_focus_last_frame`]: egui clears focus on a plain
+/// Escape before the UI runs, so the live memory is always empty when the
+/// bar's Escape handler fires.
+fn find_field_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_find_field", tab))
 }
 
 /// Find bar state id for one tab, the ctx-data pattern `complete.rs` uses.
@@ -319,6 +409,7 @@ pub(crate) fn toggle_find(ctx: &egui::Context, tab: TabId) -> bool {
     bar.open = !bar.open;
     if bar.open {
         bar.selected = None;
+        bar.field_focused = false;
     }
     let open = bar.open;
     store_find_bar(ctx, tab, bar);
@@ -328,6 +419,7 @@ pub(crate) fn toggle_find(ctx: &egui::Context, tab: TabId) -> bool {
 fn close_find(ctx: &egui::Context, tab: TabId) {
     let mut bar = find_bar_of(ctx, tab);
     bar.open = false;
+    bar.field_focused = false;
     store_find_bar(ctx, tab, bar);
 }
 
@@ -351,6 +443,20 @@ fn prune_find(state: &AppState, ctx: &egui::Context) {
     }
 }
 
+/// Whether a plain Escape with the find bar open belongs to the find bar.
+/// egui clears focus on a plain Escape before the UI runs, so this reads
+/// where focus sat at the end of last frame: the find field, the SQL
+/// editor, or nowhere. Anywhere else (an inline cell edit, the quick
+/// filter) keeps its own Escape.
+fn find_owns_escape(ctx: &egui::Context, tab: TabId) -> bool {
+    let bar = find_bar_of(ctx, tab);
+    ctx.memory(|m| {
+        m.had_focus_last_frame(find_field_id(tab))
+            || m.had_focus_last_frame(super::complete::editor_id(tab))
+            || bar.focus_was_empty
+    })
+}
+
 /// Find bar for the active tab. The count comes from `FindState::find_all`;
 /// Next and Prev move the editor selection onto the match.
 fn find_bar(state: &AppState, ui: &mut egui::Ui, just_opened: bool) {
@@ -366,16 +472,31 @@ fn find_bar(state: &AppState, ui: &mut egui::Ui, just_opened: bool) {
     }
     let mut pick: Option<usize> = None;
     let mut close = false;
+    // Claimed before the field draws: a singleline TextEdit answers Enter by
+    // surrendering focus, which would swallow the step. Keyboard stepping
+    // keeps the caret in the find field; the buttons below still hand focus
+    // to the editor so the selection paints.
+    let focused = bar.field_focused;
+    let mut step: Option<isize> = None;
+    if focused {
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter)) {
+            step = Some(-1);
+        } else if ui.input_mut(|i| super::consume_plain_key(i, egui::Key::Enter)) {
+            step = Some(1);
+        }
+    }
     ui.horizontal(|ui| {
         ui.label("Find");
         let field = ui.add(
             egui::TextEdit::singleline(&mut bar.state.query)
+                .id(find_field_id(tab_id))
                 .desired_width(200.0)
                 .hint_text("text to find"),
         );
         if just_opened {
             field.request_focus();
         }
+        bar.field_focused = field.has_focus();
         if field.changed() {
             bar.selected = None;
         }
@@ -397,39 +518,60 @@ fn find_bar(state: &AppState, ui: &mut egui::Ui, just_opened: bool) {
             close = true;
         }
     });
+    if let Some(direction) = step {
+        let count = hits.len();
+        if count > 0 {
+            pick = Some(match direction {
+                -1 => bar.selected.map_or(count - 1, |i| (i + count - 1) % count),
+                _ => bar.selected.map_or(0, |i| (i + 1) % count),
+            });
+        }
+    }
     if let Some(i) = pick {
         bar.selected = Some(i);
         if let Some(bytes) = hits.get(i) {
             super::complete::set_selection(ui.ctx(), tab_id, char_range(sql, bytes));
-            // egui paints a selection only while the TextEdit holds focus.
-            ui.ctx()
-                .memory_mut(|m| m.request_focus(super::complete::editor_id(tab_id)));
+            if step.is_none() {
+                // egui paints a selection only while the TextEdit holds focus.
+                ui.ctx()
+                    .memory_mut(|m| m.request_focus(super::complete::editor_id(tab_id)));
+            }
         }
     }
     if close {
         bar.open = false;
+        ui.ctx()
+            .memory_mut(|m| m.request_focus(super::complete::editor_id(tab_id)));
     }
     store_find_bar(ui.ctx(), tab_id, bar);
 }
 
-fn save_window(state: &mut AppState, ui: &mut egui::Ui) {
-    if state.save_prompt().is_none() {
-        return;
-    }
+pub fn save_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) -> Option<egui::LayerId> {
+    state.save_prompt()?;
     let mut confirm = false;
     let mut close = false;
-    egui::Window::new("Save query").show(ui.ctx(), |ui| {
+    let mut field_focused = false;
+    let window = egui::Window::new("Save query").show(ui.ctx(), |ui| {
         let Some(prompt) = state.save_prompt_mut() else { return };
         ui.horizontal(|ui| {
             ui.label("Name:");
-            ui.text_edit_singleline(&mut prompt.name);
+            let name = ui.text_edit_singleline(&mut prompt.name);
+            field_focused |= name.has_focus();
+            autofocus(ui, "save-name", &name);
+            note_dialog_field(ui.ctx(), crate::app::Modal::SavePrompt, &name);
         });
         ui.horizontal(|ui| {
             ui.label("Folder:");
-            ui.add(
+            let folder = ui.add(
                 egui::TextEdit::singleline(&mut prompt.folder)
                     .hint_text("no folder"),
             );
+            field_focused |= folder.has_focus();
+            note_dialog_field(ui.ctx(), crate::app::Modal::SavePrompt, &folder);
         });
         ui.checkbox(&mut prompt.pinned, "Pinned")
             .on_hover_text("List this entry first inside its folder group");
@@ -445,55 +587,69 @@ fn save_window(state: &mut AppState, ui: &mut egui::Ui) {
             }
         });
     });
-    if confirm {
+    let free_focus = ui.ctx().memory(|memory| memory.focused().is_none());
+    let submit = key == Some(ModalKey::Submit) && (field_focused || free_focus);
+    if confirm || submit {
         state.confirm_save_prompt();
-    } else if close {
+    } else if close || key == Some(ModalKey::Cancel) {
         state.close_save_prompt();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 /// The write guard modal for an UPDATE or DELETE without WHERE. Names the
 /// statement kind and the affected table; Confirm sends the held batch
 /// exactly as prepared, Cancel drops it.
-pub fn write_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
-    let Some(pending) = state.pending_write().cloned() else { return };
+pub fn write_confirm_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) -> Option<egui::LayerId> {
+    let pending = state.pending_write().cloned()?;
     let mut confirm = false;
     let mut cancel = false;
-    egui::Window::new(format!("{} without WHERE?", pending.kind)).show(ui.ctx(), |ui| {
+    let window = egui::Window::new(format!("{} without WHERE?", pending.kind)).show(ui.ctx(), |ui| {
         ui.label(format!(
             "{} on {} has no WHERE clause and affects every row.",
             pending.kind, pending.table
         ));
         ui.horizontal(|ui| {
-            if ui.button("Confirm").clicked() {
+            if approve_button(ui, "Confirm").clicked() {
                 confirm = true;
             }
-            if ui.button("Cancel").clicked() {
+            let cancel_button = ui.button("Cancel");
+            autofocus(ui, "write-cancel", &cancel_button);
+            if cancel_button.clicked() {
                 cancel = true;
             }
         });
     });
     if confirm {
         state.confirm_write();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_write();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 /// The staged-edit SQL preview. Lists the exact UPDATE, DELETE, and INSERT
 /// statements the apply path would send, in send order; Confirm sends them
 /// through the unchanged apply path, Cancel keeps the staged edits.
-pub fn edit_preview_window(state: &mut AppState, ui: &mut egui::Ui) {
-    let Some(tab) = state.pending_edit_preview() else { return };
+pub fn edit_preview_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) -> Option<egui::LayerId> {
+    let tab = state.pending_edit_preview()?;
     let table = state.edit_target(tab).map(|target| target.table).unwrap_or_default();
     let statements = state.preview_edit_statements(tab).unwrap_or_default();
     if statements.is_empty() {
         state.cancel_pending_edits();
-        return;
+        return None;
     }
     let mut confirm = false;
     let mut cancel = false;
-    egui::Window::new("Apply staged edits?").show(ui.ctx(), |ui| {
+    let window = egui::Window::new("Apply staged edits?").show(ui.ctx(), |ui| {
         ui.label(format!(
             "{} statement{} on {table}. Confirm sends them, Cancel keeps the staged edits.",
             statements.len(),
@@ -505,36 +661,47 @@ pub fn edit_preview_window(state: &mut AppState, ui: &mut egui::Ui) {
             }
         });
         ui.horizontal(|ui| {
-            if ui.button("Confirm").clicked() {
+            if approve_button(ui, "Confirm").clicked() {
                 confirm = true;
             }
-            if ui.button("Cancel").clicked() {
+            let cancel_button = ui.button("Cancel");
+            autofocus(ui, "edit-preview-cancel", &cancel_button);
+            if cancel_button.clicked() {
                 cancel = true;
             }
         });
     });
     if confirm {
         state.confirm_pending_edits();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_pending_edits();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 /// The value prompt for a run holding `:name` and `?` placeholders. Lists
 /// each parameter with a text field; Run substitutes the values and continues
 /// the prepared batch through the send path, Cancel sends nothing.
-pub fn params_window(state: &mut AppState, ui: &mut egui::Ui) {
-    if state.pending_params().is_none() {
-        return;
-    }
+pub fn params_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) -> Option<egui::LayerId> {
+    state.pending_params()?;
     let mut run = false;
     let mut cancel = false;
-    egui::Window::new("Query parameters").show(ui.ctx(), |ui| {
+    let mut field_focused = false;
+    let window = egui::Window::new("Query parameters").show(ui.ctx(), |ui| {
         let Some(pending) = state.pending_params_mut() else { return };
-        for param in &mut pending.params {
+        for (index, param) in pending.params.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(param.display());
-                ui.text_edit_singleline(&mut param.value);
+                let field = ui.text_edit_singleline(&mut param.value);
+                field_focused |= field.has_focus();
+                note_dialog_field(ui.ctx(), crate::app::Modal::Params, &field);
+                if index == 0 {
+                    autofocus(ui, "params-first", &field);
+                }
             });
         }
         ui.horizontal(|ui| {
@@ -546,11 +713,13 @@ pub fn params_window(state: &mut AppState, ui: &mut egui::Ui) {
             }
         });
     });
-    if run {
+    let free_focus = ui.ctx().memory(|memory| memory.focused().is_none());
+    if run || (key == Some(ModalKey::Submit) && (field_focused || free_focus)) {
         state.confirm_params();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_params();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 #[cfg(test)]
@@ -571,6 +740,24 @@ mod tests {
         let find = find_shortcut();
         assert_eq!(find.modifiers, egui::Modifiers::COMMAND);
         assert_eq!(find.logical_key, egui::Key::F);
+        let next_tab = next_tab_shortcut();
+        assert_eq!(next_tab.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(next_tab.logical_key, egui::Key::Tab);
+        let previous_tab = previous_tab_shortcut();
+        assert_eq!(previous_tab.modifiers, egui::Modifiers::CTRL | egui::Modifiers::SHIFT);
+        assert_eq!(previous_tab.logical_key, egui::Key::Tab);
+        let next_page = next_page_shortcut();
+        assert_eq!(next_page.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(next_page.logical_key, egui::Key::PageDown);
+        let previous_page = previous_page_shortcut();
+        assert_eq!(previous_page.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(previous_page.logical_key, egui::Key::PageUp);
+        for n in 1..=9 {
+            let nth = tab_nth_shortcut(n);
+            assert_eq!(nth.modifiers, egui::Modifiers::COMMAND, "tab {n}");
+        }
+        assert_eq!(tab_nth_shortcut(1).logical_key, egui::Key::Num1);
+        assert_eq!(tab_nth_shortcut(9).logical_key, egui::Key::Num9);
     }
 
     #[test]

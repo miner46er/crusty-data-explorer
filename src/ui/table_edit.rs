@@ -14,6 +14,8 @@ use eframe::egui;
 use crate::app::AppState;
 use crate::db::ConnectionId;
 
+use super::{ModalKey, approve_button, autofocus};
+
 /// The status-bar entry's label, measured by the status bar before it draws:
 /// the entry and the measurement read one literal.
 pub(crate) const STATUS_LABEL: &str = "+ Table";
@@ -35,17 +37,21 @@ pub fn status_entry(state: &mut AppState, ui: &mut egui::Ui) {
 
 /// The prod-gated table DDL confirmation: names the connection and lists the
 /// exact held statements. Non-prod applies never arm this modal.
-pub fn table_prod_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
-    let Some(pending) = state.pending_table_ddl().cloned() else { return };
+pub fn table_prod_confirm_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) -> Option<egui::LayerId> {
+    let pending = state.pending_table_ddl().cloned()?;
     let Some(name) =
         state.connections().iter().find(|c| c.id == pending.conn).map(|c| c.name.clone())
     else {
         state.cancel_table_ddl();
-        return;
+        return None;
     };
     let mut confirm = false;
     let mut cancel = false;
-    egui::Window::new("Apply table DDL on prod?").show(ui.ctx(), |ui| {
+    let window = egui::Window::new("Apply table DDL on prod?").show(ui.ctx(), |ui| {
         ui.label(format!(
             "{} statement{} on {name}. Prod applies need one more click.",
             pending.statements.len(),
@@ -57,19 +63,22 @@ pub fn table_prod_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
             }
         });
         ui.horizontal(|ui| {
-            if ui.button("Apply").clicked() {
+            if approve_button(ui, "Apply").clicked() {
                 confirm = true;
             }
-            if ui.button("Cancel").clicked() {
+            let cancel_button = ui.button("Cancel");
+            autofocus(ui, "table-ddl-cancel", &cancel_button);
+            if cancel_button.clicked() {
                 cancel = true;
             }
         });
     });
     if confirm {
         state.confirm_table_ddl();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_table_ddl();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 fn alter_input_id(which: &str) -> egui::Id {
@@ -99,39 +108,44 @@ fn schema_has_table(state: &AppState, conn: ConnectionId, schema: &str, table: &
 
 /// The editor window: form rows, validation errors, SQL preview with Copy,
 /// and Apply through the batch path. Nothing sends without Apply.
-pub fn table_editor_window(state: &mut AppState, ui: &mut egui::Ui) {
-    let (conn, conn_name, backend, read_only, prod, is_alter, editing_title) = match state
-        .table_editor()
-    {
-        Some(editor) => {
-            let (name, backend, read_only, prod) = state
-                .connections()
-                .iter()
-                .find(|c| c.id == editor.conn)
-                .map(|c| {
-                    (
-                        c.name.clone(),
-                        c.config.kind().label().to_owned(),
-                        c.config.is_read_only(),
-                        c.env == crate::app::Environment::Prod,
-                    )
-                })
-                .unwrap_or_else(|| ("deleted".to_owned(), String::new(), true, false));
-            let is_alter = editor.original.is_some();
-            let title = if is_alter {
-                format!("Edit table {}.{}", editor.form.schema, editor.form.table)
-            } else {
-                "New table".to_owned()
-            };
-            (editor.conn, name, backend, read_only, prod, is_alter, title)
-        }
-        None => return,
+pub fn table_editor_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) -> Option<egui::LayerId> {
+    let editor = state.table_editor()?;
+    let (conn, conn_name, backend, read_only, prod, is_alter, editing_title) = {
+        let (name, backend, read_only, prod) = state
+            .connections()
+            .iter()
+            .find(|c| c.id == editor.conn)
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    c.config.kind().label().to_owned(),
+                    c.config.is_read_only(),
+                    c.env == crate::app::Environment::Prod,
+                )
+            })
+            .unwrap_or_else(|| ("deleted".to_owned(), String::new(), true, false));
+        let is_alter = editor.original.is_some();
+        let title = if is_alter {
+            format!("Edit table {}.{}", editor.form.schema, editor.form.table)
+        } else {
+            "New table".to_owned()
+        };
+        (editor.conn, name, backend, read_only, prod, is_alter, title)
     };
+    let dismissed_popup =
+        key == Some(ModalKey::Cancel) && egui::Popup::is_any_open(ui.ctx());
+    if dismissed_popup {
+        egui::Popup::close_all(ui.ctx());
+    }
     let mut close = false;
     let mut apply = false;
     let mut load_alter: Option<(String, String)> = None;
     let mut back_to_new = false;
-    egui::Window::new(editing_title).show(ui.ctx(), |ui| {
+    let window = egui::Window::new(editing_title).show(ui.ctx(), |ui| {
         ui.label(egui::RichText::new(format!("{conn_name} · {backend}")).small().weak());
         if is_alter {
             ui.horizontal(|ui| {
@@ -336,7 +350,7 @@ pub fn table_editor_window(state: &mut AppState, ui: &mut egui::Ui) {
         set_alter_input(ui.ctx(), "table", String::new());
     } else if back_to_new {
         state.open_table_create(conn);
-    } else if close {
+    } else if !dismissed_popup && (close || key == Some(ModalKey::Cancel)) {
         state.close_table_editor();
     } else if apply {
         let tab = state
@@ -351,6 +365,7 @@ pub fn table_editor_window(state: &mut AppState, ui: &mut egui::Ui) {
             state.close_table_editor();
         }
     }
+    window.map(|window| window.response.layer_id)
 }
 
 #[cfg(test)]

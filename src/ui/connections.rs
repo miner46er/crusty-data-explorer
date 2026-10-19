@@ -16,7 +16,9 @@ use crate::db::{
 };
 use crate::ssh::{SshAuth, SshConfig};
 
-use super::{Palette, Theme};
+use super::{
+    ModalKey, Palette, Theme, approve_button, autofocus, note_dialog_field,
+};
 
 /// A connection's state as the card and the dot read it: one value that
 /// derives both the painted shape and the color, so a dot can never wear the
@@ -477,21 +479,6 @@ pub(crate) fn restore_version_then_open(state: &mut AppState, id: u64, index: us
     }
 }
 
-/// Whether a modal owns the keyboard, mirroring the editor's gate, so the
-/// version Restore and Preview buttons stay disabled under one.
-fn sidebar_modal_open(state: &AppState) -> bool {
-    state.draft().is_some()
-        || state.save_prompt().is_some()
-        || state.password_prompt().is_some()
-        || state.import_draft().is_some()
-        || state.pending_write().is_some()
-        || state.pending_params().is_some()
-        || state.pending_edit_preview().is_some()
-        || state.table_editor().is_some()
-        || state.pending_table_ddl().is_some()
-        || state.palette_open()
-}
-
 /// One saved-query row: pin mark, open button, connection name, delete, plus
 /// a collapsible version list. The list renders `versions` newest first with
 /// one Restore button (restore into the entry, then open it) and one Preview
@@ -842,10 +829,6 @@ fn saved_folder_header(
 }
 
 pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
-    // root() pumps this module through the sidebar, so the prod confirm
-    // renders with the connect gestures that raise it.
-    prod_confirm_window(state, ui);
-    terminate_confirm_window(state, ui);
     let palette = Palette::of(ui.ctx().theme());
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
         if ui
@@ -901,7 +884,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
 
                 // The saved rows and the action loop both gate on a modal, so
                 // the flag lives outside the section gate.
-                let modal_open = sidebar_modal_open(state);
+                let modal_open = super::modal_open(state, ui.ctx());
                 match state.sidebar_view() {
                     SidebarView::Schema => {
                         if !no_connections {
@@ -1510,19 +1493,27 @@ fn json_flag(object: &serde_json::Map<String, serde_json::Value>, keys: &[&str])
     keys.iter().any(|key| object.get(*key).is_some_and(|v| v.as_bool().unwrap_or(false)))
 }
 
-pub fn password_window(state: &mut AppState, ui: &mut egui::Ui) {
-    let Some(id) = state.password_prompt() else { return };
+pub fn password_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) -> Option<egui::LayerId> {
+    let id = state.password_prompt()?;
     let Some(name) =
         state.connections().iter().find(|c| c.id == id).map(|c| c.name.clone())
     else {
         state.cancel_password_prompt();
-        return;
+        return None;
     };
     let mut submit = false;
     let mut cancel = false;
-    egui::Window::new(format!("Password for {name}")).show(ui.ctx(), |ui| {
+    let mut field_focused = false;
+    let window = egui::Window::new(format!("Password for {name}")).show(ui.ctx(), |ui| {
         ui.label(format!("Enter password for {name}"));
-        ui.add(egui::TextEdit::singleline(state.prompt_password_mut()).password(true));
+        let field = ui.add(egui::TextEdit::singleline(state.prompt_password_mut()).password(true));
+        field_focused = field.has_focus();
+        autofocus(ui, "password", &field);
+        note_dialog_field(ui.ctx(), crate::app::Modal::PasswordPrompt, &field);
         ui.horizontal(|ui| {
             if ui.button("Connect").clicked() {
                 submit = true;
@@ -1532,83 +1523,110 @@ pub fn password_window(state: &mut AppState, ui: &mut egui::Ui) {
             }
         });
     });
+    let free_focus = ui.ctx().memory(|memory| memory.focused().is_none());
+    let submit = submit
+        || (key == Some(ModalKey::Submit) && (field_focused || free_focus));
     if submit {
         state.submit_password();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_password_prompt();
     }
+    window.map(|window| window.response.layer_id)
 }
 
-pub fn prod_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
-    let Some(id) = state.pending_prod() else { return };
+pub fn prod_confirm_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) -> Option<egui::LayerId> {
+    let id = state.pending_prod()?;
     let Some(name) =
         state.connections().iter().find(|c| c.id == id).map(|c| c.name.clone())
     else {
         state.cancel_prod();
-        return;
+        return None;
     };
     let mut confirm = false;
     let mut cancel = false;
-    egui::Window::new("Connect to prod?").show(ui.ctx(), |ui| {
+    let window = egui::Window::new("Connect to prod?").show(ui.ctx(), |ui| {
         ui.label(format!("Connect to {name}?"));
         ui.horizontal(|ui| {
-            if ui.button("Connect").clicked() {
+            if approve_button(ui, "Connect").clicked() {
                 confirm = true;
             }
-            if ui.button("Cancel").clicked() {
+            let cancel_button = ui.button("Cancel");
+            autofocus(ui, "prod-cancel", &cancel_button);
+            if cancel_button.clicked() {
                 cancel = true;
             }
         });
     });
     if confirm {
         state.confirm_prod();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_prod();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 /// The prod-gated terminate confirmation: names the backend and the
 /// connection, with the production warning the connect confirm carries.
 /// Non-prod terminates never arm this modal; they send on click.
-pub fn terminate_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
-    let Some(pending) = state.pending_terminate().cloned() else { return };
+pub fn terminate_confirm_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) -> Option<egui::LayerId> {
+    let pending = state.pending_terminate().cloned()?;
     let Some(name) =
         state.connections().iter().find(|c| c.id == pending.conn).map(|c| c.name.clone())
     else {
         state.cancel_terminate();
-        return;
+        return None;
     };
     let mut confirm = false;
     let mut cancel = false;
-    egui::Window::new("Terminate session?").show(ui.ctx(), |ui| {
+    let window = egui::Window::new("Terminate session?").show(ui.ctx(), |ui| {
         ui.label(format!("Terminate backend {} on {name}?", pending.backend));
         ui.label("The backend's running query stops and its connection drops.");
-        if ui.button("Terminate").clicked() {
+        if approve_button(ui, "Terminate").clicked() {
             confirm = true;
         }
-        if ui.button("Cancel").clicked() {
+        let cancel_button = ui.button("Cancel");
+        autofocus(ui, "terminate-cancel", &cancel_button);
+        if cancel_button.clicked() {
             cancel = true;
         }
     });
     if confirm {
         state.confirm_terminate();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_terminate();
     }
+    window.map(|window| window.response.layer_id)
 }
 
-pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
-    if state.draft().is_none() {
-        return;
-    }
+pub fn draft_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) -> Option<egui::LayerId> {
+    state.draft()?;
     let title = if state.draft().is_some_and(|d| d.editing.is_some()) {
         "Edit connection"
     } else {
         "New connection"
     };
+    // Escape belongs to any open dropdown first, so the form survives the
+    // press that dismissed it.
+    let dismissed_popup =
+        key == Some(ModalKey::Cancel) && egui::Popup::is_any_open(ui.ctx());
+    if dismissed_popup {
+        egui::Popup::close_all(ui.ctx());
+    }
     let mut save = false;
     let mut close = false;
-    egui::Window::new(title).show(ui.ctx(), |ui| {
+    let window = egui::Window::new(title).show(ui.ctx(), |ui| {
         let registry = state.registry();
         let Some(draft) = state.draft_mut() else { return };
         let draft_scope = draft.editing.map(|id| id.raw());
@@ -1848,9 +1866,10 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
                 state.connect(id);
             }
         }
-    } else if close {
+    } else if !dismissed_popup && (close || key == Some(ModalKey::Cancel)) {
         state.cancel_draft();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 /// The SSH tunnel fields, rendered for Postgres and MySQL drafts only. The

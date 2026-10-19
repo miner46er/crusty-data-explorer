@@ -33,43 +33,45 @@ fn row_text(state: &AppState, result: &SearchResult) -> (String, String) {
     }
 }
 
-/// Pump the palette from `root`: the Ctrl+K toggle everywhere, then the
-/// window, its keys, and its rows while it is open.
-pub fn palette(state: &mut AppState, ui: &mut egui::Ui) {
-    let other_modal_open = state.draft().is_some()
-        || state.save_prompt().is_some()
-        || state.password_prompt().is_some()
-        || state.import_draft().is_some()
-        || state.pending_write().is_some()
-        || state.pending_params().is_some();
-    let toggled = ui.input_mut(|i| i.consume_shortcut(&search_shortcut()));
-    if toggled {
-        if state.palette_open() {
+/// Pump the Ctrl+K toggle from `root`: the palette opens anywhere no other
+/// dialog owns the keyboard, and an open palette closes on a second press.
+pub fn palette_toggle(state: &mut AppState, ui: &mut egui::Ui) {
+    let other_modal_open = super::modal_open(state, ui.ctx())
+        && !matches!(state.modal(), Some(crate::app::Modal::Palette));
+    let pressed = ui.input_mut(|i| i.consume_shortcut(&search_shortcut()));
+    if pressed && !other_modal_open {
+        state.toggle_palette();
+    }
+}
+
+/// The open palette's window and keys. `owns` is false when a newer dialog
+/// covers it: it still draws, but no key reaches it. The arrows, Enter, and
+/// Escape are claimed before the filter box sees them.
+pub fn palette_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    owns: bool,
+    key: Option<super::ModalKey>,
+) -> Option<egui::LayerId> {
+    if !state.palette_open() {
+        return None;
+    }
+    if owns {
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+            state.move_palette_selection(1);
+        }
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+            state.move_palette_selection(-1);
+        }
+        if key == Some(super::ModalKey::Submit) {
+            state.activate_palette_selection();
+        }
+        if key == Some(super::ModalKey::Cancel) {
             state.close_palette();
-        } else if !other_modal_open {
-            state.open_palette();
         }
     }
     if !state.palette_open() {
-        return;
-    }
-    let just_opened = toggled;
-    // The arrows, Enter, and Escape are claimed before the filter box sees
-    // them, so they never move its caret.
-    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
-        state.move_palette_selection(1);
-    }
-    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
-        state.move_palette_selection(-1);
-    }
-    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
-        state.activate_palette_selection();
-    }
-    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-        state.close_palette();
-    }
-    if !state.palette_open() {
-        return;
+        return None;
     }
 
     let rows: Vec<(String, String)> = state
@@ -78,22 +80,22 @@ pub fn palette(state: &mut AppState, ui: &mut egui::Ui) {
         .unwrap_or_default();
     let mut clicked: Option<usize> = None;
     let mut query_changed = false;
-    egui::Window::new("Search")
+    let window = egui::Window::new("Search")
         .collapsible(false)
         .resizable(false)
         .default_width(460.0)
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
         .show(ui.ctx(), |ui| {
             let Some(palette) = state.palette_mut() else { return };
-            let focus = just_opened || ui.memory(|memory| memory.focused().is_none());
             let response = ui.add(
                 egui::TextEdit::singleline(&mut palette.query)
                     .hint_text("Search connections, saved queries, tables, and columns")
                     .desired_width(f32::INFINITY),
             );
             query_changed = response.changed();
-            if focus {
-                response.request_focus();
+            if owns {
+                super::autofocus(ui, "palette-query", &response);
+                super::note_dialog_field(ui.ctx(), crate::app::Modal::Palette, &response);
             }
             egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                 for (index, (name, detail)) in rows.iter().enumerate() {
@@ -122,6 +124,7 @@ pub fn palette(state: &mut AppState, ui: &mut egui::Ui) {
         }
         state.activate_palette_selection();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 #[cfg(test)]

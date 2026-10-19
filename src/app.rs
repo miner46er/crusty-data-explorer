@@ -1745,6 +1745,88 @@ pub struct PendingTerminate {
     pub backend: String,
 }
 
+/// The modal dialog that owns the screen, frontmost first. One variant per
+/// dialog an `AppState` field can show, so every key gate and the root
+/// dispatcher read the same one answer. Not persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Modal {
+    /// The prod connect confirmation over `pending_prod`.
+    ProdConnect,
+    /// The prod session terminate confirmation over `pending_terminate`.
+    Terminate,
+    /// The new/edit connection form over `draft`.
+    Draft,
+    /// The save-query prompt over `save_prompt`.
+    SavePrompt,
+    /// The password prompt over `password_prompt`.
+    PasswordPrompt,
+    /// The import confirmation over `imports`.
+    Import,
+    /// The UPDATE/DELETE without WHERE confirmation over `pending_write`.
+    WriteConfirm,
+    /// The placeholder value prompt over `pending_params`.
+    Params,
+    /// The staged-edit SQL preview over `pending_edit_preview`.
+    EditPreview,
+    /// The prod table DDL confirmation over `pending_table_confirm`.
+    TableDdl,
+    /// The visual table creator over `table_editor`.
+    TableEditor,
+    /// The table compare window over `compare_open`.
+    Compare,
+    /// The Ctrl+K command palette over `search`.
+    Palette,
+}
+
+impl Modal {
+    /// Every dialog an `AppState` field can show, in the order ties fall back
+    /// to when two were never marked.
+    pub const ALL: [Modal; 13] = [
+        Modal::ProdConnect,
+        Modal::Terminate,
+        Modal::Draft,
+        Modal::SavePrompt,
+        Modal::PasswordPrompt,
+        Modal::Import,
+        Modal::WriteConfirm,
+        Modal::Params,
+        Modal::EditPreview,
+        Modal::TableDdl,
+        Modal::TableEditor,
+        Modal::Compare,
+        Modal::Palette,
+    ];
+
+    /// This dialog's slot in [`Modal::ALL`]. Exhaustive, so adding a
+    /// variant fails to compile until its slot is placed.
+    fn index(self) -> usize {
+        match self {
+            Modal::ProdConnect => 0,
+            Modal::Terminate => 1,
+            Modal::Draft => 2,
+            Modal::SavePrompt => 3,
+            Modal::PasswordPrompt => 4,
+            Modal::Import => 5,
+            Modal::WriteConfirm => 6,
+            Modal::Params => 7,
+            Modal::EditPreview => 8,
+            Modal::TableDdl => 9,
+            Modal::TableEditor => 10,
+            Modal::Compare => 11,
+            Modal::Palette => 12,
+        }
+    }
+
+    /// Whether plain Enter means submit. Only the prompts with a text field
+    /// and the palette, whose Enter opens the selected row.
+    pub fn submits_on_enter(self) -> bool {
+        matches!(
+            self,
+            Modal::SavePrompt | Modal::PasswordPrompt | Modal::Params | Modal::Palette
+        )
+    }
+}
+
 /// A run held for its parameter values: the tab and connection it would run
 /// on, whether it is an explain run, the raw scoped statements with their
 /// placeholders, and the collected parameters with the typed values. Confirm
@@ -1817,6 +1899,10 @@ pub struct AppState {
     /// The idle schedule for open manual transactions, threaded to each
     /// worker at spawn. Tests swap in a short schedule.
     tx_idle: TxIdle,
+    /// The sequence number each dialog got when it last opened, indexed by
+    /// [`Modal::index`]. The newest open dialog owns the keyboard.
+    modal_marks: [u64; Modal::ALL.len()],
+    modal_seq: u64,
 }
 
 impl AppState {
@@ -1870,9 +1956,66 @@ impl AppState {
             compare: CompareState::default(),
             theme: settings.theme,
             tx_idle: TxIdle::default(),
+            modal_marks: [0; Modal::ALL.len()],
+            modal_seq: 0,
         };
         state.restore_tabs();
         state
+    }
+
+    /// The modal that owns the screen right now. Every "is a modal open" gate
+    /// and per-dialog key handler reads this one answer.
+    ///
+    /// The newest dialog wins: opening one over another stacks it on top,
+    /// gives it the keyboard, and draws it last, so what the operator sees is
+    /// what Escape and Enter reach. Ties, which only a transition that forgot
+    /// to mark a dialog can create, fall back to [`Modal::ALL`] order.
+    pub fn modal(&self) -> Option<Modal> {
+        Modal::ALL
+            .iter()
+            .copied()
+            .filter(|modal| self.modal_is_open(*modal))
+            .max_by_key(|modal| {
+                (self.modal_marks[modal.index()], std::cmp::Reverse(modal.index()))
+            })
+    }
+
+    /// Every open dialog, back to front. `root` draws it in this order, so the
+    /// last one is the topmost window and the one [`AppState::modal`] names.
+    pub fn modals_back_to_front(&self) -> Vec<Modal> {
+        let mut open: Vec<Modal> = Modal::ALL
+            .iter()
+            .copied()
+            .filter(|modal| self.modal_is_open(*modal))
+            .collect();
+        open.sort_by_key(|modal| self.modal_marks[modal.index()]);
+        open
+    }
+
+    /// Whether one dialog's backing state is set.
+    fn modal_is_open(&self, modal: Modal) -> bool {
+        match modal {
+            Modal::ProdConnect => self.pending_prod.is_some(),
+            Modal::Terminate => self.pending_terminate.is_some(),
+            Modal::Draft => self.draft.is_some(),
+            Modal::SavePrompt => self.save_prompt.is_some(),
+            Modal::PasswordPrompt => self.password_prompt.is_some(),
+            Modal::Import => self.imports.is_some(),
+            Modal::WriteConfirm => self.pending_write.is_some(),
+            Modal::Params => self.pending_params.is_some(),
+            Modal::EditPreview => self.pending_edit_preview.is_some(),
+            Modal::TableDdl => self.pending_table_confirm.is_some(),
+            Modal::TableEditor => self.table_editor.is_some(),
+            Modal::Compare => self.compare_open,
+            Modal::Palette => self.search.is_some(),
+        }
+    }
+
+    /// Record that a dialog just opened, so it draws above the dialogs already
+    /// open and owns the keyboard.
+    fn note_modal(&mut self, modal: Modal) {
+        self.modal_seq = self.modal_seq.wrapping_add(1);
+        self.modal_marks[modal.index()] = self.modal_seq;
     }
 
     /// The current app theme, flipped from the status bar.
@@ -2038,24 +2181,42 @@ impl AppState {
 
     pub fn close_tab(&mut self, tab: TabId) {
         self.tabs.retain(|t| t.id != tab);
-        if self.pending_write.as_ref().is_some_and(|pending| pending.tab == tab) {
-            self.pending_write = None;
-        }
-        if self.pending_params.as_ref().is_some_and(|pending| pending.tab == tab) {
-            self.pending_params = None;
-        }
-        if self.pending_edit_preview == Some(tab) {
-            self.pending_edit_preview = None;
-        }
-        if self.pending_table_confirm.as_ref().is_some_and(|pending| pending.tab == tab) {
-            self.pending_table_confirm = None;
-        }
+        self.clear_tab_confirms(tab);
         self.repair_active();
     }
 
     pub fn activate(&mut self, tab: TabId) {
         if self.tabs.iter().any(|t| t.id == tab) {
             self.active = Some(tab);
+        }
+    }
+
+    /// Move the active tab `step` places forward (negative goes back),
+    /// wrapping around the ends. No-op with no tabs.
+    pub fn activate_relative(&mut self, step: isize) {
+        let len = self.tabs.len();
+        if len == 0 {
+            return;
+        }
+        let Some(current) = self.active.and_then(|id| self.tabs.iter().position(|t| t.id == id))
+        else {
+            self.active = Some(self.tabs[0].id);
+            return;
+        };
+        let next = (current as isize + step).rem_euclid(len as isize) as usize;
+        self.active = Some(self.tabs[next].id);
+    }
+
+    /// Activate the `n`th tab, 1-based. Nine selects the last tab, the
+    /// browser rule, whatever the count; other out-of-range values are no-ops.
+    pub fn activate_nth(&mut self, n: usize) {
+        let index = match n {
+            0 => return,
+            9 => self.tabs.len().checked_sub(1),
+            n => n.checked_sub(1),
+        };
+        if let Some(index) = index.filter(|index| *index < self.tabs.len()) {
+            self.active = Some(self.tabs[index].id);
         }
     }
 
@@ -2085,6 +2246,24 @@ impl AppState {
         self.start_batch(tab, sql, cursor, selection, true);
     }
 
+    /// Drop this tab's armed confirms. A new batch replaces the statement a
+    /// confirm was armed for, so approving afterwards could send text the
+    /// operator never saw.
+    fn clear_tab_confirms(&mut self, tab: TabId) {
+        if self.pending_write.as_ref().is_some_and(|pending| pending.tab == tab) {
+            self.pending_write = None;
+        }
+        if self.pending_params.as_ref().is_some_and(|pending| pending.tab == tab) {
+            self.pending_params = None;
+        }
+        if self.pending_edit_preview == Some(tab) {
+            self.pending_edit_preview = None;
+        }
+        if self.pending_table_confirm.as_ref().is_some_and(|pending| pending.tab == tab) {
+            self.pending_table_confirm = None;
+        }
+    }
+
     /// The shared body of run and explain. Resolves the tab's connection, its
     /// handle, and the effective statements. A batch with `:name` or `?`
     /// placeholders arms the value prompt and holds instead of sending; a
@@ -2101,6 +2280,7 @@ impl AppState {
         selection: Option<Range<usize>>,
         explain: bool,
     ) {
+        self.clear_tab_confirms(tab);
         let (conn_id, kind, handle, scope, read_only) =
             match self.tabs.iter().find(|t| t.id == tab) {
                 Some(t) => {
@@ -2137,6 +2317,7 @@ impl AppState {
                     statements,
                     params,
                 });
+                self.note_modal(Modal::Params);
                 return;
             }
             Ok(_) => {}
@@ -2219,6 +2400,7 @@ impl AppState {
         explain: bool,
         raw_history: Option<&[String]>,
     ) {
+        self.clear_tab_confirms(tab);
         let prepare = |statement: &String| {
             if explain { explain_sql(kind, statement) } else { statement.clone() }
         };
@@ -2256,6 +2438,7 @@ impl AppState {
                 kind: found.kind.to_owned(),
                 table: found.table,
             });
+            self.note_modal(Modal::WriteConfirm);
             return;
         }
         self.send_batch(tab, conn, handle, prepared, BatchPurpose::Run, history);
@@ -2795,6 +2978,7 @@ impl AppState {
             return;
         }
         self.pending_edit_preview = Some(tab);
+        self.note_modal(Modal::EditPreview);
     }
 
     /// Send the previewed batch exactly as the apply path would: an UPDATE
@@ -2852,6 +3036,7 @@ impl AppState {
             form: crate::ui::ddl::TableForm::blank(),
         });
         self.pending_table_confirm = None;
+        self.note_modal(Modal::TableEditor);
     }
 
     /// Open the alter-table form prefilled from the loaded schema. No-op
@@ -2875,6 +3060,7 @@ impl AppState {
         let form = crate::ui::ddl::TableForm::from_table(schema, &info);
         self.table_editor = Some(TableEditorState { conn, original: Some(info), form });
         self.pending_table_confirm = None;
+        self.note_modal(Modal::TableEditor);
     }
 
     /// Close the table editor without sending anything. A held prod
@@ -2969,6 +3155,7 @@ impl AppState {
         if prod {
             self.pending_table_confirm =
                 Some(PendingTableDdl { conn: conn_id, tab, statements });
+            self.note_modal(Modal::TableDdl);
             return;
         }
         self.send_batch(tab, conn_id, handle, statements, BatchPurpose::TableDdl, None);
@@ -3074,6 +3261,7 @@ impl AppState {
             table: target.table,
             source,
         });
+        self.note_modal(Modal::Import);
         if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
             t.clear_export_notice();
         }
@@ -3318,6 +3506,7 @@ impl AppState {
     pub fn connect(&mut self, id: ConnectionId) {
         if self.prod_needs_confirm(id) {
             self.pending_prod = Some(id);
+            self.note_modal(Modal::ProdConnect);
             return;
         }
         self.connect_now(id);
@@ -3425,6 +3614,7 @@ impl AppState {
     pub fn open_password_prompt(&mut self, id: ConnectionId) {
         if self.prod_needs_confirm(id) {
             self.pending_prod = Some(id);
+            self.note_modal(Modal::ProdConnect);
             return;
         }
         self.prompt_or_connect(id);
@@ -3438,6 +3628,7 @@ impl AppState {
         };
         if should_prompt {
             self.password_prompt = Some(id);
+            self.note_modal(Modal::PasswordPrompt);
             self.prompt_password.clear();
         } else {
             self.connect_now(id);
@@ -3569,6 +3760,7 @@ impl AppState {
         if prod {
             self.pending_terminate =
                 Some(PendingTerminate { conn, backend: backend.to_owned() });
+            self.note_modal(Modal::Terminate);
             return;
         }
         self.send_terminate(conn, backend.to_owned(), handle);
@@ -3750,6 +3942,7 @@ impl AppState {
     /// Open the Table compare window.
     pub fn open_compare(&mut self) {
         self.compare_open = true;
+        self.note_modal(Modal::Compare);
     }
 
     /// Close the Table compare window without clearing its picks or diff.
@@ -4390,6 +4583,7 @@ impl AppState {
             selected: 0,
             results: Vec::new(),
         });
+        self.note_modal(Modal::Palette);
     }
 
     pub fn close_palette(&mut self) {
@@ -4534,6 +4728,7 @@ impl AppState {
                 error: None,
             },
         });
+        self.note_modal(Modal::SavePrompt);
     }
 
     pub fn close_save_prompt(&mut self) {
@@ -4617,6 +4812,7 @@ impl AppState {
             folder,
             error: None,
         });
+        self.note_modal(Modal::Draft);
     }
 
     pub fn cancel_draft(&mut self) {
@@ -6226,6 +6422,43 @@ mod tests {
     }
 
     #[test]
+    fn activate_relative_wraps_and_activate_nth_follows_the_browser_rule() {
+        with_isolated_state("tab-chords", |state| {
+            state.activate_relative(1);
+            state.activate_nth(1);
+            assert_eq!(state.active(), None, "no tabs to switch to");
+
+            let conn = add_sqlite_connection(state, "mem-chords");
+            let first = state.new_tab(conn);
+            let second = state.new_tab(conn);
+            let third = state.new_tab(conn);
+            assert_eq!(state.active(), Some(first), "the first tab starts active");
+
+            state.activate_relative(1);
+            assert_eq!(state.active(), Some(second));
+            state.activate_relative(1);
+            assert_eq!(state.active(), Some(third));
+            state.activate_relative(1);
+            assert_eq!(state.active(), Some(first), "forward wraps");
+            state.activate_relative(-1);
+            assert_eq!(state.active(), Some(third), "backward wraps");
+
+            state.activate_nth(2);
+            assert_eq!(state.active(), Some(second));
+            state.activate_nth(1);
+            assert_eq!(state.active(), Some(first));
+            state.activate_nth(3);
+            assert_eq!(state.active(), Some(third));
+            state.activate_nth(9);
+            assert_eq!(state.active(), Some(third), "9 selects the last tab");
+            state.activate_nth(4);
+            assert_eq!(state.active(), Some(third), "past the end is a no-op");
+            state.activate_nth(0);
+            assert_eq!(state.active(), Some(third), "0 is out of range");
+        });
+    }
+
+    #[test]
     fn filter_clause_sql_covers_every_operator_with_literal_typing() {
         let clause = |column: &str, op: FilterOp, value: &str| FilterClause {
             column: column.to_owned(),
@@ -7060,7 +7293,7 @@ mod tests {
                 ..Default::default()
             };
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -7074,7 +7307,7 @@ mod tests {
                 value: String::new(),
             });
             let mut output = ctx.run_ui(input, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -7103,7 +7336,7 @@ mod tests {
                 ..Default::default()
             };
             let mut grid = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             grid.textures_delta.clear();
             let grid_text = rendered_text(&grid);
@@ -7130,7 +7363,7 @@ mod tests {
             // Switching the active result re-renders the grid for that result.
             state.tab_mut(tab).expect("tab").set_active_result(1);
             let mut switched = ctx.run_ui(input, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             switched.textures_delta.clear();
             let switched_text = rendered_text(&switched);
@@ -8443,9 +8676,7 @@ mod tests {
             let frame = |state: &mut AppState, events: Vec<eframe::egui::Event>| {
                 let mut raw = input.clone();
                 raw.events = events;
-                let mut output = ctx.run_ui(raw, |ui| {
-                    crate::ui::search::palette(state, ui);
-                });
+                let mut output = ctx.run_ui(raw, |ui| crate::ui::root(state, ui));
                 output.textures_delta.clear();
                 output
             };
@@ -8505,16 +8736,22 @@ mod tests {
                 state,
                 vec![key_event(eframe::egui::Key::Enter, eframe::egui::Modifiers::NONE)],
             );
-            assert!(!state.palette_open());
-            assert_eq!(
-                state.navigator_reveal(),
-                Some(&NavigatorReveal {
-                    conn,
-                    schema: "main".to_owned(),
-                    table: "items".to_owned(),
-                })
-            );
+            assert!(!state.palette_open(), "Enter closes the palette");
             assert_eq!(state.tabs().len(), 2, "the column row opened no tab");
+            // The sidebar consumes the reveal the same frame it draws, so the
+            // pending value is gone: the effect to read is the expanded entry.
+            assert!(
+                state.navigator_reveal().is_none(),
+                "the sidebar consumed the reveal"
+            );
+            // The forced-open animates in, so the expanded entry reads on the
+            // next frame.
+            let expanded = frame(state, vec![]);
+            let text = rendered_text(&expanded);
+            assert!(
+                text.iter().any(|t| t == "Columns (3)"),
+                "the reveal expanded main.items: {text:?}"
+            );
         });
     }
 
@@ -9292,7 +9529,7 @@ mod tests {
             };
             let frame = |state: &mut AppState| {
                 let mut output = ctx.run_ui(input.clone(), |ui| {
-                    crate::ui::connections::draft_window(state, ui);
+                    crate::ui::connections::draft_window(state, ui, None);
                 });
                 output.textures_delta.clear();
                 output
@@ -9326,7 +9563,7 @@ mod tests {
                 click(pos, false),
             ];
             let mut clicked = ctx.run_ui(events, |ui| {
-                crate::ui::connections::draft_window(state, ui);
+                crate::ui::connections::draft_window(state, ui, None);
             });
             clicked.textures_delta.clear();
             let after = frame(state);
@@ -10327,6 +10564,113 @@ mod tests {
     }
 
     #[test]
+    fn modal_slots_match_all_order() {
+        for (slot, modal) in Modal::ALL.iter().copied().enumerate() {
+            assert_eq!(modal.index(), slot, "{modal:?} sits in its own slot");
+        }
+    }
+
+    #[test]
+    fn modal_ties_fall_back_to_all_order() {
+        with_isolated_state("modal-tie", |state| {
+            state.open_draft(None);
+            state.open_save_prompt();
+            state.modal_marks = [0; Modal::ALL.len()];
+            assert_eq!(
+                state.modal(),
+                Some(Modal::Draft),
+                "an unmarked tie names the earlier dialog"
+            );
+        });
+    }
+
+    #[test]
+    fn modal_names_each_dialog_while_its_state_is_set() {
+        with_isolated_state("modal-identity", |state| {
+            assert_eq!(state.modal(), None, "a fresh state is free keyboard");
+
+            state.open_draft(None);
+            assert_eq!(state.modal(), Some(Modal::Draft));
+            state.cancel_draft();
+
+            state.open_save_prompt();
+            assert_eq!(state.modal(), Some(Modal::SavePrompt));
+            state.close_save_prompt();
+
+            let (tab, conn, _commands) = editable_tab(state);
+            state.activate(tab);
+
+            let csv = std::env::temp_dir().join(format!(
+                "cde-modal-import-{}.csv",
+                std::process::id()
+            ));
+            std::fs::write(&csv, "tenant,id,name\nacme,1,Ada\n").unwrap();
+            state.begin_import(tab, &csv);
+            assert_eq!(state.modal(), Some(Modal::Import));
+            state.cancel_import();
+            let _ = std::fs::remove_file(&csv);
+
+            state.start_run(tab, "DELETE FROM items", 0, None);
+            assert_eq!(state.modal(), Some(Modal::WriteConfirm));
+            state.cancel_write();
+
+            state.start_run(tab, "SELECT item_name FROM items WHERE item_name = :name", 0, None);
+            assert_eq!(state.modal(), Some(Modal::Params));
+            state.cancel_params();
+
+            state.stage_edit(tab, 0, 2, "Ada".to_owned());
+            state.apply_edits(tab);
+            assert_eq!(state.modal(), Some(Modal::EditPreview));
+            state.cancel_pending_edits();
+
+            state.open_table_create(conn);
+            assert_eq!(state.modal(), Some(Modal::TableEditor));
+            state.close_table_editor();
+
+            state.open_compare();
+            assert_eq!(state.modal(), Some(Modal::Compare));
+            state.close_compare();
+
+            state.open_palette();
+            assert_eq!(state.modal(), Some(Modal::Palette));
+            state.close_palette();
+
+            let prod = add_sqlite_connection_env(state, "prod-modal", Environment::Prod);
+            state.connect(prod);
+            assert_eq!(state.modal(), Some(Modal::ProdConnect));
+            state.cancel_prod();
+
+            state.request_terminate(prod, "4242");
+            assert_eq!(state.modal(), Some(Modal::Terminate));
+            state.cancel_terminate();
+
+            let prod_tab = state.new_tab(prod);
+            state.open_table_create(prod);
+            {
+                let editor = state.table_editor_mut().expect("editor open");
+                editor.form.table = "audit".to_owned();
+                editor.form.columns = vec![crate::ui::ddl::TableColumnDraft {
+                    name: "id".to_owned(),
+                    data_type: "INTEGER".to_owned(),
+                    nullable: false,
+                    default: String::new(),
+                    pk: true,
+                }];
+            }
+            state.apply_table_ddl(prod_tab);
+            assert_eq!(state.modal(), Some(Modal::TableDdl), "the confirm outranks its editor");
+            state.cancel_table_ddl();
+            state.close_table_editor();
+
+            let prompting = add_postgres_connection_env(state, "pg-modal", "", Environment::Dev);
+            state.open_password_prompt(prompting);
+            assert_eq!(state.modal(), Some(Modal::PasswordPrompt));
+            assert_eq!(state.connections().len(), 3, "the prompt spawns nothing");
+            state.cancel_password_prompt();
+        });
+    }
+
+    #[test]
     fn table_create_validation_failure_lands_error_and_sends_nothing() {
         with_isolated_state("table-create-invalid", |state| {
             let conn = add_sqlite_connection(state, "mem-table-bad");
@@ -10397,11 +10741,11 @@ mod tests {
                 ..Default::default()
             };
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::query::editor(state, ui);
+                crate::ui::root(state, ui);
             });
             output.textures_delta.clear();
             let mut output = ctx.run_ui(input, |ui| {
-                crate::ui::query::editor(state, ui);
+                crate::ui::root(state, ui);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -10617,7 +10961,7 @@ mod tests {
                 ..Default::default()
             };
             let mut first = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             let pos = text_center(&first, "ada").expect("the name cell renders");
             first.textures_delta.clear();
@@ -10625,14 +10969,14 @@ mod tests {
             let mut double_click = input.clone();
             double_click.events = double_click_events(pos);
             let mut second = ctx.run_ui(double_click, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             second.textures_delta.clear();
 
             // The editor draws once before it holds focus, the way a user
             // types after the field appears.
             let mut opened = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             opened.textures_delta.clear();
 
@@ -10659,7 +11003,7 @@ mod tests {
                 },
             ];
             let mut third = ctx.run_ui(typed, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             third.textures_delta.clear();
             assert_eq!(state.tab(tab).expect("tab").edit_text(0, 2), Some("Grace"));
@@ -10668,11 +11012,11 @@ mod tests {
             let mut double_click = input.clone();
             double_click.events = double_click_events(pos);
             let mut fourth = ctx.run_ui(double_click, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             fourth.textures_delta.clear();
             let mut opened = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             opened.textures_delta.clear();
             let mut escaped = input;
@@ -10687,7 +11031,7 @@ mod tests {
                 },
             ];
             let mut fifth = ctx.run_ui(escaped, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             fifth.textures_delta.clear();
             assert_eq!(state.tab(tab).expect("tab").edit_text(0, 2), Some("Grace"));
@@ -10874,7 +11218,7 @@ mod tests {
                 ..Default::default()
             };
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -10887,7 +11231,7 @@ mod tests {
             state.stage_edit(tab, 0, 2, "Ada".to_owned());
             state.add_row(tab);
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -10899,7 +11243,7 @@ mod tests {
                 *slot = "SELECT i.id FROM items i JOIN items o ON o.id = i.id".to_owned();
             }
             let mut output = ctx.run_ui(input, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -11445,7 +11789,7 @@ mod tests {
             assert!(state.import_draft().is_some(), "draft staged");
             let render = |state: &mut AppState| {
                 let mut output = ctx.run_ui(input.clone(), |ui| {
-                    crate::ui::grid::results(state, ui);
+                    crate::ui::root(state, ui);
                 });
                 output.textures_delta.clear();
                 output
@@ -11586,7 +11930,7 @@ mod tests {
                 ..Default::default()
             };
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::root(state, ui);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -11598,7 +11942,7 @@ mod tests {
             // A fresh egui window paints from its second frame on.
             let render = |state: &mut AppState| {
                 let mut output = ctx.run_ui(input.clone(), |ui| {
-                    crate::ui::grid::results(state, ui);
+                    crate::ui::root(state, ui);
                 });
                 output.textures_delta.clear();
                 output
@@ -11618,7 +11962,7 @@ mod tests {
                 *slot = "SELECT i.id FROM items i JOIN items o ON o.id = i.id".to_owned();
             }
             let mut output = ctx.run_ui(input, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -11774,6 +12118,27 @@ mod tests {
     }
 
     #[test]
+    fn a_new_run_clears_the_tabs_armed_write_confirm() {
+        with_isolated_state("write-confirm-superseded", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.start_run(tab, "DELETE FROM users", 0, None);
+            assert!(state.pending_write().is_some(), "the guard holds the delete");
+            state.start_run(tab, "SELECT 1", 0, None);
+            assert!(
+                state.pending_write().is_none(),
+                "a later run drops the guard for the statement it replaced"
+            );
+            match commands.try_recv().expect("the new run was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["SELECT 1"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
     fn confirm_write_refuses_when_the_connection_turned_read_only() {
         with_isolated_state("write-confirm-ro", |state| {
             let (conn, commands) = scripted_connection(state, "mem");
@@ -11857,11 +12222,11 @@ mod tests {
                 ..Default::default()
             };
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::query::editor(state, ui);
+                crate::ui::root(state, ui);
             });
             output.textures_delta.clear();
             let mut output = ctx.run_ui(input, |ui| {
-                crate::ui::query::editor(state, ui);
+                crate::ui::root(state, ui);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
