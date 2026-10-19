@@ -12,8 +12,8 @@ use eframe::egui;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
-use crusty_data_explorer::app::{AppState, ConnectionState, Environment, RunOutcome};
-use crusty_data_explorer::db::{ConnectionConfig, ConnectionId, TabId};
+use crusty_data_explorer::app::{AppState, ConnectionState, Environment, Modal, RunOutcome};
+use crusty_data_explorer::db::{ConnectionConfig, ConnectionId, PostgresSslMode, TabId};
 use crusty_data_explorer::ui;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -263,16 +263,17 @@ fn arrow_keys_move_the_active_cell() {
 
 /// The Enter presses below prove Tab left no widget focused: they run behind
 /// the same gate as Ctrl+C, so a Tab that moved egui's focus would open no
-/// editor.
+/// editor. The arrow key arms the grid's keyboard, the same way a cell click
+/// does.
 #[test]
 fn tab_walks_the_view_and_keeps_the_grid_alive() {
     let _lock = env_lock();
     let (_scratch, mut harness, _tab) = grid_setup("tab");
     open_detail(&mut harness);
-    press_key(&mut harness, egui::Key::Tab);
+    press_key(&mut harness, egui::Key::ArrowDown);
     assert!(
         harness.query_by_label("Row 1 of 5").is_some(),
-        "Tab lands on the first displayed row"
+        "the arrow key lands on the first displayed row"
     );
     press_key(&mut harness, egui::Key::Tab);
     press_key(&mut harness, egui::Key::Tab);
@@ -295,6 +296,27 @@ fn tab_walks_the_view_and_keeps_the_grid_alive() {
         "Shift+Tab wraps back onto the previous row's last column"
     );
     press_key(&mut harness, egui::Key::Escape);
+}
+
+/// A cell click arms the grid's keyboard, so the next Tab steps the cursor and
+/// Enter opens the cell editor on the landed column.
+#[test]
+fn a_cell_click_arms_tab_and_enter_on_the_grid() {
+    let _lock = env_lock();
+    let (_scratch, mut harness, _tab) = grid_setup("tab-armed");
+    open_detail(&mut harness);
+    harness.get_by_label("ada@example.com").click();
+    harness.run();
+    assert!(
+        harness.query_by_label("Row 1 of 5").is_some(),
+        "the click puts the cursor on the email cell"
+    );
+    press_key(&mut harness, egui::Key::Tab);
+    press_key(&mut harness, egui::Key::Enter);
+    assert!(
+        harness.query_by_label("Currently: pro").is_some(),
+        "Tab stepped from the clicked email column to the plan column"
+    );
 }
 
 #[test]
@@ -359,30 +381,308 @@ fn shift_command_c_copies_the_active_cell() {
 }
 
 /// The cursor's row is scrolled into view: with 200 rows the last one is
-/// virtualized away until Ctrl+End moves the cursor onto it.
+/// virtualized away until Ctrl+End moves the cursor onto it. The detail pane
+/// stays closed, so the row label can only appear through the grid's own
+/// vertical scroll.
 #[test]
 fn ctrl_end_scrolls_the_cursor_row_into_view() {
     let _lock = env_lock();
     let (_scratch, mut harness, _tab) = scrolling_setup("scroll");
-    open_detail(&mut harness);
-    assert!(
-        harness.query_by_label("row-200").is_none(),
+    assert_eq!(
+        harness.query_all_by_label("row-200").count(),
+        0,
         "the last row starts below the viewport"
     );
     harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::End);
     harness.run();
-    assert!(
-        harness.query_by_label("Row 1 of 200").is_some(),
-        "a step with no cursor lands on the first row"
-    );
     harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::End);
     harness.run();
-    assert!(
-        harness.query_by_label("Row 200 of 200").is_some(),
-        "Ctrl+End puts the cursor on the last row"
-    );
-    assert!(
-        harness.query_by_label("row-200").is_some(),
+    assert_eq!(
+        harness.query_all_by_label("row-200").count(),
+        1,
         "the cursor's row scrolled into view"
     );
 }
+
+/// One saved Postgres connection, unconnected: the prompt and prod confirm
+/// cases need its config and environment, not a server.
+fn add_postgres(state: &mut AppState, env: Environment) -> ConnectionId {
+    state.open_draft(None);
+    {
+        let draft = state.draft_mut().expect("the open draft");
+        draft.name = "pg".to_owned();
+        draft.env = env;
+        draft.config = ConnectionConfig::Postgres {
+            host: "localhost".to_owned(),
+            port: 5432,
+            database: "appdb".to_owned(),
+            user: "owner".to_owned(),
+            ssl_mode: PostgresSslMode::Disable,
+            ssh: None,
+            read_only: false,
+        };
+    }
+    state.save_draft();
+    state.connections().last().expect("the saved connection").id
+}
+
+fn import_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("cde-dialogs-import-{}.csv", std::process::id()))
+}
+
+fn setup_draft(harness: &mut Harness<AppState>, _tab: TabId) {
+    harness.state_mut().open_draft(None);
+}
+fn setup_import(harness: &mut Harness<AppState>, tab: TabId) {
+    let conn = harness.state().tab(tab).and_then(|tab| tab.conn).expect("the tab connection");
+    step_until(harness, "the schema", |state| state.schema(conn).is_some());
+    let path = import_path();
+    std::fs::write(&path, "id,email,plan\n9,nine@example.com,pro\n").unwrap();
+    harness.state_mut().begin_import(tab, &path);
+}
+fn setup_write(harness: &mut Harness<AppState>, tab: TabId) {
+    harness.state_mut().start_run(tab, "DELETE FROM users", 0, None);
+}
+fn setup_edit_preview(harness: &mut Harness<AppState>, tab: TabId) {
+    let conn = harness.state().tab(tab).and_then(|tab| tab.conn).expect("the tab connection");
+    step_until(harness, "the schema", |state| state.schema(conn).is_some());
+    harness.state_mut().stage_edit(tab, 0, 1, "ada@example.com".to_owned());
+    harness.state_mut().apply_edits(tab);
+}
+fn setup_prod_connect(harness: &mut Harness<AppState>, _tab: TabId) {
+    let conn = add_postgres(harness.state_mut(), Environment::Prod);
+    harness.state_mut().connect(conn);
+}
+fn setup_terminate(harness: &mut Harness<AppState>, _tab: TabId) {
+    let conn = add_postgres(harness.state_mut(), Environment::Prod);
+    harness.state_mut().request_terminate(conn, "4242");
+}
+fn setup_table_ddl(harness: &mut Harness<AppState>, _tab: TabId) {
+    let conn = add_postgres(harness.state_mut(), Environment::Prod);
+    let tab = harness.state_mut().new_tab(conn);
+    harness.state_mut().open_table_create(conn);
+    {
+        let editor = harness.state_mut().table_editor_mut().expect("the table editor");
+        editor.form.table = "audit".to_owned();
+        editor.form.columns[0].name = "id".to_owned();
+        editor.form.columns[0].data_type = "INTEGER".to_owned();
+    }
+    harness.state_mut().apply_table_ddl(tab);
+}
+fn setup_table_editor(harness: &mut Harness<AppState>, tab: TabId) {
+    let conn = harness.state().tab(tab).and_then(|tab| tab.conn).expect("the tab connection");
+    harness.state_mut().open_table_create(conn);
+}
+fn setup_compare(harness: &mut Harness<AppState>, _tab: TabId) {
+    harness.state_mut().open_compare();
+}
+fn setup_palette(harness: &mut Harness<AppState>, _tab: TabId) {
+    harness.state_mut().open_palette();
+}
+
+#[derive(Clone, Copy)]
+struct DialogCase {
+    name: &'static str,
+    expected: Modal,
+    setup: fn(&mut Harness<AppState>, TabId),
+    open: fn(&AppState) -> bool,
+}
+
+fn sent_anything(state: &AppState) -> bool {
+    state.tabs().iter().any(|tab| matches!(tab.outcome(), RunOutcome::Running { .. }))
+        || state.connections().iter().any(|conn| {
+            matches!(
+                conn.state(),
+                ConnectionState::Connecting { .. } | ConnectionState::QueryRunning { .. }
+            )
+        })
+}
+
+/// Every dialog opens through its real transition, plain Enter never approves
+/// or sends from the approve-type and long-form windows, and Escape closes
+/// the dialog it was opened with.
+#[test]
+fn every_dialog_answers_the_keyboard() {
+    let _lock = env_lock();
+    let cases = [
+        DialogCase {
+            name: "prod-connect",
+            expected: Modal::ProdConnect,
+            setup: setup_prod_connect,
+            open: |state| state.pending_prod().is_some(),
+        },
+        DialogCase {
+            name: "terminate",
+            expected: Modal::Terminate,
+            setup: setup_terminate,
+            open: |state| state.pending_terminate().is_some(),
+        },
+        DialogCase {
+            name: "draft",
+            expected: Modal::Draft,
+            setup: setup_draft,
+            open: |state| state.draft().is_some(),
+        },
+        DialogCase {
+            name: "import",
+            expected: Modal::Import,
+            setup: setup_import,
+            open: |state| state.import_draft().is_some(),
+        },
+        DialogCase {
+            name: "write-confirm",
+            expected: Modal::WriteConfirm,
+            setup: setup_write,
+            open: |state| state.pending_write().is_some(),
+        },
+        DialogCase {
+            name: "edit-preview",
+            expected: Modal::EditPreview,
+            setup: setup_edit_preview,
+            open: |state| state.pending_edit_preview().is_some(),
+        },
+        DialogCase {
+            name: "table-ddl",
+            expected: Modal::TableDdl,
+            setup: setup_table_ddl,
+            open: |state| state.pending_table_ddl().is_some(),
+        },
+        DialogCase {
+            name: "table-editor",
+            expected: Modal::TableEditor,
+            setup: setup_table_editor,
+            open: |state| state.table_editor().is_some(),
+        },
+        DialogCase {
+            name: "compare",
+            expected: Modal::Compare,
+            setup: setup_compare,
+            open: |state| state.compare_window_open(),
+        },
+        DialogCase {
+            name: "palette",
+            expected: Modal::Palette,
+            setup: setup_palette,
+            open: |state| state.palette_open(),
+        },
+    ];
+    for case in cases {
+        let (_scratch, mut harness, tab) = grid_setup(case.name);
+        (case.setup)(&mut harness, tab);
+        harness.run();
+        assert!((case.open)(harness.state()), "{} opens", case.name);
+        assert_eq!(
+            harness.state().modal(),
+            Some(case.expected),
+            "{} owns the keyboard",
+            case.name
+        );
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert!(
+            !sent_anything(harness.state()),
+            "{} sends nothing on plain Enter",
+            case.name
+        );
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(!(case.open)(harness.state()), "{} closes on Escape", case.name);
+        assert!(!sent_anything(harness.state()), "{} sent nothing at all", case.name);
+    }
+    let _ = std::fs::remove_file(import_path());
+
+    // The three prompts: autofocus takes typing, Enter submits, Escape cancels.
+    let (_scratch, mut harness, _tab) = grid_setup("dialog-save");
+    harness.state_mut().open_save_prompt();
+    harness.run();
+    harness.event(egui::Event::Text("kept".to_owned()));
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(harness.state().save_prompt().is_none(), "SavePrompt Enter submits");
+    assert_eq!(harness.state().saved_queries().len(), 1, "the query was saved");
+
+    let (_scratch, mut harness, _tab) = grid_setup("dialog-save-escape");
+    harness.state_mut().open_save_prompt();
+    harness.run();
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(harness.state().save_prompt().is_none(), "SavePrompt Escape cancels");
+    assert!(harness.state().saved_queries().is_empty(), "Escape saved nothing");
+
+    let (_scratch, mut harness, _tab) = grid_setup("dialog-password");
+    let conn = add_postgres(harness.state_mut(), Environment::Dev);
+    harness.state_mut().open_password_prompt(conn);
+    harness.run();
+    harness.event(egui::Event::Text("pw".to_owned()));
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().password_prompt().is_none(),
+        "PasswordPrompt Enter submits"
+    );
+
+    let (_scratch, mut harness, _tab) = grid_setup("dialog-password-escape");
+    let conn = add_postgres(harness.state_mut(), Environment::Dev);
+    harness.state_mut().open_password_prompt(conn);
+    harness.run();
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(
+        harness.state().password_prompt().is_none(),
+        "PasswordPrompt Escape cancels"
+    );
+    assert!(!sent_anything(harness.state()), "Escape connected to nothing");
+
+    let (_scratch, mut harness, tab) = grid_setup("dialog-params");
+    harness.state_mut().start_run(tab, "SELECT :a AS v", 0, None);
+    harness.run();
+    harness.event(egui::Event::Text("7".to_owned()));
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(harness.state().pending_params().is_none(), "Params Enter submits");
+
+    let (_scratch, mut harness, tab) = grid_setup("dialog-params-escape");
+    harness.state_mut().start_run(tab, "SELECT :a AS v", 0, None);
+    harness.run();
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(harness.state().pending_params().is_none(), "Params Escape cancels");
+    assert!(!sent_anything(harness.state()), "Escape ran nothing");
+}
+
+/// The cell editor is a dialog the shared gate must see: Ctrl+Enter stays dead
+/// while it owns the keyboard.
+#[test]
+fn ctrl_enter_is_dead_while_the_cell_editor_is_open() {
+    let _lock = env_lock();
+    let (_scratch, mut harness, tab) = grid_setup("cell-editor-gate");
+    press_key(&mut harness, egui::Key::ArrowDown);
+    press_key(&mut harness, egui::Key::Enter);
+    assert!(
+        harness.query_by_label("Currently: 1").is_some(),
+        "the cell editor is open"
+    );
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
+    harness.run();
+    assert!(
+        !matches!(
+            harness.state().tab(tab).map(|tab| tab.outcome()),
+            Some(RunOutcome::Running { .. })
+        ),
+        "Ctrl+Enter never runs under the cell editor"
+    );
+    assert!(
+        harness.query_by_label("Currently: 1").is_some(),
+        "the cell editor survived Ctrl+Enter"
+    );
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    harness.run();
+    assert!(
+        !harness.state().palette_open(),
+        "Ctrl+K never opens the palette under the cell editor"
+    );
+}
+

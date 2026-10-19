@@ -21,7 +21,7 @@ use eframe::egui;
 use egui_kittest::Harness;
 use egui_kittest::kittest::{By, NodeT, Queryable};
 
-use crusty_data_explorer::app::{AppState, ConnectionState, Environment, RunOutcome};
+use crusty_data_explorer::app::{AppState, ConnectionState, Environment, Modal, RunOutcome};
 use crusty_data_explorer::db::{ConnectionConfig, ConnectionId, PostgresSslMode, TabId};
 use crusty_data_explorer::ui;
 use crusty_data_explorer::ui::complete::editor_id;
@@ -1547,9 +1547,10 @@ fn params_prompt_focuses_the_first_field_and_enter_runs() {
     );
 }
 
-/// The write guard: Enter is not a confirm, Escape cancels and sends nothing.
+/// The write guard: Enter never approves; its Cancel focus cancels instead.
+/// Escape cancels the re-armed guard and sends nothing.
 #[test]
-fn without_where_confirm_ignores_enter_and_cancels_on_escape() {
+fn without_where_confirm_never_approves_on_enter_and_cancels_on_escape() {
     let _guard = env_lock();
     let (_scratch, mut harness, tab) = demo_setup("write-confirm-keys");
     harness.state_mut().start_run(tab, "DELETE FROM users", 0, None);
@@ -1559,16 +1560,21 @@ fn without_where_confirm_ignores_enter_and_cancels_on_escape() {
 
     harness.key_press(egui::Key::Enter);
     harness.run();
-    assert!(
-        harness.state().pending_write().is_some(),
-        "a stray Enter never approves a DELETE without WHERE"
-    );
+    let approved = harness.state().pending_write().is_none()
+        && matches!(
+            harness.state().tab(tab).map(|tab| tab.outcome()),
+            Some(RunOutcome::Running { .. })
+        );
+    assert!(!approved, "a stray Enter never approves a DELETE without WHERE");
 
+    harness.state_mut().start_run(tab, "DELETE FROM users", 0, None);
+    harness.run();
+    assert!(harness.state().pending_write().is_some(), "the guard re-arms");
     harness.key_press(egui::Key::Escape);
     harness.run();
     assert!(harness.state().pending_write().is_none(), "Escape cancels the guard");
     assert!(
-        matches!(harness.state().tab(tab).map(|t| t.outcome()), Some(RunOutcome::Ok { .. })),
+        matches!(harness.state().tab(tab).map(|tab| tab.outcome()), Some(RunOutcome::Ok { .. })),
         "nothing was sent on cancel"
     );
 }
@@ -1707,5 +1713,343 @@ fn find_bar_steps_matches_with_enter_and_returns_focus_on_escape() {
         crusty_data_explorer::ui::complete::editor_offsets(&harness.ctx, tab, sql).0,
         16,
         "the caret sits at the end of the stepped-to match"
+    );
+}
+
+/// A connection saved as production, left unconnected: enough to arm every
+/// prod confirmation without touching a server.
+fn add_prod_sqlite(state: &mut AppState) -> ConnectionId {
+    state.open_draft(None);
+    {
+        let draft = state.draft_mut().expect("the open draft");
+        draft.name = "prod".to_owned();
+        draft.env = Environment::Prod;
+        draft.config = ConnectionConfig::Sqlite { read_only: false, path: ":memory:".into() };
+    }
+    state.save_draft();
+    state.connections().last().expect("the saved connection").id
+}
+
+#[test]
+fn every_destructive_confirm_starts_on_cancel_and_tab_enter_never_approves() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("confirm-focus");
+    let conn = harness.state().tab(tab).and_then(|tab| tab.conn).expect("the tab connection");
+    step_until(&mut harness, "the schema", |state| state.schema(conn).is_some());
+
+    harness.state_mut().start_run(tab, "DELETE FROM users", 0, None);
+    harness.run();
+    assert!(harness.state().pending_write().is_some(), "the write guard arms");
+    assert!(
+        harness.get_by_label("Cancel").is_focused(),
+        "the write guard starts on Cancel"
+    );
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().pending_write().is_some(),
+        "Tab then Enter never approves the write guard"
+    );
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+
+    harness.state_mut().stage_edit(tab, 0, 1, "ada@example.com".to_owned());
+    harness.state_mut().apply_edits(tab);
+    harness.run();
+    assert!(harness.state().pending_edit_preview().is_some(), "the edit preview arms");
+    assert!(
+        harness.get_by_label("Cancel").is_focused(),
+        "the edit preview starts on Cancel"
+    );
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().pending_edit_preview().is_some(),
+        "Tab then Enter never applies the staged edits"
+    );
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+
+    let prod = add_prod_sqlite(harness.state_mut());
+    harness.state_mut().connect(prod);
+    harness.run();
+    assert!(harness.state().pending_prod().is_some(), "the prod connect confirm arms");
+    assert!(
+        harness.get_by_label("Cancel").is_focused(),
+        "the prod connect confirm starts on Cancel"
+    );
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().pending_prod().is_some(),
+        "Tab then Enter never connects to prod"
+    );
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+
+    harness.state_mut().request_terminate(prod, "4242");
+    harness.run();
+    assert!(harness.state().pending_terminate().is_some(), "the terminate confirm arms");
+    assert!(
+        harness.get_by_label("Cancel").is_focused(),
+        "the terminate confirm starts on Cancel"
+    );
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().pending_terminate().is_some(),
+        "Tab then Enter never terminates the session"
+    );
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+
+    let prod_tab = harness.state_mut().new_tab(prod);
+    harness.state_mut().open_table_create(prod);
+    {
+        let editor = harness.state_mut().table_editor_mut().expect("the table editor");
+        editor.form.table = "audit".to_owned();
+        editor.form.columns[0].name = "id".to_owned();
+        editor.form.columns[0].data_type = "INTEGER".to_owned();
+    }
+    harness.state_mut().apply_table_ddl(prod_tab);
+    harness.run();
+    assert!(harness.state().pending_table_ddl().is_some(), "the table DDL confirm arms");
+    assert!(
+        harness.get_by_label("Cancel").is_focused(),
+        "the table DDL confirm starts on Cancel"
+    );
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().pending_table_ddl().is_some(),
+        "Tab then Enter never applies prod DDL"
+    );
+}
+
+#[test]
+fn escape_in_the_find_bar_returns_focus_after_it_moved_away() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("find-escape-focus");
+    harness.ctx.memory_mut(|memory| memory.request_focus(editor_id(tab)));
+    harness.run();
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F);
+    harness.run();
+    harness.event(egui::Event::Text("SELECT".to_owned()));
+    harness.run();
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    assert!(
+        harness.ctx.memory(|memory| memory.focused()) != Some(editor_id(tab)),
+        "Tab moved the keyboard off the editor"
+    );
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(
+        harness.query_by_label("0/2").is_none() && harness.query_by_label("1/2").is_none(),
+        "Escape closes the find bar"
+    );
+    assert_eq!(
+        harness.ctx.memory(|memory| memory.focused()),
+        Some(editor_id(tab)),
+        "closing the find bar hands the caret back to the editor"
+    );
+}
+
+#[test]
+fn a_newer_dialog_takes_escape_from_the_palette() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, _tab) = demo_setup("dispatcher-palette");
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    harness.run();
+    assert!(harness.state().palette_open(), "Ctrl+K opens the palette");
+    harness.get_by_label("+ New connection").click();
+    harness.run();
+    assert!(harness.state().draft().is_some(), "the click opens the draft over the palette");
+    assert_eq!(
+        harness.state().modal(),
+        Some(Modal::Draft),
+        "the newest dialog owns the keyboard"
+    );
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(
+        harness.state().draft().is_none(),
+        "Escape closes the frontmost dialog"
+    );
+    assert!(
+        harness.state().palette_open(),
+        "the palette underneath keeps its state"
+    );
+}
+
+#[test]
+fn a_params_prompt_armed_over_the_save_prompt_owns_escape() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("dispatcher-params");
+    harness.state_mut().open_save_prompt();
+    harness.run();
+    assert!(harness.state().save_prompt().is_some(), "the save prompt is open");
+    harness.state_mut().start_run(tab, "SELECT :a AS v", 0, None);
+    harness.run();
+    assert!(harness.state().pending_params().is_some(), "the params prompt is armed");
+    assert_eq!(
+        harness.state().modal(),
+        Some(Modal::Params),
+        "the newer prompt is frontmost"
+    );
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(
+        harness.state().pending_params().is_none(),
+        "Escape cancels the frontmost prompt"
+    );
+    assert!(
+        harness.state().save_prompt().is_some(),
+        "the save prompt underneath stays open"
+    );
+}
+
+#[test]
+fn enter_under_the_write_confirm_leaves_the_editor_text_alone() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("dialog-editor");
+    let sql = "DELETE FROM users";
+    *harness.state_mut().tab_sql_mut(tab).expect("the tab sql") = sql.to_owned();
+    harness.ctx.memory_mut(|memory| memory.request_focus(editor_id(tab)));
+    harness.run();
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().pending_write().is_some(),
+        "the write guard holds the delete"
+    );
+    let before = harness.state().tab(tab).expect("the tab").sql.clone();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert_eq!(
+        harness.state().tab(tab).expect("the tab").sql,
+        before,
+        "Enter under the dialog never edits the hidden SQL"
+    );
+}
+
+#[test]
+fn tab_then_enter_never_approves_a_write_confirm() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("confirm-tab");
+    harness.state_mut().start_run(tab, "DELETE FROM users", 0, None);
+    harness.run();
+    assert!(harness.state().pending_write().is_some(), "the guard holds the delete");
+    assert!(
+        harness.get_by_label("Cancel").is_focused(),
+        "the destructive confirm starts on Cancel"
+    );
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    let approved = harness.state().pending_write().is_none()
+        && matches!(
+            harness.state().tab(tab).map(|tab| tab.outcome()),
+            Some(RunOutcome::Running { .. }) | Some(RunOutcome::Ok { .. })
+        );
+    assert!(!approved, "Tab then Enter never approves a destructive confirm");
+}
+
+#[test]
+fn tab_in_the_find_field_moves_focus_without_moving_the_grid_cursor() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, _tab) = demo_setup("find-tab");
+    harness.get_by_label("Detail").click();
+    harness.run();
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F);
+    harness.run();
+    harness.event(egui::Event::Text("SELECT".to_owned()));
+    harness.run();
+    let before_focus = harness.ctx.memory(|memory| memory.focused());
+    assert!(before_focus.is_some(), "the find field holds the keyboard");
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    assert!(
+        harness.query_by_label("Click a cell to inspect its row.").is_some(),
+        "Tab from the find field never moves the grid cursor"
+    );
+    let after_focus = harness.ctx.memory(|memory| memory.focused());
+    assert_ne!(after_focus, before_focus, "Tab moves focus through the chrome");
+    assert!(after_focus.is_some(), "focus lands somewhere in the chrome");
+}
+
+#[test]
+fn escape_in_the_draft_closes_an_open_dropdown_before_the_form() {
+    let _guard = env_lock();
+    let _scratch = Scratch::new("draft-popup");
+    let mut harness = build();
+    let conn = add_postgres_draft(harness.state_mut());
+    harness.state_mut().open_draft(Some(conn));
+    harness.run();
+    harness.get_by_value("Disable").click();
+    harness.run();
+    assert!(
+        egui::Popup::is_any_open(&harness.ctx),
+        "the SSL dropdown is open"
+    );
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(
+        harness.state().draft().is_some(),
+        "Escape closes the dropdown, not the connection form"
+    );
+    assert!(
+        !egui::Popup::is_any_open(&harness.ctx),
+        "the dropdown closed"
+    );
+}
+
+#[test]
+fn enter_on_cancel_does_not_submit_the_password_prompt() {
+    let _guard = env_lock();
+    let _scratch = Scratch::new("password-cancel-enter");
+    let mut harness = build();
+    let conn = add_postgres_draft(harness.state_mut());
+    harness.state_mut().open_password_prompt(conn);
+    harness.run();
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().password_prompt().is_some(),
+        "Enter on Cancel never submits the password"
+    );
+}
+
+#[test]
+fn enter_on_cancel_does_not_submit_the_params_prompt() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("params-cancel-enter");
+    harness.state_mut().start_run(tab, "SELECT :a AS v", 0, None);
+    harness.run();
+    assert!(harness.state().pending_params().is_some(), "the prompt is armed");
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().pending_params().is_some(),
+        "Enter on Cancel never submits the parameters"
     );
 }

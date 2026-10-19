@@ -7291,7 +7291,7 @@ mod tests {
                 ..Default::default()
             };
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -7305,7 +7305,7 @@ mod tests {
                 value: String::new(),
             });
             let mut output = ctx.run_ui(input, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -7334,7 +7334,7 @@ mod tests {
                 ..Default::default()
             };
             let mut grid = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             grid.textures_delta.clear();
             let grid_text = rendered_text(&grid);
@@ -7361,7 +7361,7 @@ mod tests {
             // Switching the active result re-renders the grid for that result.
             state.tab_mut(tab).expect("tab").set_active_result(1);
             let mut switched = ctx.run_ui(input, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             switched.textures_delta.clear();
             let switched_text = rendered_text(&switched);
@@ -8675,7 +8675,12 @@ mod tests {
                 let mut raw = input.clone();
                 raw.events = events;
                 let mut output = ctx.run_ui(raw, |ui| {
-                    crate::ui::search::palette(state, ui);
+                    crate::ui::search::palette_toggle(state, ui);
+                    let owns = state.palette_open();
+                    let key = owns
+                        .then(|| crate::ui::modal_key(ui, true))
+                        .flatten();
+                    crate::ui::search::palette_window(state, ui, owns, key);
                 });
                 output.textures_delta.clear();
                 output
@@ -9523,7 +9528,7 @@ mod tests {
             };
             let frame = |state: &mut AppState| {
                 let mut output = ctx.run_ui(input.clone(), |ui| {
-                    crate::ui::connections::draft_window(state, ui);
+                    crate::ui::connections::draft_window(state, ui, None);
                 });
                 output.textures_delta.clear();
                 output
@@ -9557,7 +9562,7 @@ mod tests {
                 click(pos, false),
             ];
             let mut clicked = ctx.run_ui(events, |ui| {
-                crate::ui::connections::draft_window(state, ui);
+                crate::ui::connections::draft_window(state, ui, None);
             });
             clicked.textures_delta.clear();
             let after = frame(state);
@@ -10934,7 +10939,7 @@ mod tests {
                 ..Default::default()
             };
             let mut first = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             let pos = text_center(&first, "ada").expect("the name cell renders");
             first.textures_delta.clear();
@@ -10942,14 +10947,14 @@ mod tests {
             let mut double_click = input.clone();
             double_click.events = double_click_events(pos);
             let mut second = ctx.run_ui(double_click, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             second.textures_delta.clear();
 
             // The editor draws once before it holds focus, the way a user
             // types after the field appears.
             let mut opened = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             opened.textures_delta.clear();
 
@@ -10976,7 +10981,7 @@ mod tests {
                 },
             ];
             let mut third = ctx.run_ui(typed, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             third.textures_delta.clear();
             assert_eq!(state.tab(tab).expect("tab").edit_text(0, 2), Some("Grace"));
@@ -10985,11 +10990,11 @@ mod tests {
             let mut double_click = input.clone();
             double_click.events = double_click_events(pos);
             let mut fourth = ctx.run_ui(double_click, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             fourth.textures_delta.clear();
             let mut opened = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             opened.textures_delta.clear();
             let mut escaped = input;
@@ -11004,7 +11009,7 @@ mod tests {
                 },
             ];
             let mut fifth = ctx.run_ui(escaped, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             fifth.textures_delta.clear();
             assert_eq!(state.tab(tab).expect("tab").edit_text(0, 2), Some("Grace"));
@@ -11191,7 +11196,7 @@ mod tests {
                 ..Default::default()
             };
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -11204,7 +11209,7 @@ mod tests {
             state.stage_edit(tab, 0, 2, "Ada".to_owned());
             state.add_row(tab);
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -11216,7 +11221,7 @@ mod tests {
                 *slot = "SELECT i.id FROM items i JOIN items o ON o.id = i.id".to_owned();
             }
             let mut output = ctx.run_ui(input, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -11762,7 +11767,7 @@ mod tests {
             assert!(state.import_draft().is_some(), "draft staged");
             let render = |state: &mut AppState| {
                 let mut output = ctx.run_ui(input.clone(), |ui| {
-                    crate::ui::grid::results(state, ui);
+                    crate::ui::root(state, ui);
                 });
                 output.textures_delta.clear();
                 output
@@ -11903,7 +11908,7 @@ mod tests {
                 ..Default::default()
             };
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::root(state, ui);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -11915,7 +11920,7 @@ mod tests {
             // A fresh egui window paints from its second frame on.
             let render = |state: &mut AppState| {
                 let mut output = ctx.run_ui(input.clone(), |ui| {
-                    crate::ui::grid::results(state, ui);
+                    crate::ui::root(state, ui);
                 });
                 output.textures_delta.clear();
                 output
@@ -11935,7 +11940,7 @@ mod tests {
                 *slot = "SELECT i.id FROM items i JOIN items o ON o.id = i.id".to_owned();
             }
             let mut output = ctx.run_ui(input, |ui| {
-                crate::ui::grid::results(state, ui);
+                crate::ui::grid::results(state, ui, None);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -12087,6 +12092,27 @@ mod tests {
                 state.tab(tab).expect("tab").outcome(),
                 RunOutcome::Running { .. }
             ));
+        });
+    }
+
+    #[test]
+    fn a_new_run_clears_the_tabs_armed_write_confirm() {
+        with_isolated_state("write-confirm-superseded", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.start_run(tab, "DELETE FROM users", 0, None);
+            assert!(state.pending_write().is_some(), "the guard holds the delete");
+            state.start_run(tab, "SELECT 1", 0, None);
+            assert!(
+                state.pending_write().is_none(),
+                "a later run drops the guard for the statement it replaced"
+            );
+            match commands.try_recv().expect("the new run was sent") {
+                DbCommand::QueryBatch { statements, .. } => {
+                    assert_eq!(statements, vec!["SELECT 1"]);
+                }
+                other => panic!("expected QueryBatch, got {other:?}"),
+            }
         });
     }
 
