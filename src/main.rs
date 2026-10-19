@@ -3,7 +3,10 @@ use crusty_data_explorer::ui;
 
 fn main() -> eframe::Result {
     env_logger::init();
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: crate::ui::chrome::viewport(),
+        ..Default::default()
+    };
     eframe::run_native(
         "crusty-data-explorer",
         options,

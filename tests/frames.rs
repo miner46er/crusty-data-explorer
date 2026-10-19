@@ -2808,3 +2808,23 @@ fn no_completion_popup_opens_under_a_dialog() {
         "Escape still cancels the guard itself"
     );
 }
+
+/// macOS unified toolbar: the traffic lights sit inside the app's top row, so
+/// the sidebar keeps a drag pad above its header while the tab strip, which
+/// starts right of the sidebar, still holds one row.
+#[test]
+fn macos_traffic_lights_clear_the_sidebar() {
+    let _guard = env_lock();
+    let (_scratch, mut harness) = three_tabs_at(WIDE_WINDOW, "macos-chrome");
+    harness.ctx.set_os(egui::os::OperatingSystem::Mac);
+    harness.run();
+    capture_at(&mut harness, "macos-chrome-dark", WIDE_WINDOW);
+
+    let header = harness.get_by_label("CONNECTIONS").rect();
+    assert!(
+        header.min.y >= crusty_data_explorer::ui::chrome::TRAFFIC_LIGHT_PAD,
+        "the CONNECTIONS header {header:?} clears the traffic-light pad"
+    );
+    let strip_band = band_of(&harness, "persons", WIDE_WINDOW);
+    assert_same_row(&harness, &["persons", "persons 2", "persons 3"], strip_band);
+}

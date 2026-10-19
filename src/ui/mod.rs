@@ -6,6 +6,7 @@ use eframe::egui;
 use crate::app::{AppState, ConnectionState};
 
 pub mod charts;
+pub mod chrome;
 pub mod compare;
 pub mod complete;
 pub mod connections;
@@ -85,6 +86,7 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
         .frame(chrome_frame(ui.style()))
         .show(ui, |ui| {
             panel(ui);
+            chrome::traffic_light_pad(ui);
             connections::sidebar(state, ui);
         });
     egui::Panel::bottom("status")
