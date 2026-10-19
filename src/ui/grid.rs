@@ -1909,7 +1909,13 @@ fn results_grid(
                         }
                 };
                 if egui::menu::is_in_menu(ui) {
-                    ui.menu_button(item.label(), &mut copy_menu);
+                    // A submenu in the tail keeps the inline menu's close
+                    // behavior, so ticking Headers does not shut it.
+                    egui::menu::SubMenuButton::new(item.label())
+                        .config(egui::menu::MenuConfig::new().close_behavior(
+                            egui::PopupCloseBehavior::CloseOnClickOutside,
+                        ))
+                        .ui(ui, &mut copy_menu);
                 } else {
                     egui::menu::MenuButton::new(item.label())
                         .config(egui::menu::MenuConfig::new().close_behavior(
