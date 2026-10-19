@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use eframe::egui;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{By, Queryable};
 
 use crusty_data_explorer::app::{AppState, ConnectionState, Environment, Modal, RunOutcome};
 use crusty_data_explorer::db::{ConnectionConfig, ConnectionId, PostgresSslMode, TabId};
@@ -715,6 +715,58 @@ fn every_dialog_answers_the_keyboard() {
     harness.run();
     assert!(harness.state().pending_params().is_none(), "Params Escape cancels");
     assert!(!sent_anything(harness.state()), "Escape ran nothing");
+}
+
+/// With the find bar open, Escape in an inline grid cell edit cancels the
+/// edit instead of closing the find bar: the edit owns its own Escape. The
+/// quick filter is not covered: its hint-only field never reaches the
+/// accesskit tree, so the harness cannot focus it.
+#[test]
+fn escape_in_a_cell_edit_cancels_the_edit_and_keeps_the_find_bar() {
+    let _lock = env_lock();
+    let (_scratch, mut harness, tab) = grid_setup("find-cell-edit");
+    let sql = harness.state().tab(tab).map(|t| t.sql.clone());
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F);
+    harness.run();
+    assert_eq!(
+        harness.query_all_by_label("Find").count(),
+        2,
+        "the toolbar and the open bar both read Find"
+    );
+    // A cell click arms the cursor without taking focus, so typing opens the
+    // inline field instead of reaching the editor.
+    harness.get_by_label("ada@example.com").click();
+    harness.run();
+    harness.event(egui::Event::Text("q".to_owned()));
+    harness.run();
+    let inline_q = || By::new().role(egui::accesskit::Role::TextInput).value("q");
+    assert_eq!(
+        harness.query_all(inline_q()).count(),
+        1,
+        "the inline edit is open"
+    );
+    assert_eq!(
+        harness.state().tab(tab).map(|t| t.sql.clone()),
+        sql,
+        "typing reached the edit, not the editor"
+    );
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert_eq!(
+        harness.query_all(inline_q()).count(),
+        0,
+        "Escape cancels the inline edit"
+    );
+    assert_eq!(
+        harness.query_all_by_label("Find").count(),
+        2,
+        "Escape leaves the find bar open"
+    );
+    assert_eq!(
+        harness.state().tab(tab).map(|t| t.staged_count()),
+        Some(0),
+        "the cancelled edit staged nothing"
+    );
 }
 
 /// The cell editor is a dialog the shared gate must see: Ctrl+Enter stays dead

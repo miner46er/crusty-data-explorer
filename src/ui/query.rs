@@ -178,6 +178,14 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     find_opened |= super::query_tools::toolbar(state, ui);
     ui.add_space(4.0);
     if let Some(id) = state.active() {
+        // Snapshot the settled focus for the find bar's Escape handler: a
+        // plain Escape clears focus before the UI runs, so a frame carrying
+        // one can no longer report where the caret sat.
+        if ui.input(|i| !i.key_pressed(egui::Key::Escape)) {
+            let mut bar = find_bar_of(ui.ctx(), id);
+            bar.focus_was_empty = ui.ctx().memory(|m| m.focused()).is_none();
+            store_find_bar(ui.ctx(), id, bar);
+        }
         // A dialog owns the keyboard: a stale editor caret would still take
         // its text, Enter, and Tab, and the completion popup its Enter and
         // Escape. Drop the caret and draw the well without an input.
@@ -209,6 +217,7 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
         // free, and hand the caret back to the editor either way.
         if !modal_open
             && find_bar_of(ui.ctx(), id).open
+            && find_owns_escape(ui.ctx(), id)
             && ui.input_mut(|i| super::consume_plain_key(i, egui::Key::Escape))
         {
             close_find(ui.ctx(), id);
@@ -361,6 +370,19 @@ struct FindBar {
     /// clears focus on a plain Escape before the UI runs, so the bar cannot
     /// ask the live memory while deciding who owns Escape.
     field_focused: bool,
+    /// Whether focus sat nowhere at the start of the most recent frame
+    /// without a plain Escape: the settled focus from the frame before.
+    /// Read by the Escape handler, which runs on a frame whose focus egui
+    /// already cleared.
+    focus_was_empty: bool,
+}
+
+/// The find field's stable id for one tab. Read through
+/// [`egui::Memory::had_focus_last_frame`]: egui clears focus on a plain
+/// Escape before the UI runs, so the live memory is always empty when the
+/// bar's Escape handler fires.
+fn find_field_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_find_field", tab))
 }
 
 /// Find bar state id for one tab, the ctx-data pattern `complete.rs` uses.
@@ -421,6 +443,20 @@ fn prune_find(state: &AppState, ctx: &egui::Context) {
     }
 }
 
+/// Whether a plain Escape with the find bar open belongs to the find bar.
+/// egui clears focus on a plain Escape before the UI runs, so this reads
+/// where focus sat at the end of last frame: the find field, the SQL
+/// editor, or nowhere. Anywhere else (an inline cell edit, the quick
+/// filter) keeps its own Escape.
+fn find_owns_escape(ctx: &egui::Context, tab: TabId) -> bool {
+    let bar = find_bar_of(ctx, tab);
+    ctx.memory(|m| {
+        m.had_focus_last_frame(find_field_id(tab))
+            || m.had_focus_last_frame(super::complete::editor_id(tab))
+            || bar.focus_was_empty
+    })
+}
+
 /// Find bar for the active tab. The count comes from `FindState::find_all`;
 /// Next and Prev move the editor selection onto the match.
 fn find_bar(state: &AppState, ui: &mut egui::Ui, just_opened: bool) {
@@ -453,6 +489,7 @@ fn find_bar(state: &AppState, ui: &mut egui::Ui, just_opened: bool) {
         ui.label("Find");
         let field = ui.add(
             egui::TextEdit::singleline(&mut bar.state.query)
+                .id(find_field_id(tab_id))
                 .desired_width(200.0)
                 .hint_text("text to find"),
         );
