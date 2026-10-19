@@ -1797,9 +1797,24 @@ impl Modal {
         Modal::Palette,
     ];
 
-    /// This dialog's slot in [`Modal::ALL`].
+    /// This dialog's slot in [`Modal::ALL`]. Exhaustive, so adding a
+    /// variant fails to compile until its slot is placed.
     fn index(self) -> usize {
-        self as usize
+        match self {
+            Modal::ProdConnect => 0,
+            Modal::Terminate => 1,
+            Modal::Draft => 2,
+            Modal::SavePrompt => 3,
+            Modal::PasswordPrompt => 4,
+            Modal::Import => 5,
+            Modal::WriteConfirm => 6,
+            Modal::Params => 7,
+            Modal::EditPreview => 8,
+            Modal::TableDdl => 9,
+            Modal::TableEditor => 10,
+            Modal::Compare => 11,
+            Modal::Palette => 12,
+        }
     }
 
     /// Whether plain Enter means submit. Only the prompts with a text field
@@ -1960,7 +1975,9 @@ impl AppState {
             .iter()
             .copied()
             .filter(|modal| self.modal_is_open(*modal))
-            .max_by_key(|modal| self.modal_marks[modal.index()])
+            .max_by_key(|modal| {
+                (self.modal_marks[modal.index()], std::cmp::Reverse(modal.index()))
+            })
     }
 
     /// Every open dialog, back to front. `root` draws it in this order, so the
@@ -10555,6 +10572,27 @@ mod tests {
                 }
                 other => panic!("expected QueryBatch, got {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn modal_slots_match_all_order() {
+        for (slot, modal) in Modal::ALL.iter().copied().enumerate() {
+            assert_eq!(modal.index(), slot, "{modal:?} sits in its own slot");
+        }
+    }
+
+    #[test]
+    fn modal_ties_fall_back_to_all_order() {
+        with_isolated_state("modal-tie", |state| {
+            state.open_draft(None);
+            state.open_save_prompt();
+            state.modal_marks = [0; Modal::ALL.len()];
+            assert_eq!(
+                state.modal(),
+                Some(Modal::Draft),
+                "an unmarked tie names the earlier dialog"
+            );
         });
     }
 
