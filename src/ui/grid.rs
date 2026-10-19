@@ -2469,7 +2469,7 @@ fn results_grid(
     egui::ScrollArea::both().show(ui, |ui| {
         let mut table = TableBuilder::new(ui).striped(true);
         if let Some(row) = scroll_row {
-            table = table.scroll_to_row(row, Some(egui::Align::Center));
+            table = table.scroll_to_row(row, None);
         }
         for width in &widths {
             table = table.column(match width {

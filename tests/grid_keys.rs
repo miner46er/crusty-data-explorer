@@ -380,6 +380,28 @@ fn shift_command_c_copies_the_active_cell() {
     );
 }
 
+/// Steps that keep the cursor inside the viewport leave the scroll alone. A
+/// re-centre on every step walked the first visible row off screen.
+#[test]
+fn arrow_steps_inside_the_view_leave_the_scroll_alone() {
+    let _lock = env_lock();
+    let (_scratch, mut harness, _tab) = scrolling_setup("scroll-steady");
+    press_key(&mut harness, egui::Key::ArrowDown);
+    assert_eq!(
+        harness.query_all_by_label("row-1").count(),
+        1,
+        "the first arrow press lands on row 1 with it on screen"
+    );
+    for _ in 0..15 {
+        press_key(&mut harness, egui::Key::ArrowDown);
+    }
+    assert_eq!(
+        harness.query_all_by_label("row-1").count(),
+        1,
+        "steps inside the view leave the first visible row in place"
+    );
+}
+
 /// The cursor's row is scrolled into view: with 200 rows the last one is
 /// virtualized away until Ctrl+End moves the cursor onto it. The detail pane
 /// stays closed, so the row label can only appear through the grid's own
