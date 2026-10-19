@@ -2644,6 +2644,7 @@ impl PgSession {
             .enable_all()
             .build()
             .map_err(|e| DbError::Open(e.to_string()))?;
+        let read_only = *read_only;
         // `acquire_timeout` also bounds establishing the first connection;
         // sqlx 0.8 has no separate `connect_timeout` on the pool options.
         let pool = rt
@@ -2651,15 +2652,17 @@ impl PgSession {
                 sqlx::postgres::PgPoolOptions::new()
                     .max_connections(1)
                     .acquire_timeout(Duration::from_secs(10))
+                    .after_connect(move |conn, _| {
+                        Box::pin(async move {
+                            if read_only {
+                                sqlx::query("SET default_transaction_read_only = on").execute(conn).await?;
+                            }
+                            Ok(())
+                        })
+                    })
                     .connect(&connection_string),
             )
             .map_err(|e| DbError::Open(e.to_string()))?;
-        if *read_only {
-            rt.block_on(
-                sqlx::query("SET default_transaction_read_only = on").execute(&pool),
-            )
-            .map_err(|e| DbError::Open(e.to_string()))?;
-        }
         let server_version = rt
             .block_on(async {
                 let row = sqlx::query("SELECT version()")
@@ -3674,21 +3677,24 @@ impl MySession {
             .enable_all()
             .build()
             .map_err(|e| DbError::Open(e.to_string()))?;
+        let read_only = *read_only;
         // `acquire_timeout` also bounds establishing the first connection.
         let pool = rt
             .block_on(
                 sqlx::mysql::MySqlPoolOptions::new()
                     .max_connections(1)
                     .acquire_timeout(Duration::from_secs(10))
+                    .after_connect(move |conn, _| {
+                        Box::pin(async move {
+                            if read_only {
+                                sqlx::query("SET SESSION TRANSACTION READ ONLY").execute(conn).await?;
+                            }
+                            Ok(())
+                        })
+                    })
                     .connect(&connection_string),
             )
             .map_err(|e| DbError::Open(e.to_string()))?;
-        if *read_only {
-            rt.block_on(
-                sqlx::query("SET SESSION TRANSACTION READ ONLY").execute(&pool),
-            )
-            .map_err(|e| DbError::Open(e.to_string()))?;
-        }
         let server_version = rt
             .block_on(async {
                 let row = sqlx::query("SELECT VERSION()")
@@ -8546,9 +8552,14 @@ mod tests {
         let password = std::env::var("PGPASSWORD").ok();
         let mut session = Session::open(&config, password.as_deref(), None).expect("open");
         assert_eq!(session.query("SELECT 1").expect("a read passes").row_count(), 1);
+        let _ = session.query("SELECT pg_terminate_backend(pg_backend_pid())");
+        assert!(
+            (0..3).any(|_| session.query("SELECT 1").is_ok()),
+            "the pool reconnects after its backend dies"
+        );
         let refused = session
             .query("CREATE TABLE cde_read_only_probe (a integer)")
-            .expect_err("a read-only session refuses a write");
+            .expect_err("a reconnected read-only session still refuses a write");
         assert!(refused.to_string().contains("read-only"), "{refused}");
     }
 
@@ -8571,9 +8582,14 @@ mod tests {
         let password = std::env::var("MYSQLPASSWORD").ok();
         let mut session = Session::open(&config, password.as_deref(), None).expect("open");
         assert_eq!(session.query("SELECT 1").expect("a read passes").row_count(), 1);
+        let _ = session.query("KILL CONNECTION_ID()");
+        assert!(
+            (0..3).any(|_| session.query("SELECT 1").is_ok()),
+            "the pool reconnects after its connection dies"
+        );
         let refused = session
             .query("CREATE TABLE cde_read_only_probe (a integer)")
-            .expect_err("a read-only session refuses a write");
+            .expect_err("a reconnected read-only session still refuses a write");
         let text = refused.to_string().to_ascii_lowercase();
         assert!(text.contains("read only") || text.contains("read-only"), "{refused}");
     }
