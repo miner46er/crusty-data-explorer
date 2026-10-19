@@ -186,7 +186,7 @@ Density is deliberate: item spacing 8px horizontal by 4px vertical, button paddi
 
 **The Instrument Frame Rule.** The four panels are the cockpit. Work lands inside them; it does not reshape them.
 
-**The Chrome Row Rule.** A row's controls never paint over each other. Text elides first, then the row wraps to a second line, then its tail goes behind one `…` menu; the row's fixed controls never move. Every row measures its content before it draws, and a row that has the width keeps its one-row shape. A panel too narrow for a row's own controls clips them at its edge, unmoved and overlapping nothing, so the remedy there is a wider window or a smaller sidebar.
+**The Chrome Row Rule.** A row's controls never paint over each other. Text elides first, then the row wraps to a second line, then its tail goes behind one `…` menu; the row's fixed controls never move. Every row measures its content before it draws, and a row that has the width keeps its one-row shape. A row moves what does not fit behind its `…`, so no control drops. The status bar's three fixed controls are the exception: below the floor they clip at the panel edge, unmoved and overlapping nothing, so the remedy there is a wider window or a smaller sidebar.
 
 ## Elevation & Depth
 

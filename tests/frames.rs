@@ -701,9 +701,24 @@ fn narrow_window_chrome_stays_clear() {
 const TRUNCATED_SQL: &str = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c \
                               WHERE x < 10001) SELECT x FROM c;";
 
+/// Hide one column with the grid's own shortcut: click a cell of the column,
+/// then press the hide chord, so the footer's `Show columns` control comes up.
+/// The cell is the match right of the sidebar: a folder badge can carry the
+/// same number.
+fn hide_column(harness: &mut Harness<AppState>, cell: &str) {
+    let node = harness
+        .query_all_by_label(cell)
+        .max_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+        .unwrap_or_else(|| panic!("the grid cell {cell:?} renders"));
+    node.click();
+    harness.run_steps(4);
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::H);
+    harness.run_steps(4);
+}
+
 /// The truncated-result footer fixture of fix round 2 at one size: three tabs,
-/// the active tab's result truncated at the row cap, and a successful export
-/// notice set directly on the tab, so no export runs.
+/// the active tab's result truncated at the row cap with one column hidden,
+/// and a successful export notice set directly on the tab, so no export runs.
 fn truncated_footer_at(
     size: [u32; 2],
     tag: &str,
@@ -719,6 +734,7 @@ fn truncated_footer_at(
             .is_some_and(|result| result.is_truncated()),
         "the recursive query fills the row cap"
     );
+    hide_column(&mut harness, "1");
     harness
         .state_mut()
         .tab_mut(tab)
@@ -740,18 +756,34 @@ fn truncated_footer_band_stays_clear() {
 
     let band = band_of(&harness, "Count total", NARROW_WINDOW);
     assert_band_clear(&harness, band, NARROW_WINDOW);
-    // The labels the row renders: both paging buttons, measured from the
-    // tab's own state (the paging label carries the loaded count). The
-    // counts, the truncation flag, and the notice have no room left and are
-    // dropped rather than drawn over the buttons.
     let mut drawn: Vec<String> =
         band_nodes(&harness, band).into_iter().map(|(label, _)| label).collect();
     drawn.sort();
     println!("footer band labels: {drawn:?}");
-    assert!(drawn.iter().any(|label| label == "Count total"), "the count button renders");
     assert!(
-        drawn.iter().any(|label| label == "Load more (10000 loaded)"),
-        "the paging button carries the loaded count: {drawn:?}"
+        drawn.iter().any(|label| label.starts_with("truncated at 10,000")),
+        "the truncation flag keeps its place: {drawn:?}"
+    );
+    // Every expected control is inline or behind the row's one `…`.
+    assert_row_reachable(
+        &mut harness,
+        &["Count total"],
+        &["Count total", "Load more (10000 loaded)", "Show columns (1)"],
+        NARROW_WINDOW,
+    );
+    // `Show columns` from the tail is the only gesture that brings the hidden
+    // column back at this width.
+    harness
+        .query_all_by_label("…")
+        .find(|node| band.intersects(node.rect()))
+        .expect("the footer's overflow button")
+        .click();
+    harness.run_steps(6);
+    harness.get_by_label("Show columns (1)").click();
+    harness.run_steps(6);
+    assert!(
+        harness.query_by_label("x").is_some(),
+        "the tail's Show columns restored the hidden column"
     );
 
     // Without the truncation the row has room for its texts: the counts and

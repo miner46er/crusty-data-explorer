@@ -291,91 +291,122 @@ fn truncate_label(total: Option<u64>) -> String {
     }
 }
 
-/// The paging controls under a truncated grid, inline in the footer's row:
-/// the on-demand count beside the flag and the next page on demand. The
-/// footer measures each label into its budget first and passes only the
-/// buttons that fit, so a control the row cannot hold is never drawn. Pages
-/// append onto the loaded rows through [`DbEvent::PageOk`]; a stale page
-/// whose offset misses the loaded length is ignored, so a new run never
-/// gains old rows.
-fn paging_row(
-    tab: &mut Tab,
-    conn: &Option<GridConn>,
-    loaded: usize,
-    count_label: Option<&str>,
-    more_label: Option<&str>,
-    ui: &mut egui::Ui,
-) {
-    if let Some(label) = count_label
-        && ui
-            .button(label)
-            .on_hover_text("Count every row behind the truncation flag")
-            .clicked()
-    {
-        match conn.as_ref().and_then(|c| c.handle.clone()) {
-            Some(handle) => {
-                if is_single_statement(&tab.sql) {
-                    let run = paging_run_id(ui.ctx(), tab.id);
-                    let sql = tab.sql.clone();
-                    if handle
-                        .send(DbCommand::CountFor { run, tab: tab.id, sql })
-                        .is_err()
-                    {
-                        tab.set_export_notice(
-                            "Count failed: connection is gone".to_owned(),
-                            true,
-                        );
-                    }
-                } else {
-                    tab.set_export_notice(
-                        "Counting needs a single SELECT".to_owned(),
-                        true,
-                    );
-                }
-            }
-            None => tab.set_export_notice(
-                "Counting needs a live connection".to_owned(),
-                true,
-            ),
+/// One of the grid footer's controls, in the order they read left to right.
+/// The row packs them like the toolbars: what fits stays inline and the
+/// contiguous tail moves behind the footer's one `…`, and both sides draw
+/// through [`draw_footer_control`], so a control acts the same wherever the
+/// row puts it.
+#[derive(Clone, Copy)]
+enum FooterControl {
+    /// Count every row behind the truncation flag.
+    CountTotal,
+    /// Fetch the next page past the row cap.
+    LoadMore,
+    /// Bring back every hidden column.
+    ShowColumns,
+}
+
+impl FooterControl {
+    fn label(self, loaded: usize, hidden: usize) -> String {
+        match self {
+            Self::CountTotal => "Count total".to_owned(),
+            Self::LoadMore => format!("Load more ({loaded} loaded)"),
+            Self::ShowColumns => format!("Show columns ({hidden})"),
         }
     }
-    if let Some(label) = more_label
-        && ui
-            .button(label)
-            .on_hover_text("Fetch the next page past the row cap")
-            .clicked()
-    {
-        match conn.as_ref().and_then(|c| c.handle.clone()) {
-            Some(handle) => {
-                if is_single_statement(&tab.sql) {
-                    let run = paging_run_id(ui.ctx(), tab.id);
-                    let sql = tab.sql.clone();
-                    if handle
-                        .send(DbCommand::QueryPage {
-                            run,
-                            tab: tab.id,
-                            sql,
-                            offset: loaded as u64,
-                            limit: STREAM_PAGE_SIZE as u64,
-                        })
-                        .is_err()
-                    {
-                        tab.set_export_notice(
-                            "Page failed: connection is gone".to_owned(),
-                            true,
-                        );
+}
+
+/// Draw one footer control and land its click. Pages append onto the loaded
+/// rows through [`DbEvent::PageOk`]; a stale page whose offset misses the
+/// loaded length is ignored, so a new run never gains old rows.
+fn draw_footer_control(
+    ui: &mut egui::Ui,
+    control: FooterControl,
+    label: &str,
+    loaded: usize,
+    tab: &mut Tab,
+    conn: &Option<GridConn>,
+    view: &mut GridView,
+) {
+    match control {
+        FooterControl::CountTotal => {
+            if ui
+                .button(label)
+                .on_hover_text("Count every row behind the truncation flag")
+                .clicked()
+            {
+                match conn.as_ref().and_then(|c| c.handle.clone()) {
+                    Some(handle) => {
+                        if is_single_statement(&tab.sql) {
+                            let run = paging_run_id(ui.ctx(), tab.id);
+                            let sql = tab.sql.clone();
+                            if handle
+                                .send(DbCommand::CountFor { run, tab: tab.id, sql })
+                                .is_err()
+                            {
+                                tab.set_export_notice(
+                                    "Count failed: connection is gone".to_owned(),
+                                    true,
+                                );
+                            }
+                        } else {
+                            tab.set_export_notice(
+                                "Counting needs a single SELECT".to_owned(),
+                                true,
+                            );
+                        }
                     }
-                } else {
-                    tab.set_export_notice(
-                        "Paging needs a single SELECT".to_owned(),
+                    None => tab.set_export_notice(
+                        "Counting needs a live connection".to_owned(),
                         true,
-                    );
+                    ),
                 }
             }
-            None => tab.set_export_notice(
-                "Paging needs a live connection".to_owned(),
-                true,
-            ),
+        }
+        FooterControl::LoadMore => {
+            if ui
+                .button(label)
+                .on_hover_text("Fetch the next page past the row cap")
+                .clicked()
+            {
+                match conn.as_ref().and_then(|c| c.handle.clone()) {
+                    Some(handle) => {
+                        if is_single_statement(&tab.sql) {
+                            let run = paging_run_id(ui.ctx(), tab.id);
+                            let sql = tab.sql.clone();
+                            if handle
+                                .send(DbCommand::QueryPage {
+                                    run,
+                                    tab: tab.id,
+                                    sql,
+                                    offset: loaded as u64,
+                                    limit: STREAM_PAGE_SIZE as u64,
+                                })
+                                .is_err()
+                            {
+                                tab.set_export_notice(
+                                    "Page failed: connection is gone".to_owned(),
+                                    true,
+                                );
+                            }
+                        } else {
+                            tab.set_export_notice(
+                                "Paging needs a single SELECT".to_owned(),
+                                true,
+                            );
+                        }
+                    }
+                    None => tab.set_export_notice(
+                        "Paging needs a live connection".to_owned(),
+                        true,
+                    ),
+                }
+            }
+        }
+        FooterControl::ShowColumns => {
+            if ui.button(label).clicked() {
+                view.show_all();
+            }
         }
     }
 }
@@ -2103,22 +2134,37 @@ fn results_grid(
     let hidden = view.hidden_count(cols.len());
     egui::Panel::bottom("crusty_grid_footer").show(ui, |ui| {
         ui.horizontal(|ui| {
-            // The row measures before it draws, so nothing paints over the
-            // window edge. The texts reserve in the order of what the row
+            // The controls pack like the toolbars': measured before anything
+            // draws, the inline prefix keeps its place and the contiguous
+            // tail moves behind the row's one `…`, so a control the row
+            // cannot hold stays reachable. The texts elide into what the
+            // pack leaves. The texts reserve in the order of what the row
             // can least afford to lose: the truncation flag (the result is
             // incomplete), a failed-export notice, the counts, the tab's own
             // state, a success notice. Draw order is their own.
+            let mut controls: Vec<FooterControl> = Vec::new();
+            if truncated && known_total.is_none() {
+                controls.push(FooterControl::CountTotal);
+            }
+            if truncated {
+                controls.push(FooterControl::LoadMore);
+            }
+            if hidden > 0 {
+                controls.push(FooterControl::ShowColumns);
+            }
+            let labels: Vec<String> =
+                controls.iter().map(|control| control.label(total, hidden)).collect();
+            let widths: Vec<f32> =
+                labels.iter().map(|label| fit::button_w(ui, label)).collect();
+            let inline = fit::spill(ui, &widths);
             let mut budget = fit::Budget::new(ui);
-            let count_label = "Count total";
-            let count_fits = truncated
-                && known_total.is_none()
-                && budget.take(ui, fit::button_w(ui, count_label));
-            let more_label = format!("Load more ({total} loaded)");
-            let more_fits = truncated
-                && budget.take(ui, fit::button_w(ui, &more_label));
-            let columns_label = format!("Show columns ({hidden})");
-            let columns_fits =
-                hidden > 0 && budget.take(ui, fit::button_w(ui, &columns_label));
+            for width in &widths[..inline] {
+                budget.take(ui, *width);
+            }
+            let tailed = inline < controls.len();
+            if tailed {
+                budget.take(ui, fit::button_w(ui, fit::OVERFLOW_LABEL));
+            }
             let notice = tab.export_notice().map(str::to_owned);
             let notice_failed = tab.export_failed();
             let truncate_text = if truncated {
@@ -2158,16 +2204,31 @@ fn results_grid(
                     egui::RichText::new(truncate_text).small().strong(),
                 );
             }
-            paging_row(
-                tab,
-                &grid_conn,
-                total,
-                count_fits.then_some(count_label),
-                more_fits.then_some(more_label.as_str()),
-                ui,
-            );
-            if columns_fits && ui.button(columns_label).clicked() {
-                view.show_all();
+            {
+                let mut draw = |ui: &mut egui::Ui, index: usize| {
+                    draw_footer_control(
+                        ui,
+                        controls[index],
+                        &labels[index],
+                        total,
+                        tab,
+                        &grid_conn,
+                        &mut view,
+                    );
+                };
+                for index in 0..inline {
+                    draw(ui, index);
+                }
+                if tailed {
+                    let hover = labels[inline..].join(", ");
+                    ui.menu_button(fit::OVERFLOW_LABEL, |ui| {
+                        for index in inline..controls.len() {
+                            draw(ui, index);
+                        }
+                    })
+                    .response
+                    .on_hover_text(format!("More: {hover}"));
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if !edit_text.is_empty() {
