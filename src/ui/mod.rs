@@ -20,6 +20,10 @@ pub mod schema;
 pub mod search;
 pub mod table_edit;
 
+fn chrome_frame(style: &egui::Style) -> egui::Frame {
+    egui::Frame::side_top_panel(style).inner_margin(egui::Margin::symmetric(8, 6))
+}
+
 pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     // The palette's Ctrl+K stays live everywhere; an open dialog refuses it.
     search::palette_toggle(state, ui);
@@ -78,31 +82,39 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     egui::Panel::left("connections")
         .resizable(true)
         .default_size(240.0)
+        .frame(chrome_frame(ui.style()))
         .show(ui, |ui| {
             panel(ui);
             connections::sidebar(state, ui);
         });
-    egui::Panel::bottom("status").show(ui, |ui| {
-        panel(ui);
-        status_bar(state, ui);
-    });
-    egui::Panel::top("tabs").show(ui, |ui| {
-        panel(ui);
-        query::tab_bar(state, ui);
-    });
+    egui::Panel::bottom("status")
+        .frame(chrome_frame(ui.style()))
+        .show(ui, |ui| {
+            panel(ui);
+            status_bar(state, ui);
+        });
+    egui::Panel::top("tabs")
+        .frame(chrome_frame(ui.style()))
+        .show(ui, |ui| {
+            panel(ui);
+            query::tab_bar(state, ui);
+        });
     let table_tab = state
         .active()
         .and_then(|id| state.tab(id))
         .is_some_and(|tab| matches!(tab.kind, crate::app::TabKind::Table { .. }));
     if table_tab {
-        egui::Panel::top("table").show(ui, |ui| {
-            panel(ui);
-            query::table_header(state, ui);
-        });
+        egui::Panel::top("table")
+            .frame(chrome_frame(ui.style()))
+            .show(ui, |ui| {
+                panel(ui);
+                query::table_header(state, ui);
+            });
     } else {
         egui::Panel::top("editor")
             .resizable(true)
             .default_size(210.0)
+            .frame(chrome_frame(ui.style()))
             .show(ui, |ui| {
                 panel(ui);
                 query::editor(state, ui);
