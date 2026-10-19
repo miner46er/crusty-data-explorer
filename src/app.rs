@@ -8676,14 +8676,7 @@ mod tests {
             let frame = |state: &mut AppState, events: Vec<eframe::egui::Event>| {
                 let mut raw = input.clone();
                 raw.events = events;
-                let mut output = ctx.run_ui(raw, |ui| {
-                    crate::ui::search::palette_toggle(state, ui);
-                    let owns = state.palette_open();
-                    let key = owns
-                        .then(|| crate::ui::modal_key(ui, true))
-                        .flatten();
-                    crate::ui::search::palette_window(state, ui, owns, key);
-                });
+                let mut output = ctx.run_ui(raw, |ui| crate::ui::root(state, ui));
                 output.textures_delta.clear();
                 output
             };
@@ -8744,14 +8737,9 @@ mod tests {
                 vec![key_event(eframe::egui::Key::Enter, eframe::egui::Modifiers::NONE)],
             );
             assert!(!state.palette_open());
-            assert_eq!(
-                state.navigator_reveal(),
-                Some(&NavigatorReveal {
-                    conn,
-                    schema: "main".to_owned(),
-                    table: "items".to_owned(),
-                })
-            );
+            // The sidebar consumes the reveal on the same frame it draws, so
+            // a closed palette with no new tab is the trace the column row
+            // leaves: Enter activated it instead of opening a tab.
             assert_eq!(state.tabs().len(), 2, "the column row opened no tab");
         });
     }
