@@ -68,6 +68,9 @@ struct ToolState<'a> {
     transaction_open: bool,
     transaction_ready: bool,
     find_open: bool,
+    /// A dialog owns the keyboard: the tools draw disabled instead of
+    /// collecting clicks the dispatch would drop.
+    modal_open: bool,
 }
 
 impl ToolState<'_> {
@@ -117,7 +120,11 @@ fn close_in_menu(ui: &egui::Ui) {
 
 impl ToolClicks {
     fn draw(&mut self, ui: &mut egui::Ui, tool: Tool, state: &ToolState) {        match tool {
-            Tool::Save => self.save |= ui.button(tool.label()).clicked(),
+            Tool::Save => {
+                self.save |= ui
+                    .add_enabled(!state.modal_open, egui::Button::new(tool.label()))
+                    .clicked();
+            }
             Tool::Commit | Tool::Rollback => {
                 let action = if tool == Tool::Commit {
                     TransactionAction::Commit
@@ -159,10 +166,17 @@ impl ToolClicks {
                 }
             }
             Tool::Complete => super::complete::complete_menu(ui),
-            Tool::Format => self.format |= ui.button(tool.label()).clicked(),
+            Tool::Format => {
+                self.format |= ui
+                    .add_enabled(!state.modal_open, egui::Button::new(tool.label()))
+                    .clicked();
+            }
             Tool::Find => {
                 if ui
-                    .selectable_label(state.find_open, tool.label())
+                    .add_enabled(
+                        !state.modal_open,
+                        egui::Button::selectable(state.find_open, tool.label()),
+                    )
                     .on_hover_text(format!(
                         "Find ({})",
                         ui.ctx().format_shortcut(&find_shortcut())
@@ -252,6 +266,7 @@ pub(crate) fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
             transaction_open,
             transaction_ready,
             find_open: find_shown,
+            modal_open,
         };
         let hint = format!(
             "{} · {}",
@@ -276,13 +291,14 @@ pub(crate) fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                         }
                     });
                 run_clicked = ui
-                    .add(
+                    .add_enabled(
+                        !modal_open,
                         egui::Button::new(egui::RichText::new(RUN_LABEL).strong())
                             .fill(Palette::of(ui.ctx().theme()).success),
                     )
                     .clicked();
                 explain_clicked = ui
-                    .button(EXPLAIN_LABEL)
+                    .add_enabled(!modal_open, egui::Button::new(EXPLAIN_LABEL))
                     .on_hover_text("Query execution plan")
                     .clicked();
             }
@@ -339,25 +355,24 @@ pub(crate) fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
     if let Some(on) = clicks.autocommit {
         state.set_autocommit(tab_id, on);
     }
-    if clicks.save && !modal_open {
+    if clicks.save {
         state.open_save_prompt();
     }
     if clicks.format
-        && !modal_open
         && let Some(sql) = state.tab_sql_mut(tab_id)
     {
         *sql = format_sql(sql);
     }
     let mut find_opened = false;
-    if clicks.find && !modal_open {
+    if clicks.find {
         find_opened = toggle_find(ui.ctx(), tab_id);
     }
-    if run_clicked && !modal_open {
+    if run_clicked {
         let sql = state.tab(tab_id).map(|t| t.sql.clone()).unwrap_or_default();
         let (cursor, selection) = super::complete::editor_offsets(ui.ctx(), tab_id, &sql);
         state.start_run(tab_id, &sql, cursor, selection);
     }
-    if explain_clicked && !modal_open {
+    if explain_clicked {
         let sql = state.tab(tab_id).map(|t| t.sql.clone()).unwrap_or_default();
         let (cursor, selection) = super::complete::editor_offsets(ui.ctx(), tab_id, &sql);
         state.start_explain(tab_id, &sql, cursor, selection);
@@ -498,6 +513,7 @@ mod tests {
                     transaction_open: false,
                     transaction_ready: true,
                     find_open: false,
+                    modal_open: false,
                 };
                 answer = Some(fits_one_row(ui, &state, RunScope::All.label()));
             });
@@ -533,6 +549,7 @@ mod tests {
                     transaction_open: false,
                     transaction_ready: true,
                     find_open: false,
+                    modal_open: false,
                 };
                 let running_slot = AutocommitSlot::Running;
                 let running = ToolState { slot: &running_slot, ..idle };
