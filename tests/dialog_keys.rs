@@ -222,6 +222,7 @@ struct DialogCase {
     expected: Modal,
     setup: fn(&mut Harness<AppState>, TabId),
     open: fn(&AppState) -> bool,
+    held: fn(&Harness<AppState>, TabId),
 }
 
 /// Approval is read from the fact it would change, never from `Running`:
@@ -236,6 +237,125 @@ fn assert_sent_nothing(harness: &Harness<AppState>, tab: TabId, conns: usize) {
     assert_eq!(rows, Some(5), "the dialog ran nothing");
 }
 
+/// The approval's own fact, still unchanged: plain Enter never approves, so
+/// the state approval would move stays put. Enter cancels the approve-type
+/// dialogs through their focused Cancel, which clears the pending value the
+/// same way approval does: the detector is the approval's effect, not the
+/// pending flag. Connection and row counts alone cannot see a prod approval
+/// go through.
+fn prod_conn(harness: &Harness<AppState>) -> ConnectionId {
+    harness
+        .state()
+        .connections()
+        .iter()
+        .find(|c| c.env == Environment::Prod)
+        .expect("the prod connection")
+        .id
+}
+
+fn held_prod_connect(harness: &Harness<AppState>, _tab: TabId) {
+    let state = harness.state();
+    let prod = prod_conn(harness);
+    assert!(
+        matches!(
+            state.connections().iter().find(|c| c.id == prod).map(|c| c.state()),
+            Some(ConnectionState::Disconnected)
+        ),
+        "prod-connect sent nothing on Enter"
+    );
+    assert!(
+        state.password_prompt().is_none(),
+        "prod-connect asked for no password on Enter"
+    );
+}
+
+fn held_terminate(harness: &Harness<AppState>, _tab: TabId) {
+    let state = harness.state();
+    assert!(
+        state.sessions_error(prod_conn(harness)).is_none(),
+        "terminate sent nothing on Enter"
+    );
+}
+
+fn held_draft(harness: &Harness<AppState>, _tab: TabId) {
+    assert!(harness.state().draft().is_some(), "draft still open after Enter");
+}
+
+fn held_import(harness: &Harness<AppState>, tab: TabId) {
+    assert!(
+        !matches!(
+            harness.state().tab(tab).map(|t| t.outcome()),
+            Some(RunOutcome::Running { .. })
+        ),
+        "import sent nothing on Enter"
+    );
+}
+
+fn held_write(harness: &Harness<AppState>, tab: TabId) {
+    assert!(
+        !matches!(
+            harness.state().tab(tab).map(|t| t.outcome()),
+            Some(RunOutcome::Running { .. })
+        ),
+        "write-confirm sent nothing on Enter"
+    );
+}
+
+fn held_edit_preview(harness: &Harness<AppState>, tab: TabId) {
+    let state = harness.state();
+    assert_eq!(
+        state.tab(tab).map(|t| t.staged_count()),
+        Some(1),
+        "cancel keeps the staged edit"
+    );
+    assert!(
+        !matches!(
+            state.tab(tab).map(|t| t.outcome()),
+            Some(RunOutcome::Running { .. })
+        ),
+        "edit-preview sent nothing on Enter"
+    );
+}
+
+fn held_table_ddl(harness: &Harness<AppState>, _tab: TabId) {
+    let state = harness.state();
+    let ddl = state
+        .tabs()
+        .iter()
+        .find(|t| t.conn == Some(prod_conn(harness)))
+        .expect("the ddl tab");
+    assert!(
+        matches!(ddl.outcome(), RunOutcome::Never),
+        "table-ddl sent nothing on Enter"
+    );
+}
+
+fn held_table_editor(harness: &Harness<AppState>, tab: TabId) {
+    let state = harness.state();
+    assert!(state.table_editor().is_some(), "table editor still open after Enter");
+    assert!(
+        matches!(
+            state.tab(tab).map(|t| t.outcome()),
+            Some(RunOutcome::Ok { .. })
+        ),
+        "the blank table editor applied nothing on Enter"
+    );
+}
+
+fn held_compare(harness: &Harness<AppState>, _tab: TabId) {
+    let state = harness.state();
+    assert!(state.compare_window_open(), "compare still open after Enter");
+    assert!(!state.compare().running(), "compare ran nothing on Enter");
+    assert!(state.compare().left_result().is_none(), "compare ran nothing on Enter");
+    assert!(state.compare().output().is_none(), "compare ran nothing on Enter");
+}
+
+fn held_palette(harness: &Harness<AppState>, _tab: TabId) {
+    let state = harness.state();
+    assert!(state.palette_open(), "palette still open after Enter");
+    assert_eq!(state.tabs().len(), 1, "an empty palette opened no tab");
+}
+
 /// Every dialog opens through its real transition, plain Enter never approves
 /// or sends from the approve-type and long-form windows, and Escape closes
 /// the dialog it was opened with.
@@ -248,60 +368,70 @@ fn every_dialog_answers_the_keyboard() {
             expected: Modal::ProdConnect,
             setup: setup_prod_connect,
             open: |state| state.pending_prod().is_some(),
+            held: held_prod_connect,
         },
         DialogCase {
             name: "terminate",
             expected: Modal::Terminate,
             setup: setup_terminate,
             open: |state| state.pending_terminate().is_some(),
+            held: held_terminate,
         },
         DialogCase {
             name: "draft",
             expected: Modal::Draft,
             setup: setup_draft,
             open: |state| state.draft().is_some(),
+            held: held_draft,
         },
         DialogCase {
             name: "import",
             expected: Modal::Import,
             setup: setup_import,
             open: |state| state.import_draft().is_some(),
+            held: held_import,
         },
         DialogCase {
             name: "write-confirm",
             expected: Modal::WriteConfirm,
             setup: setup_write,
             open: |state| state.pending_write().is_some(),
+            held: held_write,
         },
         DialogCase {
             name: "edit-preview",
             expected: Modal::EditPreview,
             setup: setup_edit_preview,
             open: |state| state.pending_edit_preview().is_some(),
+            held: held_edit_preview,
         },
         DialogCase {
             name: "table-ddl",
             expected: Modal::TableDdl,
             setup: setup_table_ddl,
             open: |state| state.pending_table_ddl().is_some(),
+            held: held_table_ddl,
         },
         DialogCase {
             name: "table-editor",
             expected: Modal::TableEditor,
             setup: setup_table_editor,
             open: |state| state.table_editor().is_some(),
+            held: held_table_editor,
         },
         DialogCase {
             name: "compare",
             expected: Modal::Compare,
             setup: setup_compare,
             open: |state| state.compare_window_open(),
+            held: held_compare,
         },
         DialogCase {
             name: "palette",
             expected: Modal::Palette,
             setup: setup_palette,
             open: |state| state.palette_open(),
+            held: held_palette,
         },
     ];
     for case in cases {
@@ -319,6 +449,7 @@ fn every_dialog_answers_the_keyboard() {
         harness.key_press(egui::Key::Enter);
         harness.run();
         assert_sent_nothing(&harness, tab, conns);
+        (case.held)(&harness, tab);
         harness.key_press(egui::Key::Escape);
         harness.run();
         assert!(!(case.open)(harness.state()), "{} closes on Escape", case.name);
