@@ -1259,7 +1259,7 @@ pub fn import_window(
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
 ) -> Option<egui::LayerId> {
-    let Some(draft) = state.import_draft() else { return None };
+    let draft = state.import_draft()?;
     let title = format!("Import into {}", draft.table);
     let mut confirm = false;
     let mut cancel = false;

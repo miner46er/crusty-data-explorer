@@ -1498,7 +1498,7 @@ pub fn password_window(
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
 ) -> Option<egui::LayerId> {
-    let Some(id) = state.password_prompt() else { return None };
+    let id = state.password_prompt()?;
     let Some(name) =
         state.connections().iter().find(|c| c.id == id).map(|c| c.name.clone())
     else {
@@ -1539,7 +1539,7 @@ pub fn prod_confirm_window(
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
 ) -> Option<egui::LayerId> {
-    let Some(id) = state.pending_prod() else { return None };
+    let id = state.pending_prod()?;
     let Some(name) =
         state.connections().iter().find(|c| c.id == id).map(|c| c.name.clone())
     else {
@@ -1577,7 +1577,7 @@ pub fn terminate_confirm_window(
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
 ) -> Option<egui::LayerId> {
-    let Some(pending) = state.pending_terminate().cloned() else { return None };
+    let pending = state.pending_terminate().cloned()?;
     let Some(name) =
         state.connections().iter().find(|c| c.id == pending.conn).map(|c| c.name.clone())
     else {
@@ -1611,9 +1611,7 @@ pub fn draft_window(
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
 ) -> Option<egui::LayerId> {
-    if state.draft().is_none() {
-        return None;
-    }
+    state.draft()?;
     let title = if state.draft().is_some_and(|d| d.editing.is_some()) {
         "Edit connection"
     } else {

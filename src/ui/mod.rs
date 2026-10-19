@@ -25,16 +25,15 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     search::palette_toggle(state, ui);
     let open_modals = state.modals_back_to_front();
     // The cell editor owns the keyboard like a dialog when no dialog backs
-    // it, so it gets the same shield, first-frame disable, and owner-only
-    // layer, keyed on the same flag.
+    // it; its flag folds into the same newly-opened answer, so its first
+    // frame draws the panels disabled too.
     let cell_editor_open = grid::cell_editor_open(state, ui.ctx());
-    let cell_editor_prev: bool =
-        ui.ctx().data_mut(|data| data.get_temp(cell_editor_id()).unwrap_or(false));
     // egui reads the modal layer from the previous frame, so a dialog that
     // just opened cannot block the chrome behind it until the next frame.
     // Draw that one frame's panels disabled: they register no focus and take
     // no clicks, which closes the gap.
-    let (newly_opened, restore_focus) = note_open_modals(ui.ctx(), &open_modals);
+    let (newly_opened, restore_focus) =
+        note_open_modals(ui.ctx(), &open_modals, cell_editor_open);
     // A press that landed on the opening frame armed a click against the
     // previous frame's chrome. Keep the panels disabled until that press is
     // released, so its release cannot turn into a click behind the dialog.
@@ -42,8 +41,7 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     let holding_click: bool =
         ui.ctx().data_mut(|data| data.get_temp(hold_id).unwrap_or(false));
     let pointer_down = ui.input(|input| input.pointer.any_down());
-    let block_panels =
-        newly_opened || (cell_editor_open && !cell_editor_prev) || holding_click;
+    let block_panels = newly_opened || holding_click;
     ui.ctx().data_mut(|data| data.insert_temp(hold_id, block_panels && pointer_down));
     let modal = open_modals.last().copied();
     let key = modal.and_then(|modal| {
@@ -117,66 +115,54 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
         panel(ui);
         grid::results(state, ui, cell_editor_key);
     });
-    // A dialog that opened or closed mid-frame needs one more frame for the
-    // modal layer, focus handoff, or first-field focus to land.
-    let cell_editor_now = grid::cell_editor_open(state, ui.ctx());
-    let previous_cell: bool =
-        ui.ctx().data_mut(|data| data.get_temp(cell_editor_id()).unwrap_or(false));
-    ui.ctx().data_mut(|data| data.insert_temp(cell_editor_id(), cell_editor_now));
-    if state.modals_back_to_front() != open_modals || cell_editor_now != previous_cell {
+    // A dialog or cell editor that opened or closed mid-frame needs one more
+    // frame for the modal layer or the focus handoff to land.
+    if state.modals_back_to_front() != open_modals
+        || grid::cell_editor_open(state, ui.ctx()) != cell_editor_open
+    {
         ui.ctx().request_repaint();
     }
     // The modal layer from the frame just gone still blocks the widget we
     // want, so hand focus back after every widget has drawn. The layer clears
-    // at the end of this pass and the repaint draws the widget focused.
-    let handing_back = !restore_focus.is_empty();
+    // at the end of this pass and the repaint above draws the widget focused.
     for focused in restore_focus {
         ui.ctx().memory_mut(|memory| memory.request_focus(focused));
     }
-    if handing_back {
-        ui.ctx().request_repaint();
-    }
-}
-
-fn cell_editor_id() -> egui::Id {
-    egui::Id::new("crusty_cell_editor_was_open")
 }
 
 /// Whether the open dialog set gained one since last frame. Remember this
-/// frame's set for the next comparison, what held focus before each newly
-/// opened dialog (so closing it can hand focus back), and restore that focus
-/// for every dialog that closed. A stacked dialog records the field under it,
-/// so closing the top one refocuses the dialog beneath.
+/// frame's set and the cell editor flag for the next comparison, and keep one
+/// focus stack across the dialogs: a dialog that opens in the frame another
+/// closes inherits the closed one's return target, and a close with no
+/// matching open hands focus back. A stacked dialog records the field under
+/// it, so closing the top one refocuses the dialog beneath.
 fn note_open_modals(
     ctx: &egui::Context,
     open: &[crate::app::Modal],
+    cell_editor_open: bool,
 ) -> (bool, Vec<egui::Id>) {
     let id = egui::Id::new("crusty_open_modals");
-    let previous: Vec<crate::app::Modal> =
+    let (previous, previous_cell): (Vec<crate::app::Modal>, bool) =
         ctx.data_mut(|data| data.get_temp(id)).unwrap_or_default();
-    let opened = open.iter().any(|modal| !previous.contains(modal));
-    for modal in open.iter().filter(|modal| !previous.contains(modal)) {
-        let key = modal_return_id(*modal);
-        let focused = ctx.memory(|memory| memory.focused());
-        ctx.data_mut(|data| data.insert_temp(key, focused));
-    }
-    let mut restore = Vec::new();
-    for modal in previous.iter().filter(|modal| !open.contains(modal)) {
+    let opened = open.iter().any(|modal| !previous.contains(modal))
+        || (cell_editor_open && !previous_cell);
+    let stack_id = egui::Id::new("crusty_modal_focus_stack");
+    let mut stack: Vec<Option<egui::Id>> =
+        ctx.data_mut(|data| data.get_temp(stack_id)).unwrap_or_default();
+    let mut freed: Vec<Option<egui::Id>> = Vec::new();
+    for modal in previous.iter().rev().filter(|modal| !open.contains(modal)) {
         ctx.data_mut(|data| data.remove_temp::<Vec<egui::Id>>(dialog_fields_id(*modal)));
-        let key = modal_return_id(*modal);
-        let focused = ctx
-            .data_mut(|data| data.remove_temp::<Option<egui::Id>>(key))
-            .flatten();
-        if let Some(focused) = focused {
-            restore.push(focused);
-        }
+        freed.push(stack.pop().flatten());
     }
-    ctx.data_mut(|data| data.insert_temp(id, open.to_vec()));
+    for _ in open.iter().filter(|modal| !previous.contains(modal)) {
+        let inherited =
+            freed.pop().flatten().or_else(|| ctx.memory(|memory| memory.focused()));
+        stack.push(inherited);
+    }
+    let restore: Vec<egui::Id> = freed.into_iter().flatten().collect();
+    ctx.data_mut(|data| data.insert_temp(id, (open.to_vec(), cell_editor_open)));
+    ctx.data_mut(|data| data.insert_temp(stack_id, stack));
     (opened, restore)
-}
-
-fn modal_return_id(modal: crate::app::Modal) -> egui::Id {
-    egui::Id::new(("crusty_modal_return_focus", modal))
 }
 
 fn dialog_fields_id(modal: crate::app::Modal) -> egui::Id {
@@ -261,10 +247,8 @@ fn draw_modal(
         Modal::Compare => compare::compare_window(state, ui, key),
         Modal::Palette => search::palette_window(state, ui, owns, key),
     };
-    if owns {
-        if let Some(layer) = layer {
-            ui.ctx().memory_mut(|memory| memory.set_modal_layer(layer));
-        }
+    if owns && let Some(layer) = layer {
+        ui.ctx().memory_mut(|memory| memory.set_modal_layer(layer));
     }
 }
 

@@ -2063,6 +2063,69 @@ fn a_click_behind_the_cell_editor_opens_nothing_and_tab_stays_inside() {
     }
 }
 
+/// A dialog that opens in the frame another closes inherits the closed one's
+/// return target: Enter in the params prompt hands first focus to the write
+/// guard's Cancel, and Escape hands it back to the SQL editor it came from.
+#[test]
+fn params_enter_hands_focus_through_the_write_confirm() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("params-write-chain");
+    let sql = "UPDATE users SET plan = :p";
+    *harness.state_mut().tab_sql_mut(tab).expect("the tab sql") = sql.to_owned();
+    harness.ctx.memory_mut(|memory| memory.request_focus(editor_id(tab)));
+    harness.run();
+    assert_eq!(
+        harness.ctx.memory(|memory| memory.focused()),
+        Some(editor_id(tab)),
+        "the editor starts focused"
+    );
+    harness.state_mut().start_run(tab, sql, sql.len(), None);
+    harness.run();
+    assert!(
+        harness.state().pending_params().is_some(),
+        "the params prompt holds the run"
+    );
+    harness.event(egui::Event::Text("pro".to_owned()));
+    harness.run();
+    assert_eq!(
+        harness.state().pending_params().map(|pending| pending.params[0].value.as_str()),
+        Some("pro"),
+        "typing lands in the parameter field"
+    );
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().pending_params().is_none(),
+        "Enter runs the params prompt"
+    );
+    assert!(
+        harness.state().pending_write().is_some(),
+        "the params run arms the write guard"
+    );
+    assert!(
+        harness.get_by_label("Cancel").is_focused(),
+        "the write guard starts on Cancel"
+    );
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(
+        harness.state().pending_write().is_none(),
+        "Escape cancels the guard"
+    );
+    assert_eq!(
+        harness.ctx.memory(|memory| memory.focused()),
+        Some(editor_id(tab)),
+        "closing the guard hands focus back to the SQL editor"
+    );
+    harness.event(egui::Event::Text("x".to_owned()));
+    harness.run();
+    assert_ne!(
+        harness.state().tab(tab).expect("the tab").sql,
+        sql,
+        "typing after the guard lands in the SQL"
+    );
+}
+
 #[test]
 fn escape_returns_focus_to_the_editor_after_a_confirm() {
     let _guard = env_lock();

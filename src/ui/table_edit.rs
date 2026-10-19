@@ -42,7 +42,7 @@ pub fn table_prod_confirm_window(
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
 ) -> Option<egui::LayerId> {
-    let Some(pending) = state.pending_table_ddl().cloned() else { return None };
+    let pending = state.pending_table_ddl().cloned()?;
     let Some(name) =
         state.connections().iter().find(|c| c.id == pending.conn).map(|c| c.name.clone())
     else {
@@ -113,32 +113,28 @@ pub fn table_editor_window(
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
 ) -> Option<egui::LayerId> {
-    let (conn, conn_name, backend, read_only, prod, is_alter, editing_title) = match state
-        .table_editor()
-    {
-        Some(editor) => {
-            let (name, backend, read_only, prod) = state
-                .connections()
-                .iter()
-                .find(|c| c.id == editor.conn)
-                .map(|c| {
-                    (
-                        c.name.clone(),
-                        c.config.kind().label().to_owned(),
-                        c.config.is_read_only(),
-                        c.env == crate::app::Environment::Prod,
-                    )
-                })
-                .unwrap_or_else(|| ("deleted".to_owned(), String::new(), true, false));
-            let is_alter = editor.original.is_some();
-            let title = if is_alter {
-                format!("Edit table {}.{}", editor.form.schema, editor.form.table)
-            } else {
-                "New table".to_owned()
-            };
-            (editor.conn, name, backend, read_only, prod, is_alter, title)
-        }
-        None => return None,
+    let editor = state.table_editor()?;
+    let (conn, conn_name, backend, read_only, prod, is_alter, editing_title) = {
+        let (name, backend, read_only, prod) = state
+            .connections()
+            .iter()
+            .find(|c| c.id == editor.conn)
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    c.config.kind().label().to_owned(),
+                    c.config.is_read_only(),
+                    c.env == crate::app::Environment::Prod,
+                )
+            })
+            .unwrap_or_else(|| ("deleted".to_owned(), String::new(), true, false));
+        let is_alter = editor.original.is_some();
+        let title = if is_alter {
+            format!("Edit table {}.{}", editor.form.schema, editor.form.table)
+        } else {
+            "New table".to_owned()
+        };
+        (editor.conn, name, backend, read_only, prod, is_alter, title)
     };
     let dismissed_popup =
         key == Some(ModalKey::Cancel) && egui::Popup::is_any_open(ui.ctx());

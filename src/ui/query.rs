@@ -514,9 +514,7 @@ pub fn save_window(
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
 ) -> Option<egui::LayerId> {
-    if state.save_prompt().is_none() {
-        return None;
-    }
+    state.save_prompt()?;
     let mut confirm = false;
     let mut close = false;
     let mut field_focused = false;
@@ -570,7 +568,7 @@ pub fn write_confirm_window(
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
 ) -> Option<egui::LayerId> {
-    let Some(pending) = state.pending_write().cloned() else { return None };
+    let pending = state.pending_write().cloned()?;
     let mut confirm = false;
     let mut cancel = false;
     let window = egui::Window::new(format!("{} without WHERE?", pending.kind)).show(ui.ctx(), |ui| {
@@ -605,7 +603,7 @@ pub fn edit_preview_window(
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
 ) -> Option<egui::LayerId> {
-    let Some(tab) = state.pending_edit_preview() else { return None };
+    let tab = state.pending_edit_preview()?;
     let table = state.edit_target(tab).map(|target| target.table).unwrap_or_default();
     let statements = state.preview_edit_statements(tab).unwrap_or_default();
     if statements.is_empty() {
@@ -652,9 +650,7 @@ pub fn params_window(
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
 ) -> Option<egui::LayerId> {
-    if state.pending_params().is_none() {
-        return None;
-    }
+    state.pending_params()?;
     let mut run = false;
     let mut cancel = false;
     let mut field_focused = false;
