@@ -827,10 +827,6 @@ fn saved_folder_header(
 }
 
 pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
-    // root() pumps this module through the sidebar, so the prod confirm
-    // renders with the connect gestures that raise it.
-    prod_confirm_window(state, ui);
-    terminate_confirm_window(state, ui);
     let palette = Palette::of(ui.ctx().theme());
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
         if ui
