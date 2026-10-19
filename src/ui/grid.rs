@@ -27,7 +27,16 @@ use crate::export::{
 use crate::edit::{STAGED_DEFAULT, editable_table};
 use crate::import::{ParsedCsv, parse_csv, parse_jsonl, parse_xlsx};
 
-use super::Palette;
+use super::{Palette, fit};
+
+/// The row filter's desired width, and the narrowest it shrinks to before
+/// the results toolbar wraps to a second row.
+const FIELD_W: f32 = 180.0;
+const FIELD_MIN: f32 = 64.0;
+
+/// The filter's clear label. The results toolbar measures it before it draws
+/// it, so both sides read this.
+const CLEAR_LABEL: &str = "Clear";
 
 /// Identity of the result a [`Selection`] was made on. A new run, a result
 /// switch, or a shape change carries a new id and clears the selection.
@@ -286,87 +295,122 @@ fn truncate_label(total: Option<u64>) -> String {
     }
 }
 
-/// The paging controls under a truncated grid, inline in the footer's row:
-/// the on-demand count beside the flag and the next page on demand. Pages
-/// append onto the loaded rows through [`DbEvent::PageOk`]; a stale page
-/// whose offset misses the loaded length is ignored, so a new run never
-/// gains old rows.
-fn paging_row(
-    tab: &mut Tab,
-    conn: &Option<GridConn>,
-    known_total: Option<u64>,
-    loaded: usize,
-    ui: &mut egui::Ui,
-) {
-    if known_total.is_none()
-        && ui
-            .button("Count total")
-            .on_hover_text("Count every row behind the truncation flag")
-            .clicked()
-    {
-        match conn.as_ref().and_then(|c| c.handle.clone()) {
-            Some(handle) => {
-                if is_single_statement(&tab.sql) {
-                    let run = paging_run_id(ui.ctx(), tab.id);
-                    let sql = tab.sql.clone();
-                    if handle
-                        .send(DbCommand::CountFor { run, tab: tab.id, sql })
-                        .is_err()
-                    {
-                        tab.set_export_notice(
-                            "Count failed: connection is gone".to_owned(),
-                            true,
-                        );
-                    }
-                } else {
-                    tab.set_export_notice(
-                        "Counting needs a single SELECT".to_owned(),
-                        true,
-                    );
-                }
-            }
-            None => tab.set_export_notice(
-                "Counting needs a live connection".to_owned(),
-                true,
-            ),
+/// One of the grid footer's controls, in the order they read left to right.
+/// The row packs them like the toolbars: what fits stays inline and the
+/// contiguous tail moves behind the footer's one `…`, and both sides draw
+/// through [`draw_footer_control`], so a control acts the same wherever the
+/// row puts it.
+#[derive(Clone, Copy)]
+enum FooterControl {
+    /// Count every row behind the truncation flag.
+    CountTotal,
+    /// Fetch the next page past the row cap.
+    LoadMore,
+    /// Bring back every hidden column.
+    ShowColumns,
+}
+
+impl FooterControl {
+    fn label(self, loaded: usize, hidden: usize) -> String {
+        match self {
+            Self::CountTotal => "Count total".to_owned(),
+            Self::LoadMore => format!("Load more ({loaded} loaded)"),
+            Self::ShowColumns => format!("Show columns ({hidden})"),
         }
     }
-    if ui
-        .button(format!("Load more ({loaded} loaded)"))
-        .on_hover_text("Fetch the next page past the row cap")
-        .clicked()
-    {
-        match conn.as_ref().and_then(|c| c.handle.clone()) {
-            Some(handle) => {
-                if is_single_statement(&tab.sql) {
-                    let run = paging_run_id(ui.ctx(), tab.id);
-                    let sql = tab.sql.clone();
-                    if handle
-                        .send(DbCommand::QueryPage {
-                            run,
-                            tab: tab.id,
-                            sql,
-                            offset: loaded as u64,
-                            limit: STREAM_PAGE_SIZE as u64,
-                        })
-                        .is_err()
-                    {
-                        tab.set_export_notice(
-                            "Page failed: connection is gone".to_owned(),
-                            true,
-                        );
+}
+
+/// Draw one footer control and land its click. Pages append onto the loaded
+/// rows through [`DbEvent::PageOk`]; a stale page whose offset misses the
+/// loaded length is ignored, so a new run never gains old rows.
+fn draw_footer_control(
+    ui: &mut egui::Ui,
+    control: FooterControl,
+    label: &str,
+    loaded: usize,
+    tab: &mut Tab,
+    conn: &Option<GridConn>,
+    view: &mut GridView,
+) {
+    match control {
+        FooterControl::CountTotal => {
+            if ui
+                .button(label)
+                .on_hover_text("Count every row behind the truncation flag")
+                .clicked()
+            {
+                match conn.as_ref().and_then(|c| c.handle.clone()) {
+                    Some(handle) => {
+                        if is_single_statement(&tab.sql) {
+                            let run = paging_run_id(ui.ctx(), tab.id);
+                            let sql = tab.sql.clone();
+                            if handle
+                                .send(DbCommand::CountFor { run, tab: tab.id, sql })
+                                .is_err()
+                            {
+                                tab.set_export_notice(
+                                    "Count failed: connection is gone".to_owned(),
+                                    true,
+                                );
+                            }
+                        } else {
+                            tab.set_export_notice(
+                                "Counting needs a single SELECT".to_owned(),
+                                true,
+                            );
+                        }
                     }
-                } else {
-                    tab.set_export_notice(
-                        "Paging needs a single SELECT".to_owned(),
+                    None => tab.set_export_notice(
+                        "Counting needs a live connection".to_owned(),
                         true,
-                    );
+                    ),
                 }
             }
-            None => tab.set_export_notice(
-                "Paging needs a live connection".to_owned(),
-                true,
-            ),
+        }
+        FooterControl::LoadMore => {
+            if ui
+                .button(label)
+                .on_hover_text("Fetch the next page past the row cap")
+                .clicked()
+            {
+                match conn.as_ref().and_then(|c| c.handle.clone()) {
+                    Some(handle) => {
+                        if is_single_statement(&tab.sql) {
+                            let run = paging_run_id(ui.ctx(), tab.id);
+                            let sql = tab.sql.clone();
+                            if handle
+                                .send(DbCommand::QueryPage {
+                                    run,
+                                    tab: tab.id,
+                                    sql,
+                                    offset: loaded as u64,
+                                    limit: STREAM_PAGE_SIZE as u64,
+                                })
+                                .is_err()
+                            {
+                                tab.set_export_notice(
+                                    "Page failed: connection is gone".to_owned(),
+                                    true,
+                                );
+                            }
+                        } else {
+                            tab.set_export_notice(
+                                "Paging needs a single SELECT".to_owned(),
+                                true,
+                            );
+                        }
+                    }
+                    None => tab.set_export_notice(
+                        "Paging needs a live connection".to_owned(),
+                        true,
+                    ),
+                }
+            }
+        }
+        FooterControl::ShowColumns => {
+            if ui.button(label).clicked() {
+                view.show_all();
+            }
         }
     }
 }
@@ -1446,6 +1490,30 @@ pub(crate) enum SidePane {
     Chart,
 }
 
+/// The result actions, in the order they read left to right. The inline row
+/// and the overflow menu both draw through the same drawer, so an action is
+/// drawn once whatever the width.
+#[derive(Clone, Copy)]
+enum ActionItem {
+    Copy,
+    Export,
+    Edit,
+    Detail,
+    Chart,
+}
+
+impl ActionItem {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Copy => "Copy",
+            Self::Export => "Export",
+            Self::Edit => "Edit",
+            Self::Detail => "Detail",
+            Self::Chart => "Chart",
+        }
+    }
+}
+
 fn side_pane_id(tab: TabId) -> egui::Id {
     egui::Id::new(("crusty_side_pane", tab))
 }
@@ -1606,7 +1674,7 @@ fn results_grid(
                 Some(n) => {
                     ui.colored_label(
                         palette.success,
-                        egui::RichText::new(format!("✓ {n} rows affected")).strong(),
+                        egui::RichText::new(format!("✔ {n} rows affected")).strong(),
                     );
                 }
                 None => {
@@ -1661,176 +1729,56 @@ fn results_grid(
     let rows = selection.resolve(&visible);
     let nrows = rows.len();
     let edit_label = target.map(|target| target.table.clone());
-    ui.horizontal(|ui| {
-        let mut text = tab.filter().to_owned();
-        let field = ui.add(
-            egui::TextEdit::singleline(&mut text)
-                .hint_text("Filter rows")
-                .desired_width(180.0),
-        );
-        if take_filter_focus(ui.ctx(), tab.id) {
-            field.request_focus();
-        }
-        if field.changed() {
-            tab.set_filter(text);
-        }
-        if !tab.filter().is_empty() && ui.button("Clear").clicked() {
-            tab.set_filter(String::new());
-        }
-        let clauses = tab.filter_clauses().len();
-        let label = if clauses > 0 {
-            format!("Filters ({clauses})")
-        } else {
-            "Filters".to_owned()
-        };
-        if ui
-            .selectable_label(filters_open, label)
-            .on_hover_text("Show the structured filter builder")
-            .clicked()
-        {
-            filters_open = !filters_open;
-            filters_toggled = true;
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .selectable_label(side_pane == SidePane::Chart, "Chart")
-                .on_hover_text("Plot the result beside the grid")
-                .clicked()
-            {
-                side_pane = if side_pane == SidePane::Chart {
-                    SidePane::None
-                } else {
-                    SidePane::Chart
-                };
-            }
-            if ui
-                .selectable_label(side_pane == SidePane::Detail, "Detail")
-                .on_hover_text("Show the focused row as JSON and record beside the grid")
-                .clicked()
-            {
-                side_pane = if side_pane == SidePane::Detail {
-                    SidePane::None
-                } else {
-                    SidePane::Detail
-                };
-            }
-            if editable {
-                ui.menu_button("Edit", |ui| {
-                    if ui
-                        .button("Add row")
-                        .on_hover_text("Stage one empty row for INSERT")
-                        .clicked()
-                    {
-                        actions.push(EditAction::AddRow);
-                        ui.close();
-                    }
-                    if ui
-                        .button("Paste rows")
-                        .on_hover_text(
-                            "Paste TSV or CSV from the clipboard as new rows for review",
-                        )
-                        .clicked()
-                    {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
-                        ui.ctx()
-                            .data_mut(|data| data.insert_temp(paste_armed_id(tab.id), true));
-                        ui.close();
-                    }
-                    let can_fill = selection.active().is_some_and(|(row, col)| {
-                        row < total
-                            && tab
-                                .active_query_result()
-                                .is_some_and(|result| col < result.columns().len())
-                            && !tab.is_row_deleted(row)
-                    });
-                    if ui
-                        .add_enabled(can_fill, egui::Button::new("Fill down"))
-                        .on_hover_text(format!(
-                            "Fill the focused cell down the selection ({})",
-                            ui.ctx().format_shortcut(&fill_shortcut())
-                        ))
-                        .clicked()
-                    {
-                        if let Some((row, col)) = selection.active() {
-                            let targets: Vec<usize> = selection.resolve(&visible);
-                            actions.extend(fill_from(tab, row, col, &targets));
-                        }
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui
-                        .button("Import file")
-                        .on_hover_text("Load a CSV or JSONL file into this table")
-                        .clicked()
-                    {
-                        actions.push(EditAction::ImportCsv);
-                        ui.close();
-                    }
-                    if ui
-                        .button("Import JSONL")
-                        .on_hover_text("Load a JSONL file as new rows for review")
-                        .clicked()
-                    {
-                        actions.push(EditAction::ImportJsonl);
-                        ui.close();
-                    }
-                    if ui
-                        .button("Import XLSX")
-                        .on_hover_text(
-                            "Load the first sheet of an XLSX file as new rows for review",
-                        )
-                        .clicked()
-                    {
-                        actions.push(EditAction::ImportXlsx);
-                        ui.close();
-                    }
-                });
-            }
-            let can_export = tab
-                .active_query_result()
-                .is_some_and(|result| !result.columns().is_empty());
-            let can_export_all =
-                tab.results().iter().any(|result| !result.columns().is_empty());
-            ui.menu_button("Export", |ui| {
-                if ui.add_enabled(can_export, egui::Button::new("CSV")).clicked() {
-                    export_csv_streaming(tab, &grid_conn, ui);
-                }
-                if ui.add_enabled(can_export, egui::Button::new("JSON")).clicked() {
-                    export_json_streaming(tab, &grid_conn, ui);
-                }
-                if ui.add_enabled(can_export, egui::Button::new("JSONL")).clicked() {
-                    export_jsonl_streaming(tab, &grid_conn, ui);
-                }
-                if ui
-                    .add_enabled(can_export, egui::Button::new("XLSX"))
-                    .on_hover_text("Export this view as a spreadsheet workbook")
-                    .clicked()
-                {
-                    export_xlsx_streaming(tab, &grid_conn, ui);
-                }
-                ui.separator();
-                // No scope state here, so it fires as an action rather than a check.
-                if ui
-                    .add_enabled(can_export_all, egui::Button::new("All result sets"))
-                    .on_hover_text("Export every result set into one folder, one CSV per set")
-                    .clicked()
-                {
-                    export_all_results(tab);
-                }
-            });
-            if can_export {
+    let can_export = tab
+        .active_query_result()
+        .is_some_and(|result| !result.columns().is_empty());
+    let can_export_all = tab.results().iter().any(|result| !result.columns().is_empty());
+    let action_items: Vec<ActionItem> = [
+        ActionItem::Copy,
+        ActionItem::Export,
+        ActionItem::Edit,
+        ActionItem::Detail,
+        ActionItem::Chart,
+    ]
+    .into_iter()
+    .filter(|item| match item {
+        ActionItem::Copy => can_export,
+        ActionItem::Edit => editable,
+        ActionItem::Export | ActionItem::Detail | ActionItem::Chart => true,
+    })
+    .collect();
+    let gap = ui.spacing().item_spacing.x;
+    let clauses = tab.filter_clauses().len();
+    let filters_label = if clauses > 0 {
+        format!("Filters ({clauses})")
+    } else {
+        "Filters".to_owned()
+    };
+    let clear_shown = !tab.filter().is_empty();
+    let clear_w = fit::button_w(ui, CLEAR_LABEL);
+    let filters_w = fit::button_w(ui, &filters_label);
+    let left_fixed = filters_w + if clear_shown { clear_w + gap } else { 0.0 };
+    let tab_id = tab.id;
+    let filter_before = tab.filter().to_owned();
+    let mut filter_after: Option<String> = None;
+    let action_w: Vec<f32> = action_items
+        .iter()
+        .map(|item| fit::button_w(ui, item.label()))
+        .collect();
+    let actions_w: f32 = action_w.iter().map(|w| w + gap).sum();
+    let avail = ui.available_width();
+    let one_row = avail >= FIELD_MIN + left_fixed + 2.0 * gap + actions_w;
+    let mut draw_action = |ui: &mut egui::Ui, item: ActionItem| {
+        match item {
+            ActionItem::Copy => {
                 let tab_id = tab.id;
                 let mut headers = tsv_headers_of(ui.ctx(), tab_id);
                 // A menu that closes on any click costs open, tick, reopen,
-                // click to get TSV with headers, so this one ignores inside
-                // clicks and each copy closes it; the checkbox leaves it
-                // standing.
-                egui::menu::MenuButton::new("Copy")
-                    .config(
-                        egui::menu::MenuConfig::new()
-                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
-                    )
-                    .ui(ui, |ui| {
+                // click to get TSV with headers, so the inline row keeps one
+                // that ignores inside clicks and leaves the checkbox standing.
+                // Inside the row's `…` menu every tail item is a plain menu
+                // button, so the tail draws that instead of a nested popup.
+                let mut copy_menu = |ui: &mut egui::Ui| {
                         if ui
                             .button("TSV")
                             .on_hover_text("Copy the selection as tab-separated values")
@@ -1959,10 +1907,212 @@ fn results_grid(
                                 data.insert_temp(tsv_headers_id(tab_id), headers)
                             });
                         }
-                    });
+                };
+                if egui::menu::is_in_menu(ui) {
+                    // A submenu in the tail keeps the inline menu's close
+                    // behavior, so ticking Headers does not shut it.
+                    egui::menu::SubMenuButton::new(item.label())
+                        .config(egui::menu::MenuConfig::new().close_behavior(
+                            egui::PopupCloseBehavior::CloseOnClickOutside,
+                        ))
+                        .ui(ui, &mut copy_menu);
+                } else {
+                    egui::menu::MenuButton::new(item.label())
+                        .config(egui::menu::MenuConfig::new().close_behavior(
+                            egui::PopupCloseBehavior::CloseOnClickOutside,
+                        ))
+                        .ui(ui, &mut copy_menu);
+                }
             }
-        });
+            ActionItem::Export => {
+                ui.menu_button(item.label(), |ui| {
+                    if ui.add_enabled(can_export, egui::Button::new("CSV")).clicked() {
+                        export_csv_streaming(tab, &grid_conn, ui);
+                    }
+                    if ui.add_enabled(can_export, egui::Button::new("JSON")).clicked() {
+                        export_json_streaming(tab, &grid_conn, ui);
+                    }
+                    if ui.add_enabled(can_export, egui::Button::new("JSONL")).clicked() {
+                        export_jsonl_streaming(tab, &grid_conn, ui);
+                    }
+                    if ui
+                        .add_enabled(can_export, egui::Button::new("XLSX"))
+                        .on_hover_text("Export this view as a spreadsheet workbook")
+                        .clicked()
+                    {
+                        export_xlsx_streaming(tab, &grid_conn, ui);
+                    }
+                    ui.separator();
+                    // No scope state here, so it fires as an action rather than a check.
+                    if ui
+                        .add_enabled(can_export_all, egui::Button::new("All result sets"))
+                        .on_hover_text("Export every result set into one folder, one CSV per set")
+                        .clicked()
+                    {
+                        export_all_results(tab);
+                    }
+                });
+            }
+            ActionItem::Edit => {
+                ui.menu_button(item.label(), |ui| {
+                    if ui
+                        .button("Add row")
+                        .on_hover_text("Stage one empty row for INSERT")
+                        .clicked()
+                    {
+                        actions.push(EditAction::AddRow);
+                        ui.close();
+                    }
+                    if ui
+                        .button("Paste rows")
+                        .on_hover_text(
+                            "Paste TSV or CSV from the clipboard as new rows for review",
+                        )
+                        .clicked()
+                    {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                        ui.ctx()
+                            .data_mut(|data| data.insert_temp(paste_armed_id(tab.id), true));
+                        ui.close();
+                    }
+                    let can_fill = selection.active().is_some_and(|(row, col)| {
+                        row < total
+                            && tab
+                                .active_query_result()
+                                .is_some_and(|result| col < result.columns().len())
+                            && !tab.is_row_deleted(row)
+                    });
+                    if ui
+                        .add_enabled(can_fill, egui::Button::new("Fill down"))
+                        .on_hover_text(format!(
+                            "Fill the focused cell down the selection ({})",
+                            ui.ctx().format_shortcut(&fill_shortcut())
+                        ))
+                        .clicked()
+                    {
+                        if let Some((row, col)) = selection.active() {
+                            let targets: Vec<usize> = selection.resolve(&visible);
+                            actions.extend(fill_from(tab, row, col, &targets));
+                        }
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .button("Import file")
+                        .on_hover_text("Load a CSV or JSONL file into this table")
+                        .clicked()
+                    {
+                        actions.push(EditAction::ImportCsv);
+                        ui.close();
+                    }
+                    if ui
+                        .button("Import JSONL")
+                        .on_hover_text("Load a JSONL file as new rows for review")
+                        .clicked()
+                    {
+                        actions.push(EditAction::ImportJsonl);
+                        ui.close();
+                    }
+                    if ui
+                        .button("Import XLSX")
+                        .on_hover_text(
+                            "Load the first sheet of an XLSX file as new rows for review",
+                        )
+                        .clicked()
+                    {
+                        actions.push(EditAction::ImportXlsx);
+                        ui.close();
+                    }
+                });
+            }
+            ActionItem::Detail => {
+                if ui
+                    .selectable_label(side_pane == SidePane::Detail, item.label())
+                    .on_hover_text("Show the focused row as JSON and record beside the grid")
+                    .clicked()
+                {
+                    side_pane = if side_pane == SidePane::Detail {
+                        SidePane::None
+                    } else {
+                        SidePane::Detail
+                    };
+                    // A tail toggle ends like the tail's other items: the
+                    // menu it was opened from closes.
+                    if egui::menu::is_in_menu(ui) {
+                        ui.close();
+                    }
+                }
+            }
+            ActionItem::Chart => {
+                if ui
+                    .selectable_label(side_pane == SidePane::Chart, item.label())
+                    .on_hover_text("Plot the result beside the grid")
+                    .clicked()
+                {
+                    side_pane = if side_pane == SidePane::Chart {
+                        SidePane::None
+                    } else {
+                        SidePane::Chart
+                    };
+                    // A tail toggle ends like the tail's other items: the
+                    // menu it was opened from closes.
+                    if egui::menu::is_in_menu(ui) {
+                        ui.close();
+                    }
+                }
+            }
+        }
+    };
+    ui.horizontal(|ui| {
+        let mut text = filter_before;
+        let field_w = if one_row {
+            (avail - left_fixed - 2.0 * gap - actions_w).clamp(FIELD_MIN, FIELD_W)
+        } else {
+            (avail - left_fixed - gap).clamp(FIELD_MIN, FIELD_W)
+        };
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .hint_text("Filter rows")
+                .desired_width(field_w),
+        );
+        if take_filter_focus(ui.ctx(), tab_id) {
+            field.request_focus();
+        }
+        if field.changed() {
+            filter_after = Some(text);
+        }
+        if clear_shown && ui.button(CLEAR_LABEL).clicked() {
+            filter_after = Some(String::new());
+        }
+        if ui
+            .selectable_label(filters_open, filters_label)
+            .on_hover_text("Show the structured filter builder")
+            .clicked()
+        {
+            filters_open = !filters_open;
+            filters_toggled = true;
+        }
+        if one_row {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                for item in action_items.iter().rev() {
+                    draw_action(ui, *item);
+                }
+            });
+        }
     });
+    if !one_row {
+        ui.horizontal(|ui| {
+            let labels: Vec<&str> =
+                action_items.iter().map(|item| item.label()).collect();
+            fit::packed_row(ui, &action_w, &labels, |ui, index| {
+                draw_action(ui, action_items[index]);
+            });
+        });
+    }
+    if let Some(filter) = filter_after {
+        tab.set_filter(filter);
+    }
+
     store_side_pane(ui.ctx(), tab.id, side_pane);
     if filters_toggled {
         store_filters_open(ui.ctx(), tab.id, filters_open);
@@ -1994,46 +2144,117 @@ fn results_grid(
     let hidden = view.hidden_count(cols.len());
     egui::Panel::bottom("crusty_grid_footer").show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} of {} rows · {:.0} ms",
-                    visible.len(),
-                    total,
-                    ms
-                ))
-                .small()
-                .weak(),
-            );
+            // The controls pack like the toolbars': measured before anything
+            // draws, the inline prefix keeps its place and the contiguous
+            // tail moves behind the row's one `…`, so a control the row
+            // cannot hold stays reachable. The texts elide into what the
+            // pack leaves. The texts reserve in the order of what the row
+            // can least afford to lose: the truncation flag (the result is
+            // incomplete), a failed-export notice, the counts, the tab's own
+            // state, a success notice. Draw order is their own.
+            let mut controls: Vec<FooterControl> = Vec::new();
+            if truncated && known_total.is_none() {
+                controls.push(FooterControl::CountTotal);
+            }
             if truncated {
+                controls.push(FooterControl::LoadMore);
+            }
+            if hidden > 0 {
+                controls.push(FooterControl::ShowColumns);
+            }
+            let labels: Vec<String> =
+                controls.iter().map(|control| control.label(total, hidden)).collect();
+            let widths: Vec<f32> =
+                labels.iter().map(|label| fit::button_w(ui, label)).collect();
+            let inline = fit::spill(ui, &widths);
+            let mut budget = fit::Budget::new(ui);
+            for width in &widths[..inline] {
+                budget.take(ui, *width);
+            }
+            let tailed = inline < controls.len();
+            if tailed {
+                budget.take(ui, fit::button_w(ui, fit::OVERFLOW_LABEL));
+            }
+            let notice = tab.export_notice().map(str::to_owned);
+            let notice_failed = tab.export_failed();
+            let truncate_text = if truncated {
+                budget.elide(ui, &truncate_label(known_total), egui::TextStyle::Small)
+            } else {
+                String::new()
+            };
+            let failed_text = notice
+                .as_deref()
+                .filter(|_| notice_failed)
+                .map(|notice| budget.elide(ui, notice, egui::TextStyle::Body))
+                .unwrap_or_default();
+            let stats_text = budget.elide(
+                ui,
+                &format!("{} of {} rows · {:.0} ms", visible.len(), total, ms),
+                egui::TextStyle::Small,
+            );
+            let edit_text = match &edit_label {
+                Some(table) => {
+                    budget.elide(ui, &format!("editing {table}"), egui::TextStyle::Small)
+                }
+                None => budget.elide(ui, "read-only view", egui::TextStyle::Small),
+            };
+            let ok_text = notice
+                .as_deref()
+                .filter(|_| !notice_failed)
+                .map(|notice| budget.elide(ui, notice, egui::TextStyle::Body))
+                .unwrap_or_default();
+            let notice_text = if notice_failed { failed_text } else { ok_text };
+
+            if !stats_text.is_empty() {
+                ui.label(egui::RichText::new(stats_text).small().weak());
+            }
+            if !truncate_text.is_empty() {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
-                    egui::RichText::new(truncate_label(known_total)).small().strong(),
+                    egui::RichText::new(truncate_text).small().strong(),
                 );
-                paging_row(tab, &grid_conn, known_total, total, ui);
             }
-            if hidden > 0 && ui.button(format!("Show columns ({hidden})")).clicked() {
-                view.show_all();
+            {
+                let mut draw = |ui: &mut egui::Ui, index: usize| {
+                    draw_footer_control(
+                        ui,
+                        controls[index],
+                        &labels[index],
+                        total,
+                        tab,
+                        &grid_conn,
+                        &mut view,
+                    );
+                };
+                for index in 0..inline {
+                    draw(ui, index);
+                }
+                if tailed {
+                    let hover = labels[inline..].join(", ");
+                    ui.menu_button(fit::OVERFLOW_LABEL, |ui| {
+                        for index in inline..controls.len() {
+                            draw(ui, index);
+                        }
+                    })
+                    .response
+                    .on_hover_text(format!("More: {hover}"));
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                match &edit_label {
-                    Some(table) => {
-                        ui.label(
-                            egui::RichText::new(format!("editing {table}")).small().weak(),
+                if !edit_text.is_empty() {
+                    let label = ui.label(egui::RichText::new(&edit_text).small().weak());
+                    if edit_label.is_none() {
+                        label.on_hover_text(
+                            "Inline editing needs an idle connection and a single-table \
+                             SELECT whose table has a primary key in the result.",
                         );
                     }
-                    None => {
-                        ui.label(egui::RichText::new("read-only view").small().weak())
-                            .on_hover_text(
-                                "Inline editing needs an idle connection and a single-table \
-                                 SELECT whose table has a primary key in the result.",
-                            );
-                    }
                 }
-                if let Some(notice) = tab.export_notice().map(str::to_owned) {
-                    if tab.export_failed() {
-                        ui.colored_label(ui.visuals().error_fg_color, notice);
+                if !notice_text.is_empty() {
+                    if notice_failed {
+                        ui.colored_label(ui.visuals().error_fg_color, notice_text);
                     } else {
-                        ui.colored_label(palette.success, notice);
+                        ui.colored_label(palette.success, notice_text);
                     }
                 }
             });
@@ -2080,8 +2301,8 @@ fn results_grid(
                     let active = sort_col == Some(i);
                     let marker = if active {
                         match sort_dir {
-                            SortDir::Asc => " ▲",
-                            SortDir::Desc => " ▼",
+                            SortDir::Asc => " ⏶",
+                            SortDir::Desc => " ⏷",
                         }
                     } else {
                         ""
@@ -2418,7 +2639,7 @@ fn structured_filter_body(
             {
                 actions.push(EditAction::ApplyTableFilter);
             }
-            if ui.button("Clear").clicked() {
+            if ui.button(CLEAR_LABEL).clicked() {
                 actions.push(EditAction::ClearTableFilter);
             }
             if !single {

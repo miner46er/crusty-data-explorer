@@ -7,11 +7,11 @@ use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
 
-use super::editor::{char_range, format_sql, FindState};
-use crate::app::{AppState, ConnectionState, RunOutcome, RunScope, TransactionAction};
-use crate::db::{DbKind, TabId};
+use super::editor::{char_range, FindState};
+use crate::app::AppState;
+use crate::db::TabId;
 
-use super::Palette;
+use super::{Palette, fit};
 
 /// True while any modal owns the screen, so the editor's shortcuts stay dead.
 pub(crate) fn any_modal_open(state: &AppState) -> bool {
@@ -54,7 +54,10 @@ pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
     let mut activate: Option<TabId> = None;
     let mut close: Vec<TabId> = Vec::new();
     let mut new_tab = false;
-    ui.horizontal(|ui| {
+    // Wrapping, not scrolling: a narrow window puts the tail of the strip on
+    // a second row so every tab and its close button stays one click away.
+    ui.horizontal_wrapped(|ui| {
+        let strip_w = ui.available_width();
         let titles = numbered_titles(
             &state
                 .tabs()
@@ -66,27 +69,57 @@ pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
                 .collect::<Vec<_>>(),
         );
         for (tab, title) in state.tabs().iter().zip(titles) {
-            let is_active = Some(tab.id) == active;
-            let label = if is_active {
-                egui::RichText::new(title).strong()
-            } else {
-                egui::RichText::new(title).weak()
-            };
-            if ui.selectable_value(&mut active, Some(tab.id), label).clicked() {
-                activate = Some(tab.id);
-            }
             let transaction_open = state
                 .connections()
                 .iter()
                 .find(|c| Some(c.id) == tab.conn)
                 .is_some_and(|c| c.transaction().is_open());
-            if transaction_open {
-                ui.label(egui::RichText::new("tx").small().strong())
-                    .on_hover_text("Open transaction: commit or roll back to close it");
-            }
-            if ui.small_button("×").clicked() {
-                close.push(tab.id);
-            }
+            // One item per tab, measured before the strip lays it out: the
+            // wrapped row can then put the whole group on the next line, so
+            // the title never ends a row that its close button starts. A group
+            // wider than the row tightens its own gap first; the buttons keep
+            // their labels.
+            let gap = ui.spacing().item_spacing.x;
+            let title_w = fit::button_w(ui, &title);
+            let close_w = fit::button_w(ui, "×");
+            let tx_w = if transaction_open {
+                fit::text_w(ui, "tx", egui::TextStyle::Small)
+            } else {
+                0.0
+            };
+            let gaps = if transaction_open { 2.0 } else { 1.0 };
+            let content_w = title_w + close_w + tx_w;
+            let inner_gap = if content_w + gaps * gap <= strip_w {
+                gap
+            } else {
+                ((strip_w - 1.0 - content_w) / gaps).clamp(0.0, gap)
+            };
+            let group_w = content_w + gaps * inner_gap;
+            let title_h =
+                ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y;
+            ui.allocate_ui_with_layout(
+                egui::vec2(group_w, title_h),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = inner_gap;
+                    let is_active = Some(tab.id) == active;
+                    let label = if is_active {
+                        egui::RichText::new(title).strong()
+                    } else {
+                        egui::RichText::new(title).weak()
+                    };
+                    if ui.selectable_value(&mut active, Some(tab.id), label).clicked() {
+                        activate = Some(tab.id);
+                    }
+                    if transaction_open {
+                        ui.label(egui::RichText::new("tx").small().strong())
+                            .on_hover_text("Open transaction: commit or roll back to close it");
+                    }
+                    if ui.small_button("×").clicked() {
+                        close.push(tab.id);
+                    }
+                },
+            );
         }
         if ui
             .small_button("+")
@@ -127,7 +160,7 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
             find_opened = toggle_find(ui.ctx(), id);
         }
     }
-    find_opened |= toolbar(state, ui);
+    find_opened |= super::query_tools::toolbar(state, ui);
     ui.add_space(4.0);
     save_window(state, ui);
     write_confirm_window(state, ui);
@@ -210,253 +243,6 @@ pub fn table_header(state: &mut AppState, ui: &mut egui::Ui) {
     }
 }
 
-fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
-    let Some(tab_id) = state.active() else { return false };
-    let find_open = find_bar_of(ui.ctx(), tab_id).open;
-    let (mut run_clicked, mut explain_clicked, mut cancel_clicked, mut save_clicked) =
-        (false, false, false, false);
-    let (mut format_clicked, mut find_clicked) = (false, false);
-    let mut transaction_clicked: Option<TransactionAction> = None;
-    let mut autocommit_clicked: Option<bool> = None;
-    let mut scope = state.tab(tab_id).map(|t| t.run_scope()).unwrap_or_default();
-    if state.tab(tab_id).is_some() {
-        let running = matches!(
-            state.tab(tab_id).map(|t| t.outcome()),
-            Some(RunOutcome::Running { .. })
-        );
-        let transaction_ready = state.transaction_ready(tab_id);
-        let (transaction_open, autocommit, sqlite) = state
-            .tab(tab_id)
-            .and_then(|t| t.conn)
-            .and_then(|id| state.connections().iter().find(|c| c.id == id))
-            .map(|c| {
-                (
-                    c.transaction().is_open(),
-                    c.autocommit(),
-                    c.config.kind() == DbKind::Sqlite,
-                )
-            })
-            .unwrap_or((false, true, false));
-        let slot = AutocommitSlot::of(state, tab_id);
-        ui.horizontal(|ui| {
-            if running {
-                cancel_clicked = ui.button("Cancel").clicked();
-            } else {
-                egui::ComboBox::from_id_salt(("crusty_run_scope", tab_id))
-                    .selected_text(scope.label())
-                    .show_ui(ui, |ui| {
-                        for option in RunScope::ALL {
-                            ui.selectable_value(&mut scope, option, option.label());
-                        }
-                    });
-                run_clicked = ui
-                    .add(
-                        egui::Button::new(egui::RichText::new("▶ Run").strong())
-                            .fill(Palette::of(ui.ctx().theme()).success),
-                    )
-                    .clicked();
-                explain_clicked = ui
-                    .button("Explain")
-                    .on_hover_text("Query execution plan")
-                    .clicked();
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} · {}",
-                        scope.hint(),
-                        ui.ctx().format_shortcut(&run_shortcut())
-                    ))
-                        .small()
-                        .weak(),
-                );
-                save_clicked = ui.button("Save").clicked();
-            }
-            // Only the states that depart from the default get a control on
-            // the row; Begin and the autocommit mode wait in one menu. Manual
-            // mode opens its transaction on the first statement, so Begin has
-            // no job there.
-            if transaction_open {
-                for action in [TransactionAction::Commit, TransactionAction::Rollback] {
-                    if ui
-                        .add_enabled(transaction_ready, egui::Button::new(action.label()))
-                        .on_hover_text(format!("Send {}", action.statement()))
-                        .clicked()
-                    {
-                        transaction_clicked = Some(action);
-                    }
-                }
-            }
-            if !autocommit {
-                let toggle = autocommit_control(ui, &slot, autocommit, sqlite);
-                if toggle.clicked() {
-                    autocommit_clicked = Some(!autocommit);
-                }
-            } else if !transaction_open {
-                ui.menu_button("Transaction", |ui| {
-                    if ui
-                        .add_enabled(transaction_ready, egui::Button::new("Begin"))
-                        .on_hover_text("Send BEGIN")
-                        .clicked()
-                    {
-                        transaction_clicked = Some(TransactionAction::Begin);
-                        ui.close();
-                    }
-                    ui.separator();
-                    let toggle = autocommit_control(ui, &slot, autocommit, sqlite);
-                    if toggle.clicked() {
-                        autocommit_clicked = Some(!autocommit);
-                    }
-                });
-            }
-            super::complete::complete_menu(ui);
-            format_clicked = ui.button("Format").clicked();
-            find_clicked = ui
-                .selectable_label(find_open, "Find")
-                .on_hover_text(format!("Find ({})", ui.ctx().format_shortcut(&find_shortcut())))
-                .clicked();
-            if let Some(RunOutcome::Running { started, .. }) =
-                state.tab(tab_id).map(|t| t.outcome())
-            {
-                ui.spinner();
-                ui.label(format!("{:.1}s", started.elapsed().as_secs_f32()));
-            }
-        });
-    }
-    if scope != state.tab(tab_id).map(|t| t.run_scope()).unwrap_or_default() {
-        if let Some(tab) = state.tab_mut(tab_id) {
-            tab.set_run_scope(scope);
-        }
-    }
-    run_clicked |= ui.input_mut(|i| i.consume_shortcut(&run_shortcut()));
-    if cancel_clicked {
-        state.cancel_run(tab_id);
-    }
-    if let Some(action) = transaction_clicked {
-        state.start_transaction(tab_id, action);
-    }
-    if let Some(on) = autocommit_clicked {
-        state.set_autocommit(tab_id, on);
-    }
-    if save_clicked {
-        state.open_save_prompt();
-    }
-    if format_clicked {
-        if let Some(sql) = state.tab_sql_mut(tab_id) {
-            *sql = format_sql(sql);
-        }
-    }
-    let mut find_opened = false;
-    if find_clicked {
-        find_opened = toggle_find(ui.ctx(), tab_id);
-    }
-    if run_clicked {
-        let sql = state.tab(tab_id).map(|t| t.sql.clone()).unwrap_or_default();
-        let (cursor, selection) = super::complete::editor_offsets(ui.ctx(), tab_id, &sql);
-        state.start_run(tab_id, &sql, cursor, selection);
-    }
-    if explain_clicked {
-        let sql = state.tab(tab_id).map(|t| t.sql.clone()).unwrap_or_default();
-        let (cursor, selection) = super::complete::editor_offsets(ui.ctx(), tab_id, &sql);
-        state.start_explain(tab_id, &sql, cursor, selection);
-    }
-    find_opened
-}
-
-/// The Autocommit control's situation, read from the tab's connection at the
-/// call site. The first three render as a chip; `Toggle` is the live toggle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AutocommitSlot {
-    /// No connection, still connecting, or failed: nothing to switch.
-    Offline,
-    /// Live on SQLite, which has no manual mode.
-    Sqlite,
-    /// Live on another engine with a run in flight: the mode has to wait.
-    Running,
-    /// Live on another engine and idle: the toggle can act.
-    Toggle,
-}
-
-impl AutocommitSlot {
-    /// Which slot `tab`'s connection is in.
-    pub(crate) fn of(state: &AppState, tab: TabId) -> Self {
-        let conn = state
-            .tab(tab)
-            .and_then(|t| t.conn)
-            .and_then(|id| state.connections().iter().find(|c| c.id == id));
-        let Some(conn) = conn else { return Self::Offline };
-        if !matches!(
-            conn.state(),
-            ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
-        ) {
-            return Self::Offline;
-        }
-        if conn.config.kind() == DbKind::Sqlite {
-            return Self::Sqlite;
-        }
-        if state.transaction_ready(tab) { Self::Toggle } else { Self::Running }
-    }
-
-    /// The chip's label and the reason on its tooltip, or None for the live
-    /// toggle. `on` is the observed mode; `sqlite` keeps the label plain,
-    /// since the mode there is constant whatever the state.
-    pub(crate) fn chip(
-        self,
-        on: bool,
-        sqlite: bool,
-    ) -> Option<(String, &'static str)> {
-        let label = if sqlite {
-            "Autocommit".to_owned()
-        } else if on {
-            "Autocommit: on".to_owned()
-        } else {
-            "Autocommit: off".to_owned()
-        };
-        match self {
-            Self::Toggle => None,
-            Self::Offline => Some((label, "Connect to change autocommit")),
-            Self::Running => Some((label, "Wait for the run to finish")),
-            Self::Sqlite => Some((label, "SQLite handles autocommit itself")),
-        }
-    }
-}
-
-/// The Autocommit control for one slot: the chip for states that cannot act,
-/// the live toggle otherwise. Shared by the inline control and the
-/// Transaction menu so both read the same logic.
-fn autocommit_control(
-    ui: &mut egui::Ui,
-    slot: &AutocommitSlot,
-    autocommit: bool,
-    sqlite: bool,
-) -> egui::Response {
-    match slot.chip(autocommit, sqlite) {
-        Some((label, reason)) => autocommit_chip(ui, &label, reason),
-        None => {
-            let mut shown = autocommit;
-            ui.toggle_value(&mut shown, "Autocommit").on_hover_text(
-                "Off: every statement runs inside a transaction on one tagged \
-                 connection until Commit or Rollback",
-            )
-        }
-    }
-}
-
-/// An Autocommit chip for the states where the toggle cannot act: filled and
-/// colored as unavailable, sensed as hover only so it never lights up or
-/// moves, with the reason on the tooltip. The hairline edge is the neutral
-/// outline color: the fill alone sits within a few percent of the panel, so
-/// the edge is what makes the chip read as a control slot.
-fn autocommit_chip(ui: &mut egui::Ui, label: &str, reason: &str) -> egui::Response {
-    let palette = Palette::of(ui.ctx().theme());
-    let edge = ui.visuals().widgets.noninteractive.bg_stroke.color;
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).color(palette.disabled_text))
-            .fill(palette.disabled_fill)
-            .stroke(egui::Stroke::new(1.0, edge))
-            .sense(egui::Sense::hover()),
-    )
-    .on_hover_text(reason)
-}
-
 pub(crate) fn tab_title(sql: String) -> String {
     if let Some(table) = crate::sql::select_table_title(&sql) {
         return table;
@@ -522,8 +308,13 @@ fn store_find_bar(ctx: &egui::Context, tab: TabId, bar: FindBar) {
     ctx.data_mut(|d| d.insert_temp(find_id(tab), bar));
 }
 
+/// Whether the find bar is open for one tab, read by the editor toolbar.
+pub(crate) fn find_open(ctx: &egui::Context, tab: TabId) -> bool {
+    find_bar_of(ctx, tab).open
+}
+
 /// Flip the find bar open and report the new state.
-fn toggle_find(ctx: &egui::Context, tab: TabId) -> bool {
+pub(crate) fn toggle_find(ctx: &egui::Context, tab: TabId) -> bool {
     let mut bar = find_bar_of(ctx, tab);
     bar.open = !bar.open;
     if bar.open {
@@ -873,47 +664,11 @@ mod tests {
             ["a", "a 2", "a 2 2"].map(str::to_owned).to_vec()
         );
     }
-
-    #[test]
-    fn autocommit_chip_carries_the_mode_and_the_reason_for_its_slot() {
-        use AutocommitSlot::{Offline, Running, Sqlite, Toggle};
-        assert_eq!(
-            Offline.chip(true, false),
-            Some(("Autocommit: on".to_owned(), "Connect to change autocommit"))
-        );
-        assert_eq!(
-            Offline.chip(false, false),
-            Some(("Autocommit: off".to_owned(), "Connect to change autocommit"))
-        );
-        // SQLite's mode is constant, so its label never carries one, even
-        // while the connection is not live yet.
-        assert_eq!(
-            Offline.chip(true, true),
-            Some(("Autocommit".to_owned(), "Connect to change autocommit"))
-        );
-        assert_eq!(
-            Sqlite.chip(true, true),
-            Some(("Autocommit".to_owned(), "SQLite handles autocommit itself"))
-        );
-        assert_eq!(
-            Sqlite.chip(false, true),
-            Some(("Autocommit".to_owned(), "SQLite handles autocommit itself"))
-        );
-        assert_eq!(
-            Running.chip(false, false),
-            Some(("Autocommit: off".to_owned(), "Wait for the run to finish"))
-        );
-        assert_eq!(Toggle.chip(true, false), None);
-        assert_eq!(Toggle.chip(false, false), None);
-    }
 }
+
 // Manual check: Ctrl+T creates a tab on default_connection and activates it
 // (no-op with no connection), Ctrl+W closes the active tab (no-op with none),
 // Ctrl+F toggles the find bar for the active tab, and all three stay off with
 // a draft, save, or password modal open, using the same new_tab/activate/
 // close_tab/default_connection transitions as the plus and cross buttons
-// covered by AppState tests. Explain runs start_explain with the same offsets
-// Run passes, and Format and the find bar's Next/Prev selection are manual
-// too. The Autocommit toggle beside Begin/Commit/Rollback sends one
-// `SetAutocommit` through `set_autocommit` (disabled for SQLite and while a
-// run is in flight) and shows the landed state, covered by AppState tests.
+// covered by AppState tests. The find bar's Next/Prev selection is manual too.

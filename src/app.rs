@@ -11695,7 +11695,7 @@ mod tests {
 
     #[test]
     fn autocommit_chip_reason_follows_the_connection_state_and_engine() {
-        use crate::ui::query::AutocommitSlot;
+        use crate::ui::query_tools::AutocommitSlot;
         with_isolated_state("autocommit-chip", |state| {
             /// The chip for one real tab: the reason from its slot and the
             /// label from its engine.

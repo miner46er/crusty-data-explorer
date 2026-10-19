@@ -528,13 +528,17 @@ struct CompleteState {
     selected: usize,
 }
 
+/// The completion menu's label, measured by the editor toolbar before it
+/// draws: the menu and the measurement read one literal.
+pub(crate) const COMPLETE_MENU_LABEL: &str = "Complete";
+
 /// The completion toggles, as a toolbar menu. The state lives in the egui
 /// context the way the popup's does, so the editor and the menu agree.
 pub fn complete_menu(ui: &mut egui::Ui) {
     let toggles_id = egui::Id::new("crusty_complete_toggles");
     let mut toggles: CompletionToggles =
         ui.ctx().data_mut(|data| data.get_temp(toggles_id).unwrap_or_default());
-    ui.menu_button("Complete", |ui| {
+    ui.menu_button(COMPLETE_MENU_LABEL, |ui| {
         ui.checkbox(&mut toggles.keywords, "Keywords");
         ui.checkbox(&mut toggles.tables, "Tables");
         ui.checkbox(&mut toggles.columns, "Columns");

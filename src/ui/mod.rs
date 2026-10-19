@@ -11,9 +11,11 @@ pub mod complete;
 pub mod connections;
 pub mod ddl;
 pub mod editor;
+pub mod fit;
 pub mod grid;
 pub mod plan;
 pub mod query;
+pub mod query_tools;
 pub mod schema;
 pub mod search;
 pub mod table_edit;
@@ -48,29 +50,54 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
 }
 
 fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
+    let live = state
+        .connections()
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.state(),
+                ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
+            )
+        })
+        .count();
+    let stats = format!(
+        "{} connection{}, {} live",
+        state.connections().len(),
+        if state.connections().len() == 1 { "" } else { "s" },
+        live
+    );
+    let theme_label = match state.theme() {
+        Theme::Dark => "☀ Light",
+        Theme::Light => "🌙 Dark",
+    };
+    let backend = state
+        .active()
+        .and_then(|id| state.tab(id))
+        .and_then(|tab| state.connections().iter().find(|c| Some(c.id) == tab.conn))
+        .map(|c| format!("{} · {}", c.name, c.config.kind().label()))
+        .unwrap_or_else(|| "no backend".to_owned());
     ui.horizontal(|ui| {
-        let live = state
-            .connections()
-            .iter()
-            .filter(|c| {
-                matches!(
-                    c.state(),
-                    ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
-                )
-            })
-            .count();
-        ui.label(format!(
-            "{} connection{}, {} live",
-            state.connections().len(),
-            if state.connections().len() == 1 { "" } else { "s" },
-            live
-        ));
+        // Controls first, then the counts, then the backend name. Below the
+        // row's floor the controls clip at the panel edge: dropping one
+        // would move the others, and a clipped control stays reachable.
+        let mut budget = fit::Budget::new(ui);
+        for control in [
+            fit::button_w(ui, theme_label),
+            fit::button_w(ui, table_edit::STATUS_LABEL),
+            fit::button_w(ui, "Compare"),
+        ] {
+            budget.take(ui, control);
+        }
+        let stats_text = budget.elide(ui, &stats, egui::TextStyle::Body);
+        let backend_text = budget.elide(ui, &backend, egui::TextStyle::Small);
+        if !stats_text.is_empty() {
+            ui.add(
+                egui::Label::new(stats_text)
+                    .wrap_mode(egui::TextWrapMode::Extend),
+            );
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let label = match state.theme() {
-                Theme::Dark => "☀ Light",
-                Theme::Light => "🌙 Dark",
-            };
-            if ui.button(label).on_hover_text("Flip the app theme").clicked() {
+            if ui.button(theme_label).on_hover_text("Flip the app theme").clicked() {
                 state.toggle_theme();
             }
             table_edit::status_entry(state, ui);
@@ -81,13 +108,12 @@ fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {
             {
                 state.open_compare();
             }
-            let backend = state
-                .active()
-                .and_then(|id| state.tab(id))
-                .and_then(|tab| state.connections().iter().find(|c| Some(c.id) == tab.conn))
-                .map(|c| format!("{} · {}", c.name, c.config.kind().label()))
-                .unwrap_or_else(|| "no backend".to_owned());
-            ui.label(egui::RichText::new(backend).small().weak());
+            if !backend_text.is_empty() {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(backend_text).small().weak())
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
+            }
         });
     });
 }
