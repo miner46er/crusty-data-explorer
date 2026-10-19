@@ -573,9 +573,29 @@ pub fn to_literal(text: &str, was_null: bool) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
+/// One cell text as a literal for a column whose declared type is known. A
+/// text column always takes the escaped quoted form, so `"007"` and `"1e3"`
+/// keep their text identity; every other column keeps [`to_literal`]'s
+/// mapping. The [`STAGED_DEFAULT`] marker and empty or NULL text win first,
+/// since neither carries a column type.
+pub fn to_typed_literal(text: &str, was_null: bool, is_text_column: bool) -> String {
+    if text == STAGED_DEFAULT {
+        return "DEFAULT".to_owned();
+    }
+    if text.is_empty() || was_null {
+        return "NULL".to_owned();
+    }
+    if is_text_column {
+        return format!("'{}'", text.replace('\'', "''"));
+    }
+    to_literal(text, was_null)
+}
+
 /// True when `text` is a spelling of a number SQL accepts. The character
 /// gate keeps the spellings `f64` parses but SQL does not, such as `inf`
-/// and `NaN`, out.
+/// and `NaN`, out. A leading `+` and a leading-zero integer part are kept
+/// out too, so `"007"` and `"010"` stay text: both engines read `010` as a
+/// different value than the text it looks like.
 fn numeric_literal(text: &str) -> bool {
     if !text.bytes().any(|b| b.is_ascii_digit()) {
         return false;
@@ -583,6 +603,15 @@ fn numeric_literal(text: &str) -> bool {
     if !text
         .bytes()
         .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'+' | b'-' | b'e' | b'E'))
+    {
+        return false;
+    }
+    if text.starts_with('+') {
+        return false;
+    }
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    if unsigned.starts_with('0')
+        && !matches!(unsigned.as_bytes().get(1).copied(), None | Some(b'.' | b'e' | b'E'))
     {
         return false;
     }
@@ -614,9 +643,25 @@ pub fn is_text_type(type_name: &str) -> bool {
 /// with [`to_literal`], because only the caller can tell a NULL cell from a
 /// text cell reading `NULL`.
 pub fn update_statement(table: &str, pk: &[(String, String)], sets: &[(String, String)]) -> String {
+    let typed = sets
+        .iter()
+        .map(|(column, text)| (column.clone(), text.clone(), false))
+        .collect::<Vec<_>>();
+    update_typed_statement(table, pk, &typed)
+}
+
+/// [`update_statement`] with each set column's text flag: a text column
+/// renders through [`to_typed_literal`], so `"007"` keeps its text identity.
+pub fn update_typed_statement(
+    table: &str,
+    pk: &[(String, String)],
+    sets: &[(String, String, bool)],
+) -> String {
     let sets = sets
         .iter()
-        .map(|(column, text)| format!("{} = {}", ident(column), to_literal(text, false)))
+        .map(|(column, text, is_text)| {
+            format!("{} = {}", ident(column), to_typed_literal(text, false, *is_text))
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!("UPDATE {} SET {} WHERE {}", quote_qualified(table), sets, predicate(pk))
@@ -631,8 +676,27 @@ pub fn delete_statement(table: &str, pk: &[(String, String)]) -> String {
 /// `INSERT INTO "table" ("col", ...) VALUES (<literal>, ...)`. Values are raw
 /// text and render through [`to_literal`], so an empty value is NULL.
 pub fn insert_statement(table: &str, columns: &[String], values: &[String]) -> String {
+    insert_typed_statement(table, columns, values, &[])
+}
+
+/// [`insert_statement`] with one text flag per column position: a text
+/// column renders through [`to_typed_literal`], so `"007"` keeps its text
+/// identity. A missing flag reads as false.
+pub fn insert_typed_statement(
+    table: &str,
+    columns: &[String],
+    values: &[String],
+    text_cols: &[bool],
+) -> String {
     let columns = columns.iter().map(|c| ident(c)).collect::<Vec<_>>().join(", ");
-    let values = values.iter().map(|v| to_literal(v, false)).collect::<Vec<_>>().join(", ");
+    let values = values
+        .iter()
+        .enumerate()
+        .map(|(index, v)| {
+            to_typed_literal(v, false, text_cols.get(index).copied().unwrap_or(false))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("INSERT INTO {} ({}) VALUES ({})", quote_qualified(table), columns, values)
 }
 
@@ -934,6 +998,29 @@ mod tests {
         assert_eq!(to_literal("NaN", false), "'NaN'");
         assert_eq!(to_literal("inf", false), "'inf'");
         assert_eq!(to_literal("1_000", false), "'1_000'");
+        // A leading plus and a leading-zero integer part stay text, so the
+        // literal reads back as the same characters.
+        assert_eq!(to_literal("+7", false), "'+7'");
+        assert_eq!(to_literal("007", false), "'007'");
+        assert_eq!(to_literal("010", false), "'010'");
+        assert_eq!(to_literal("-010", false), "'-010'");
+        assert_eq!(to_literal("00.5", false), "'00.5'");
+        assert_eq!(to_literal("0", false), "0");
+        assert_eq!(to_literal("-0", false), "-0");
+        assert_eq!(to_literal("-0.5", false), "-0.5");
+        assert_eq!(to_literal("0e3", false), "0e3");
+    }
+
+    #[test]
+    fn typed_literals_always_quote_a_text_column() {
+        assert_eq!(to_typed_literal("007", false, true), "'007'");
+        assert_eq!(to_typed_literal("007", false, false), "'007'");
+        assert_eq!(to_typed_literal("42", false, true), "'42'");
+        assert_eq!(to_typed_literal("42", false, false), "42");
+        assert_eq!(to_typed_literal("O'Brien", false, true), "'O''Brien'");
+        assert_eq!(to_typed_literal("", false, true), "NULL");
+        assert_eq!(to_typed_literal("ada", true, true), "NULL");
+        assert_eq!(to_typed_literal(STAGED_DEFAULT, false, true), "DEFAULT");
     }
 
     #[test]
@@ -977,6 +1064,37 @@ mod tests {
         assert_eq!(
             delete_statement("\"a.b\"", &[("id".to_owned(), "1".to_owned())]),
             "DELETE FROM \"a.b\" WHERE \"id\" = 1"
+        );
+    }
+
+    #[test]
+    fn typed_update_and_insert_quote_text_columns() {
+        let pk = [("id".to_owned(), "1".to_owned())];
+        let sets = [
+            ("code".to_owned(), "42".to_owned(), true),
+            ("n".to_owned(), "42".to_owned(), false),
+        ];
+        assert_eq!(
+            update_typed_statement("t", &pk, &sets),
+            "UPDATE \"t\" SET \"code\" = '42', \"n\" = 42 WHERE \"id\" = 1"
+        );
+        assert_eq!(
+            insert_typed_statement(
+                "t",
+                &["code".to_owned(), "n".to_owned()],
+                &["007".to_owned(), "42".to_owned()],
+                &[true, false],
+            ),
+            "INSERT INTO \"t\" (\"code\", \"n\") VALUES ('007', 42)"
+        );
+        // The untyped builders keep the old mapping.
+        assert_eq!(
+            update_statement("t", &pk, &[("n".to_owned(), "42".to_owned())]),
+            "UPDATE \"t\" SET \"n\" = 42 WHERE \"id\" = 1"
+        );
+        assert_eq!(
+            insert_statement("t", &["n".to_owned()], &["42".to_owned()]),
+            "INSERT INTO \"t\" (\"n\") VALUES (42)"
         );
     }
 
