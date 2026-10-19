@@ -275,7 +275,7 @@ pub fn table_header(state: &mut AppState, ui: &mut egui::Ui) {
         let len = sql.len();
         state.start_run(id, &sql, len, None);
     }
-    if edit {
+    if edit && !modal_open {
         state.edit_as_query(id);
     }
 }
