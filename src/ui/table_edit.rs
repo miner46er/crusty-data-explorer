@@ -140,7 +140,11 @@ pub fn table_editor_window(
         }
         None => return,
     };
-    let key = modal_key(ui, false);
+    let dismissed_popup =
+        key == Some(ModalKey::Cancel) && egui::Popup::is_any_open(ui.ctx());
+    if dismissed_popup {
+        egui::Popup::close_all(ui.ctx());
+    }
     let mut close = false;
     let mut apply = false;
     let mut load_alter: Option<(String, String)> = None;
@@ -350,7 +354,7 @@ pub fn table_editor_window(
         set_alter_input(ui.ctx(), "table", String::new());
     } else if back_to_new {
         state.open_table_create(conn);
-    } else if close || key == Some(ModalKey::Cancel) {
+    } else if !dismissed_popup && (close || key == Some(ModalKey::Cancel)) {
         state.close_table_editor();
     } else if apply {
         let tab = state

@@ -1603,7 +1603,13 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKe
     } else {
         "New connection"
     };
-    let key = modal_key(ui, false);
+    // Escape belongs to any open dropdown first, so the form survives the
+    // press that dismissed it.
+    let dismissed_popup =
+        key == Some(ModalKey::Cancel) && egui::Popup::is_any_open(ui.ctx());
+    if dismissed_popup {
+        egui::Popup::close_all(ui.ctx());
+    }
     let mut save = false;
     let mut close = false;
     egui::Window::new(title).show(ui.ctx(), |ui| {
@@ -1846,7 +1852,7 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKe
                 state.connect(id);
             }
         }
-    } else if close || key == Some(ModalKey::Cancel) {
+    } else if !dismissed_popup && (close || key == Some(ModalKey::Cancel)) {
         state.cancel_draft();
     }
 }
