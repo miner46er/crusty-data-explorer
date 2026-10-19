@@ -5,15 +5,18 @@
 //! Pure text, no engine calls. `app.rs` decides when an edit may be staged
 //! and sends the statements this module builds.
 
-/// Some(table name) only for a single-table SELECT: a plain or double-quoted
-/// identifier after FROM, optionally one more of either kind joined by a
-/// single unquoted dot, with WHERE, GROUP, ORDER, HAVING, LIMIT, or OFFSET
-/// allowed to follow it. Joins, unions, comma sources, parenthesized FROM
-/// clauses, aliases, deeper qualifiers, and anything but a SELECT are not
-/// editable. The name joins its parts with a dot; a part containing a dot or
-/// quote keeps its quotes.
-pub fn editable_table(sql: &str) -> Option<String> {
-    let tokens = lex(sql);
+use crate::db::DbKind;
+use crate::sql::hash_comments;
+
+/// Some(table name) only for a single-table SELECT: a plain, double-quoted,
+/// or backtick-quoted identifier after FROM, optionally one more of either
+/// kind joined by a single unquoted dot, with WHERE, GROUP, ORDER, HAVING,
+/// LIMIT, or OFFSET allowed to follow it. Joins, unions, comma sources,
+/// parenthesized FROM clauses, aliases, deeper qualifiers, and anything but
+/// a SELECT are not editable. The name joins its parts with a dot; a part
+/// containing a dot or quote keeps its quotes.
+pub fn editable_table(sql: &str, kind: DbKind) -> Option<String> {
+    let tokens = lex(sql, kind);
     if !matches!(tokens.first(), Some(Token::Word(w)) if w.eq_ignore_ascii_case("select")) {
         return None;
     }
@@ -46,7 +49,8 @@ pub fn editable_table(sql: &str) -> Option<String> {
     }
 }
 
-/// One plain or double-quoted identifier at `index`, with the index after it.
+/// One plain, double-quoted, or backtick-quoted identifier at `index`, with
+/// the index after it.
 fn identifier_at(tokens: &[Token], index: usize) -> Option<(String, usize)> {
     match tokens.get(index) {
         Some(Token::Word(name)) | Some(Token::Quoted(name)) => Some((name.clone(), index + 1)),
@@ -110,8 +114,8 @@ pub struct JoinPlan {
 /// unions, subquery sources, deeper qualifiers, or multiple statements. Each
 /// item parses on its own, so one expression marks only its own column
 /// unresolvable. Pure text, no engine calls.
-pub fn parse_join(sql: &str) -> Option<JoinPlan> {
-    let tokens = lex(sql);
+pub fn parse_join(sql: &str, kind: DbKind) -> Option<JoinPlan> {
+    let tokens = lex(sql, kind);
     if !matches!(tokens.first(), Some(Token::Word(w)) if w.eq_ignore_ascii_case("select")) {
         return None;
     }
@@ -125,6 +129,26 @@ pub fn parse_join(sql: &str) -> Option<JoinPlan> {
         return None;
     }
     Some(JoinPlan { sources, selects })
+}
+
+/// True when the SELECT list is exactly `*` or `table.*`, the forms whose
+/// result columns read positionally from the one source table. A function or
+/// arithmetic item is not a wildcard even though its parsed column is None.
+pub fn wildcard_select(sql: &str, kind: DbKind) -> bool {
+    let tokens = lex(sql, kind);
+    let Some(from) = top_level_from(&tokens) else { return false };
+    let mut list = &tokens[1..from];
+    if matches!(
+        list.first(),
+        Some(Token::Word(w)) if w.eq_ignore_ascii_case("distinct") || w.eq_ignore_ascii_case("all")
+    ) {
+        list = &list[1..];
+    }
+    matches!(
+        list,
+        [Token::Punct('*')]
+            | [Token::Word(_) | Token::Quoted(_), Token::Punct('.'), Token::Punct('*')]
+    )
 }
 
 /// Index of the top-level FROM, so a subquery's FROM never reads as the
@@ -405,16 +429,18 @@ fn is_union_at(tokens: &[Token], pos: usize) -> bool {
 enum Token {
     /// An unquoted word: identifier or keyword.
     Word(String),
-    /// A double-quoted identifier, doubled quotes unescaped, so it never
-    /// reads as a keyword.
+    /// A double- or backtick-quoted identifier, doubled quotes unescaped, so
+    /// it never reads as a keyword.
     Quoted(String),
-    /// A single-quoted string literal; its contents never matter here.
+    /// A single-quoted string literal, a Postgres dollar-quoted string, or
+    /// anything else whose contents never matter here.
     Str,
     /// Any other single character: punctuation and operators.
     Punct(char),
 }
 
-fn lex(sql: &str) -> Vec<Token> {
+fn lex(sql: &str, kind: DbKind) -> Vec<Token> {
+    let hash = hash_comments(kind);
     let chars: Vec<char> = sql.chars().collect();
     let mut tokens = Vec::new();
     let mut i = 0;
@@ -436,13 +462,14 @@ fn lex(sql: &str) -> Vec<Token> {
                 i += 1;
             }
             tokens.push(Token::Str);
-        } else if c == '"' {
+        } else if c == '"' || c == '`' {
+            let quote = c;
             let mut text = String::new();
             i += 1;
             while i < chars.len() {
-                if chars[i] == '"' {
-                    if chars.get(i + 1) == Some(&'"') {
-                        text.push('"');
+                if chars[i] == quote {
+                    if chars.get(i + 1) == Some(&quote) {
+                        text.push(quote);
                         i += 2;
                         continue;
                     }
@@ -458,6 +485,11 @@ fn lex(sql: &str) -> Vec<Token> {
             while i < chars.len() && chars[i] != '\n' {
                 i += 1;
             }
+        } else if c == '#' && hash {
+            i += 1;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
         } else if c == '/' && chars.get(i + 1) == Some(&'*') {
             i += 2;
             while i < chars.len() {
@@ -467,6 +499,9 @@ fn lex(sql: &str) -> Vec<Token> {
                 }
                 i += 1;
             }
+        } else if let Some(end) = dollar_quote_end(&chars, i) {
+            i = end;
+            tokens.push(Token::Str);
         } else if c.is_alphanumeric() || c == '_' || c == '$' {
             let start = i;
             while i < chars.len()
@@ -481,6 +516,43 @@ fn lex(sql: &str) -> Vec<Token> {
         }
     }
     tokens
+}
+
+/// Index after the Postgres dollar-quoted string starting at `index`: `$$`
+/// or `$tag$` where a nonempty tag starts with an ASCII letter or `_` and
+/// continues with ASCII letters, digits, or `_`. None when no quote opens
+/// there, so `$1` stays a word. An unterminated quote runs to the end.
+fn dollar_quote_end(chars: &[char], index: usize) -> Option<usize> {
+    if chars.get(index) != Some(&'$') {
+        return None;
+    }
+    let mut tag_end = index + 1;
+    while tag_end < chars.len()
+        && (chars[tag_end].is_ascii_alphanumeric() || chars[tag_end] == '_')
+    {
+        tag_end += 1;
+    }
+    if chars.get(tag_end) != Some(&'$') {
+        return None;
+    }
+    let tag = &chars[index + 1..tag_end];
+    if let Some(first) = tag.first()
+        && !(first.is_ascii_alphabetic() || *first == '_')
+    {
+        return None;
+    }
+    let mut close = Vec::with_capacity(tag.len() + 2);
+    close.push('$');
+    close.extend_from_slice(tag);
+    close.push('$');
+    let mut cursor = tag_end + 1;
+    while cursor + close.len() <= chars.len() {
+        if chars[cursor..cursor + close.len()] == close[..] {
+            return Some(cursor + close.len());
+        }
+        cursor += 1;
+    }
+    Some(chars.len())
 }
 
 /// Staged text meaning the SQL `DEFAULT` keyword. A control-wrapped marker
@@ -505,9 +577,29 @@ pub fn to_literal(text: &str, was_null: bool) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
+/// One cell text as a literal for a column whose declared type is known. A
+/// text column always takes the escaped quoted form, so `"007"` and `"1e3"`
+/// keep their text identity; every other column keeps [`to_literal`]'s
+/// mapping. The [`STAGED_DEFAULT`] marker and empty or NULL text win first,
+/// since neither carries a column type.
+pub fn to_typed_literal(text: &str, was_null: bool, is_text_column: bool) -> String {
+    if text == STAGED_DEFAULT {
+        return "DEFAULT".to_owned();
+    }
+    if text.is_empty() || was_null {
+        return "NULL".to_owned();
+    }
+    if is_text_column {
+        return format!("'{}'", text.replace('\'', "''"));
+    }
+    to_literal(text, was_null)
+}
+
 /// True when `text` is a spelling of a number SQL accepts. The character
 /// gate keeps the spellings `f64` parses but SQL does not, such as `inf`
-/// and `NaN`, out.
+/// and `NaN`, out. A leading `+` and a leading-zero integer part are kept
+/// out too, so `"007"` and `"010"` stay text: both engines read `010` as a
+/// different value than the text it looks like.
 fn numeric_literal(text: &str) -> bool {
     if !text.bytes().any(|b| b.is_ascii_digit()) {
         return false;
@@ -515,6 +607,15 @@ fn numeric_literal(text: &str) -> bool {
     if !text
         .bytes()
         .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'+' | b'-' | b'e' | b'E'))
+    {
+        return false;
+    }
+    if text.starts_with('+') {
+        return false;
+    }
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    if unsigned.starts_with('0')
+        && !matches!(unsigned.as_bytes().get(1).copied(), None | Some(b'.' | b'e' | b'E'))
     {
         return false;
     }
@@ -546,9 +647,25 @@ pub fn is_text_type(type_name: &str) -> bool {
 /// with [`to_literal`], because only the caller can tell a NULL cell from a
 /// text cell reading `NULL`.
 pub fn update_statement(table: &str, pk: &[(String, String)], sets: &[(String, String)]) -> String {
+    let typed = sets
+        .iter()
+        .map(|(column, text)| (column.clone(), text.clone(), false))
+        .collect::<Vec<_>>();
+    update_typed_statement(table, pk, &typed)
+}
+
+/// [`update_statement`] with each set column's text flag: a text column
+/// renders through [`to_typed_literal`], so `"007"` keeps its text identity.
+pub fn update_typed_statement(
+    table: &str,
+    pk: &[(String, String)],
+    sets: &[(String, String, bool)],
+) -> String {
     let sets = sets
         .iter()
-        .map(|(column, text)| format!("{} = {}", ident(column), to_literal(text, false)))
+        .map(|(column, text, is_text)| {
+            format!("{} = {}", ident(column), to_typed_literal(text, false, *is_text))
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!("UPDATE {} SET {} WHERE {}", quote_qualified(table), sets, predicate(pk))
@@ -563,8 +680,27 @@ pub fn delete_statement(table: &str, pk: &[(String, String)]) -> String {
 /// `INSERT INTO "table" ("col", ...) VALUES (<literal>, ...)`. Values are raw
 /// text and render through [`to_literal`], so an empty value is NULL.
 pub fn insert_statement(table: &str, columns: &[String], values: &[String]) -> String {
+    insert_typed_statement(table, columns, values, &[])
+}
+
+/// [`insert_statement`] with one text flag per column position: a text
+/// column renders through [`to_typed_literal`], so `"007"` keeps its text
+/// identity. A missing flag reads as false.
+pub fn insert_typed_statement(
+    table: &str,
+    columns: &[String],
+    values: &[String],
+    text_cols: &[bool],
+) -> String {
     let columns = columns.iter().map(|c| ident(c)).collect::<Vec<_>>().join(", ");
-    let values = values.iter().map(|v| to_literal(v, false)).collect::<Vec<_>>().join(", ");
+    let values = values
+        .iter()
+        .enumerate()
+        .map(|(index, v)| {
+            to_typed_literal(v, false, text_cols.get(index).copied().unwrap_or(false))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("INSERT INTO {} ({}) VALUES ({})", quote_qualified(table), columns, values)
 }
 
@@ -586,26 +722,30 @@ pub fn qualified_parts(table: &str) -> Vec<String> {
     split_unquoted(table).into_iter().map(|part| unquote(&part)).collect()
 }
 
-/// Split on dots outside double quotes, keeping each part's quotes.
+/// Split on dots outside double or backtick quotes, keeping each part's
+/// quotes.
 fn split_unquoted(table: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
-    let mut in_quotes = false;
+    let mut quote: Option<char> = None;
     let mut chars = table.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '"' {
-            current.push(c);
-            if !in_quotes {
-                in_quotes = true;
-            } else if chars.next_if_eq(&'"').is_some() {
-                current.push('"');
-            } else {
-                in_quotes = false;
+        match quote {
+            Some(q) if c == q => {
+                current.push(c);
+                if chars.next_if_eq(&q).is_some() {
+                    current.push(q);
+                } else {
+                    quote = None;
+                }
             }
-        } else if c == '.' && !in_quotes {
-            parts.push(std::mem::take(&mut current));
-        } else {
-            current.push(c);
+            Some(_) => current.push(c),
+            None if c == '"' || c == '`' => {
+                current.push(c);
+                quote = Some(c);
+            }
+            None if c == '.' => parts.push(std::mem::take(&mut current)),
+            None => current.push(c),
         }
     }
     parts.push(current);
@@ -615,11 +755,13 @@ fn split_unquoted(table: &str) -> Vec<String> {
 /// One part's content: a fully quoted part loses its quotes and undoubles
 /// its inner quotes; a bare part is kept as is.
 fn unquote(part: &str) -> String {
-    if part.len() >= 2 && part.starts_with('"') && part.ends_with('"') {
-        part[1..part.len() - 1].replace("\"\"", "\"")
-    } else {
-        part.to_owned()
+    for quote in ['"', '`'] {
+        if part.len() >= 2 && part.starts_with(quote) && part.ends_with(quote) {
+            let doubled = format!("{quote}{quote}");
+            return part[1..part.len() - 1].replace(&doubled, &quote.to_string());
+        }
     }
+    part.to_owned()
 }
 
 fn predicate(pk: &[(String, String)]) -> String {
@@ -634,7 +776,7 @@ mod tests {
     use super::*;
 
     fn table_of(sql: &str) -> Option<String> {
-        editable_table(sql)
+        editable_table(sql, DbKind::Postgres)
     }
 
     #[test]
@@ -744,6 +886,65 @@ mod tests {
     }
 
     #[test]
+    fn a_backtick_identifier_is_accepted_and_unescaped() {
+        assert_eq!(table_of("SELECT * FROM `users`"), Some("users".to_owned()));
+        assert_eq!(
+            table_of("select `id` from `main`.`Users` where `id` = 1"),
+            Some("main.Users".to_owned())
+        );
+        assert_eq!(table_of("SELECT * FROM `odd``name`"), Some("odd`name".to_owned()));
+        // A backtick identifier is not the FROM keyword.
+        assert_eq!(table_of("SELECT `from` FROM users").as_deref(), Some("users"));
+    }
+
+    #[test]
+    fn hash_hides_nothing_outside_mysql() {
+        let sql = "SELECT id, data #>> '{a}' AS label FROM t";
+        let plan = parse_join(sql, DbKind::Postgres).expect("one source");
+        let columns: Vec<_> = plan.selects.iter().map(|s| s.column.as_deref()).collect();
+        assert_eq!(columns, vec![Some("id"), None]);
+        assert_eq!(editable_table(sql, DbKind::Postgres), Some("t".to_owned()));
+        assert_eq!(editable_table(sql, DbKind::Mysql), None);
+    }
+
+    #[test]
+    fn hash_comments_and_dollar_quotes_lex_as_skipped_text() {
+        assert_eq!(
+            editable_table("SELECT * FROM users # note with from join\nWHERE id = 1", DbKind::Mysql),
+            Some("users".to_owned())
+        );
+        assert_eq!(
+            table_of("SELECT * FROM users WHERE note = $tag$from join 'where'$tag$"),
+            Some("users".to_owned())
+        );
+        assert_eq!(
+            table_of("SELECT * FROM users WHERE note = $$from join$$ LIMIT 5"),
+            Some("users".to_owned())
+        );
+        assert_eq!(
+            join_of("SELECT u.id FROM users u JOIN orders o ON o.note = $$join from$$"),
+            Some(JoinPlan {
+                sources: vec![
+                    JoinSource { table: "users".to_owned(), alias: Some("u".to_owned()) },
+                    JoinSource { table: "orders".to_owned(), alias: Some("o".to_owned()) },
+                ],
+                selects: vec![JoinSelect {
+                    qualifier: Some("u".to_owned()),
+                    column: Some("id".to_owned())
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn wildcard_selects_read_positionally() {
+        assert!(wildcard_select("SELECT * FROM users", DbKind::Postgres));
+        assert!(wildcard_select("SELECT DISTINCT t.* FROM users t", DbKind::Postgres));
+        assert!(!wildcard_select("SELECT count(*) FROM users", DbKind::Postgres));
+        assert!(!wildcard_select("SELECT u.id, u.* FROM users u", DbKind::Postgres));
+    }
+
+    #[test]
     fn quote_qualified_splits_only_on_unquoted_dots() {
         assert_eq!(quote_qualified("users"), "\"users\"");
         assert_eq!(quote_qualified("\"main\".\"users\""), "\"main\".\"users\"");
@@ -811,6 +1012,29 @@ mod tests {
         assert_eq!(to_literal("NaN", false), "'NaN'");
         assert_eq!(to_literal("inf", false), "'inf'");
         assert_eq!(to_literal("1_000", false), "'1_000'");
+        // A leading plus and a leading-zero integer part stay text, so the
+        // literal reads back as the same characters.
+        assert_eq!(to_literal("+7", false), "'+7'");
+        assert_eq!(to_literal("007", false), "'007'");
+        assert_eq!(to_literal("010", false), "'010'");
+        assert_eq!(to_literal("-010", false), "'-010'");
+        assert_eq!(to_literal("00.5", false), "'00.5'");
+        assert_eq!(to_literal("0", false), "0");
+        assert_eq!(to_literal("-0", false), "-0");
+        assert_eq!(to_literal("-0.5", false), "-0.5");
+        assert_eq!(to_literal("0e3", false), "0e3");
+    }
+
+    #[test]
+    fn typed_literals_always_quote_a_text_column() {
+        assert_eq!(to_typed_literal("007", false, true), "'007'");
+        assert_eq!(to_typed_literal("007", false, false), "'007'");
+        assert_eq!(to_typed_literal("42", false, true), "'42'");
+        assert_eq!(to_typed_literal("42", false, false), "42");
+        assert_eq!(to_typed_literal("O'Brien", false, true), "'O''Brien'");
+        assert_eq!(to_typed_literal("", false, true), "NULL");
+        assert_eq!(to_typed_literal("ada", true, true), "NULL");
+        assert_eq!(to_typed_literal(STAGED_DEFAULT, false, true), "DEFAULT");
     }
 
     #[test]
@@ -857,8 +1081,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn typed_update_and_insert_quote_text_columns() {
+        let pk = [("id".to_owned(), "1".to_owned())];
+        let sets = [
+            ("code".to_owned(), "42".to_owned(), true),
+            ("n".to_owned(), "42".to_owned(), false),
+        ];
+        assert_eq!(
+            update_typed_statement("t", &pk, &sets),
+            "UPDATE \"t\" SET \"code\" = '42', \"n\" = 42 WHERE \"id\" = 1"
+        );
+        assert_eq!(
+            insert_typed_statement(
+                "t",
+                &["code".to_owned(), "n".to_owned()],
+                &["007".to_owned(), "42".to_owned()],
+                &[true, false],
+            ),
+            "INSERT INTO \"t\" (\"code\", \"n\") VALUES ('007', 42)"
+        );
+        // The untyped builders keep the old mapping.
+        assert_eq!(
+            update_statement("t", &pk, &[("n".to_owned(), "42".to_owned())]),
+            "UPDATE \"t\" SET \"n\" = 42 WHERE \"id\" = 1"
+        );
+        assert_eq!(
+            insert_statement("t", &["n".to_owned()], &["42".to_owned()]),
+            "INSERT INTO \"t\" (\"n\") VALUES (42)"
+        );
+    }
+
     fn join_of(sql: &str) -> Option<JoinPlan> {
-        parse_join(sql)
+        parse_join(sql, DbKind::Postgres)
     }
 
     #[test]
@@ -941,6 +1196,26 @@ mod tests {
                 selects: vec![
                     JoinSelect { qualifier: Some("a".to_owned()), column: Some("id".to_owned()) },
                     JoinSelect { qualifier: Some("b".to_owned()), column: Some("total".to_owned()) },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn backtick_sources_and_columns_parse_as_join_items() {
+        assert_eq!(
+            join_of(
+                "SELECT `u`.`id`, `o`.`total` FROM `users` `u` JOIN `orders` `o` \
+                 ON `o`.`user_id` = `u`.`id`"
+            ),
+            Some(JoinPlan {
+                sources: vec![
+                    JoinSource { table: "users".to_owned(), alias: Some("u".to_owned()) },
+                    JoinSource { table: "orders".to_owned(), alias: Some("o".to_owned()) },
+                ],
+                selects: vec![
+                    JoinSelect { qualifier: Some("u".to_owned()), column: Some("id".to_owned()) },
+                    JoinSelect { qualifier: Some("o".to_owned()), column: Some("total".to_owned()) },
                 ],
             })
         );

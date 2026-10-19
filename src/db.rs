@@ -8,6 +8,7 @@
 //! tunnel itself lives in [`crate::ssh`].
 
 use std::borrow::Cow;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -16,6 +17,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::sql::{
+    blank_hash_comments, block_comment_end, hash_comments, line_comment_end, scan_dollar_quote,
+    scan_quote,
+};
 use crate::ssh::SshConfig;
 
 /// Cap on materialized rows per statement. The result reports truncation.
@@ -26,37 +31,125 @@ pub const STREAM_PAGE_SIZE: usize = 5_000;
 /// Cap on displayed characters per text cell in the grid.
 pub const CELL_CAP: usize = 256;
 
-/// One statement trimmed of trailing whitespace and semicolons, so a page
-/// or count wrapper never nests a second terminator inside the subselect.
-fn trim_statement(sql: &str) -> &str {
-    let mut inner = sql.trim();
-    while let Some(stripped) = inner.strip_suffix(';') {
-        inner = stripped.trim_end();
-        if inner.is_empty() {
-            break;
+/// One whole token the scanner steps over: its end offset and whether the
+/// text counts as code (`'...'`, `"..."`, `` `...` ``, `$$...$$`) or as a
+/// comment that does not.
+#[derive(Clone, Copy)]
+enum Skipped {
+    Code { end: usize },
+    Comment { end: usize },
+}
+
+impl Skipped {
+    /// One past the token.
+    fn end(self) -> usize {
+        match self {
+            Skipped::Code { end } | Skipped::Comment { end } => end,
         }
     }
-    inner
+}
+
+/// The string, quoted identifier, comment, or dollar-quoted literal starting
+/// at `i`, with `#` opening a line comment only when `hash` is set. None when
+/// `i` starts ordinary text, so callers decide what to do with the byte
+/// themselves.
+fn skipped_token(sql: &str, i: usize, hash: bool) -> Option<Skipped> {
+    let bytes = sql.as_bytes();
+    let token = match bytes.get(i) {
+        Some(&b'\'') | Some(&b'"') | Some(&b'`') => {
+            Skipped::Code { end: scan_quote(bytes, i, bytes[i]) }
+        }
+        Some(&b'$') => Skipped::Code { end: scan_dollar_quote(bytes, i)? },
+        Some(&b'-') if bytes.get(i + 1) == Some(&b'-') => {
+            Skipped::Comment { end: line_comment_end(bytes, i + 2) }
+        }
+        Some(&b'#') if hash => Skipped::Comment { end: line_comment_end(bytes, i + 1) },
+        Some(&b'/') if bytes.get(i + 1) == Some(&b'*') => {
+            Skipped::Comment { end: block_comment_end(bytes, i + 2) }
+        }
+        _ => return None,
+    };
+    Some(token)
+}
+
+/// One statement with its leading and trailing comments dropped and its
+/// trailing terminators removed, so a page or count wrapper never nests a
+/// second terminator or swallows its own closing paren in a trailing line
+/// comment. Empty when no code token is left. A comment with code after it
+/// stays, since its newline keeps the wrapper's paren out of it.
+fn trim_statement(sql: &str, kind: DbKind) -> &str {
+    let hash = hash_comments(kind);
+    let bytes = sql.as_bytes();
+    let mut first: Option<usize> = None;
+    let mut last = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b';' {
+            i += 1;
+            continue;
+        }
+        if let Some(token) = skipped_token(sql, i, hash) {
+            if let Skipped::Code { end } = token {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = end;
+            }
+            i = token.end();
+            continue;
+        }
+        let character = sql[i..].chars().next().expect("non-empty slice");
+        if character.is_whitespace() {
+            i += character.len_utf8();
+            continue;
+        }
+        if first.is_none() {
+            first = Some(i);
+        }
+        last = i + character.len_utf8();
+        i = last;
+    }
+    first.map_or("", |start| &sql[start..last])
 }
 
 /// One page of `sql` as a subselect. `LIMIT` plus `OFFSET` reads on SQLite,
 /// Postgres, and MySQL 8, so one wrapper covers every engine.
-pub fn paged_sql(sql: &str, limit: u64, offset: u64) -> String {
-    let inner = trim_statement(sql);
+pub fn paged_sql(sql: &str, kind: DbKind, limit: u64, offset: u64) -> String {
+    let inner = trim_statement(sql, kind);
     format!("SELECT * FROM ({inner}) AS __cde_page LIMIT {limit} OFFSET {offset}")
 }
 
 /// The total row count behind `sql` as one scalar row.
-pub fn count_sql(sql: &str) -> String {
-    let inner = trim_statement(sql);
+pub fn count_sql(sql: &str, kind: DbKind) -> String {
+    let inner = trim_statement(sql, kind);
     format!("SELECT COUNT(*) FROM ({inner}) AS __cde_count")
 }
 
 /// True when `sql` holds one statement with no inner terminator. Paging and
 /// streamed export wrap the whole text as a subselect, so a batch falls back
-/// to the visible grid instead.
-pub fn is_single_statement(sql: &str) -> bool {
-    !trim_statement(sql).contains(';')
+/// to the visible grid instead. A `;` inside a string, quoted identifier, or
+/// comment never counts.
+pub fn is_single_statement(sql: &str, kind: DbKind) -> bool {
+    !has_terminator(trim_statement(sql, kind), kind)
+}
+
+/// True when `sql` holds a `;` outside strings, quoted identifiers, comments,
+/// and dollar-quoted literals.
+fn has_terminator(sql: &str, kind: DbKind) -> bool {
+    let hash = hash_comments(kind);
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(token) = skipped_token(sql, i, hash) {
+            i = token.end();
+            continue;
+        }
+        if bytes[i] == b';' {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Branded id so a tab id cannot stand in for a connection id.
@@ -190,25 +283,44 @@ pub fn explain_sql(kind: DbKind, statement: &str) -> String {
 }
 
 /// One write kind the read-only guard refuses, as uppercase text for errors.
-/// The single classifier behind the guard; callers never match keywords.
+/// The single classifier behind the guard; callers never match keywords. A
+/// write hidden inside a `WITH` list or behind an `EXPLAIN ANALYZE` still
+/// counts, since both run the statement they wrap. The text is read with `#`
+/// as an operator and again with `#` as a MySQL comment, and a write under
+/// either reading counts, so the guard needs no engine kind.
 pub fn write_statement_kind(sql: &str) -> Option<&'static str> {
-    let keyword = first_keyword(sql)?;
-    Some(match keyword.as_str() {
-        "INSERT" => "INSERT",
-        "UPDATE" => "UPDATE",
-        "DELETE" => "DELETE",
-        "CREATE" => "CREATE",
-        "ALTER" => "ALTER",
-        "DROP" => "DROP",
-        "TRUNCATE" => "TRUNCATE",
-        "REPLACE" => "REPLACE",
-        "MERGE" => "MERGE",
-        "COPY" => "COPY",
-        "VACUUM" => "VACUUM",
-        "GRANT" => "GRANT",
-        "REVOKE" => "REVOKE",
-        _ => return None,
-    })
+    write_kind(sql).or_else(|| write_kind(&blank_hash_comments(sql)))
+}
+
+/// [`write_statement_kind`] for one reading, with `#` as ordinary text.
+fn write_kind(sql: &str) -> Option<&'static str> {
+    let (keyword, end) = keyword_span(sql)?;
+    match keyword.as_str() {
+        "INSERT" => Some("INSERT"),
+        "UPDATE" => Some("UPDATE"),
+        "DELETE" => Some("DELETE"),
+        "CREATE" => Some("CREATE"),
+        "ALTER" => Some("ALTER"),
+        "DROP" => Some("DROP"),
+        "TRUNCATE" => Some("TRUNCATE"),
+        "REPLACE" => Some("REPLACE"),
+        "MERGE" => Some("MERGE"),
+        "COPY" => Some("COPY"),
+        "VACUUM" => Some("VACUUM"),
+        "GRANT" => Some("GRANT"),
+        "REVOKE" => Some("REVOKE"),
+        "DO" => Some("DO"),
+        "CALL" => Some("CALL"),
+        "WITH" => {
+            let (bodies, main) = with_clause(sql, end)?;
+            bodies
+                .iter()
+                .find_map(|body| write_kind(&sql[body.clone()]))
+                .or_else(|| write_kind(&sql[main..]))
+        }
+        "EXPLAIN" => explain_inner(sql, end).and_then(write_kind),
+        _ => None,
+    }
 }
 
 /// True when [`write_statement_kind`] names a write.
@@ -225,33 +337,191 @@ pub struct UnqualifiedWrite {
 
 /// Some only for an UPDATE or DELETE with no WHERE at paren depth zero.
 /// Leading comments and wrapping parens are skipped; matching is
-/// case-insensitive and strings, quoted identifiers, and comments never
-/// count as WHERE.
+/// case-insensitive and strings, quoted identifiers, comments, and
+/// dollar-quoted literals never count as WHERE. A `WITH` list is read CTE by
+/// CTE and the statement after it on its own, and an `EXPLAIN ANALYZE` reads
+/// as the statement it runs. Like [`write_statement_kind`], both readings of
+/// `#` are tried and either one finding an unqualified write counts.
 pub fn unqualified_write(sql: &str) -> Option<UnqualifiedWrite> {
+    unqualified(sql).or_else(|| unqualified(&blank_hash_comments(sql)))
+}
+
+/// [`unqualified_write`] for one reading, with `#` as ordinary text.
+fn unqualified(sql: &str) -> Option<UnqualifiedWrite> {
     let (keyword, end) = keyword_span(sql)?;
     match keyword.as_str() {
         "UPDATE" => {
             let (table, _) = identifier_at(sql, end)?;
             (!has_outer_where(sql)).then(|| UnqualifiedWrite { kind: "UPDATE", table })
         }
-        "DELETE" => {
-            let mut pos = skip_ignorable(sql, end);
-            let (word, next) = word_at(sql, pos)?;
-            if !word.eq_ignore_ascii_case("from") {
-                return None;
-            }
-            pos = next;
-            let (table, _) = identifier_at(sql, pos)?;
-            (!has_outer_where(sql)).then(|| UnqualifiedWrite { kind: "DELETE", table })
+        "DELETE" => delete_write(sql, end),
+        "WITH" => {
+            let (bodies, main) = with_clause(sql, end)?;
+            bodies
+                .iter()
+                .find_map(|body| unqualified(&sql[body.clone()]))
+                .or_else(|| unqualified(&sql[main..]))
         }
+        "EXPLAIN" => explain_inner(sql, end).and_then(unqualified),
         _ => None,
     }
 }
 
-/// First keyword uppercased, skipping whitespace, line and block comments,
-/// and wrapping open parens, so a parenthesized SELECT reads as SELECT.
-fn first_keyword(sql: &str) -> Option<String> {
-    keyword_span(sql).map(|(keyword, _)| keyword)
+/// One `DELETE` with no outer WHERE. The single-table form reads its target
+/// after `FROM`; MySQL's multi-table form names its targets first and copies
+/// only those tables, so it confirms too as long as a top-level `FROM`
+/// follows the target list.
+fn delete_write(sql: &str, after_delete: usize) -> Option<UnqualifiedWrite> {
+    let mut pos = skip_ignorable(sql, after_delete);
+    let (word, after_word) = loop {
+        let (word, next) = word_at(sql, pos)?;
+        if word.eq_ignore_ascii_case("from") || !is_delete_modifier(&word) {
+            break (word, next);
+        }
+        pos = skip_ignorable(sql, next);
+    };
+    if word.eq_ignore_ascii_case("from") {
+        let (table, _) = identifier_at(sql, after_word)?;
+        return (!has_outer_where(sql))
+            .then_some(UnqualifiedWrite { kind: "DELETE", table });
+    }
+    let (table, after_target) = identifier_at(sql, pos)?;
+    if !targets_from(sql, after_target) || has_outer_where(sql) {
+        return None;
+    }
+    Some(UnqualifiedWrite { kind: "DELETE", table })
+}
+
+/// MySQL's optional words between `DELETE` and its target list.
+fn is_delete_modifier(word: &str) -> bool {
+    ["LOW_PRIORITY", "QUICK", "IGNORE"]
+        .iter()
+        .any(|modifier| word.eq_ignore_ascii_case(modifier))
+}
+
+/// True when a top-level `FROM` comes before any top-level `WHERE` in
+/// `sql[start..]`, the tail of a multi-table `DELETE`'s target list.
+fn targets_from(sql: &str, start: usize) -> bool {
+    first_top_level_word(sql, start, &["FROM", "WHERE"])
+        .is_some_and(|word| word.eq_ignore_ascii_case("from"))
+}
+
+/// A readable `WITH` list: one byte range per CTE body and the offset where
+/// the statement after the list begins. None when the text does not read as
+/// `WITH [RECURSIVE] <name> [(<columns>)] AS [[NOT] MATERIALIZED] (...)`.
+fn with_clause(sql: &str, after_with: usize) -> Option<(Vec<Range<usize>>, usize)> {
+    let mut pos = skip_ignorable(sql, after_with);
+    if let Some((word, next)) = word_at(sql, pos)
+        && word.eq_ignore_ascii_case("recursive")
+    {
+        pos = skip_ignorable(sql, next);
+    }
+    let mut bodies = Vec::new();
+    loop {
+        let (_, next) = identifier_at(sql, pos)?;
+        pos = skip_ignorable(sql, next);
+        if sql.as_bytes().get(pos) == Some(&b'(') {
+            pos = skip_ignorable(sql, matching_paren(sql, pos)? + 1);
+        }
+        let (word, next) = word_at(sql, pos)?;
+        if !word.eq_ignore_ascii_case("as") {
+            return None;
+        }
+        pos = skip_ignorable(sql, next);
+        if let Some((word, next)) = word_at(sql, pos) {
+            if word.eq_ignore_ascii_case("not") {
+                pos = skip_ignorable(sql, next);
+                let (word, next) = word_at(sql, pos)?;
+                if !word.eq_ignore_ascii_case("materialized") {
+                    return None;
+                }
+                pos = skip_ignorable(sql, next);
+            } else if word.eq_ignore_ascii_case("materialized") {
+                pos = skip_ignorable(sql, next);
+            }
+        }
+        if sql.as_bytes().get(pos) != Some(&b'(') {
+            return None;
+        }
+        let close = matching_paren(sql, pos)?;
+        bodies.push(pos + 1..close);
+        pos = skip_ignorable(sql, close + 1);
+        if sql.as_bytes().get(pos) != Some(&b',') {
+            return Some((bodies, pos));
+        }
+        pos = skip_ignorable(sql, pos + 1);
+    }
+}
+
+/// The statement an `EXPLAIN` runs: Some only when its options turn `ANALYZE`
+/// on, bare or inside the parenthesized option list. A plain plan never
+/// executes the statement it describes.
+fn explain_inner(sql: &str, after_explain: usize) -> Option<&str> {
+    let pos = skip_ignorable(sql, after_explain);
+    if sql.as_bytes().get(pos) == Some(&b'(') {
+        let close = matching_paren(sql, pos)?;
+        return analyze_enabled(&sql[pos + 1..close]).then(|| &sql[close + 1..]);
+    }
+    let (word, next) = word_at(sql, pos)?;
+    if word.eq_ignore_ascii_case("verbose") {
+        let (word, next) = word_at(sql, skip_ignorable(sql, next))?;
+        return word.eq_ignore_ascii_case("analyze").then(|| &sql[next..]);
+    }
+    word.eq_ignore_ascii_case("analyze").then(|| &sql[next..])
+}
+
+/// True when a parenthesized `EXPLAIN` option list turns `ANALYZE` on.
+fn analyze_enabled(options: &str) -> bool {
+    options.split(',').any(analyze_on)
+}
+
+/// One option in an `EXPLAIN ( ... )` list, true when it is `ANALYZE` left on.
+/// The option is off only when it is spelled false, off, or 0.
+fn analyze_on(option: &str) -> bool {
+    let Some((word, next)) = word_at(option, skip_ignorable(option, 0)) else {
+        return false;
+    };
+    if !word.eq_ignore_ascii_case("analyze") {
+        return false;
+    }
+    match word_at(option, skip_ignorable(option, next)) {
+        Some((value, _)) => {
+            !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("off")
+                && value != "0"
+        }
+        None => true,
+    }
+}
+
+/// Byte offset of the `)` matching the `(` at `open`, outside strings, quoted
+/// identifiers, comments, and dollar-quoted literals. None when the parens
+/// never close.
+fn matching_paren(sql: &str, open: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth: i32 = 0;
+    let mut i = open;
+    while i < bytes.len() {
+        if let Some(token) = skipped_token(sql, i, false) {
+            i = token.end();
+            continue;
+        }
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The bare transaction controls. Only these spellings are special: the
@@ -268,10 +538,11 @@ enum TxControl {
 /// controls run on the text protocol through `raw_sql` there.
 #[cfg(any(feature = "postgres", feature = "mysql"))]
 fn tx_control(sql: &str) -> Option<TxControl> {
-    match first_keyword(sql).as_deref() {
-        Some("BEGIN") => Some(TxControl::Begin),
-        Some("COMMIT") => Some(TxControl::Commit),
-        Some("ROLLBACK") => Some(TxControl::Rollback),
+    let (keyword, _) = keyword_span(sql)?;
+    match keyword.as_str() {
+        "BEGIN" => Some(TxControl::Begin),
+        "COMMIT" => Some(TxControl::Commit),
+        "ROLLBACK" => Some(TxControl::Rollback),
         _ => None,
     }
 }
@@ -300,6 +571,9 @@ fn manual_plan(open: bool, control: Option<TxControl>) -> ManualPlan {
     }
 }
 
+/// Uppercase keyword at the head of `sql` and the byte offset after it,
+/// skipping whitespace, `--` and `#` line comments, block comments, and the
+/// wrapping parens and terminators around the head.
 fn keyword_span(sql: &str) -> Option<(String, usize)> {
     let bytes = sql.as_bytes();
     let mut i = 0;
@@ -307,33 +581,14 @@ fn keyword_span(sql: &str) -> Option<(String, usize)> {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        if sql[i..].starts_with("--") {
-            match sql[i..].find('\n') {
-                Some(nl) => {
-                    i += nl + 1;
-                    continue;
-                }
-                None => return None,
-            }
-        }
-        if sql[i..].starts_with("/*") {
-            match sql[i..].find("*/") {
-                Some(end) => {
-                    i += end + 2;
-                    continue;
-                }
-                None => return None,
-            }
-        }
-        if bytes.get(i) == Some(&b'(') {
+        if matches!(bytes.get(i), Some(&b'(') | Some(&b';')) {
             i += 1;
             continue;
         }
-        if bytes.get(i) == Some(&b';') {
-            i += 1;
-            continue;
+        match skipped_token(sql, i, false) {
+            Some(Skipped::Comment { end }) => i = end,
+            _ => break,
         }
-        break;
     }
     let start = i;
     while i < bytes.len()
@@ -354,27 +609,11 @@ fn skip_ignorable(sql: &str, mut i: usize) -> usize {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        if sql[i..].starts_with("--") {
-            match sql[i..].find('\n') {
-                Some(nl) => {
-                    i += nl + 1;
-                    continue;
-                }
-                None => return sql.len(),
-            }
+        match skipped_token(sql, i, false) {
+            Some(Skipped::Comment { end }) => i = end,
+            _ => return i,
         }
-        if sql[i..].starts_with("/*") {
-            match sql[i..].find("*/") {
-                Some(end) => {
-                    i += end + 2;
-                    continue;
-                }
-                None => return sql.len(),
-            }
-        }
-        break;
     }
-    i
 }
 
 /// One ASCII word at `i` with the offset after it.
@@ -392,42 +631,41 @@ fn word_at(sql: &str, i: usize) -> Option<(String, usize)> {
     Some((sql[i..end].to_owned(), end))
 }
 
-/// One table name at `i`: a bare or double-quoted part with dots joining
-/// further parts. Quoted parts unescape; each part keeps its text.
+/// One table name at `i`: a bare or quoted part with dots joining further
+/// parts, and a trailing `.*` reading as the same table. Quoted parts
+/// unescape; each part keeps its text.
 fn identifier_at(sql: &str, i: usize) -> Option<(String, usize)> {
     let mut pos = skip_ignorable(sql, i);
     let mut parts = Vec::new();
     loop {
         let bytes = sql.as_bytes();
-        if bytes.get(pos) == Some(&b'"') {
-            let mut text = String::new();
-            pos += 1;
-            loop {
-                let c = sql[pos..].chars().next()?;
-                if c == '"' {
-                    if sql[pos + 1..].starts_with('"') {
-                        text.push('"');
-                        pos += 2;
-                        continue;
-                    }
-                    pos += 1;
-                    break;
+        match bytes.get(pos) {
+            Some(&quote @ (b'"' | b'`')) => {
+                let end = scan_quote(bytes, pos, quote);
+                if bytes.get(end - 1) != Some(&quote) {
+                    return None;
                 }
-                text.push(c);
-                pos += c.len_utf8();
+                let text = unquote(&sql[pos..end], quote);
+                if text.trim().is_empty() {
+                    return None;
+                }
+                parts.push(text);
+                pos = end;
             }
-            if text.trim().is_empty() {
-                return None;
+            _ => {
+                let (word, next) = word_at(sql, pos)?;
+                parts.push(word);
+                pos = next;
             }
-            parts.push(text);
-        } else {
-            let (word, next) = word_at(sql, pos)?;
-            parts.push(word);
-            pos = next;
         }
         let after = skip_ignorable(sql, pos);
-        if sql.as_bytes().get(after) == Some(&b'.') {
-            pos = skip_ignorable(sql, after + 1);
+        if bytes.get(after) == Some(&b'.') {
+            let next_part = skip_ignorable(sql, after + 1);
+            if bytes.get(next_part) == Some(&b'*') {
+                pos = skip_ignorable(sql, next_part + 1);
+                break;
+            }
+            pos = next_part;
             continue;
         }
         pos = after;
@@ -436,83 +674,74 @@ fn identifier_at(sql: &str, i: usize) -> Option<(String, usize)> {
     (!parts.is_empty()).then(|| (parts.join("."), pos))
 }
 
-/// True when a WHERE keyword sits at paren depth zero outside strings,
-/// quoted identifiers, and comments.
-fn has_outer_where(sql: &str) -> bool {
-    let bytes = sql.as_bytes();
+/// `text`, a quoted identifier including its quotes, with the quotes removed
+/// and each doubled quote inside collapsed to one, the SQL standard escape.
+fn unquote(text: &str, quote: u8) -> String {
+    let inner = &text[1..text.len() - 1];
+    let bytes = inner.as_bytes();
+    let mut out = String::with_capacity(inner.len());
     let mut i = 0;
-    let mut depth: i32 = 0;
     while i < bytes.len() {
-        if bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'-') {
+        if bytes[i] == quote && bytes.get(i + 1) == Some(&quote) {
+            out.push(char::from(quote));
             i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
             continue;
         }
-        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
-            i += 2;
-            while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
-                i += 1;
-            }
-            i = (i + 2).min(bytes.len());
-            continue;
-        }
-        if bytes[i] == b'\'' {
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'\'' {
-                    if bytes.get(i + 1) == Some(&b'\'') {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if bytes[i] == b'"' {
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'"' {
-                    if bytes.get(i + 1) == Some(&b'"') {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if bytes[i] == b'(' {
-            depth += 1;
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b')' {
-            depth = depth.saturating_sub(1);
-            i += 1;
-            continue;
-        }
-        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
-            let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
-            {
-                i += 1;
-            }
-            if depth == 0 && sql[start..i].eq_ignore_ascii_case("where") {
-                return true;
-            }
-            continue;
-        }
-        i += 1;
+        let character = inner[i..].chars().next().expect("non-empty slice");
+        out.push(character);
+        i += character.len_utf8();
     }
-    false
+    out
+}
+
+/// True when a WHERE keyword sits at paren depth zero outside strings,
+/// quoted identifiers, comments, and dollar-quoted literals.
+fn has_outer_where(sql: &str) -> bool {
+    first_top_level_word(sql, 0, &["WHERE"]).is_some()
+}
+
+/// The first word in `words`, matched case-insensitively, at paren depth zero
+/// in `sql[start..]`. Strings, quoted identifiers, comments, and
+/// dollar-quoted literals never count. None when none of `words` appears.
+fn first_top_level_word<'a>(sql: &'a str, start: usize, words: &[&str]) -> Option<&'a str> {
+    let bytes = sql.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = start;
+    while i < bytes.len() {
+        if let Some(token) = skipped_token(sql, i, false) {
+            i = token.end();
+            continue;
+        }
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let word_start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric()
+                        || bytes[i] == b'_'
+                        || bytes[i] == b'$')
+                {
+                    i += 1;
+                }
+                if depth == 0
+                    && words
+                        .iter()
+                        .any(|word| sql[word_start..i].eq_ignore_ascii_case(word))
+                {
+                    return Some(&sql[word_start..i]);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// The single list of bundled engines. The connection form iterates
@@ -1926,6 +2155,17 @@ pub enum Session {
 }
 
 impl Session {
+    /// The engine this session talks to.
+    fn kind(&self) -> DbKind {
+        match self {
+            Session::Sqlite(_) => DbKind::Sqlite,
+            #[cfg(feature = "postgres")]
+            Session::Postgres(_) => DbKind::Postgres,
+            #[cfg(feature = "mysql")]
+            Session::Mysql(_) => DbKind::Mysql,
+        }
+    }
+
     /// Opens the engine. `password` is the database secret and
     /// `ssh_password` the SSH secret (an SSH password or key passphrase);
     /// both are memory-only.
@@ -1935,9 +2175,15 @@ impl Session {
         ssh_password: Option<&str>,
     ) -> Result<Session, DbError> {
         match config {
-            ConnectionConfig::Sqlite { path, .. } => rusqlite::Connection::open(path)
-                .map(Session::Sqlite)
-                .map_err(|e| DbError::Open(e.to_string())),
+            ConnectionConfig::Sqlite { path, read_only } => {
+                let conn = rusqlite::Connection::open(path)
+                    .map_err(|e| DbError::Open(e.to_string()))?;
+                if *read_only {
+                    conn.execute_batch("PRAGMA query_only = ON")
+                        .map_err(|e| DbError::Open(e.to_string()))?;
+                }
+                Ok(Session::Sqlite(conn))
+            }
             ConnectionConfig::Postgres { .. } => {
                 Self::open_postgres(config, password, ssh_password)
             }
@@ -2039,7 +2285,7 @@ impl Session {
         if limit == 0 {
             return Err(DbError::Query("page size is zero".to_owned()));
         }
-        let mut page = self.query(&paged_sql(sql, limit, offset))?;
+        let mut page = self.query(&paged_sql(sql, self.kind(), limit, offset))?;
         page.truncated = page.row_count() == limit as usize;
         Ok(page)
     }
@@ -2047,7 +2293,7 @@ impl Session {
     /// The exact total behind `sql` for the truncation flag. Runs the count
     /// wrapper through the same query path as any SELECT.
     pub fn count_for(&mut self, sql: &str) -> Result<u64, DbError> {
-        let result = self.query(&count_sql(sql))?;
+        let result = self.query(&count_sql(sql, self.kind()))?;
         match result.cell(0, 0) {
             Some(Value::Integer(n)) if *n >= 0 => Ok(*n as u64),
             Some(Value::Text(text)) => text
@@ -2411,7 +2657,7 @@ impl PgSession {
             user,
             ssl_mode,
             ssh,
-            ..
+            read_only,
         } = config
         else {
             return Err(DbError::Config("not a postgres connection".to_owned()));
@@ -2428,6 +2674,7 @@ impl PgSession {
             .enable_all()
             .build()
             .map_err(|e| DbError::Open(e.to_string()))?;
+        let read_only = *read_only;
         // `acquire_timeout` also bounds establishing the first connection;
         // sqlx 0.8 has no separate `connect_timeout` on the pool options.
         let pool = rt
@@ -2435,6 +2682,14 @@ impl PgSession {
                 sqlx::postgres::PgPoolOptions::new()
                     .max_connections(1)
                     .acquire_timeout(Duration::from_secs(10))
+                    .after_connect(move |conn, _| {
+                        Box::pin(async move {
+                            if read_only {
+                                sqlx::query("SET default_transaction_read_only = on").execute(conn).await?;
+                            }
+                            Ok(())
+                        })
+                    })
                     .connect(&connection_string),
             )
             .map_err(|e| DbError::Open(e.to_string()))?;
@@ -3435,7 +3690,8 @@ impl MySession {
         password: Option<&str>,
         ssh_password: Option<&str>,
     ) -> Result<Self, DbError> {
-        let ConnectionConfig::Mysql { host, port, database, user, ssl_mode, ssh, .. } = config
+        let ConnectionConfig::Mysql { host, port, database, user, ssl_mode, ssh, read_only } =
+            config
         else {
             return Err(DbError::Config("not a mysql connection".to_owned()));
         };
@@ -3451,12 +3707,21 @@ impl MySession {
             .enable_all()
             .build()
             .map_err(|e| DbError::Open(e.to_string()))?;
+        let read_only = *read_only;
         // `acquire_timeout` also bounds establishing the first connection.
         let pool = rt
             .block_on(
                 sqlx::mysql::MySqlPoolOptions::new()
                     .max_connections(1)
                     .acquire_timeout(Duration::from_secs(10))
+                    .after_connect(move |conn, _| {
+                        Box::pin(async move {
+                            if read_only {
+                                sqlx::query("SET SESSION TRANSACTION READ ONLY").execute(conn).await?;
+                            }
+                            Ok(())
+                        })
+                    })
                     .connect(&connection_string),
             )
             .map_err(|e| DbError::Open(e.to_string()))?;
@@ -5515,7 +5780,7 @@ mod tests {
     #[test]
     fn paged_sql_wraps_with_limit_and_offset() {
         assert_eq!(
-            paged_sql("SELECT id FROM users ORDER BY id", 5000, 10000),
+            paged_sql("SELECT id FROM users ORDER BY id", DbKind::Postgres, 5000, 10000),
             "SELECT * FROM (SELECT id FROM users ORDER BY id) AS __cde_page LIMIT 5000 OFFSET 10000"
         );
     }
@@ -5523,7 +5788,7 @@ mod tests {
     #[test]
     fn paged_sql_strips_trailing_semicolons_and_whitespace() {
         assert_eq!(
-            paged_sql("SELECT 1;  \n;", 10, 0),
+            paged_sql("SELECT 1;  \n;", DbKind::Postgres, 10, 0),
             "SELECT * FROM (SELECT 1) AS __cde_page LIMIT 10 OFFSET 0"
         );
     }
@@ -5531,16 +5796,93 @@ mod tests {
     #[test]
     fn count_sql_wraps_the_statement() {
         assert_eq!(
-            count_sql("SELECT id FROM users WHERE id > 3;"),
+            count_sql("SELECT id FROM users WHERE id > 3;", DbKind::Postgres),
             "SELECT COUNT(*) FROM (SELECT id FROM users WHERE id > 3) AS __cde_count"
         );
     }
 
     #[test]
     fn single_statement_rejects_batches() {
-        assert!(is_single_statement("SELECT * FROM users"));
-        assert!(is_single_statement("SELECT 1;  "));
-        assert!(!is_single_statement("SELECT 1; SELECT 2"));
+        assert!(is_single_statement("SELECT * FROM users", DbKind::Postgres));
+        assert!(is_single_statement("SELECT 1;  ", DbKind::Postgres));
+        assert!(!is_single_statement("SELECT 1; SELECT 2", DbKind::Postgres));
+    }
+
+    #[test]
+    fn paged_sql_strips_trailing_comments_and_terminators() {
+        assert_eq!(
+            paged_sql("SELECT 1 -- trailing note", DbKind::Postgres, 10, 0),
+            "SELECT * FROM (SELECT 1) AS __cde_page LIMIT 10 OFFSET 0"
+        );
+        assert_eq!(
+            paged_sql("SELECT 1 # trailing note", DbKind::Mysql, 10, 0),
+            "SELECT * FROM (SELECT 1) AS __cde_page LIMIT 10 OFFSET 0"
+        );
+        assert_eq!(
+            paged_sql("SELECT 1 /* trailing */ ;", DbKind::Postgres, 10, 0),
+            "SELECT * FROM (SELECT 1) AS __cde_page LIMIT 10 OFFSET 0"
+        );
+        assert_eq!(
+            paged_sql("-- lead\nSELECT 1\n-- note", DbKind::Postgres, 10, 0),
+            "SELECT * FROM (SELECT 1) AS __cde_page LIMIT 10 OFFSET 0"
+        );
+        assert_eq!(
+            paged_sql("SELECT $$a;b$$", DbKind::Postgres, 10, 0),
+            "SELECT * FROM (SELECT $$a;b$$) AS __cde_page LIMIT 10 OFFSET 0"
+        );
+        // A comment with code after it stays: its newline keeps the wrapper's
+        // closing paren outside the comment.
+        assert_eq!(
+            paged_sql("SELECT 1 -- inline\n + 2", DbKind::Postgres, 10, 0),
+            "SELECT * FROM (SELECT 1 -- inline\n + 2) AS __cde_page LIMIT 10 OFFSET 0"
+        );
+    }
+
+    #[test]
+    fn count_sql_strips_trailing_comments_and_terminators() {
+        assert_eq!(
+            count_sql("SELECT 1 -- trailing note", DbKind::Postgres),
+            "SELECT COUNT(*) FROM (SELECT 1) AS __cde_count"
+        );
+        assert_eq!(
+            count_sql("SELECT 1 # trailing note", DbKind::Mysql),
+            "SELECT COUNT(*) FROM (SELECT 1) AS __cde_count"
+        );
+    }
+
+    #[test]
+    fn paged_and_count_sql_stay_valid_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let page = paged_sql("SELECT 1 -- trailing note", DbKind::Sqlite, 10, 0);
+        assert_eq!(conn.query_row(&page, [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        let count = count_sql("SELECT 1 -- trailing note", DbKind::Sqlite);
+        assert_eq!(conn.query_row(&count, [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn hash_reads_as_an_operator_outside_mysql() {
+        assert_eq!(
+            paged_sql("SELECT data #>> '{a}' AS v FROM t", DbKind::Postgres, 10, 0),
+            "SELECT * FROM (SELECT data #>> '{a}' AS v FROM t) AS __cde_page LIMIT 10 OFFSET 0"
+        );
+        assert_eq!(
+            count_sql("SELECT 5 # 3", DbKind::Sqlite),
+            "SELECT COUNT(*) FROM (SELECT 5 # 3) AS __cde_count"
+        );
+        assert!(!is_single_statement("SELECT 5 # 3; DELETE FROM t", DbKind::Postgres));
+        assert!(is_single_statement("SELECT 5 # 3; DELETE FROM t", DbKind::Mysql));
+    }
+
+    #[test]
+    fn single_statement_ignores_quoted_and_commented_terminators() {
+        assert!(is_single_statement("SELECT ';'", DbKind::Postgres));
+        assert!(is_single_statement("SELECT 1; -- note", DbKind::Postgres));
+        assert!(is_single_statement("SELECT 1 # note", DbKind::Mysql));
+        assert!(is_single_statement("SELECT $$a;b$$", DbKind::Postgres));
+        assert!(is_single_statement("SELECT \"a;b\"", DbKind::Postgres));
+        assert!(!is_single_statement("SELECT 1; SELECT 2", DbKind::Postgres));
+        assert!(!is_single_statement("SELECT 1; -- note\nSELECT 2", DbKind::Postgres));
+        assert!(!is_single_statement("SELECT 1 # note\n; SELECT 2", DbKind::Mysql));
     }
 
     fn two_rows(first: Vec<Value>, second: Vec<Value>) -> QueryResult {
@@ -6775,6 +7117,10 @@ mod tests {
         let plan = explain_sql(DbKind::Postgres, "SELECT 1");
         let result = session.query(&plan).expect("explain runs");
         assert!(result.row_count() > 0);
+        let page = session
+            .query_page(r#"SELECT '{"a":"x"}'::jsonb #>> '{a}' AS v"#, 0, 10)
+            .expect("a page keeps the #>> operator");
+        assert_eq!(page.cell(0, 0), Some(&Value::Text("x".to_owned())));
     }
 
     #[cfg(feature = "postgres")]
@@ -8024,6 +8370,8 @@ mod tests {
             ("VACUUM", "VACUUM"),
             ("GRANT SELECT ON t TO reader", "GRANT"),
             ("REVOKE SELECT ON t FROM reader", "REVOKE"),
+            ("DO $$ BEGIN UPDATE t SET a = 1; END $$", "DO"),
+            ("CALL refresh_stats()", "CALL"),
             ("  insert into t (a) values (1)", "INSERT"),
             ("-- wipe\nDELETE FROM t", "DELETE"),
             ("/* plan */ DROP TABLE t", "DROP"),
@@ -8057,6 +8405,160 @@ mod tests {
     }
 
     #[test]
+    fn guards_flag_a_write_under_either_reading_of_hash() {
+        assert_eq!(
+            write_statement_kind("WITH x AS (SELECT a # b FROM s) DELETE FROM t"),
+            Some("DELETE")
+        );
+        assert_eq!(
+            unqualified_write("WITH x AS (SELECT a # b FROM s) DELETE FROM t"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "t".to_owned() })
+        );
+        // MySQL reads the WHERE as a comment, so the guard confirms on every
+        // engine rather than trust the Postgres reading.
+        assert_eq!(
+            unqualified_write("UPDATE t SET f = f # 4 WHERE id = 1"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "t".to_owned() })
+        );
+        assert_eq!(unqualified_write("UPDATE t SET f = 1 WHERE f # 4 = 0"), None);
+    }
+
+    #[test]
+    fn guards_read_hash_comments_and_backtick_identifiers() {
+        assert_eq!(write_statement_kind("# wipe\nDELETE FROM t"), Some("DELETE"));
+        assert_eq!(
+            unqualified_write("DELETE FROM t # WHERE id = 1"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "t".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("UPDATE `my table` SET a = 1"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "my table".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("DELETE FROM `a``b`"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "a`b".to_owned() })
+        );
+        assert_eq!(unqualified_write("DELETE FROM `orders` WHERE id = 1"), None);
+        assert_eq!(
+            unqualified_write("UPDATE `t` SET note = 'x' -- where\n"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "t".to_owned() })
+        );
+    }
+
+    #[test]
+    fn dollar_quoted_text_never_reads_as_a_clause() {
+        assert_eq!(
+            unqualified_write("UPDATE t SET note = $$ WHERE $$"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "t".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("UPDATE t SET note = $q$ WHERE $q$"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "t".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("UPDATE t SET note = $$x$$ /* where */"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "t".to_owned() })
+        );
+        assert_eq!(unqualified_write("DELETE FROM t WHERE note = $$x$$"), None);
+    }
+
+    #[test]
+    fn write_classifier_sees_cte_bodies_and_explain_analyze() {
+        for (sql, kind) in [
+            ("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d", "DELETE"),
+            ("WITH ids AS (SELECT 1) DELETE FROM t", "DELETE"),
+            ("WITH RECURSIVE t(n) AS (SELECT 1) UPDATE t SET n = 2", "UPDATE"),
+            ("WITH x (a) AS (SELECT 1) UPDATE t SET a = 1", "UPDATE"),
+            ("WITH x AS MATERIALIZED (SELECT 1) INSERT INTO t VALUES (1)", "INSERT"),
+            (
+                "WITH x AS (SELECT 1), y AS NOT MATERIALIZED (DELETE FROM t) SELECT 1",
+                "DELETE",
+            ),
+            ("EXPLAIN ANALYZE UPDATE t SET a = 1", "UPDATE"),
+            ("EXPLAIN VERBOSE ANALYZE DELETE FROM t", "DELETE"),
+            ("EXPLAIN (ANALYZE, BUFFERS) DELETE FROM t", "DELETE"),
+            ("EXPLAIN (VERBOSE, ANALYZE TRUE) INSERT INTO t VALUES (1)", "INSERT"),
+            ("EXPLAIN (FORMAT JSON, ANALYZE) UPDATE t SET a = 1", "UPDATE"),
+        ] {
+            assert_eq!(write_statement_kind(sql), Some(kind), "{sql}");
+            assert!(is_write_statement(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn write_classifier_leaves_reads_and_plain_explain_alone() {
+        for sql in [
+            "WITH ids AS (SELECT 1) SELECT * FROM ids",
+            "WITH x AS (SELECT 1), y AS (SELECT 2) SELECT * FROM y",
+            "WITH x AS NOT MATERIALIZED (SELECT 1) SELECT 1",
+            "EXPLAIN UPDATE t SET a = 1",
+            "EXPLAIN QUERY PLAN DELETE FROM t",
+            "EXPLAIN (VERBOSE) DELETE FROM t",
+            "EXPLAIN (ANALYZE FALSE) DELETE FROM t",
+            "EXPLAIN (ANALYZE OFF) DELETE FROM t",
+            "EXPLAIN (ANALYZE 0) DELETE FROM t",
+            "EXPLAIN ANALYZE SELECT 1",
+        ] {
+            assert_eq!(write_statement_kind(sql), None, "{sql:?}");
+            assert!(!is_write_statement(sql), "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn unqualified_write_sees_through_ctes_and_explain_analyze() {
+        assert_eq!(
+            unqualified_write("WITH ids AS (SELECT 1) DELETE FROM t"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "t".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("WITH d AS (UPDATE t SET a = 1 RETURNING *) SELECT * FROM d"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "t".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("EXPLAIN ANALYZE DELETE FROM t"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "t".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("EXPLAIN (ANALYZE) UPDATE public.t SET a = 1"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "public.t".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("WITH ids AS (SELECT 1) DELETE FROM t WHERE id = 1"),
+            None
+        );
+        assert_eq!(unqualified_write("EXPLAIN ANALYZE DELETE FROM t WHERE id = 1"), None);
+        assert_eq!(unqualified_write("EXPLAIN DELETE FROM t"), None);
+        assert_eq!(unqualified_write("EXPLAIN (ANALYZE FALSE) DELETE FROM t"), None);
+        assert_eq!(unqualified_write("WITH d AS (SELECT 1) SELECT * FROM d"), None);
+    }
+
+    #[test]
+    fn unqualified_write_reads_mysql_multi_table_delete() {
+        assert_eq!(
+            unqualified_write("DELETE t1 FROM t1 JOIN t2 ON t1.id = t2.id"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "t1".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("DELETE LOW_PRIORITY QUICK IGNORE t1 FROM t1 JOIN t2 ON t1.id = t2.id"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "t1".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("DELETE t1.* FROM t1 JOIN t2 ON t1.id = t2.id"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "t1".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("DELETE t1, t2 FROM t1 JOIN t2 ON t1.id = t2.id"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "t1".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("DELETE t1 FROM t1 JOIN t2 ON t1.id = t2.id WHERE t2.a = 1"),
+            None
+        );
+        assert_eq!(unqualified_write("DELETE t1 WHERE a = 1"), None);
+        assert_eq!(unqualified_write("DELETE t1"), None);
+    }
+
+    #[test]
     fn read_only_flag_defaults_off_and_leaves_validate_green() {
         let old = serde_json::json!({
             "kind": "sqlite",
@@ -8077,6 +8579,86 @@ mod tests {
         assert!(json.contains("\"read_only\":true"), "{json}");
         let roundtrip: ConnectionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip, flagged);
+    }
+
+    #[test]
+    fn sqlite_read_only_session_refuses_writes() {
+        let read_only = ConnectionConfig::Sqlite {
+            path: PathBuf::from(":memory:"),
+            read_only: true,
+        };
+        let mut session = Session::open(&read_only, None, None).unwrap();
+        assert_eq!(session.query("SELECT 1 AS n").unwrap().row_count(), 1);
+        let refused = session.query("CREATE TABLE t (a INTEGER)").unwrap_err();
+        assert!(refused.to_string().contains("readonly"), "{refused}");
+
+        let writable = ConnectionConfig::Sqlite {
+            path: PathBuf::from(":memory:"),
+            read_only: false,
+        };
+        let mut session = Session::open(&writable, None, None).unwrap();
+        session.query("CREATE TABLE t (a INTEGER)").expect("a writable session creates");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_read_only_session_refuses_writes() {
+        let config = ConnectionConfig::Postgres {
+            read_only: true,
+            host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
+            port: std::env::var("PGPORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
+            user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+            ssl_mode: PostgresSslMode::Disable,
+            ssh: None,
+        };
+        let password = std::env::var("PGPASSWORD").ok();
+        let mut session = Session::open(&config, password.as_deref(), None).expect("open");
+        assert_eq!(session.query("SELECT 1").expect("a read passes").row_count(), 1);
+        let _ = session.query("SELECT pg_terminate_backend(pg_backend_pid())");
+        assert!(
+            (0..3).any(|_| session.query("SELECT 1").is_ok()),
+            "the pool reconnects after its backend dies"
+        );
+        let refused = session
+            .query("CREATE TABLE cde_read_only_probe (a integer)")
+            .expect_err("a reconnected read-only session still refuses a write");
+        assert!(refused.to_string().contains("read-only"), "{refused}");
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    #[ignore = "needs a live MySQL; set MYSQLHOST/MYSQLPORT/MYSQLDATABASE/MYSQLUSER/MYSQLPASSWORD"]
+    fn mysql_live_read_only_session_refuses_writes() {
+        let config = ConnectionConfig::Mysql {
+            read_only: true,
+            host: std::env::var("MYSQLHOST").unwrap_or_else(|_| "localhost".to_owned()),
+            port: std::env::var("MYSQLPORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(3306),
+            database: std::env::var("MYSQLDATABASE").unwrap_or_else(|_| "cde_test".to_owned()),
+            user: std::env::var("MYSQLUSER").unwrap_or_else(|_| "root".to_owned()),
+            ssl_mode: MysqlSslMode::default(),
+            ssh: None,
+        };
+        let password = std::env::var("MYSQLPASSWORD").ok();
+        let mut session = Session::open(&config, password.as_deref(), None).expect("open");
+        assert_eq!(session.query("SELECT 1").expect("a read passes").row_count(), 1);
+        let _ = session.query("KILL CONNECTION_ID()");
+        assert!(
+            (0..3).any(|_| session.query("SELECT 1").is_ok()),
+            "the pool reconnects after its connection dies"
+        );
+        let refused = session
+            .query("CREATE TABLE cde_read_only_probe (a integer)")
+            .expect_err("a reconnected read-only session still refuses a write");
+        let text = refused.to_string().to_ascii_lowercase();
+        assert!(text.contains("read only") || text.contains("read-only"), "{refused}");
     }
 
     #[test]

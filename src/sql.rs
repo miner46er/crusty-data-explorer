@@ -1,40 +1,66 @@
 //! Statement splitting for multi-statement scripts.
 //!
 //! Pure text scanning. A semicolon separates statements only outside single
-//! quotes, double quotes, line comments, and block comments. Every engine call
-//! runs one statement, so a script is split here before it is sent.
+//! quotes, double quotes, backtick-quoted identifiers, `--` line comments,
+//! block comments, Postgres dollar-quoted strings, and, on MySQL only, `#`
+//! line comments. Postgres and SQLite read `#` as an operator (`#>`, XOR), so
+//! the scanners that split, page, or bind take the engine kind. Every engine
+//! call runs one statement, so a script is split here before it is sent.
 
 use std::ops::Range;
 
-use crate::db::DbError;
+use crate::db::{DbError, DbKind};
 use crate::edit::to_literal;
+
+/// True when `#` opens a line comment on `kind`. Only MySQL reads it that
+/// way; Postgres and SQLite use it as an operator.
+pub(crate) fn hash_comments(kind: DbKind) -> bool {
+    kind == DbKind::Mysql
+}
+
+/// `sql` with each MySQL `#` line comment overwritten by spaces, byte for
+/// byte, so offsets into the result are offsets into `sql`. The guards read
+/// both texts and flag a statement when either reading holds a write.
+pub(crate) fn blank_hash_comments(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"' | b'`') => i = scan_quote(bytes, i, quote),
+            b'-' if bytes.get(i + 1) == Some(&b'-') => i = line_comment_end(bytes, i + 2),
+            b'/' if bytes.get(i + 1) == Some(&b'*') => i = block_comment_end(bytes, i + 2),
+            b'$' => i = scan_dollar_quote(bytes, i).unwrap_or(i + 1),
+            b'#' => {
+                let end = line_comment_end(bytes, i + 1);
+                out.push_str(&sql[copied..i]);
+                out.extend(std::iter::repeat_n(' ', end - i));
+                copied = end;
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    out.push_str(&sql[copied..]);
+    out
+}
 
 /// Byte ranges of the statements in `sql`, in order. Each range is trimmed of
 /// surrounding whitespace and empty pieces are dropped.
-pub fn statement_ranges(sql: &str) -> Vec<Range<usize>> {
+pub fn statement_ranges(sql: &str, kind: DbKind) -> Vec<Range<usize>> {
+    let hash = hash_comments(kind);
     let bytes = sql.as_bytes();
     let mut ranges = Vec::new();
     let mut start = 0;
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' => i = scan_quote(bytes, i, b'\''),
-            b'"' => i = scan_quote(bytes, i, b'"'),
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                i += 2;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i < bytes.len()
-                    && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/'))
-                {
-                    i += 1;
-                }
-                i = (i + 2).min(bytes.len());
-            }
+            quote @ (b'\'' | b'"' | b'`') => i = scan_quote(bytes, i, quote),
+            b'-' if bytes.get(i + 1) == Some(&b'-') => i = line_comment_end(bytes, i + 2),
+            b'#' if hash => i = line_comment_end(bytes, i + 1),
+            b'/' if bytes.get(i + 1) == Some(&b'*') => i = block_comment_end(bytes, i + 2),
+            b'$' => i = scan_dollar_quote(bytes, i).unwrap_or(i + 1),
             b';' => {
                 if let Some(range) = trim_range(sql, start, i) {
                     ranges.push(range);
@@ -82,11 +108,12 @@ impl Param {
 
 /// Parameters across `statements`, in first-appearance order. A repeated
 /// `:name` collects once; each `?` collects separately, numbered from 1 in
-/// scan order. Placeholders inside string literals, quoted identifiers, line
-/// comments, and block comments do not count. A `::` cast never counts, and
-/// `$n` passes through untouched. Mixing `:name` and `?` in one run is a
-/// [`DbError::Config`].
-pub fn collect_params(statements: &[String]) -> Result<Vec<Param>, DbError> {
+/// scan order. Placeholders inside string literals, quoted identifiers, `--`
+/// line comments, block comments, dollar-quoted strings, and MySQL `#` line
+/// comments do not count. A `::` cast never counts, and `$n` passes through untouched. Mixing
+/// `:name` and `?` in one run is a [`DbError::Config`].
+pub fn collect_params(statements: &[String], kind: DbKind) -> Result<Vec<Param>, DbError> {
+    let hash = hash_comments(kind);
     let mut params = Vec::new();
     let mut positional = 0u32;
     let mut has_named = false;
@@ -96,23 +123,11 @@ pub fn collect_params(statements: &[String]) -> Result<Vec<Param>, DbError> {
         let mut i = 0;
         while i < bytes.len() {
             match bytes[i] {
-                b'\'' => i = scan_quote(bytes, i, b'\''),
-                b'"' => i = scan_quote(bytes, i, b'"'),
-                b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                    i += 2;
-                    while i < bytes.len() && bytes[i] != b'\n' {
-                        i += 1;
-                    }
-                }
-                b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                    i += 2;
-                    while i < bytes.len()
-                        && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/'))
-                    {
-                        i += 1;
-                    }
-                    i = (i + 2).min(bytes.len());
-                }
+                quote @ (b'\'' | b'"' | b'`') => i = scan_quote(bytes, i, quote),
+                b'-' if bytes.get(i + 1) == Some(&b'-') => i = line_comment_end(bytes, i + 2),
+                b'#' if hash => i = line_comment_end(bytes, i + 1),
+                b'/' if bytes.get(i + 1) == Some(&b'*') => i = block_comment_end(bytes, i + 2),
+                b'$' => i = scan_dollar_quote(bytes, i).unwrap_or(i + 1),
                 b'?' => {
                     has_positional = true;
                     positional += 1;
@@ -158,12 +173,19 @@ pub fn collect_params(statements: &[String]) -> Result<Vec<Param>, DbError> {
 
 /// `statement` with placeholders replaced by `params` values rendered through
 /// [`to_literal`], so text quotes and numbers stay bare, and an empty value
-/// renders as NULL. String literals, quoted identifiers, and comments copy
-/// through untouched, as does a `:name` with no matching param and a `?`
+/// renders as NULL. String literals, quoted identifiers, `--` line comments,
+/// block comments, dollar-quoted strings, and MySQL `#` comments copy through
+/// untouched, as does a `:name` with no matching param and a `?`
 /// past the end of the positional values. Each `?` consumes the next
 /// positional param from `*next_pos`, which the caller threads across the
 /// run's statements in order, so one counter numbers every `?` in the run.
-pub fn substitute(statement: &str, params: &[Param], next_pos: &mut usize) -> String {
+pub fn substitute(
+    statement: &str,
+    params: &[Param],
+    next_pos: &mut usize,
+    kind: DbKind,
+) -> String {
+    let hash = hash_comments(kind);
     let positional: Vec<&str> = params
         .iter()
         .filter(|p| p.style == PlaceholderStyle::Positional)
@@ -174,27 +196,28 @@ pub fn substitute(statement: &str, params: &[Param], next_pos: &mut usize) -> St
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' | b'"' => {
-                let end = scan_quote(bytes, i, bytes[i]);
+            quote @ (b'\'' | b'"' | b'`') => {
+                let end = scan_quote(bytes, i, quote);
                 out.push_str(&statement[i..end]);
                 i = end;
             }
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                let mut end = i + 2;
-                while end < bytes.len() && bytes[end] != b'\n' {
-                    end += 1;
-                }
+                let end = line_comment_end(bytes, i + 2);
+                out.push_str(&statement[i..end]);
+                i = end;
+            }
+            b'#' if hash => {
+                let end = line_comment_end(bytes, i + 1);
                 out.push_str(&statement[i..end]);
                 i = end;
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                let mut end = i + 2;
-                while end < bytes.len()
-                    && !(bytes[end] == b'*' && bytes.get(end + 1) == Some(&b'/'))
-                {
-                    end += 1;
-                }
-                end = (end + 2).min(bytes.len());
+                let end = block_comment_end(bytes, i + 2);
+                out.push_str(&statement[i..end]);
+                i = end;
+            }
+            b'$' => {
+                let end = scan_dollar_quote(bytes, i).unwrap_or(i + 1);
                 out.push_str(&statement[i..end]);
                 i = end;
             }
@@ -244,7 +267,7 @@ fn is_name_char(byte: u8) -> bool {
 
 /// Scan from an opening quote to just past its closing quote. A doubled quote
 /// stays inside the literal, the SQL standard escape.
-fn scan_quote(bytes: &[u8], start: usize, quote: u8) -> usize {
+pub(crate) fn scan_quote(bytes: &[u8], start: usize, quote: u8) -> usize {
     let mut i = start + 1;
     while i < bytes.len() {
         if bytes[i] == quote {
@@ -257,6 +280,62 @@ fn scan_quote(bytes: &[u8], start: usize, quote: u8) -> usize {
         i += 1;
     }
     bytes.len()
+}
+
+/// Index of the newline ending the line comment whose body starts at `from`,
+/// or the end of `bytes` when none follows. `--` and MySQL's `#` share the
+/// body scan; only the opening byte count differs.
+pub(crate) fn line_comment_end(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < bytes.len() && bytes[i] != b'\n' {
+        i += 1;
+    }
+    i
+}
+
+/// Just past the `*/` closing the block comment whose body starts at `from`,
+/// or the end of `bytes` when it never closes.
+pub(crate) fn block_comment_end(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+        i += 1;
+    }
+    (i + 2).min(bytes.len())
+}
+
+/// Just past the closing delimiter of the Postgres dollar-quoted string
+/// opening at `start`, which is `$$` or `$tag$` with a tag that starts like an
+/// identifier. None when no such delimiter opens there, so `$1` and a bare `$`
+/// stay ordinary text and a `$n` placeholder passes through. Unclosed at the
+/// end of the input reads as a string running to that end, the way an
+/// unterminated quote does.
+pub(crate) fn scan_dollar_quote(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'$') {
+        return None;
+    }
+    let tag_end = match bytes.get(start + 1) {
+        Some(&b'$') => start + 1,
+        Some(&first) if is_name_start(first) => {
+            let mut i = start + 2;
+            while i < bytes.len() && is_name_char(bytes[i]) {
+                i += 1;
+            }
+            if bytes.get(i) != Some(&b'$') {
+                return None;
+            }
+            i
+        }
+        _ => return None,
+    };
+    let delimiter = &bytes[start..=tag_end];
+    let mut i = tag_end + 1;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(delimiter) {
+            return Some(i + delimiter.len());
+        }
+        i += 1;
+    }
+    Some(bytes.len())
 }
 
 /// Trim whitespace off `start..end`, reporting None when nothing is left.
@@ -281,8 +360,8 @@ fn trim_range(sql: &str, start: usize, end: usize) -> Option<Range<usize>> {
 }
 
 /// Statements in `sql`, trimmed and with empties dropped.
-pub fn split_statements(sql: &str) -> Vec<String> {
-    statement_ranges(sql)
+pub fn split_statements(sql: &str, kind: DbKind) -> Vec<String> {
+    statement_ranges(sql, kind)
         .into_iter()
         .map(|range| sql[range].to_owned())
         .collect()
@@ -293,9 +372,10 @@ const SCHEMA_KEYWORDS: [&str; 6] =
     ["CREATE", "ALTER", "DROP", "RENAME", "ATTACH", "DETACH"];
 
 /// True when any statement in `sql` begins, after whitespace and comments,
-/// with one of [`SCHEMA_KEYWORDS`].
+/// with one of [`SCHEMA_KEYWORDS`]. Splits without `#` comments, the reading
+/// that finds the most statement heads, so a schema change is never missed.
 pub fn sql_changes_schema(sql: &str) -> bool {
-    split_statements(sql)
+    split_statements(sql, DbKind::Postgres)
         .iter()
         .any(|statement| statement_changes_schema(statement))
 }
@@ -323,16 +403,19 @@ fn head_word(statement: &str) -> Option<Range<usize>> {
     (end > 0).then_some(start..start + end)
 }
 
-/// `statement` past its leading whitespace, `--` line comments, and `/* */`
-/// block comments.
+/// `statement` past its leading whitespace, `--` and `#` line comments, and
+/// `/* */` block comments.
 fn skip_leading_trivia(statement: &str) -> &str {
     let mut rest = statement;
     loop {
         rest = rest.trim_start();
-        if let Some(tail) = rest.strip_prefix("--") {
-            rest = tail.split_once('\n').map_or("", |(_, after)| after);
-        } else if let Some(tail) = rest.strip_prefix("/*") {
-            rest = tail.split_once("*/").map_or("", |(_, after)| after);
+        let bytes = rest.as_bytes();
+        if bytes.starts_with(b"--") {
+            rest = &rest[line_comment_end(bytes, 2)..];
+        } else if bytes.starts_with(b"#") {
+            rest = &rest[line_comment_end(bytes, 1)..];
+        } else if bytes.starts_with(b"/*") {
+            rest = &rest[block_comment_end(bytes, 2)..];
         } else {
             return rest;
         }
@@ -355,9 +438,10 @@ pub fn capped_title(text: &str) -> String {
 /// The title for a script whose first statement is a SELECT: the identifier
 /// after the statement's top-level FROM, capped like the text fallback. None
 /// for anything else, so the caller falls back to the trimmed text: no
-/// SELECT head, no FROM outside parentheses, or no identifier after it.
+/// SELECT head, no FROM outside parentheses, or no identifier after it. The
+/// title is cosmetic and its caller has no engine, so `#` reads as text.
 pub fn select_table_title(sql: &str) -> Option<String> {
-    let first = split_statements(sql).into_iter().next()?;
+    let first = split_statements(sql, DbKind::Postgres).into_iter().next()?;
     let head = head_word(&first)?;
     let after_head = head.end;
     if !first[head].eq_ignore_ascii_case("select") {
@@ -372,8 +456,8 @@ pub fn select_table_title(sql: &str) -> Option<String> {
 }
 
 /// Byte offset of the first `FROM` word in `text` outside parentheses,
-/// skipping strings, quoted identifiers, line comments, and block comments.
-/// None when there is none.
+/// skipping strings, quoted identifiers, `--` line comments, block comments,
+/// and dollar-quoted strings. None when there is none.
 fn top_level_from(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut depth = 0usize;
@@ -382,20 +466,12 @@ fn top_level_from(text: &str) -> Option<usize> {
         match bytes[index] {
             quote @ (b'\'' | b'"' | b'`') => index = scan_quote(bytes, index, quote),
             b'-' if bytes.get(index + 1) == Some(&b'-') => {
-                index += 2;
-                while index < bytes.len() && bytes[index] != b'\n' {
-                    index += 1;
-                }
+                index = line_comment_end(bytes, index + 2);
             }
             b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                index += 2;
-                while index < bytes.len()
-                    && !(bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/'))
-                {
-                    index += 1;
-                }
-                index = (index + 2).min(bytes.len());
+                index = block_comment_end(bytes, index + 2);
             }
+            b'$' => index = scan_dollar_quote(bytes, index).unwrap_or(index + 1),
             b'(' => {
                 depth += 1;
                 index += 1;
@@ -478,8 +554,8 @@ fn read_identifier(text: &str) -> Option<(String, &str)> {
 /// Index into [`split_statements`] of the statement under `cursor_byte`. A
 /// cursor in the whitespace between statements, or after the last one, belongs
 /// to the statement before it; leading whitespace belongs to the first.
-pub fn current_statement(sql: &str, cursor_byte: usize) -> Option<usize> {
-    let ranges = statement_ranges(sql);
+pub fn current_statement(sql: &str, cursor_byte: usize, kind: DbKind) -> Option<usize> {
+    let ranges = statement_ranges(sql, kind);
     if ranges.is_empty() {
         return None;
     }
@@ -509,19 +585,19 @@ mod tests {
     #[test]
     fn semicolons_in_quotes_do_not_split() {
         assert_eq!(
-            split_statements("SELECT ';'; SELECT 2"),
+            split_statements("SELECT ';'; SELECT 2", DbKind::Postgres),
             vec!["SELECT ';'", "SELECT 2"]
         );
         assert_eq!(
-            split_statements("SELECT \";\" FROM t; SELECT 2"),
+            split_statements("SELECT \";\" FROM t; SELECT 2", DbKind::Postgres),
             vec!["SELECT \";\" FROM t", "SELECT 2"]
         );
         assert_eq!(
-            split_statements("SELECT 'it''s; ok'; SELECT 2"),
+            split_statements("SELECT 'it''s; ok'; SELECT 2", DbKind::Postgres),
             vec!["SELECT 'it''s; ok'", "SELECT 2"]
         );
         assert_eq!(
-            split_statements("SELECT \"a\"\"b;c\"; SELECT 2"),
+            split_statements("SELECT \"a\"\"b;c\"; SELECT 2", DbKind::Postgres),
             vec!["SELECT \"a\"\"b;c\"", "SELECT 2"]
         );
     }
@@ -529,37 +605,83 @@ mod tests {
     #[test]
     fn semicolons_in_comments_do_not_split() {
         assert_eq!(
-            split_statements("SELECT 1 -- a; b\n; SELECT 2"),
+            split_statements("SELECT 1 -- a; b\n; SELECT 2", DbKind::Postgres),
             vec!["SELECT 1 -- a; b", "SELECT 2"]
         );
         assert_eq!(
-            split_statements("SELECT /* a; b */ 1; SELECT 2"),
+            split_statements("SELECT /* a; b */ 1; SELECT 2", DbKind::Postgres),
             vec!["SELECT /* a; b */ 1", "SELECT 2"]
         );
     }
 
     #[test]
+    fn semicolons_in_backticks_and_hash_comments_do_not_split() {
+        assert_eq!(
+            split_statements("SELECT `a;b`; SELECT 2", DbKind::Mysql),
+            vec!["SELECT `a;b`", "SELECT 2"]
+        );
+        assert_eq!(
+            split_statements("SELECT `a``b;c`; SELECT 2", DbKind::Mysql),
+            vec!["SELECT `a``b;c`", "SELECT 2"]
+        );
+        assert_eq!(
+            split_statements("SELECT 1 # a; b\n; SELECT 2", DbKind::Mysql),
+            vec!["SELECT 1 # a; b", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn semicolons_in_dollar_quotes_do_not_split() {
+        assert_eq!(
+            split_statements("SELECT $$a;b$$; SELECT 2", DbKind::Postgres),
+            vec!["SELECT $$a;b$$", "SELECT 2"]
+        );
+        assert_eq!(
+            split_statements("SELECT $tag$a;b$tag$; SELECT 2", DbKind::Postgres),
+            vec!["SELECT $tag$a;b$tag$", "SELECT 2"]
+        );
+        // A positional parameter is not a dollar quote, so its semicolon splits.
+        assert_eq!(
+            split_statements("SELECT $1; SELECT 2", DbKind::Postgres),
+            vec!["SELECT $1", "SELECT 2"]
+        );
+        // Unclosed at the end of the script, the quote runs to that end.
+        assert_eq!(split_statements("SELECT $$oops", DbKind::Postgres), vec!["SELECT $$oops"]);
+    }
+
+    #[test]
+    fn dollar_quote_delimiters_need_a_tag_or_a_second_dollar() {
+        assert_eq!(scan_dollar_quote(b"$1", 0), None);
+        assert_eq!(scan_dollar_quote(b"$", 0), None);
+        assert_eq!(scan_dollar_quote(b"a", 0), None);
+        assert_eq!(scan_dollar_quote(b"x$ta$", 0), None);
+        assert_eq!(scan_dollar_quote(b"$$a$$; rest", 0), Some(5));
+        assert_eq!(scan_dollar_quote(b"$q$a;b$q$; rest", 0), Some(9));
+        assert_eq!(scan_dollar_quote(b"$q$unclosed", 0), Some(11));
+    }
+
+    #[test]
     fn trailing_text_without_a_semicolon_is_a_statement() {
         assert_eq!(
-            split_statements("SELECT 1; SELECT 2"),
+            split_statements("SELECT 1; SELECT 2", DbKind::Postgres),
             vec!["SELECT 1", "SELECT 2"]
         );
-        assert_eq!(split_statements("SELECT 1;"), vec!["SELECT 1"]);
-        assert_eq!(split_statements("  SELECT 1  "), vec!["SELECT 1"]);
+        assert_eq!(split_statements("SELECT 1;", DbKind::Postgres), vec!["SELECT 1"]);
+        assert_eq!(split_statements("  SELECT 1  ", DbKind::Postgres), vec!["SELECT 1"]);
         assert_eq!(
-            split_statements("SELECT 1;;SELECT 2"),
+            split_statements("SELECT 1;;SELECT 2", DbKind::Postgres),
             vec!["SELECT 1", "SELECT 2"]
         );
     }
 
     #[test]
     fn empty_input_yields_no_statements() {
-        assert!(split_statements("").is_empty());
-        assert!(split_statements("   \n\t ").is_empty());
-        assert!(split_statements(";").is_empty());
-        assert!(split_statements(" ; ; ").is_empty());
-        assert!(current_statement("", 0).is_none());
-        assert!(current_statement("  ;  ", 2).is_none());
+        assert!(split_statements("", DbKind::Postgres).is_empty());
+        assert!(split_statements("   \n\t ", DbKind::Postgres).is_empty());
+        assert!(split_statements(";", DbKind::Postgres).is_empty());
+        assert!(split_statements(" ; ; ", DbKind::Postgres).is_empty());
+        assert!(current_statement("", 0, DbKind::Postgres).is_none());
+        assert!(current_statement("  ;  ", 2, DbKind::Postgres).is_none());
     }
 
     #[test]
@@ -679,29 +801,29 @@ mod tests {
     #[test]
     fn cursor_in_first_middle_and_last_statement() {
         let sql = "SELECT 1;\nSELECT 2;\nSELECT 3";
-        assert_eq!(current_statement(sql, 0), Some(0));
-        assert_eq!(current_statement(sql, 3), Some(0));
-        assert_eq!(current_statement(sql, 12), Some(1));
-        assert_eq!(current_statement(sql, 24), Some(2));
-        assert_eq!(current_statement(sql, sql.len()), Some(2));
+        assert_eq!(current_statement(sql, 0, DbKind::Postgres), Some(0));
+        assert_eq!(current_statement(sql, 3, DbKind::Postgres), Some(0));
+        assert_eq!(current_statement(sql, 12, DbKind::Postgres), Some(1));
+        assert_eq!(current_statement(sql, 24, DbKind::Postgres), Some(2));
+        assert_eq!(current_statement(sql, sql.len(), DbKind::Postgres), Some(2));
     }
 
     #[test]
     fn cursor_in_whitespace_between_statements_takes_the_previous() {
         let sql = "SELECT 1;\n\nSELECT 2";
-        assert_eq!(current_statement(sql, 9), Some(0));
-        assert_eq!(current_statement(sql, 10), Some(0));
+        assert_eq!(current_statement(sql, 9, DbKind::Postgres), Some(0));
+        assert_eq!(current_statement(sql, 10, DbKind::Postgres), Some(0));
         // The semicolon itself belongs to the statement before it.
-        assert_eq!(current_statement(sql, 8), Some(0));
+        assert_eq!(current_statement(sql, 8, DbKind::Postgres), Some(0));
         // Leading whitespace belongs to the first statement.
-        assert_eq!(current_statement("   SELECT 1", 1), Some(0));
+        assert_eq!(current_statement("   SELECT 1", 1, DbKind::Postgres), Some(0));
     }
 
     #[test]
     fn ranges_match_the_split_statements() {
         let sql = "SELECT 1; /* x;y */ SELECT ';' FROM t";
-        let ranges = statement_ranges(sql);
-        let statements = split_statements(sql);
+        let ranges = statement_ranges(sql, DbKind::Postgres);
+        let statements = split_statements(sql, DbKind::Postgres);
         assert_eq!(ranges.len(), statements.len());
         for (range, statement) in ranges.iter().zip(statements.iter()) {
             assert_eq!(&sql[range.clone()], statement);
@@ -711,7 +833,7 @@ mod tests {
     #[test]
     fn named_repeats_collect_once_in_order() {
         let params =
-            collect_params(&["SELECT :b, :a, :b".to_owned(), "SELECT :c".to_owned()])
+            collect_params(&["SELECT :b, :a, :b".to_owned(), "SELECT :c".to_owned()], DbKind::Postgres)
                 .unwrap();
         assert_eq!(params.len(), 3);
         assert_eq!(params[0].name, "b");
@@ -725,7 +847,7 @@ mod tests {
     #[test]
     fn positional_placeholders_number_in_order() {
         let params =
-            collect_params(&["SELECT ?, ?".to_owned(), "SELECT ?".to_owned()]).unwrap();
+            collect_params(&["SELECT ?, ?".to_owned(), "SELECT ?".to_owned()], DbKind::Postgres).unwrap();
         assert_eq!(params.len(), 3);
         assert!(params.iter().all(|p| p.style == PlaceholderStyle::Positional));
         assert_eq!(params[0].name, "1");
@@ -737,7 +859,7 @@ mod tests {
     #[test]
     fn placeholders_in_strings_identifiers_and_comments_do_not_count() {
         let params = collect_params(
-            &["SELECT ':a', \"?\", x FROM t -- :b\n WHERE y = ? /* ? */".to_owned()],
+            &["SELECT ':a', \"?\", x FROM t -- :b\n WHERE y = ? /* ? */".to_owned()], DbKind::Postgres,
         )
         .unwrap();
         assert_eq!(params.len(), 1);
@@ -745,20 +867,74 @@ mod tests {
     }
 
     #[test]
+    fn placeholders_in_backticks_hash_comments_and_dollar_quotes_do_not_count() {
+        let params = collect_params(
+            &["SELECT `:a`, `?` FROM t # :b ?\n WHERE x = $$?$$ AND y = ?".to_owned()], DbKind::Mysql,
+        )
+        .unwrap();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].display(), "?1");
+        assert!(collect_params(&["SELECT `:a`, $$:b ?$$".to_owned()], DbKind::Mysql).unwrap().is_empty());
+        assert!(
+            collect_params(&["SELECT $q$:a ?$q$, $1, $2".to_owned()], DbKind::Postgres).unwrap().is_empty()
+        );
+    }
+
+    #[test]
+    fn table_title_reads_past_hash_operators_and_dollar_quotes() {
+        assert_eq!(
+            select_table_title("SELECT data #>> '{from}' FROM users"),
+            Some("users".to_owned())
+        );
+        assert_eq!(
+            select_table_title("SELECT $$FROM x$$ FROM users"),
+            Some("users".to_owned())
+        );
+        assert_eq!(
+            select_table_title("SELECT * FROM `my; table`"),
+            Some("my; table".to_owned())
+        );
+    }
+
+    #[test]
+    fn hash_comments_only_on_mysql() {
+        let sql = "SELECT 5 # 3; SELECT 2";
+        assert_eq!(split_statements(sql, DbKind::Postgres), vec!["SELECT 5 # 3", "SELECT 2"]);
+        assert_eq!(split_statements(sql, DbKind::Sqlite).len(), 2);
+        assert_eq!(split_statements(sql, DbKind::Mysql), vec![sql]);
+        let statements = vec!["SELECT a # :x".to_owned()];
+        assert_eq!(collect_params(&statements, DbKind::Postgres).unwrap().len(), 1);
+        assert!(collect_params(&statements, DbKind::Mysql).unwrap().is_empty());
+        let params = vec![Param {
+            name: "x".to_owned(),
+            style: PlaceholderStyle::Named,
+            value: "7".to_owned(),
+        }];
+        assert_eq!(substitute("SELECT a # :x", &params, &mut 0, DbKind::Postgres), "SELECT a # 7");
+        assert_eq!(substitute("SELECT a # :x", &params, &mut 0, DbKind::Mysql), "SELECT a # :x");
+    }
+
+    #[test]
+    fn blanking_hash_comments_keeps_offsets() {
+        assert_eq!(blank_hash_comments("a # b é\nc '#' d"), "a       \nc '#' d");
+        assert_eq!(blank_hash_comments("a # b é\nc").len(), "a # b é\nc".len());
+    }
+
+    #[test]
     fn mixing_named_and_positional_is_a_config_error() {
         let error =
-            collect_params(&["SELECT :a".to_owned(), "SELECT ?".to_owned()]).unwrap_err();
+            collect_params(&["SELECT :a".to_owned(), "SELECT ?".to_owned()], DbKind::Postgres).unwrap_err();
         assert!(matches!(error, DbError::Config(_)));
         assert!(error.to_string().contains(":name"), "{error}");
         assert!(error.to_string().contains("?"), "{error}");
-        assert!(collect_params(&["SELECT :a, ?".to_owned()]).is_err());
+        assert!(collect_params(&["SELECT :a, ?".to_owned()], DbKind::Postgres).is_err());
     }
 
     #[test]
     fn dollar_casts_and_bare_colons_pass_through() {
-        assert!(collect_params(&["SELECT $1, $2".to_owned()]).unwrap().is_empty());
-        assert!(collect_params(&["SELECT 1::text".to_owned()]).unwrap().is_empty());
-        assert!(collect_params(&["SELECT :1, := 2".to_owned()]).unwrap().is_empty());
+        assert!(collect_params(&["SELECT $1, $2".to_owned()], DbKind::Postgres).unwrap().is_empty());
+        assert!(collect_params(&["SELECT 1::text".to_owned()], DbKind::Postgres).unwrap().is_empty());
+        assert!(collect_params(&["SELECT :1, := 2".to_owned()], DbKind::Postgres).unwrap().is_empty());
     }
 
     fn named_param(name: &str, value: &str) -> Param {
@@ -776,23 +952,23 @@ mod tests {
             substitute(
                 "SELECT * FROM t WHERE name = :name",
                 &[named_param("name", "ada")],
-                &mut next
+                &mut next, DbKind::Postgres
             ),
             "SELECT * FROM t WHERE name = 'ada'"
         );
         let mut next = 0;
         assert_eq!(
-            substitute("SELECT * FROM t WHERE id = :id", &[named_param("id", "42")], &mut next),
+            substitute("SELECT * FROM t WHERE id = :id", &[named_param("id", "42")], &mut next, DbKind::Postgres),
             "SELECT * FROM t WHERE id = 42"
         );
         let mut next = 0;
         assert_eq!(
-            substitute("SELECT :v", &[named_param("v", "O'Brien")], &mut next),
+            substitute("SELECT :v", &[named_param("v", "O'Brien")], &mut next, DbKind::Postgres),
             "SELECT 'O''Brien'"
         );
         let mut next = 0;
         assert_eq!(
-            substitute("SELECT :v", &[named_param("v", "")], &mut next),
+            substitute("SELECT :v", &[named_param("v", "")], &mut next, DbKind::Postgres),
             "SELECT NULL"
         );
     }
@@ -804,9 +980,22 @@ mod tests {
             substitute(
                 "SELECT ':name', x FROM t -- :name\nWHERE y = :name AND z = :missing",
                 &[named_param("name", "ada")],
-                &mut next
+                &mut next, DbKind::Postgres
             ),
             "SELECT ':name', x FROM t -- :name\nWHERE y = 'ada' AND z = :missing"
+        );
+    }
+
+    #[test]
+    fn substitute_leaves_backticks_hash_comments_and_dollar_quotes_alone() {
+        let mut next = 0;
+        assert_eq!(
+            substitute(
+                "SELECT `:a`, $$:a ?$$ # :a\n, :b",
+                &[named_param("b", "ada")],
+                &mut next, DbKind::Mysql
+            ),
+            "SELECT `:a`, $$:a ?$$ # :a\n, 'ada'"
         );
     }
 
@@ -825,10 +1014,10 @@ mod tests {
             },
         ];
         let mut next = 0;
-        assert_eq!(substitute("SELECT ?, ?", &params, &mut next), "SELECT 'ada', 7");
+        assert_eq!(substitute("SELECT ?, ?", &params, &mut next, DbKind::Postgres), "SELECT 'ada', 7");
         assert_eq!(next, 2);
         let mut next = 0;
-        assert_eq!(substitute("SELECT ?", &[], &mut next), "SELECT ?");
+        assert_eq!(substitute("SELECT ?", &[], &mut next, DbKind::Postgres), "SELECT ?");
         assert_eq!(next, 1);
     }
 }

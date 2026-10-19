@@ -18,7 +18,7 @@ use crate::app::{
 };
 use crate::db::{
     CELL_CAP, CancelHandle, ConnectionConfig, DbCommand, DbHandle, QueryResult, RunId,
-    STREAM_PAGE_SIZE, TabId, Value, is_single_statement,
+    DbKind, STREAM_PAGE_SIZE, TabId, Value, is_single_statement,
 };
 use crate::export::{
     StreamFormat, stream_session_to_file, to_csv, to_in_list, to_inserts, to_json, to_jsonl,
@@ -341,7 +341,7 @@ fn draw_footer_control(
             {
                 match conn.as_ref().and_then(|c| c.handle.clone()) {
                     Some(handle) => {
-                        if is_single_statement(&tab.sql) {
+                        if conn.as_ref().is_some_and(|c| is_single_statement(&tab.sql, c.config.kind())) {
                             let run = paging_run_id(ui.ctx(), tab.id);
                             let sql = tab.sql.clone();
                             if handle
@@ -375,7 +375,7 @@ fn draw_footer_control(
             {
                 match conn.as_ref().and_then(|c| c.handle.clone()) {
                     Some(handle) => {
-                        if is_single_statement(&tab.sql) {
+                        if conn.as_ref().is_some_and(|c| is_single_statement(&tab.sql, c.config.kind())) {
                             let run = paging_run_id(ui.ctx(), tab.id);
                             let sql = tab.sql.clone();
                             if handle
@@ -477,7 +477,7 @@ fn start_stream_export(
         visible(tab);
         return;
     };
-    if !is_single_statement(&tab.sql) {
+    if !is_single_statement(&tab.sql, conn.config.kind()) {
         visible(tab);
         return;
     }
@@ -2138,7 +2138,8 @@ fn results_grid(
         });
     }
     if filters_open {
-        let mut filter_actions = structured_filter_body(tab, &cols, filter_history, ui);
+        let kind = grid_conn.as_ref().map(|c| c.config.kind());
+        let mut filter_actions = structured_filter_body(tab, &cols, filter_history, kind, ui);
         actions.append(&mut filter_actions);
     }
     let hidden = view.hidden_count(cols.len());
@@ -2570,6 +2571,7 @@ fn structured_filter_body(
     tab: &mut Tab,
     columns: &[(String, String)],
     history: &[SavedFilter],
+    kind: Option<DbKind>,
     ui: &mut egui::Ui,
 ) -> Vec<EditAction> {
     let mut actions = Vec::new();
@@ -2630,7 +2632,7 @@ fn structured_filter_body(
                     value: String::new(),
                 });
             }
-            let single = editable_table(&tab.sql).is_some();
+            let single = kind.is_some_and(|kind| editable_table(&tab.sql, kind).is_some());
             let can_apply = single && tab.filter_where().is_some();
             if ui
                 .add_enabled(can_apply, egui::Button::new("Apply filter"))
