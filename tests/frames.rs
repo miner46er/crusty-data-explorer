@@ -2063,6 +2063,35 @@ fn a_click_behind_the_cell_editor_opens_nothing_and_tab_stays_inside() {
     }
 }
 
+/// A click on the cell editor's own Set NULL stages an edit: the shield sits
+/// under the window, so the click reaches the button instead of the shield.
+#[test]
+fn clicking_set_null_in_the_cell_editor_stages_an_edit() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("cell-editor-click");
+    let conn = harness.state().tab(tab).and_then(|tab| tab.conn).expect("a connection");
+    step_until(&mut harness, "the schema", |state| state.schema(conn).is_some());
+    harness.key_press(egui::Key::ArrowDown);
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.query_by_label("Set NULL").is_some(),
+        "Enter on the grid opens the cell editor"
+    );
+    harness.get_by_label("Set NULL").click();
+    harness.run_steps(6);
+    assert!(
+        harness.query_by_label("Set NULL").is_none(),
+        "Set NULL closes the cell editor"
+    );
+    assert_eq!(
+        harness.state().tab(tab).map(|tab| tab.staged_count()),
+        Some(1),
+        "clicking Set NULL stages one edit"
+    );
+}
+
 /// A dialog that opens in the frame another closes inherits the closed one's
 /// return target: Enter in the params prompt hands first focus to the write
 /// guard's Cancel, and Escape hands it back to the SQL editor it came from.

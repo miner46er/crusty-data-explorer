@@ -63,9 +63,6 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     ui.ctx().data_mut(|data| {
         data.insert_temp(grid::cell_editor_owns_id(), modal.is_none() && cell_editor_open);
     });
-    if cell_editor_open && modal.is_none() {
-        cell_editor_shield(ui.ctx());
-    }
     // Back to front, so the newest dialog draws last, on top, and the one
     // `state.modal()` names is the one whose key was read.
     for open in &open_modals {
@@ -205,8 +202,9 @@ fn modal_shield(ctx: &egui::Context, modal: crate::app::Modal) {
 }
 
 /// The same shield under the cell editor, which owns the keyboard like a
-/// dialog when no dialog backs it.
-fn cell_editor_shield(ctx: &egui::Context) {
+/// dialog when no dialog backs it. The editor draws it immediately before its
+/// window, so the window lands on top.
+pub(crate) fn cell_editor_shield(ctx: &egui::Context) {
     click_shield(ctx, egui::Id::new("crusty_cell_editor_shield"));
 }
 

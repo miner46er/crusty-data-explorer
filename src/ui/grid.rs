@@ -1045,6 +1045,10 @@ pub fn results(
     }
     let target = state.edit_target(tab_id);
     let filter_history = state.filter_history().to_vec();
+    // Whether a dialog backs the grid this frame, read live. The cell editor
+    // draws its shield on exactly the frames no dialog does, the way `root`
+    // gates it, but a pre-panel read would lag the creation frame.
+    let dialog_open = state.modal().is_some();
     let grid_conn = state
         .tab(tab_id)
         .and_then(|t| t.conn)
@@ -1063,6 +1067,7 @@ pub fn results(
         target.as_ref(),
         &filter_history,
         modal_open,
+        dialog_open,
         grid_conn,
         cell_editor_key,
         ui,
@@ -1502,6 +1507,7 @@ fn cell_editor_window(
     editable: bool,
     active_result: usize,
     key: Option<ModalKey>,
+    dialog_open: bool,
     ui: &mut egui::Ui,
 ) -> Vec<EditAction> {
     let mut actions = Vec::new();
@@ -1517,6 +1523,12 @@ fn cell_editor_window(
     let mut set_null = false;
     let mut set_default = false;
     let mut cancel = false;
+    // The click shield goes down immediately before the window, the dialog
+    // pattern, so the window lands on top. `dialog_open` reads live, so the
+    // creation frame already draws both together.
+    if !dialog_open {
+        super::cell_editor_shield(ui.ctx());
+    }
     let window = egui::Window::new(title).collapsible(false).resizable(true).show(ui.ctx(), |ui| {
         ui.label(egui::RichText::new(format!("{name} · {type_name}")).small().weak());
         ui.label(egui::RichText::new(status).small().weak());
@@ -1853,11 +1865,13 @@ fn cell_label_color(selected: bool, palette: &Palette) -> Option<egui::Color32> 
     selected.then_some(palette.selection_text)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn results_grid(
     tab: &mut Tab,
     target: Option<&EditTarget>,
     filter_history: &[SavedFilter],
     modal_open: bool,
+    dialog_open: bool,
     grid_conn: Option<GridConn>,
     cell_editor_key: Option<ModalKey>,
     ui: &mut egui::Ui,
@@ -2764,7 +2778,7 @@ fn results_grid(
     let mut clipboard = grid_clipboard_keys(tab, editable, &selection, &visible, modal_open, ui);
     actions.append(&mut clipboard);
     let mut editor_modal =
-        cell_editor_window(tab, &cols, editable, active_result, cell_editor_key, ui);
+        cell_editor_window(tab, &cols, editable, active_result, cell_editor_key, dialog_open, ui);
     actions.append(&mut editor_modal);
     store_selection(ui.ctx(), tab.id, &selection);
     store_grid_view(ui.ctx(), tab.id, &view);
