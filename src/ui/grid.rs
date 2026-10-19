@@ -335,6 +335,21 @@ fn take_grid_scroll(ctx: &egui::Context, tab: TabId) -> Option<usize> {
     ctx.data_mut(|data| data.remove_temp::<usize>(grid_scroll_id(tab)))
 }
 
+/// Whether the grid, rather than the chrome, owns the keyboard for one tab.
+/// Armed by a cell click or a cursor key with nothing else focused; disarmed
+/// when any widget takes focus, so Tab never runs the grid behind a field.
+fn grid_armed_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_grid_armed", tab))
+}
+
+fn grid_armed(ctx: &egui::Context, tab: TabId) -> bool {
+    ctx.data(|data| data.get_temp(grid_armed_id(tab))).unwrap_or(false)
+}
+
+fn set_grid_armed(ctx: &egui::Context, tab: TabId, armed: bool) {
+    ctx.data_mut(|data| data.insert_temp(grid_armed_id(tab), armed));
+}
+
 const GRID_ROW_H: f32 = 20.0;
 
 /// The page a PageUp or PageDown moves when the viewport cannot be measured.
@@ -1543,6 +1558,9 @@ fn cell_editor_window(
     } else if cancel {
         store_cell_editor(ui.ctx(), tab.id, None);
     }
+    if cell_editor_of(ui.ctx(), tab.id).is_none() {
+        set_grid_armed(ui.ctx(), tab.id, true);
+    }
     actions
 }
 
@@ -2694,8 +2712,15 @@ fn results_grid(
             );
         }
     });
+    let clicked_cell = !gestures.is_empty();
     for (row, col, shift, ctrl) in gestures {
         selection.gesture(row, col, shift, ctrl);
+    }
+    if clicked_cell {
+        if let Some(focused) = ui.ctx().memory(|memory| memory.focused()) {
+            ui.ctx().memory_mut(|memory| memory.surrender_focus(focused));
+        }
+        set_grid_armed(ui.ctx(), tab.id, true);
     }
     let mut keyed = grid_edit_keys(tab, editable, &selection, &visible, &mut view, modal_open, ui);
     actions.append(&mut keyed);
@@ -3309,19 +3334,10 @@ fn grid_edit_keys(
     actions
 }
 
-/// Hand back the focus egui's Tab traversal gives the first focusable widget
-/// of the frame, which happens before this handler runs. Without it one Tab
-/// press would move the chrome's focus and the typing gate would then block
-/// every grid key.
-fn release_tab_focus(ui: &egui::Ui) {
-    let Some(focused) = ui.ctx().memory(|memory| memory.focused()) else { return };
-    if !ui.ctx().memory(|memory| memory.had_focus_last_frame(focused)) {
-        ui.ctx().memory_mut(|memory| memory.surrender_focus(focused));
-    }
-}
-
-/// Arrow, Home/End, Page, and Tab movement of the grid cursor, gated like
-/// [`grid_clipboard_keys`]. Returns the table row the view should scroll to.
+/// Arrow, Home/End, Page, and Tab movement of the grid cursor. The grid only
+/// owns those keys while [`grid_armed`] says so, which a cell click or a
+/// cursor key with nothing focused arms. Returns the table row the view
+/// should scroll to.
 fn grid_cursor_keys(
     tab: TabId,
     selection: &mut Selection,
@@ -3332,17 +3348,40 @@ fn grid_cursor_keys(
     ui: &egui::Ui,
 ) -> Option<usize> {
     if modal_open {
+        set_grid_armed(ui.ctx(), tab, false);
         return None;
     }
+    let mut armed = grid_armed(ui.ctx(), tab);
     let (shift, alt) = ui.input(|input| (input.modifiers.shift, input.modifiers.alt));
     let tab_pressed = ui.input(|input| input.key_pressed(egui::Key::Tab));
-    let can_move = !visible.is_empty() && cols > 0;
-    if tab_pressed && can_move {
-        release_tab_focus(ui);
+    let focused = ui.ctx().memory(|memory| memory.focused());
+    if let Some(focused) = focused {
+        let newly_focused =
+            !ui.ctx().memory(|memory| memory.had_focus_last_frame(focused));
+        // Tab traversal runs before this handler. While the grid is armed it
+        // took a widget the operator did not ask for, so drop that focus and
+        // keep the press for the grid.
+        if armed && tab_pressed && newly_focused {
+            ui.ctx().memory_mut(|memory| memory.surrender_focus(focused));
+        } else {
+            set_grid_armed(ui.ctx(), tab, false);
+            return None;
+        }
     }
-    let typing = edit_field_of(ui.ctx(), tab).is_some()
-        || ui.ctx().memory(|memory| memory.focused().is_some());
+    let typing = edit_field_of(ui.ctx(), tab).is_some();
     if typing {
+        return None;
+    }
+    if tab_pressed {
+        if armed
+            && !visible.is_empty()
+            && cols > 0
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+        {
+            selection.tab_step(shift, visible, cols, page);
+            set_grid_armed(ui.ctx(), tab, true);
+            return selection.position(visible);
+        }
         return None;
     }
     let mut cursor: Option<Step> = None;
@@ -3365,16 +3404,10 @@ fn grid_cursor_keys(
         take(egui::Modifiers::NONE, egui::Key::ArrowLeft, Step::Left);
         take(egui::Modifiers::NONE, egui::Key::ArrowRight, Step::Right);
     }
-    if let Some(step) = cursor {
-        selection.step(step, shift, visible, cols, page);
-    } else if tab_pressed
-        && can_move
-        && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
-    {
-        selection.tab_step(shift, visible, cols, page);
-    } else {
-        return None;
-    }
+    let step = cursor?;
+    selection.step(step, shift, visible, cols, page);
+    armed = true;
+    set_grid_armed(ui.ctx(), tab, armed);
     selection.position(visible)
 }
 
