@@ -2140,6 +2140,35 @@ impl AppState {
         }
     }
 
+    /// Move the active tab `step` places forward (negative goes back),
+    /// wrapping around the ends. No-op with no tabs.
+    pub fn activate_relative(&mut self, step: isize) {
+        let len = self.tabs.len();
+        if len == 0 {
+            return;
+        }
+        let Some(current) = self.active.and_then(|id| self.tabs.iter().position(|t| t.id == id))
+        else {
+            self.active = Some(self.tabs[0].id);
+            return;
+        };
+        let next = (current as isize + step).rem_euclid(len as isize) as usize;
+        self.active = Some(self.tabs[next].id);
+    }
+
+    /// Activate the `n`th tab, 1-based. Nine selects the last tab, the
+    /// browser rule, whatever the count; other out-of-range values are no-ops.
+    pub fn activate_nth(&mut self, n: usize) {
+        let index = match n {
+            0 => return,
+            9 => self.tabs.len().checked_sub(1),
+            n => n.checked_sub(1),
+        };
+        if let Some(index) = index.filter(|index| *index < self.tabs.len()) {
+            self.active = Some(self.tabs[index].id);
+        }
+    }
+
     /// Resolve the tab's scope against the editor text and send the batch.
     /// An empty effective set is an error before anything reaches the worker.
     /// A batch with placeholders arms the value prompt instead of sending.
@@ -6303,6 +6332,43 @@ mod tests {
             assert_eq!(state.tab(tab).expect("tab").sort_dir(), SortDir::Asc);
             state.tab_mut(tab).expect("tab").set_filter("ada".to_owned());
             assert_eq!(state.tab(tab).expect("tab").filter(), "ada");
+        });
+    }
+
+    #[test]
+    fn activate_relative_wraps_and_activate_nth_follows_the_browser_rule() {
+        with_isolated_state("tab-chords", |state| {
+            state.activate_relative(1);
+            state.activate_nth(1);
+            assert_eq!(state.active(), None, "no tabs to switch to");
+
+            let conn = add_sqlite_connection(state, "mem-chords");
+            let first = state.new_tab(conn);
+            let second = state.new_tab(conn);
+            let third = state.new_tab(conn);
+            assert_eq!(state.active(), Some(first), "the first tab starts active");
+
+            state.activate_relative(1);
+            assert_eq!(state.active(), Some(second));
+            state.activate_relative(1);
+            assert_eq!(state.active(), Some(third));
+            state.activate_relative(1);
+            assert_eq!(state.active(), Some(first), "forward wraps");
+            state.activate_relative(-1);
+            assert_eq!(state.active(), Some(third), "backward wraps");
+
+            state.activate_nth(2);
+            assert_eq!(state.active(), Some(second));
+            state.activate_nth(1);
+            assert_eq!(state.active(), Some(first));
+            state.activate_nth(3);
+            assert_eq!(state.active(), Some(third));
+            state.activate_nth(9);
+            assert_eq!(state.active(), Some(third), "9 selects the last tab");
+            state.activate_nth(4);
+            assert_eq!(state.active(), Some(third), "past the end is a no-op");
+            state.activate_nth(0);
+            assert_eq!(state.active(), Some(third), "0 is out of range");
         });
     }
 

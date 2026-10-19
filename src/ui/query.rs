@@ -28,6 +28,33 @@ pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
             i.consume_shortcut(&close_tab_shortcut()),
         )
     });
+    // Tab switching claims its chords before the TextEdit sees them, so
+    // Ctrl+Tab never inserts a tab character and plain Tab stays focus
+    // traversal. Previous-tab is checked first: `consume_shortcut` matches
+    // logically, so CTRL would also eat Ctrl+Shift+Tab.
+    let mut switch: Option<isize> = None;
+    let mut switch_nth: Option<usize> = None;
+    if !modal_open {
+        ui.input_mut(|i| {
+            if i.consume_shortcut(&previous_tab_shortcut())
+                || i.consume_shortcut(&previous_page_shortcut())
+            {
+                switch = Some(-1);
+            } else if i.consume_shortcut(&next_tab_shortcut())
+                || i.consume_shortcut(&next_page_shortcut())
+            {
+                switch = Some(1);
+            } else {
+                switch_nth = (1..=9).find(|n| i.consume_shortcut(&tab_nth_shortcut(*n)));
+            }
+        });
+        if let Some(step) = switch {
+            state.activate_relative(step);
+        }
+        if let Some(n) = switch_nth {
+            state.activate_nth(n);
+        }
+    }
     if !modal_open {
         if new_tab_shortcut_pressed {
             if let Some(conn) = state.default_connection() {
@@ -272,6 +299,42 @@ pub fn close_tab_shortcut() -> egui::KeyboardShortcut {
 
 pub fn find_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::F)
+}
+
+/// Ctrl+Tab on every platform: Cmd+Tab is the macOS app switcher.
+pub fn next_tab_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Tab)
+}
+
+/// Ctrl+Shift+Tab, the reverse of [`next_tab_shortcut`]. Checked first,
+/// because `consume_shortcut` matches logically and Ctrl alone would eat it.
+pub fn previous_tab_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Tab)
+}
+
+pub fn next_page_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::PageDown)
+}
+
+pub fn previous_page_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::PageUp)
+}
+
+/// The Cmd/Ctrl+N tab chord, 1 through 9. Nine selects the last tab.
+pub fn tab_nth_shortcut(n: usize) -> egui::KeyboardShortcut {
+    const KEYS: [egui::Key; 9] = [
+        egui::Key::Num1,
+        egui::Key::Num2,
+        egui::Key::Num3,
+        egui::Key::Num4,
+        egui::Key::Num5,
+        egui::Key::Num6,
+        egui::Key::Num7,
+        egui::Key::Num8,
+        egui::Key::Num9,
+    ];
+    let key = *KEYS.get(n - 1).expect("tab numbers are 1 through 9");
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key)
 }
 
 /// Per-tab find bar state, kept in the egui context data keyed by tab id.
@@ -566,6 +629,24 @@ mod tests {
         let find = find_shortcut();
         assert_eq!(find.modifiers, egui::Modifiers::COMMAND);
         assert_eq!(find.logical_key, egui::Key::F);
+        let next_tab = next_tab_shortcut();
+        assert_eq!(next_tab.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(next_tab.logical_key, egui::Key::Tab);
+        let previous_tab = previous_tab_shortcut();
+        assert_eq!(previous_tab.modifiers, egui::Modifiers::CTRL | egui::Modifiers::SHIFT);
+        assert_eq!(previous_tab.logical_key, egui::Key::Tab);
+        let next_page = next_page_shortcut();
+        assert_eq!(next_page.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(next_page.logical_key, egui::Key::PageDown);
+        let previous_page = previous_page_shortcut();
+        assert_eq!(previous_page.modifiers, egui::Modifiers::CTRL);
+        assert_eq!(previous_page.logical_key, egui::Key::PageUp);
+        for n in 1..=9 {
+            let nth = tab_nth_shortcut(n);
+            assert_eq!(nth.modifiers, egui::Modifiers::COMMAND, "tab {n}");
+        }
+        assert_eq!(tab_nth_shortcut(1).logical_key, egui::Key::Num1);
+        assert_eq!(tab_nth_shortcut(9).logical_key, egui::Key::Num9);
     }
 
     #[test]

@@ -24,6 +24,7 @@ use egui_kittest::kittest::{By, NodeT, Queryable};
 use crusty_data_explorer::app::{AppState, ConnectionState, Environment, RunOutcome};
 use crusty_data_explorer::db::{ConnectionConfig, ConnectionId, PostgresSslMode, TabId};
 use crusty_data_explorer::ui;
+use crusty_data_explorer::ui::complete::editor_id;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1595,4 +1596,65 @@ fn password_prompt_focuses_the_field_and_escape_cancels() {
     harness.key_press(egui::Key::Escape);
     harness.run();
     assert!(harness.state().password_prompt().is_none(), "Escape cancels the prompt");
+}
+
+/// The tab chords: Ctrl+Tab and Ctrl+PageDown step the strip, Ctrl+1..9
+/// jump, and none of them lands as a tab character in the focused editor.
+#[test]
+fn tab_chords_switch_tabs_without_typing_into_the_editor() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, first) = demo_setup("tab-chords");
+    let conn = harness.state().tab(first).and_then(|tab| tab.conn).expect("a connection");
+    let second = harness.state_mut().new_tab(conn);
+    let third = harness.state_mut().new_tab(conn);
+    harness.state_mut().activate(first);
+    harness.ctx.memory_mut(|memory| memory.request_focus(editor_id(first)));
+    harness.run();
+    assert_eq!(
+        harness.ctx.memory(|memory| memory.focused()),
+        Some(editor_id(first)),
+        "the SQL editor holds focus"
+    );
+    let first_sql = harness.state().tab(first).expect("first tab").sql.clone();
+
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Tab);
+    harness.run();
+    assert_eq!(harness.state().active(), Some(second), "Ctrl+Tab steps forward");
+    assert_eq!(
+        harness.state().tab(first).expect("first tab").sql,
+        first_sql,
+        "Ctrl+Tab inserted no tab character"
+    );
+
+    harness.ctx.memory_mut(|memory| memory.request_focus(editor_id(second)));
+    harness.run();
+    let second_sql = harness.state().tab(second).expect("second tab").sql.clone();
+    harness.key_press_modifiers(
+        egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        egui::Key::Tab,
+    );
+    harness.run();
+    assert_eq!(harness.state().active(), Some(first), "Ctrl+Shift+Tab steps back");
+    assert_eq!(
+        harness.state().tab(second).expect("second tab").sql,
+        second_sql,
+        "Ctrl+Shift+Tab inserted no tab character"
+    );
+
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::PageDown);
+    harness.run();
+    assert_eq!(harness.state().active(), Some(second), "Ctrl+PageDown steps forward");
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::PageUp);
+    harness.run();
+    assert_eq!(harness.state().active(), Some(first), "Ctrl+PageUp steps back");
+
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num3);
+    harness.run();
+    assert_eq!(harness.state().active(), Some(third), "Cmd/Ctrl+3 jumps to the third tab");
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num9);
+    harness.run();
+    assert_eq!(harness.state().active(), Some(third), "9 selects the last tab");
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num1);
+    harness.run();
+    assert_eq!(harness.state().active(), Some(first), "1 selects the first tab");
 }
