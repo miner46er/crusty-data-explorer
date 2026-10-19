@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use calamine::{Data, ExcelDateTime, Reader, Xlsx, open_workbook_from_rs};
 
-use crate::edit::{ident, quote_qualified, to_literal};
+use crate::edit::{ident, quote_qualified, to_typed_literal};
 
 /// Data rows beyond this count are dropped from one import.
 pub const ROW_CAP: usize = 1000;
@@ -299,10 +299,22 @@ pub fn map_headers(headers: &[String], table_columns: &[String]) -> ColumnMap {
 
 /// The INSERT statements one import sends: each row's mapped cells in table
 /// column order, at most [`BATCH_ROWS`] value tuples per statement, and at
-/// most [`ROW_CAP`] rows in all. Values render through [`to_literal`] so an
-/// imported cell maps exactly like an inserted edit row. No mapped column
-/// means no statements.
+/// most [`ROW_CAP`] rows in all. Values render through
+/// [`crate::edit::to_literal`] so an imported cell maps exactly like an
+/// inserted edit row. No mapped column means no statements.
 pub fn insert_batches(table: &str, map: &ColumnMap, rows: &[Vec<String>]) -> Vec<String> {
+    insert_typed_batches(table, map, rows, &[])
+}
+
+/// [`insert_batches`] with one text flag per table column position: a cell
+/// landing in a text column renders through [`crate::edit::to_typed_literal`],
+/// so `"007"` keeps its text identity. A missing flag reads as false.
+pub fn insert_typed_batches(
+    table: &str,
+    map: &ColumnMap,
+    rows: &[Vec<String>],
+    text_cols: &[bool],
+) -> Vec<String> {
     if map.pairs.is_empty() {
         return Vec::new();
     }
@@ -323,7 +335,10 @@ pub fn insert_batches(table: &str, map: &ColumnMap, rows: &[Vec<String>]) -> Vec
                     let values = map
                         .pairs
                         .iter()
-                        .map(|(header, _)| to_literal(&row[*header], false))
+                        .map(|(header, column)| {
+                            let is_text = text_cols.get(*column).copied().unwrap_or(false);
+                            to_typed_literal(&row[*header], false, is_text)
+                        })
                         .collect::<Vec<_>>()
                         .join(", ");
                     format!("({values})")
@@ -503,6 +518,39 @@ mod tests {
                  VALUES ('acme', 7, 'O''Brien'), ('globex', NULL, 'Lin')"
             ]
         );
+    }
+
+    #[test]
+    fn insert_typed_batches_quote_text_columns_by_position() {
+        let map = ColumnMap {
+            pairs: vec![(0, 0), (1, 1)],
+            columns: vec!["code".to_owned(), "n".to_owned()],
+            skipped: Vec::new(),
+        };
+        let rows = vec![
+            vec!["42".to_owned(), "42".to_owned()],
+            vec!["007".to_owned(), String::new()],
+        ];
+        assert_eq!(
+            insert_typed_batches("main.items", &map, &rows, &[true, false]),
+            vec![
+                "INSERT INTO \"main\".\"items\" (\"code\", \"n\") \
+                 VALUES ('42', 42), ('007', NULL)"
+            ]
+        );
+        assert_eq!(
+            insert_typed_batches("main.items", &map, &rows, &[]),
+            vec![
+                "INSERT INTO \"main\".\"items\" (\"code\", \"n\") \
+                 VALUES (42, 42), ('007', NULL)"
+            ]
+        );
+        let none = ColumnMap {
+            pairs: Vec::new(),
+            columns: vec!["code".to_owned()],
+            skipped: Vec::new(),
+        };
+        assert!(insert_typed_batches("main.items", &none, &rows, &[true]).is_empty());
     }
 
     #[test]
