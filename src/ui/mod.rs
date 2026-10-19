@@ -90,7 +90,7 @@ pub(crate) fn modal_key(ui: &egui::Ui, allow_submit: bool) -> Option<ModalKey> {
 
 /// Consume one press of `key` with no modifiers at all. `consume_key` matches
 /// logically and would also eat Shift+Enter.
-fn consume_plain_key(input: &mut egui::InputState, key: egui::Key) -> bool {
+pub(crate) fn consume_plain_key(input: &mut egui::InputState, key: egui::Key) -> bool {
     let before = input.events.len();
     input.events.retain(|event| match event {
         egui::Event::Key { key: event_key, modifiers, pressed: true, .. } => {

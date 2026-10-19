@@ -343,6 +343,10 @@ struct FindBar {
     open: bool,
     selected: Option<usize>,
     state: FindState,
+    /// Whether the find field held focus at the end of last frame. egui
+    /// clears focus on a plain Escape before the UI runs, so the bar cannot
+    /// ask the live memory while deciding who owns Escape.
+    field_focused: bool,
 }
 
 /// Find bar state id for one tab, the ctx-data pattern `complete.rs` uses.
@@ -369,6 +373,7 @@ pub(crate) fn toggle_find(ctx: &egui::Context, tab: TabId) -> bool {
     bar.open = !bar.open;
     if bar.open {
         bar.selected = None;
+        bar.field_focused = false;
     }
     let open = bar.open;
     store_find_bar(ctx, tab, bar);
@@ -378,6 +383,7 @@ pub(crate) fn toggle_find(ctx: &egui::Context, tab: TabId) -> bool {
 fn close_find(ctx: &egui::Context, tab: TabId) {
     let mut bar = find_bar_of(ctx, tab);
     bar.open = false;
+    bar.field_focused = false;
     store_find_bar(ctx, tab, bar);
 }
 
@@ -416,6 +422,22 @@ fn find_bar(state: &AppState, ui: &mut egui::Ui, just_opened: bool) {
     }
     let mut pick: Option<usize> = None;
     let mut close = false;
+    // Claimed before the field draws: a singleline TextEdit answers Enter by
+    // surrendering focus, which would swallow the step. Keyboard stepping
+    // keeps the caret in the find field; the buttons below still hand focus
+    // to the editor so the selection paints.
+    let focused = bar.field_focused;
+    let mut step: Option<isize> = None;
+    if focused {
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter)) {
+            step = Some(-1);
+        } else if ui.input_mut(|i| super::consume_plain_key(i, egui::Key::Enter)) {
+            step = Some(1);
+        }
+        if ui.input_mut(|i| super::consume_plain_key(i, egui::Key::Escape)) {
+            close = true;
+        }
+    }
     ui.horizontal(|ui| {
         ui.label("Find");
         let field = ui.add(
@@ -426,6 +448,7 @@ fn find_bar(state: &AppState, ui: &mut egui::Ui, just_opened: bool) {
         if just_opened {
             field.request_focus();
         }
+        bar.field_focused = field.has_focus();
         if field.changed() {
             bar.selected = None;
         }
@@ -447,17 +470,30 @@ fn find_bar(state: &AppState, ui: &mut egui::Ui, just_opened: bool) {
             close = true;
         }
     });
+    if let Some(direction) = step {
+        let count = hits.len();
+        if count > 0 {
+            pick = Some(match direction {
+                -1 => bar.selected.map_or(count - 1, |i| (i + count - 1) % count),
+                _ => bar.selected.map_or(0, |i| (i + 1) % count),
+            });
+        }
+    }
     if let Some(i) = pick {
         bar.selected = Some(i);
         if let Some(bytes) = hits.get(i) {
             super::complete::set_selection(ui.ctx(), tab_id, char_range(sql, bytes));
-            // egui paints a selection only while the TextEdit holds focus.
-            ui.ctx()
-                .memory_mut(|m| m.request_focus(super::complete::editor_id(tab_id)));
+            if step.is_none() {
+                // egui paints a selection only while the TextEdit holds focus.
+                ui.ctx()
+                    .memory_mut(|m| m.request_focus(super::complete::editor_id(tab_id)));
+            }
         }
     }
     if close {
         bar.open = false;
+        ui.ctx()
+            .memory_mut(|m| m.request_focus(super::complete::editor_id(tab_id)));
     }
     store_find_bar(ui.ctx(), tab_id, bar);
 }

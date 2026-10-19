@@ -1658,3 +1658,54 @@ fn tab_chords_switch_tabs_without_typing_into_the_editor() {
     harness.run();
     assert_eq!(harness.state().active(), Some(first), "1 selects the first tab");
 }
+
+/// The find bar's keys: Enter steps to the next match and Shift+Enter to the
+/// previous, the caret stays in the find field, and Escape closes the bar and
+/// hands the caret back to the editor.
+#[test]
+fn find_bar_steps_matches_with_enter_and_returns_focus_on_escape() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("find-keys");
+    let sql = "SELECT 1;\nSELECT 2;";
+    *harness.state_mut().tab_sql_mut(tab).expect("the tab's sql") = sql.to_owned();
+    harness.ctx.memory_mut(|memory| memory.request_focus(editor_id(tab)));
+    harness.run();
+
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F);
+    harness.run();
+    harness.event(egui::Event::Text("SELECT".to_owned()));
+    harness.run();
+    assert!(harness.query_by_label("0/2").is_some(), "the query finds both statements");
+
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(harness.query_by_label("1/2").is_some(), "Enter moves to the first match");
+    assert_ne!(
+        harness.ctx.memory(|memory| memory.focused()),
+        Some(editor_id(tab)),
+        "Enter keeps the caret in the find field"
+    );
+
+    harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.query_by_label("2/2").is_some(),
+        "Shift+Enter wraps to the previous match"
+    );
+
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(harness.query_by_label("2/2").is_none(), "Escape closes the bar");
+    assert_eq!(
+        harness.ctx.memory(|memory| memory.focused()),
+        Some(editor_id(tab)),
+        "Escape returns the caret to the editor"
+    );
+    // egui collapses a selection set while the editor is unfocused to the
+    // selection's end; stepping still parks the editor caret on the match.
+    assert_eq!(
+        crusty_data_explorer::ui::complete::editor_offsets(&harness.ctx, tab, sql).0,
+        16,
+        "the caret sits at the end of the stepped-to match"
+    );
+}
