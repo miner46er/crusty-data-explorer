@@ -386,6 +386,9 @@ fn manual_plan(open: bool, control: Option<TxControl>) -> ManualPlan {
     }
 }
 
+/// Uppercase keyword at the head of `sql` and the byte offset after it,
+/// skipping whitespace, `--` and `#` line comments, block comments, and the
+/// wrapping parens and terminators around the head.
 fn keyword_span(sql: &str) -> Option<(String, usize)> {
     let bytes = sql.as_bytes();
     let mut i = 0;
@@ -393,33 +396,14 @@ fn keyword_span(sql: &str) -> Option<(String, usize)> {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        if sql[i..].starts_with("--") {
-            match sql[i..].find('\n') {
-                Some(nl) => {
-                    i += nl + 1;
-                    continue;
-                }
-                None => return None,
-            }
-        }
-        if sql[i..].starts_with("/*") {
-            match sql[i..].find("*/") {
-                Some(end) => {
-                    i += end + 2;
-                    continue;
-                }
-                None => return None,
-            }
-        }
-        if bytes.get(i) == Some(&b'(') {
+        if matches!(bytes.get(i), Some(&b'(') | Some(&b';')) {
             i += 1;
             continue;
         }
-        if bytes.get(i) == Some(&b';') {
-            i += 1;
-            continue;
+        match skipped_token(sql, i) {
+            Some(Skipped::Comment { end }) => i = end,
+            _ => break,
         }
-        break;
     }
     let start = i;
     while i < bytes.len()
@@ -440,27 +424,11 @@ fn skip_ignorable(sql: &str, mut i: usize) -> usize {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        if sql[i..].starts_with("--") {
-            match sql[i..].find('\n') {
-                Some(nl) => {
-                    i += nl + 1;
-                    continue;
-                }
-                None => return sql.len(),
-            }
+        match skipped_token(sql, i) {
+            Some(Skipped::Comment { end }) => i = end,
+            _ => return i,
         }
-        if sql[i..].starts_with("/*") {
-            match sql[i..].find("*/") {
-                Some(end) => {
-                    i += end + 2;
-                    continue;
-                }
-                None => return sql.len(),
-            }
-        }
-        break;
     }
-    i
 }
 
 /// One ASCII word at `i` with the offset after it.
@@ -478,42 +446,41 @@ fn word_at(sql: &str, i: usize) -> Option<(String, usize)> {
     Some((sql[i..end].to_owned(), end))
 }
 
-/// One table name at `i`: a bare or double-quoted part with dots joining
-/// further parts. Quoted parts unescape; each part keeps its text.
+/// One table name at `i`: a bare or quoted part with dots joining further
+/// parts, and a trailing `.*` reading as the same table. Quoted parts
+/// unescape; each part keeps its text.
 fn identifier_at(sql: &str, i: usize) -> Option<(String, usize)> {
     let mut pos = skip_ignorable(sql, i);
     let mut parts = Vec::new();
     loop {
         let bytes = sql.as_bytes();
-        if bytes.get(pos) == Some(&b'"') {
-            let mut text = String::new();
-            pos += 1;
-            loop {
-                let c = sql[pos..].chars().next()?;
-                if c == '"' {
-                    if sql[pos + 1..].starts_with('"') {
-                        text.push('"');
-                        pos += 2;
-                        continue;
-                    }
-                    pos += 1;
-                    break;
+        match bytes.get(pos) {
+            Some(&quote @ (b'"' | b'`')) => {
+                let end = scan_quote(bytes, pos, quote);
+                if bytes.get(end - 1) != Some(&quote) {
+                    return None;
                 }
-                text.push(c);
-                pos += c.len_utf8();
+                let text = unquote(&sql[pos..end], quote);
+                if text.trim().is_empty() {
+                    return None;
+                }
+                parts.push(text);
+                pos = end;
             }
-            if text.trim().is_empty() {
-                return None;
+            _ => {
+                let (word, next) = word_at(sql, pos)?;
+                parts.push(word);
+                pos = next;
             }
-            parts.push(text);
-        } else {
-            let (word, next) = word_at(sql, pos)?;
-            parts.push(word);
-            pos = next;
         }
         let after = skip_ignorable(sql, pos);
-        if sql.as_bytes().get(after) == Some(&b'.') {
-            pos = skip_ignorable(sql, after + 1);
+        if bytes.get(after) == Some(&b'.') {
+            let next_part = skip_ignorable(sql, after + 1);
+            if bytes.get(next_part) == Some(&b'*') {
+                pos = skip_ignorable(sql, next_part + 1);
+                break;
+            }
+            pos = next_part;
             continue;
         }
         pos = after;
@@ -522,83 +489,74 @@ fn identifier_at(sql: &str, i: usize) -> Option<(String, usize)> {
     (!parts.is_empty()).then(|| (parts.join("."), pos))
 }
 
-/// True when a WHERE keyword sits at paren depth zero outside strings,
-/// quoted identifiers, and comments.
-fn has_outer_where(sql: &str) -> bool {
-    let bytes = sql.as_bytes();
+/// `text`, a quoted identifier including its quotes, with the quotes removed
+/// and each doubled quote inside collapsed to one, the SQL standard escape.
+fn unquote(text: &str, quote: u8) -> String {
+    let inner = &text[1..text.len() - 1];
+    let bytes = inner.as_bytes();
+    let mut out = String::with_capacity(inner.len());
     let mut i = 0;
-    let mut depth: i32 = 0;
     while i < bytes.len() {
-        if bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'-') {
+        if bytes[i] == quote && bytes.get(i + 1) == Some(&quote) {
+            out.push(char::from(quote));
             i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
             continue;
         }
-        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
-            i += 2;
-            while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
-                i += 1;
-            }
-            i = (i + 2).min(bytes.len());
-            continue;
-        }
-        if bytes[i] == b'\'' {
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'\'' {
-                    if bytes.get(i + 1) == Some(&b'\'') {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if bytes[i] == b'"' {
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'"' {
-                    if bytes.get(i + 1) == Some(&b'"') {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if bytes[i] == b'(' {
-            depth += 1;
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b')' {
-            depth = depth.saturating_sub(1);
-            i += 1;
-            continue;
-        }
-        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
-            let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
-            {
-                i += 1;
-            }
-            if depth == 0 && sql[start..i].eq_ignore_ascii_case("where") {
-                return true;
-            }
-            continue;
-        }
-        i += 1;
+        let character = inner[i..].chars().next().expect("non-empty slice");
+        out.push(character);
+        i += character.len_utf8();
     }
-    false
+    out
+}
+
+/// True when a WHERE keyword sits at paren depth zero outside strings,
+/// quoted identifiers, comments, and dollar-quoted literals.
+fn has_outer_where(sql: &str) -> bool {
+    first_top_level_word(sql, 0, &["WHERE"]).is_some()
+}
+
+/// The first word in `words`, matched case-insensitively, at paren depth zero
+/// in `sql[start..]`. Strings, quoted identifiers, comments, and
+/// dollar-quoted literals never count. None when none of `words` appears.
+fn first_top_level_word<'a>(sql: &'a str, start: usize, words: &[&str]) -> Option<&'a str> {
+    let bytes = sql.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = start;
+    while i < bytes.len() {
+        if let Some(token) = skipped_token(sql, i) {
+            i = token.end();
+            continue;
+        }
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let word_start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric()
+                        || bytes[i] == b'_'
+                        || bytes[i] == b'$')
+                {
+                    i += 1;
+                }
+                if depth == 0
+                    && words
+                        .iter()
+                        .any(|word| sql[word_start..i].eq_ignore_ascii_case(word))
+                {
+                    return Some(&sql[word_start..i]);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// The single list of bundled engines. The connection form iterates
@@ -8203,6 +8161,45 @@ mod tests {
             assert_eq!(write_statement_kind(sql), None, "{sql:?}");
             assert!(!is_write_statement(sql), "{sql:?}");
         }
+    }
+
+    #[test]
+    fn guards_read_hash_comments_and_backtick_identifiers() {
+        assert_eq!(write_statement_kind("# wipe\nDELETE FROM t"), Some("DELETE"));
+        assert_eq!(
+            unqualified_write("DELETE FROM t # WHERE id = 1"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "t".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("UPDATE `my table` SET a = 1"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "my table".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("DELETE FROM `a``b`"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "a`b".to_owned() })
+        );
+        assert_eq!(unqualified_write("DELETE FROM `orders` WHERE id = 1"), None);
+        assert_eq!(
+            unqualified_write("UPDATE `t` SET note = 'x' -- where\n"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "t".to_owned() })
+        );
+    }
+
+    #[test]
+    fn dollar_quoted_text_never_reads_as_a_clause() {
+        assert_eq!(
+            unqualified_write("UPDATE t SET note = $$ WHERE $$"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "t".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("UPDATE t SET note = $q$ WHERE $q$"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "t".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("UPDATE t SET note = $$x$$ /* where */"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "t".to_owned() })
+        );
+        assert_eq!(unqualified_write("DELETE FROM t WHERE note = $$x$$"), None);
     }
 
     #[test]
