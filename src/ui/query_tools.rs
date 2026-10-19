@@ -438,7 +438,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_toolbar_row_count_comes_from_the_idle_content() {
+    fn idle_toolbar_wraps_narrow_and_fits_wide() {
         let fits = |width: f32| {
             let ctx = egui::Context::default();
             crate::ui::install(&ctx);
