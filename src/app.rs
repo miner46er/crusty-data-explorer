@@ -1528,6 +1528,8 @@ fn table_column_is_text(schema: &SchemaInfo, table: &str, column: &str) -> bool 
 /// Key pairs for one row: each key column with the literal of the original
 /// cell display, so the WHERE clause names the row exactly as displayed. A
 /// text key always renders quoted; the rest keep [`to_literal`]'s mapping.
+/// None when a key cell is NULL: `= NULL` matches nothing, so an outer join's
+/// unmatched side refuses rather than building a dead statement.
 fn key_pairs(
     result: &QueryResult,
     target: &EditTarget,
@@ -1536,16 +1538,19 @@ fn key_pairs(
     let mut pairs = Vec::with_capacity(target.pk_cols.len());
     for (index, (name, col)) in target.pk_cols.iter().enumerate() {
         let cell = result.cell(row, *col)?;
-        let was_null = matches!(cell, Value::Null);
+        if matches!(cell, Value::Null) {
+            return None;
+        }
         let text_key = target.pk_types.get(index).copied().unwrap_or(false);
-        let literal = key_literal(&cell.display(usize::MAX), was_null, text_key);
+        let literal = key_literal(&cell.display(usize::MAX), false, text_key);
         pairs.push((name.clone(), literal));
     }
     Some(pairs)
 }
 
 /// Key pairs for one joined table: the same literal mapping as
-/// [`key_pairs`] over that table's result columns.
+/// [`key_pairs`] over that table's result columns, and the same NULL refusal
+/// so an unmatched outer-joined side never builds `WHERE "id" = NULL`.
 fn join_key_pairs(
     result: &QueryResult,
     table: &JoinTableTarget,
@@ -1554,9 +1559,11 @@ fn join_key_pairs(
     let mut pairs = Vec::with_capacity(table.pk_cols.len());
     for (index, (name, col)) in table.pk_cols.iter().enumerate() {
         let cell = result.cell(row, *col)?;
-        let was_null = matches!(cell, Value::Null);
+        if matches!(cell, Value::Null) {
+            return None;
+        }
         let text_key = table.pk_types.get(index).copied().unwrap_or(false);
-        let literal = key_literal(&cell.display(usize::MAX), was_null, text_key);
+        let literal = key_literal(&cell.display(usize::MAX), false, text_key);
         pairs.push((name.clone(), literal));
     }
     Some(pairs)
@@ -2304,14 +2311,28 @@ impl AppState {
         self.pending_write.as_ref()
     }
 
-    /// Send the held batch exactly as prepared.
+    /// Send the held batch exactly as prepared. The connection may have been
+    /// flipped read-only while the modal was open, so the guard re-runs here
+    /// and refuses with the same error a run reports.
     pub fn confirm_write(&mut self) {
         let Some(pending) = self.pending_write.take() else { return };
-        let handle = self
-            .connections
-            .iter()
-            .find(|c| c.id == pending.conn)
-            .and_then(|c| c.handle());
+        let (handle, read_only) = match self.connections.iter().find(|c| c.id == pending.conn) {
+            Some(c) => (c.handle(), c.config.is_read_only()),
+            None => (None, false),
+        };
+        if read_only {
+            self.set_outcome(
+                pending.tab,
+                RunOutcome::Err(
+                    crate::db::DbError::Config(format!(
+                        "read-only connection refused {}",
+                        pending.kind
+                    ))
+                    .to_string(),
+                ),
+            );
+            return;
+        }
         self.send_batch(pending.tab, pending.conn, handle, pending.statements, BatchPurpose::Run, None);
     }
 
@@ -6080,6 +6101,42 @@ mod tests {
                     "total".to_owned(),
                     "INTEGER".to_owned(),
                     vec![crate::db::Value::Integer(100), crate::db::Value::Integer(200)],
+                ),
+            ],
+            false,
+            None,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap()
+    }
+
+    /// The left-joined shape where the second row has no orders side, so the
+    /// `oid` and `total` cells are NULL.
+    fn null_join_result() -> QueryResult {
+        QueryResult::from_columns(
+            vec![
+                crate::db::Column::new(
+                    "id".to_owned(),
+                    "INTEGER".to_owned(),
+                    vec![crate::db::Value::Integer(1), crate::db::Value::Integer(2)],
+                ),
+                crate::db::Column::new(
+                    "name".to_owned(),
+                    "TEXT".to_owned(),
+                    vec![
+                        crate::db::Value::Text("ada".to_owned()),
+                        crate::db::Value::Text("grace".to_owned()),
+                    ],
+                ),
+                crate::db::Column::new(
+                    "oid".to_owned(),
+                    "INTEGER".to_owned(),
+                    vec![crate::db::Value::Integer(10), crate::db::Value::Null],
+                ),
+                crate::db::Column::new(
+                    "total".to_owned(),
+                    "INTEGER".to_owned(),
+                    vec![crate::db::Value::Integer(100), crate::db::Value::Null],
                 ),
             ],
             false,
@@ -9942,6 +9999,28 @@ mod tests {
     }
 
     #[test]
+    fn a_null_key_cell_refuses_to_build_a_where_clause() {
+        with_isolated_state("edit-null-key", |state| {
+            let (tab, _conn, commands) = join_tab(state);
+            set_tab_sql(
+                state,
+                tab,
+                "SELECT u.id, u.name, o.id AS oid, o.total FROM users u \
+                 LEFT JOIN orders o ON o.user_id = u.id",
+            );
+            set_tab_result(state, tab, null_join_result());
+            let target = state.edit_target(tab).expect("join target");
+            assert_eq!(target.join_tables[1].pk_cols, vec![("id".to_owned(), 2)]);
+            state.stage_edit(tab, 1, 3, "5".to_owned());
+            assert_eq!(state.tab(tab).expect("tab").edits().len(), 1);
+            assert_eq!(state.preview_edit_statements(tab), None);
+            state.apply_edits(tab);
+            assert_eq!(state.pending_edit_preview(), None);
+            assert!(commands.try_recv().is_err());
+        });
+    }
+
+    #[test]
     fn stage_and_discard_roundtrip() {
         with_isolated_state("edit-stage", |state| {
             let (tab, _conn, _commands) = editable_tab(state);
@@ -11682,6 +11761,33 @@ mod tests {
                 state.tab(tab).expect("tab").outcome(),
                 RunOutcome::Running { .. }
             ));
+        });
+    }
+
+    #[test]
+    fn confirm_write_refuses_when_the_connection_turned_read_only() {
+        with_isolated_state("write-confirm-ro", |state| {
+            let (conn, commands) = scripted_connection(state, "mem");
+            let tab = state.new_tab(conn);
+            state.start_run(tab, "SELECT 1; DELETE FROM users", 0, None);
+            assert!(state.pending_write().is_some());
+            state
+                .connections
+                .iter_mut()
+                .find(|c| c.id == conn)
+                .expect("connection")
+                .config
+                .set_read_only(true);
+            state.confirm_write();
+            assert!(state.pending_write().is_none());
+            match state.tab(tab).expect("tab").outcome() {
+                RunOutcome::Err(message) => assert_eq!(
+                    message,
+                    "invalid settings: read-only connection refused DELETE"
+                ),
+                other => panic!("expected Err, got {other:?}"),
+            }
+            assert!(commands.try_recv().is_err(), "read-only sends nothing");
         });
     }
 
