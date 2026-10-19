@@ -16,7 +16,9 @@ use crate::db::{
 };
 use crate::ssh::{SshAuth, SshConfig};
 
-use super::{ModalKey, Palette, Theme, approve_button, autofocus, own_modal_layer};
+use super::{
+    ModalKey, Palette, Theme, approve_button, autofocus, note_dialog_field, own_modal_layer,
+};
 
 /// A connection's state as the card and the dot read it: one value that
 /// derives both the painted shape and the color, so a dot can never wear the
@@ -1511,6 +1513,7 @@ pub fn password_window(
         let field = ui.add(egui::TextEdit::singleline(state.prompt_password_mut()).password(true));
         field_focused = field.has_focus();
         autofocus(ui, "password", &field);
+        note_dialog_field(ui.ctx(), crate::app::Modal::PasswordPrompt, &field);
         ui.horizontal(|ui| {
             if ui.button("Connect").clicked() {
                 submit = true;

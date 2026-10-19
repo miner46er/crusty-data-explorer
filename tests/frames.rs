@@ -2402,8 +2402,68 @@ fn escape_in_the_draft_closes_an_open_dropdown_before_the_form() {
     );
 }
 
+/// Enter in the password field submits: the prompt closes and the
+/// connection leaves `Disconnected`, so the attempt went out.
 #[test]
-fn enter_on_cancel_does_not_submit_the_password_prompt() {
+fn enter_in_the_password_field_submits_the_prompt() {
+    let _guard = env_lock();
+    let _scratch = Scratch::new("password-field-enter");
+    let mut harness = build();
+    let conn = add_postgres_draft(harness.state_mut());
+    harness.state_mut().open_password_prompt(conn);
+    harness.run();
+    harness.event(egui::Event::Text("secret".to_owned()));
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().password_prompt().is_none(),
+        "Enter in the field submits the password"
+    );
+    assert!(
+        !matches!(
+            harness.state().connections().iter().find(|c| c.id == conn).map(|c| c.state()),
+            Some(ConnectionState::Disconnected)
+        ),
+        "submitting the password starts the connection"
+    );
+}
+
+/// One Tab lands on Connect, and Enter there submits through the button.
+#[test]
+fn enter_on_the_password_connect_button_submits() {
+    let _guard = env_lock();
+    let _scratch = Scratch::new("password-connect-enter");
+    let mut harness = build();
+    let conn = add_postgres_draft(harness.state_mut());
+    harness.state_mut().open_password_prompt(conn);
+    harness.run();
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    assert_eq!(
+        focused_label(&harness),
+        Some("Connect".to_owned()),
+        "one Tab lands on Connect"
+    );
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().password_prompt().is_none(),
+        "Enter on Connect submits the password"
+    );
+    assert!(
+        !matches!(
+            harness.state().connections().iter().find(|c| c.id == conn).map(|c| c.state()),
+            Some(ConnectionState::Disconnected)
+        ),
+        "submitting the password starts the connection"
+    );
+}
+
+/// Two Tabs land on Cancel, and Enter there cancels: the prompt closes and
+/// the connection stays `Disconnected`, so nothing went out.
+#[test]
+fn enter_on_the_password_cancel_button_cancels() {
     let _guard = env_lock();
     let _scratch = Scratch::new("password-cancel-enter");
     let mut harness = build();
@@ -2414,16 +2474,71 @@ fn enter_on_cancel_does_not_submit_the_password_prompt() {
     harness.run();
     harness.key_press(egui::Key::Tab);
     harness.run();
+    assert!(
+        harness.get_by_label("Cancel").is_focused(),
+        "two Tabs land on Cancel"
+    );
     harness.key_press(egui::Key::Enter);
     harness.run();
     assert!(
-        harness.state().password_prompt().is_some(),
-        "Enter on Cancel never submits the password"
+        harness.state().password_prompt().is_none(),
+        "Enter on Cancel cancels the password prompt"
+    );
+    assert!(
+        matches!(
+            harness.state().connections().iter().find(|c| c.id == conn).map(|c| c.state()),
+            Some(ConnectionState::Disconnected)
+        ),
+        "cancelling the prompt connects to nothing"
     );
 }
 
+/// One Tab lands on Run, and Enter there runs the batch: the prompt closes
+/// and the grid shows the substituted value.
 #[test]
-fn enter_on_cancel_does_not_submit_the_params_prompt() {
+fn enter_on_the_params_run_button_runs() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("params-run-enter");
+    harness.state_mut().start_run(tab, "SELECT :a AS v", 0, None);
+    harness.run();
+    assert!(harness.state().pending_params().is_some(), "the prompt is armed");
+    harness.event(egui::Event::Text("7".to_owned()));
+    harness.run();
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    assert_eq!(
+        focused_label(&harness),
+        Some("Run".to_owned()),
+        "one Tab lands on Run"
+    );
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().pending_params().is_none(),
+        "Enter on Run submits the parameters"
+    );
+    step_until(&mut harness, "the substituted run", |state| {
+        state
+            .tab(tab)
+            .and_then(|tab| tab.active_query_result())
+            .and_then(|result| result.cell(0, 0))
+            .is_some_and(|cell| *cell != Value::Integer(1))
+    });
+    assert_eq!(
+        harness
+            .state()
+            .tab(tab)
+            .and_then(|tab| tab.active_query_result())
+            .and_then(|result| result.cell(0, 0)),
+        Some(&Value::Integer(7)),
+        "submitting the parameters runs the substituted batch"
+    );
+}
+
+/// Two Tabs land on Cancel, and Enter there cancels: the prompt closes and
+/// the grid still shows the rows from before the prompt.
+#[test]
+fn enter_on_the_params_cancel_button_cancels() {
     let _guard = env_lock();
     let (_scratch, mut harness, tab) = demo_setup("params-cancel-enter");
     harness.state_mut().start_run(tab, "SELECT :a AS v", 0, None);
@@ -2433,10 +2548,106 @@ fn enter_on_cancel_does_not_submit_the_params_prompt() {
     harness.run();
     harness.key_press(egui::Key::Tab);
     harness.run();
+    assert!(
+        harness.get_by_label("Cancel").is_focused(),
+        "two Tabs land on Cancel"
+    );
     harness.key_press(egui::Key::Enter);
     harness.run();
     assert!(
-        harness.state().pending_params().is_some(),
-        "Enter on Cancel never submits the parameters"
+        harness.state().pending_params().is_none(),
+        "Enter on Cancel cancels the parameters prompt"
+    );
+    assert_eq!(
+        harness
+            .state()
+            .tab(tab)
+            .and_then(|tab| tab.active_query_result())
+            .and_then(|result| result.cell(0, 0)),
+        Some(&Value::Integer(1)),
+        "cancelling the prompt runs nothing"
     );
 }
+
+/// Enter in the save name field saves: the prompt closes and the entry
+/// lands in the saved list.
+#[test]
+fn enter_in_the_save_name_field_saves() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, _tab) = demo_setup("save-field-enter");
+    harness.state_mut().open_save_prompt();
+    harness.run();
+    harness.event(egui::Event::Text("field save".to_owned()));
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().save_prompt().is_none(),
+        "Enter in the name field saves the query"
+    );
+    assert!(
+        harness.state().saved_queries().iter().any(|q| q.name == "field save"),
+        "the entry lands in the saved list"
+    );
+}
+
+/// Three Tabs land on Save, and Enter there saves through the button.
+#[test]
+fn enter_on_the_save_button_saves() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, _tab) = demo_setup("save-button-enter");
+    harness.state_mut().open_save_prompt();
+    harness.run();
+    harness.event(egui::Event::Text("button save".to_owned()));
+    harness.run();
+    for _ in 0..3 {
+        harness.key_press(egui::Key::Tab);
+        harness.run();
+    }
+    assert_eq!(
+        focused_label(&harness),
+        Some("Save".to_owned()),
+        "three Tabs land on Save"
+    );
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().save_prompt().is_none(),
+        "Enter on Save saves the query"
+    );
+    assert!(
+        harness.state().saved_queries().iter().any(|q| q.name == "button save"),
+        "the entry lands in the saved list"
+    );
+}
+
+/// Four Tabs land on Cancel, and Enter there cancels: the prompt closes and
+/// nothing is saved.
+#[test]
+fn enter_on_the_save_cancel_button_cancels_without_saving() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, _tab) = demo_setup("save-cancel-enter");
+    harness.state_mut().open_save_prompt();
+    harness.run();
+    harness.event(egui::Event::Text("unsaved".to_owned()));
+    harness.run();
+    for _ in 0..4 {
+        harness.key_press(egui::Key::Tab);
+        harness.run();
+    }
+    assert!(
+        harness.get_by_label("Cancel").is_focused(),
+        "four Tabs land on Cancel"
+    );
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().save_prompt().is_none(),
+        "Enter on Cancel cancels the save prompt"
+    );
+    assert!(
+        harness.state().saved_queries().is_empty(),
+        "cancelling the prompt saves nothing"
+    );
+}
+

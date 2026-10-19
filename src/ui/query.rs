@@ -11,7 +11,9 @@ use super::editor::{char_range, FindState};
 use crate::app::AppState;
 use crate::db::TabId;
 
-use super::{ModalKey, Palette, approve_button, autofocus, fit, own_modal_layer};
+use super::{
+    ModalKey, Palette, approve_button, autofocus, fit, note_dialog_field, own_modal_layer,
+};
 
 /// The tab strip, drawn by `root` for every tab whatever its kind. The new
 /// and close shortcuts live here so they work on a table tab too.
@@ -521,6 +523,7 @@ pub fn save_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKey
             let name = ui.text_edit_singleline(&mut prompt.name);
             field_focused |= name.has_focus();
             autofocus(ui, "save-name", &name);
+            note_dialog_field(ui.ctx(), crate::app::Modal::SavePrompt, &name);
         });
         ui.horizontal(|ui| {
             ui.label("Folder:");
@@ -529,6 +532,7 @@ pub fn save_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKey
                     .hint_text("no folder"),
             );
             field_focused |= folder.has_focus();
+            note_dialog_field(ui.ctx(), crate::app::Modal::SavePrompt, &folder);
         });
         ui.checkbox(&mut prompt.pinned, "Pinned")
             .on_hover_text("List this entry first inside its folder group");
@@ -664,6 +668,7 @@ pub fn params_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalK
                 ui.label(param.display());
                 let field = ui.text_edit_singleline(&mut param.value);
                 field_focused |= field.has_focus();
+                note_dialog_field(ui.ctx(), crate::app::Modal::Params, &field);
                 if index == 0 {
                     autofocus(ui, "params-first", &field);
                 }

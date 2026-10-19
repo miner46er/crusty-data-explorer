@@ -95,6 +95,7 @@ pub fn palette_window(
             query_changed = response.changed();
             if owns {
                 super::autofocus(ui, "palette-query", &response);
+                super::note_dialog_field(ui.ctx(), crate::app::Modal::Palette, &response);
             }
             egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                 for (index, (name, detail)) in rows.iter().enumerate() {

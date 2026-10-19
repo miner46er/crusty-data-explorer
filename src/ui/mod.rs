@@ -39,7 +39,15 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     let block_panels = newly_opened || holding_click;
     ui.ctx().data_mut(|data| data.insert_temp(hold_id, block_panels && pointer_down));
     let modal = open_modals.last().copied();
-    let key = modal.and_then(|modal| modal_key(ui, modal.submits_on_enter()));
+    let key = modal.and_then(|modal| {
+        // Plain Enter submits the prompt only from its own text field or with
+        // no focus at all. On a focused Connect/Run/Save/Cancel button the
+        // event stays put, so the button's Enter/Space activation works.
+        let submit = modal.submits_on_enter()
+            && (ui.ctx().memory(|memory| memory.focused().is_none())
+                || dialog_field_focused(ui.ctx(), modal));
+        modal_key(ui, submit)
+    });
     // The cell editor lives in egui temp data, so it has no `Modal` variant;
     // it owns the keyboard only when no dialog backs it.
     let cell_editor_open = grid::cell_editor_open(state, ui.ctx());
@@ -142,6 +150,7 @@ fn note_open_modals(
     }
     let mut restore = Vec::new();
     for modal in previous.iter().filter(|modal| !open.contains(modal)) {
+        ctx.data_mut(|data| data.remove_temp::<Vec<egui::Id>>(dialog_fields_id(*modal)));
         let key = modal_return_id(*modal);
         let focused = ctx
             .data_mut(|data| data.remove_temp::<Option<egui::Id>>(key))
@@ -156,6 +165,35 @@ fn note_open_modals(
 
 fn modal_return_id(modal: crate::app::Modal) -> egui::Id {
     egui::Id::new(("crusty_modal_return_focus", modal))
+}
+
+fn dialog_fields_id(modal: crate::app::Modal) -> egui::Id {
+    egui::Id::new(("crusty_dialog_fields", modal))
+}
+
+/// Register one text field of the owning prompt, so `root` can tell Enter in
+/// a field from Enter on a focused button before either draws.
+pub(crate) fn note_dialog_field(
+    ctx: &egui::Context,
+    modal: crate::app::Modal,
+    field: &egui::Response,
+) {
+    let key = dialog_fields_id(modal);
+    let mut fields: Vec<egui::Id> =
+        ctx.data_mut(|data| data.get_temp(key).unwrap_or_default());
+    if !fields.contains(&field.id) {
+        fields.push(field.id);
+        ctx.data_mut(|data| data.insert_temp(key, fields));
+    }
+}
+
+fn dialog_field_focused(ctx: &egui::Context, modal: crate::app::Modal) -> bool {
+    let Some(focused) = ctx.memory(|memory| memory.focused()) else {
+        return false;
+    };
+    let fields: Vec<egui::Id> =
+        ctx.data_mut(|data| data.get_temp(dialog_fields_id(modal)).unwrap_or_default());
+    fields.contains(&focused)
 }
 
 /// One invisible full-screen click shield under each dialog's window. egui's
