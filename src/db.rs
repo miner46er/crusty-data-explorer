@@ -8,6 +8,7 @@
 //! tunnel itself lives in [`crate::ssh`].
 
 use std::borrow::Cow;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -276,25 +277,37 @@ pub fn explain_sql(kind: DbKind, statement: &str) -> String {
 }
 
 /// One write kind the read-only guard refuses, as uppercase text for errors.
-/// The single classifier behind the guard; callers never match keywords.
+/// The single classifier behind the guard; callers never match keywords. A
+/// write hidden inside a `WITH` list or behind an `EXPLAIN ANALYZE` still
+/// counts, since both run the statement they wrap.
 pub fn write_statement_kind(sql: &str) -> Option<&'static str> {
-    let keyword = first_keyword(sql)?;
-    Some(match keyword.as_str() {
-        "INSERT" => "INSERT",
-        "UPDATE" => "UPDATE",
-        "DELETE" => "DELETE",
-        "CREATE" => "CREATE",
-        "ALTER" => "ALTER",
-        "DROP" => "DROP",
-        "TRUNCATE" => "TRUNCATE",
-        "REPLACE" => "REPLACE",
-        "MERGE" => "MERGE",
-        "COPY" => "COPY",
-        "VACUUM" => "VACUUM",
-        "GRANT" => "GRANT",
-        "REVOKE" => "REVOKE",
-        _ => return None,
-    })
+    let (keyword, end) = keyword_span(sql)?;
+    match keyword.as_str() {
+        "INSERT" => Some("INSERT"),
+        "UPDATE" => Some("UPDATE"),
+        "DELETE" => Some("DELETE"),
+        "CREATE" => Some("CREATE"),
+        "ALTER" => Some("ALTER"),
+        "DROP" => Some("DROP"),
+        "TRUNCATE" => Some("TRUNCATE"),
+        "REPLACE" => Some("REPLACE"),
+        "MERGE" => Some("MERGE"),
+        "COPY" => Some("COPY"),
+        "VACUUM" => Some("VACUUM"),
+        "GRANT" => Some("GRANT"),
+        "REVOKE" => Some("REVOKE"),
+        "DO" => Some("DO"),
+        "CALL" => Some("CALL"),
+        "WITH" => {
+            let (bodies, main) = with_clause(sql, end)?;
+            bodies
+                .iter()
+                .find_map(|body| write_statement_kind(&sql[body.clone()]))
+                .or_else(|| write_statement_kind(&sql[main..]))
+        }
+        "EXPLAIN" => explain_inner(sql, end).and_then(write_statement_kind),
+        _ => None,
+    }
 }
 
 /// True when [`write_statement_kind`] names a write.
@@ -311,8 +324,10 @@ pub struct UnqualifiedWrite {
 
 /// Some only for an UPDATE or DELETE with no WHERE at paren depth zero.
 /// Leading comments and wrapping parens are skipped; matching is
-/// case-insensitive and strings, quoted identifiers, and comments never
-/// count as WHERE.
+/// case-insensitive and strings, quoted identifiers, comments, and
+/// dollar-quoted literals never count as WHERE. A `WITH` list is read CTE by
+/// CTE and the statement after it on its own, and an `EXPLAIN ANALYZE` reads
+/// as the statement it runs.
 pub fn unqualified_write(sql: &str) -> Option<UnqualifiedWrite> {
     let (keyword, end) = keyword_span(sql)?;
     match keyword.as_str() {
@@ -320,24 +335,173 @@ pub fn unqualified_write(sql: &str) -> Option<UnqualifiedWrite> {
             let (table, _) = identifier_at(sql, end)?;
             (!has_outer_where(sql)).then(|| UnqualifiedWrite { kind: "UPDATE", table })
         }
-        "DELETE" => {
-            let mut pos = skip_ignorable(sql, end);
-            let (word, next) = word_at(sql, pos)?;
-            if !word.eq_ignore_ascii_case("from") {
-                return None;
-            }
-            pos = next;
-            let (table, _) = identifier_at(sql, pos)?;
-            (!has_outer_where(sql)).then(|| UnqualifiedWrite { kind: "DELETE", table })
+        "DELETE" => delete_write(sql, end),
+        "WITH" => {
+            let (bodies, main) = with_clause(sql, end)?;
+            bodies
+                .iter()
+                .find_map(|body| unqualified_write(&sql[body.clone()]))
+                .or_else(|| unqualified_write(&sql[main..]))
         }
+        "EXPLAIN" => explain_inner(sql, end).and_then(unqualified_write),
         _ => None,
     }
 }
 
-/// First keyword uppercased, skipping whitespace, line and block comments,
-/// and wrapping open parens, so a parenthesized SELECT reads as SELECT.
-fn first_keyword(sql: &str) -> Option<String> {
-    keyword_span(sql).map(|(keyword, _)| keyword)
+/// One `DELETE` with no outer WHERE. The single-table form reads its target
+/// after `FROM`; MySQL's multi-table form names its targets first and copies
+/// only those tables, so it confirms too as long as a top-level `FROM`
+/// follows the target list.
+fn delete_write(sql: &str, after_delete: usize) -> Option<UnqualifiedWrite> {
+    let mut pos = skip_ignorable(sql, after_delete);
+    let (word, after_word) = loop {
+        let (word, next) = word_at(sql, pos)?;
+        if word.eq_ignore_ascii_case("from") || !is_delete_modifier(&word) {
+            break (word, next);
+        }
+        pos = skip_ignorable(sql, next);
+    };
+    if word.eq_ignore_ascii_case("from") {
+        let (table, _) = identifier_at(sql, after_word)?;
+        return (!has_outer_where(sql)).then(|| UnqualifiedWrite { kind: "DELETE", table });
+    }
+    let (table, after_target) = identifier_at(sql, pos)?;
+    if !targets_from(sql, after_target) || has_outer_where(sql) {
+        return None;
+    }
+    Some(UnqualifiedWrite { kind: "DELETE", table })
+}
+
+/// MySQL's optional words between `DELETE` and its target list.
+fn is_delete_modifier(word: &str) -> bool {
+    ["LOW_PRIORITY", "QUICK", "IGNORE"]
+        .iter()
+        .any(|modifier| word.eq_ignore_ascii_case(modifier))
+}
+
+/// True when a top-level `FROM` comes before any top-level `WHERE` in
+/// `sql[start..]`, the tail of a multi-table `DELETE`'s target list.
+fn targets_from(sql: &str, start: usize) -> bool {
+    first_top_level_word(sql, start, &["FROM", "WHERE"])
+        .is_some_and(|word| word.eq_ignore_ascii_case("from"))
+}
+
+/// A readable `WITH` list: one byte range per CTE body and the offset where
+/// the statement after the list begins. None when the text does not read as
+/// `WITH [RECURSIVE] <name> [(<columns>)] AS [[NOT] MATERIALIZED] (...)`.
+fn with_clause(sql: &str, after_with: usize) -> Option<(Vec<Range<usize>>, usize)> {
+    let mut pos = skip_ignorable(sql, after_with);
+    if let Some((word, next)) = word_at(sql, pos) {
+        if word.eq_ignore_ascii_case("recursive") {
+            pos = skip_ignorable(sql, next);
+        }
+    }
+    let mut bodies = Vec::new();
+    loop {
+        let (_, next) = identifier_at(sql, pos)?;
+        pos = skip_ignorable(sql, next);
+        if sql.as_bytes().get(pos) == Some(&b'(') {
+            pos = skip_ignorable(sql, matching_paren(sql, pos)? + 1);
+        }
+        let (word, next) = word_at(sql, pos)?;
+        if !word.eq_ignore_ascii_case("as") {
+            return None;
+        }
+        pos = skip_ignorable(sql, next);
+        if let Some((word, next)) = word_at(sql, pos) {
+            if word.eq_ignore_ascii_case("not") {
+                pos = skip_ignorable(sql, next);
+                let (word, next) = word_at(sql, pos)?;
+                if !word.eq_ignore_ascii_case("materialized") {
+                    return None;
+                }
+                pos = skip_ignorable(sql, next);
+            } else if word.eq_ignore_ascii_case("materialized") {
+                pos = skip_ignorable(sql, next);
+            }
+        }
+        if sql.as_bytes().get(pos) != Some(&b'(') {
+            return None;
+        }
+        let close = matching_paren(sql, pos)?;
+        bodies.push(pos + 1..close);
+        pos = skip_ignorable(sql, close + 1);
+        if sql.as_bytes().get(pos) != Some(&b',') {
+            return Some((bodies, pos));
+        }
+        pos = skip_ignorable(sql, pos + 1);
+    }
+}
+
+/// The statement an `EXPLAIN` runs: Some only when its options turn `ANALYZE`
+/// on, bare or inside the parenthesized option list. A plain plan never
+/// executes the statement it describes.
+fn explain_inner(sql: &str, after_explain: usize) -> Option<&str> {
+    let pos = skip_ignorable(sql, after_explain);
+    if sql.as_bytes().get(pos) == Some(&b'(') {
+        let close = matching_paren(sql, pos)?;
+        return analyze_enabled(&sql[pos + 1..close]).then(|| &sql[close + 1..]);
+    }
+    let (word, next) = word_at(sql, pos)?;
+    if word.eq_ignore_ascii_case("verbose") {
+        let (word, next) = word_at(sql, skip_ignorable(sql, next))?;
+        return word.eq_ignore_ascii_case("analyze").then(|| &sql[next..]);
+    }
+    word.eq_ignore_ascii_case("analyze").then(|| &sql[next..])
+}
+
+/// True when a parenthesized `EXPLAIN` option list turns `ANALYZE` on.
+fn analyze_enabled(options: &str) -> bool {
+    options.split(',').any(analyze_on)
+}
+
+/// One option in an `EXPLAIN ( ... )` list, true when it is `ANALYZE` left on.
+/// The option is off only when it is spelled false, off, or 0.
+fn analyze_on(option: &str) -> bool {
+    let Some((word, next)) = word_at(option, skip_ignorable(option, 0)) else {
+        return false;
+    };
+    if !word.eq_ignore_ascii_case("analyze") {
+        return false;
+    }
+    match word_at(option, skip_ignorable(option, next)) {
+        Some((value, _)) => {
+            !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("off")
+                && value != "0"
+        }
+        None => true,
+    }
+}
+
+/// Byte offset of the `)` matching the `(` at `open`, outside strings, quoted
+/// identifiers, comments, and dollar-quoted literals. None when the parens
+/// never close.
+fn matching_paren(sql: &str, open: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth: i32 = 0;
+    let mut i = open;
+    while i < bytes.len() {
+        if let Some(token) = skipped_token(sql, i) {
+            i = token.end();
+            continue;
+        }
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The bare transaction controls. Only these spellings are special: the
@@ -354,10 +518,11 @@ enum TxControl {
 /// controls run on the text protocol through `raw_sql` there.
 #[cfg(any(feature = "postgres", feature = "mysql"))]
 fn tx_control(sql: &str) -> Option<TxControl> {
-    match first_keyword(sql).as_deref() {
-        Some("BEGIN") => Some(TxControl::Begin),
-        Some("COMMIT") => Some(TxControl::Commit),
-        Some("ROLLBACK") => Some(TxControl::Rollback),
+    let (keyword, _) = keyword_span(sql)?;
+    match keyword.as_str() {
+        "BEGIN" => Some(TxControl::Begin),
+        "COMMIT" => Some(TxControl::Commit),
+        "ROLLBACK" => Some(TxControl::Rollback),
         _ => None,
     }
 }
@@ -8131,6 +8296,8 @@ mod tests {
             ("VACUUM", "VACUUM"),
             ("GRANT SELECT ON t TO reader", "GRANT"),
             ("REVOKE SELECT ON t FROM reader", "REVOKE"),
+            ("DO $$ BEGIN UPDATE t SET a = 1; END $$", "DO"),
+            ("CALL refresh_stats()", "CALL"),
             ("  insert into t (a) values (1)", "INSERT"),
             ("-- wipe\nDELETE FROM t", "DELETE"),
             ("/* plan */ DROP TABLE t", "DROP"),
@@ -8200,6 +8367,102 @@ mod tests {
             Some(UnqualifiedWrite { kind: "UPDATE", table: "t".to_owned() })
         );
         assert_eq!(unqualified_write("DELETE FROM t WHERE note = $$x$$"), None);
+    }
+
+    #[test]
+    fn write_classifier_sees_cte_bodies_and_explain_analyze() {
+        for (sql, kind) in [
+            ("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d", "DELETE"),
+            ("WITH ids AS (SELECT 1) DELETE FROM t", "DELETE"),
+            ("WITH RECURSIVE t(n) AS (SELECT 1) UPDATE t SET n = 2", "UPDATE"),
+            ("WITH x (a) AS (SELECT 1) UPDATE t SET a = 1", "UPDATE"),
+            ("WITH x AS MATERIALIZED (SELECT 1) INSERT INTO t VALUES (1)", "INSERT"),
+            (
+                "WITH x AS (SELECT 1), y AS NOT MATERIALIZED (DELETE FROM t) SELECT 1",
+                "DELETE",
+            ),
+            ("EXPLAIN ANALYZE UPDATE t SET a = 1", "UPDATE"),
+            ("EXPLAIN VERBOSE ANALYZE DELETE FROM t", "DELETE"),
+            ("EXPLAIN (ANALYZE, BUFFERS) DELETE FROM t", "DELETE"),
+            ("EXPLAIN (VERBOSE, ANALYZE TRUE) INSERT INTO t VALUES (1)", "INSERT"),
+            ("EXPLAIN (FORMAT JSON, ANALYZE) UPDATE t SET a = 1", "UPDATE"),
+        ] {
+            assert_eq!(write_statement_kind(sql), Some(kind), "{sql}");
+            assert!(is_write_statement(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn write_classifier_leaves_reads_and_plain_explain_alone() {
+        for sql in [
+            "WITH ids AS (SELECT 1) SELECT * FROM ids",
+            "WITH x AS (SELECT 1), y AS (SELECT 2) SELECT * FROM y",
+            "WITH x AS NOT MATERIALIZED (SELECT 1) SELECT 1",
+            "EXPLAIN UPDATE t SET a = 1",
+            "EXPLAIN QUERY PLAN DELETE FROM t",
+            "EXPLAIN (VERBOSE) DELETE FROM t",
+            "EXPLAIN (ANALYZE FALSE) DELETE FROM t",
+            "EXPLAIN (ANALYZE OFF) DELETE FROM t",
+            "EXPLAIN (ANALYZE 0) DELETE FROM t",
+            "EXPLAIN ANALYZE SELECT 1",
+        ] {
+            assert_eq!(write_statement_kind(sql), None, "{sql:?}");
+            assert!(!is_write_statement(sql), "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn unqualified_write_sees_through_ctes_and_explain_analyze() {
+        assert_eq!(
+            unqualified_write("WITH ids AS (SELECT 1) DELETE FROM t"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "t".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("WITH d AS (UPDATE t SET a = 1 RETURNING *) SELECT * FROM d"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "t".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("EXPLAIN ANALYZE DELETE FROM t"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "t".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("EXPLAIN (ANALYZE) UPDATE public.t SET a = 1"),
+            Some(UnqualifiedWrite { kind: "UPDATE", table: "public.t".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("WITH ids AS (SELECT 1) DELETE FROM t WHERE id = 1"),
+            None
+        );
+        assert_eq!(unqualified_write("EXPLAIN ANALYZE DELETE FROM t WHERE id = 1"), None);
+        assert_eq!(unqualified_write("EXPLAIN DELETE FROM t"), None);
+        assert_eq!(unqualified_write("EXPLAIN (ANALYZE FALSE) DELETE FROM t"), None);
+        assert_eq!(unqualified_write("WITH d AS (SELECT 1) SELECT * FROM d"), None);
+    }
+
+    #[test]
+    fn unqualified_write_reads_mysql_multi_table_delete() {
+        assert_eq!(
+            unqualified_write("DELETE t1 FROM t1 JOIN t2 ON t1.id = t2.id"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "t1".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("DELETE LOW_PRIORITY QUICK IGNORE t1 FROM t1 JOIN t2 ON t1.id = t2.id"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "t1".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("DELETE t1.* FROM t1 JOIN t2 ON t1.id = t2.id"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "t1".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("DELETE t1, t2 FROM t1 JOIN t2 ON t1.id = t2.id"),
+            Some(UnqualifiedWrite { kind: "DELETE", table: "t1".to_owned() })
+        );
+        assert_eq!(
+            unqualified_write("DELETE t1 FROM t1 JOIN t2 ON t1.id = t2.id WHERE t2.a = 1"),
+            None
+        );
+        assert_eq!(unqualified_write("DELETE t1 WHERE a = 1"), None);
+        assert_eq!(unqualified_write("DELETE t1"), None);
     }
 
     #[test]
