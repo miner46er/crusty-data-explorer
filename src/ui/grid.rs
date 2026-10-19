@@ -2104,9 +2104,10 @@ fn results_grid(
     egui::Panel::bottom("crusty_grid_footer").show(ui, |ui| {
         ui.horizontal(|ui| {
             // The row measures before it draws, so nothing paints over the
-            // window edge: the paging controls keep their place, the tab's
-            // own state on the right takes its share, and the counts elide
-            // into the rest.
+            // window edge. The texts reserve in the order of what the row
+            // can least afford to lose: the truncation flag (the result is
+            // incomplete), a failed-export notice, the counts, the tab's own
+            // state, a success notice. Draw order is their own.
             let mut budget = fit::Budget::new(ui);
             let count_label = "Count total";
             let count_fits = truncated
@@ -2118,27 +2119,35 @@ fn results_grid(
             let columns_label = format!("Show columns ({hidden})");
             let columns_fits =
                 hidden > 0 && budget.take(ui, fit::button_w(ui, &columns_label));
-            let edit_text = match &edit_label {
-                Some(table) => {
-                    budget.elide(ui, &format!("editing {table}"), egui::TextStyle::Small)
-                }
-                None => budget.elide(ui, "read-only view", egui::TextStyle::Small),
+            let notice = tab.export_notice().map(str::to_owned);
+            let notice_failed = tab.export_failed();
+            let truncate_text = if truncated {
+                budget.elide(ui, &truncate_label(known_total), egui::TextStyle::Small)
+            } else {
+                String::new()
             };
-            let notice_text = tab
-                .export_notice()
-                .map(str::to_owned)
-                .map(|notice| budget.elide(ui, &notice, egui::TextStyle::Body))
+            let failed_text = notice
+                .as_deref()
+                .filter(|_| notice_failed)
+                .map(|notice| budget.elide(ui, notice, egui::TextStyle::Body))
                 .unwrap_or_default();
             let stats_text = budget.elide(
                 ui,
                 &format!("{} of {} rows · {:.0} ms", visible.len(), total, ms),
                 egui::TextStyle::Small,
             );
-            let truncate_text = if truncated {
-                budget.elide(ui, &truncate_label(known_total), egui::TextStyle::Small)
-            } else {
-                String::new()
+            let edit_text = match &edit_label {
+                Some(table) => {
+                    budget.elide(ui, &format!("editing {table}"), egui::TextStyle::Small)
+                }
+                None => budget.elide(ui, "read-only view", egui::TextStyle::Small),
             };
+            let ok_text = notice
+                .as_deref()
+                .filter(|_| !notice_failed)
+                .map(|notice| budget.elide(ui, notice, egui::TextStyle::Body))
+                .unwrap_or_default();
+            let notice_text = if notice_failed { failed_text } else { ok_text };
 
             if !stats_text.is_empty() {
                 ui.label(egui::RichText::new(stats_text).small().weak());
@@ -2171,7 +2180,7 @@ fn results_grid(
                     }
                 }
                 if !notice_text.is_empty() {
-                    if tab.export_failed() {
+                    if notice_failed {
                         ui.colored_label(ui.visuals().error_fg_color, notice_text);
                     } else {
                         ui.colored_label(palette.success, notice_text);

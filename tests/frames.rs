@@ -754,8 +754,9 @@ fn truncated_footer_band_stays_clear() {
         "the paging button carries the loaded count: {drawn:?}"
     );
 
-    // Without the truncation the row has room for its texts: the counts elide
-    // into what the tab's own state leaves, and the notice keeps its place.
+    // Without the truncation the row has room for its texts: the counts and
+    // the tab's own state keep their whole labels, and the success notice,
+    // reserved last, is the one that gives up width.
     run_sql(&mut harness, tab, "SELECT personid FROM persons;");
     harness
         .state_mut()
@@ -771,12 +772,35 @@ fn truncated_footer_band_stays_clear() {
     drawn.sort();
     println!("plain footer band labels: {drawn:?}");
     assert!(
-        drawn.iter().any(|label| label.starts_with('1') && label.ends_with('…')),
-        "the counts elide into their share: {drawn:?}"
+        drawn.iter().any(|label| label == "1 of 1 rows · 0 ms"),
+        "the counts keep their whole label: {drawn:?}"
     );
     assert!(
-        drawn.iter().any(|label| label == "Copied 10000 rows as TSV"),
-        "the notice keeps its whole label at the row's right edge: {drawn:?}"
+        drawn.iter().any(|label| label.starts_with("Copied") && label.ends_with('…')),
+        "the success notice elides first: {drawn:?}"
+    );
+
+    // A failed export outranks the counts: its notice keeps its whole label
+    // while the counts give up theirs.
+    harness
+        .state_mut()
+        .tab_mut(tab)
+        .expect("the active tab")
+        .set_export_notice("Export failed: no space left on device".to_owned(), true);
+    harness.run();
+    let band = band_of(&harness, "Export failed: no space left on device", NARROW_WINDOW);
+    assert_band_clear(&harness, band, NARROW_WINDOW);
+    let mut drawn: Vec<String> =
+        band_nodes(&harness, band).into_iter().map(|(label, _)| label).collect();
+    drawn.sort();
+    println!("failed footer band labels: {drawn:?}");
+    assert!(
+        drawn.iter().any(|label| label == "Export failed: no space left on device"),
+        "the failed notice keeps its whole label: {drawn:?}"
+    );
+    assert!(
+        drawn.iter().any(|label| label.starts_with('1') && label.ends_with('…')),
+        "the counts elide behind the failed notice: {drawn:?}"
     );
 }
 
