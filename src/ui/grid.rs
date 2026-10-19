@@ -80,19 +80,37 @@ impl Selection {
         self.active = Some((row, col));
         self.anchor = Some(row);
     }
-    fn extend(&mut self, row: usize, col: usize) {
+    /// Extend from the anchor to `row` over the view order, so a sorted view
+    /// selects the rows the operator passed rather than a raw index range. An
+    /// anchor that is not displayed selects only `row`.
+    fn extend(&mut self, row: usize, col: usize, visible: &[usize]) {
         let origin =
             self.anchor.or_else(|| self.active.map(|(row, _)| row)).unwrap_or(row);
         self.rows.clear();
-        self.rows.extend(origin.min(row)..=origin.max(row));
+        let (Some(from), Some(to)) = (
+            visible.iter().position(|visible_row| *visible_row == origin),
+            visible.iter().position(|visible_row| *visible_row == row),
+        ) else {
+            self.rows.insert(row);
+            self.active = Some((row, col));
+            return;
+        };
+        self.rows.extend(visible[from.min(to)..=from.max(to)].iter().copied());
         self.active = Some((row, col));
     }
     /// One cell gesture: ctrl toggles, shift extends, else selects.
-    fn gesture(&mut self, row: usize, col: usize, shift: bool, ctrl: bool) {
+    fn gesture(
+        &mut self,
+        row: usize,
+        col: usize,
+        shift: bool,
+        ctrl: bool,
+        visible: &[usize],
+    ) {
         if ctrl {
             self.toggle(row, col);
         } else if shift {
-            self.extend(row, col);
+            self.extend(row, col, visible);
         } else {
             self.click(row, col);
         }
@@ -161,7 +179,7 @@ impl Selection {
             self.anchor = Some(row);
             self.active = Some((row, col));
         } else if row != active_row {
-            self.extend(row, col);
+            self.extend(row, col, visible);
         } else {
             self.active = Some((row, col));
         }
@@ -2702,7 +2720,7 @@ fn results_grid(
     });
     let clicked_cell = !gestures.is_empty();
     for (row, col, shift, ctrl) in gestures {
-        selection.gesture(row, col, shift, ctrl);
+        selection.gesture(row, col, shift, ctrl, &visible);
     }
     if clicked_cell {
         if let Some(focused) = ui.ctx().memory(|memory| memory.focused()) {
@@ -3612,25 +3630,64 @@ mod tests {
     #[test]
     fn click_shift_and_ctrl_gestures_shape_the_selection() {
         let mut selection = Selection::default();
-        selection.gesture(1, 0, false, false);
+        selection.gesture(1, 0, false, false, &[0, 1, 2]);
         assert_eq!(selection.resolve(&[0, 1, 2]), vec![1]);
         assert_eq!(selection.active(), Some((1, 0)));
-        selection.gesture(2, 1, true, false);
+        selection.gesture(2, 1, true, false, &[0, 1, 2]);
         assert_eq!(selection.resolve(&[0, 1, 2]), vec![1, 2]);
         assert_eq!(selection.active(), Some((2, 1)));
-        selection.gesture(0, 0, false, true);
+        selection.gesture(0, 0, false, true, &[0, 1, 2]);
         assert_eq!(selection.resolve(&[2, 0, 1]), vec![2, 0, 1]);
         assert_eq!(selection.active(), Some((0, 0)));
-        selection.gesture(1, 0, false, true);
+        selection.gesture(1, 0, false, true, &[0, 1, 2]);
         assert_eq!(selection.resolve(&[0, 1, 2]), vec![0, 2]);
     }
 
     #[test]
     fn shift_without_an_anchor_selects_one_row() {
         let mut selection = Selection::default();
-        selection.gesture(2, 1, true, false);
+        selection.gesture(2, 1, true, false, &[0, 1, 2]);
         assert_eq!(selection.resolve(&[0, 1, 2]), vec![2]);
         assert_eq!(selection.active(), Some((2, 1)));
+    }
+
+    #[test]
+    fn a_shift_step_extends_over_view_positions_not_raw_rows() {
+        let visible = [5, 1, 9, 3];
+        let mut selection = Selection::default();
+        selection.click(5, 0);
+        selection.step(Step::Down, true, &visible, 2, 1);
+        assert_eq!(
+            selection.resolve(&visible),
+            vec![5, 1],
+            "the step selects the two view positions it passed"
+        );
+    }
+
+    #[test]
+    fn a_shift_click_extends_over_view_positions_not_raw_rows() {
+        let visible = [5, 1, 9, 3];
+        let mut selection = Selection::default();
+        selection.gesture(5, 0, false, false, &visible);
+        selection.gesture(9, 1, true, false, &visible);
+        assert_eq!(
+            selection.resolve(&visible),
+            vec![5, 1, 9],
+            "the click selects the three displayed rows it passed"
+        );
+    }
+
+    #[test]
+    fn a_shift_click_with_an_off_view_anchor_selects_one_row() {
+        let visible = [5, 1, 9, 3];
+        let mut selection = Selection::default();
+        selection.click(2, 0);
+        selection.gesture(9, 1, true, false, &visible);
+        assert_eq!(
+            selection.resolve(&visible),
+            vec![9],
+            "an anchor the filter hid never selects rows between raw indices"
+        );
     }
 
     #[test]
@@ -3649,7 +3706,7 @@ mod tests {
             ResultId { active: 0, rows: 2, cols: 2, took: Duration::from_millis(2) };
         let mut selection = Selection::default();
         selection.sync(first);
-        selection.gesture(0, 0, false, false);
+        selection.gesture(0, 0, false, false, &[0, 1, 2]);
         selection.sync(first);
         assert_eq!(selection.resolve(&[0, 1]), vec![0]);
         selection.sync(rerun);
