@@ -5,6 +5,9 @@
 //! Pure text, no engine calls. `app.rs` decides when an edit may be staged
 //! and sends the statements this module builds.
 
+use crate::db::DbKind;
+use crate::sql::hash_comments;
+
 /// Some(table name) only for a single-table SELECT: a plain, double-quoted,
 /// or backtick-quoted identifier after FROM, optionally one more of either
 /// kind joined by a single unquoted dot, with WHERE, GROUP, ORDER, HAVING,
@@ -12,8 +15,8 @@
 /// parenthesized FROM clauses, aliases, deeper qualifiers, and anything but
 /// a SELECT are not editable. The name joins its parts with a dot; a part
 /// containing a dot or quote keeps its quotes.
-pub fn editable_table(sql: &str) -> Option<String> {
-    let tokens = lex(sql);
+pub fn editable_table(sql: &str, kind: DbKind) -> Option<String> {
+    let tokens = lex(sql, kind);
     if !matches!(tokens.first(), Some(Token::Word(w)) if w.eq_ignore_ascii_case("select")) {
         return None;
     }
@@ -111,8 +114,8 @@ pub struct JoinPlan {
 /// unions, subquery sources, deeper qualifiers, or multiple statements. Each
 /// item parses on its own, so one expression marks only its own column
 /// unresolvable. Pure text, no engine calls.
-pub fn parse_join(sql: &str) -> Option<JoinPlan> {
-    let tokens = lex(sql);
+pub fn parse_join(sql: &str, kind: DbKind) -> Option<JoinPlan> {
+    let tokens = lex(sql, kind);
     if !matches!(tokens.first(), Some(Token::Word(w)) if w.eq_ignore_ascii_case("select")) {
         return None;
     }
@@ -131,8 +134,8 @@ pub fn parse_join(sql: &str) -> Option<JoinPlan> {
 /// True when the SELECT list is exactly `*` or `table.*`, the forms whose
 /// result columns read positionally from the one source table. A function or
 /// arithmetic item is not a wildcard even though its parsed column is None.
-pub fn wildcard_select(sql: &str) -> bool {
-    let tokens = lex(sql);
+pub fn wildcard_select(sql: &str, kind: DbKind) -> bool {
+    let tokens = lex(sql, kind);
     let Some(from) = top_level_from(&tokens) else { return false };
     let mut list = &tokens[1..from];
     if matches!(
@@ -436,7 +439,8 @@ enum Token {
     Punct(char),
 }
 
-fn lex(sql: &str) -> Vec<Token> {
+fn lex(sql: &str, kind: DbKind) -> Vec<Token> {
+    let hash = hash_comments(kind);
     let chars: Vec<char> = sql.chars().collect();
     let mut tokens = Vec::new();
     let mut i = 0;
@@ -481,7 +485,7 @@ fn lex(sql: &str) -> Vec<Token> {
             while i < chars.len() && chars[i] != '\n' {
                 i += 1;
             }
-        } else if c == '#' {
+        } else if c == '#' && hash {
             i += 1;
             while i < chars.len() && chars[i] != '\n' {
                 i += 1;
@@ -772,7 +776,7 @@ mod tests {
     use super::*;
 
     fn table_of(sql: &str) -> Option<String> {
-        editable_table(sql)
+        editable_table(sql, DbKind::Postgres)
     }
 
     #[test]
@@ -894,9 +898,19 @@ mod tests {
     }
 
     #[test]
+    fn hash_hides_nothing_outside_mysql() {
+        let sql = "SELECT id, data #>> '{a}' AS label FROM t";
+        let plan = parse_join(sql, DbKind::Postgres).expect("one source");
+        let columns: Vec<_> = plan.selects.iter().map(|s| s.column.as_deref()).collect();
+        assert_eq!(columns, vec![Some("id"), None]);
+        assert_eq!(editable_table(sql, DbKind::Postgres), Some("t".to_owned()));
+        assert_eq!(editable_table(sql, DbKind::Mysql), None);
+    }
+
+    #[test]
     fn hash_comments_and_dollar_quotes_lex_as_skipped_text() {
         assert_eq!(
-            table_of("SELECT * FROM users # note with from join\nWHERE id = 1"),
+            editable_table("SELECT * FROM users # note with from join\nWHERE id = 1", DbKind::Mysql),
             Some("users".to_owned())
         );
         assert_eq!(
@@ -924,10 +938,10 @@ mod tests {
 
     #[test]
     fn wildcard_selects_read_positionally() {
-        assert!(wildcard_select("SELECT * FROM users"));
-        assert!(wildcard_select("SELECT DISTINCT t.* FROM users t"));
-        assert!(!wildcard_select("SELECT count(*) FROM users"));
-        assert!(!wildcard_select("SELECT u.id, u.* FROM users u"));
+        assert!(wildcard_select("SELECT * FROM users", DbKind::Postgres));
+        assert!(wildcard_select("SELECT DISTINCT t.* FROM users t", DbKind::Postgres));
+        assert!(!wildcard_select("SELECT count(*) FROM users", DbKind::Postgres));
+        assert!(!wildcard_select("SELECT u.id, u.* FROM users u", DbKind::Postgres));
     }
 
     #[test]
@@ -1099,7 +1113,7 @@ mod tests {
     }
 
     fn join_of(sql: &str) -> Option<JoinPlan> {
-        parse_join(sql)
+        parse_join(sql, DbKind::Postgres)
     }
 
     #[test]

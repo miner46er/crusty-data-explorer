@@ -1211,26 +1211,27 @@ fn now_unix_secs() -> u64 {
 /// programmatic run and an empty selection still run something.
 fn effective_statements(
     sql: &str,
+    kind: DbKind,
     scope: RunScope,
     cursor: usize,
     selection: Option<Range<usize>>,
 ) -> Vec<String> {
     match scope {
-        RunScope::All => split_statements(sql),
+        RunScope::All => split_statements(sql, kind),
         RunScope::Current => {
-            let statements = split_statements(sql);
-            current_statement(sql, cursor)
+            let statements = split_statements(sql, kind);
+            current_statement(sql, cursor, kind)
                 .and_then(|index| statements.get(index).cloned())
                 .into_iter()
                 .collect()
         }
         RunScope::Selection => match selection {
-            Some(selection) => statement_ranges(sql)
+            Some(selection) => statement_ranges(sql, kind)
                 .into_iter()
                 .filter(|range| range.start < selection.end && selection.start < range.end)
                 .map(|range| sql[range].to_owned())
                 .collect(),
-            None => effective_statements(sql, RunScope::Current, cursor, None),
+            None => effective_statements(sql, kind, RunScope::Current, cursor, None),
         },
     }
 }
@@ -2118,12 +2119,12 @@ impl AppState {
                 }
                 None => return,
             };
-        let statements = effective_statements(sql, scope, cursor, selection);
+        let statements = effective_statements(sql, kind, scope, cursor, selection);
         if statements.is_empty() {
             self.set_outcome(tab, RunOutcome::Err("nothing to run".to_owned()));
             return;
         }
-        match collect_params(&statements) {
+        match collect_params(&statements, kind) {
             Err(error) => {
                 self.set_outcome(tab, RunOutcome::Err(error.to_string()));
                 return;
@@ -2275,12 +2276,6 @@ impl AppState {
     /// History keeps the raw placeholder text.
     pub fn confirm_params(&mut self) {
         let Some(pending) = self.pending_params.take() else { return };
-        let mut next_pos = 0;
-        let substituted: Vec<String> = pending
-            .statements
-            .iter()
-            .map(|statement| substitute(statement, &pending.params, &mut next_pos))
-            .collect();
         let (kind, handle, read_only) =
             match self.connections.iter().find(|c| c.id == pending.conn) {
                 Some(c) => (c.config.kind(), c.handle(), c.config.is_read_only()),
@@ -2289,6 +2284,12 @@ impl AppState {
                     return;
                 }
             };
+        let mut next_pos = 0;
+        let substituted: Vec<String> = pending
+            .statements
+            .iter()
+            .map(|statement| substitute(statement, &pending.params, &mut next_pos, kind))
+            .collect();
         self.continue_batch(
             pending.tab,
             pending.conn,
@@ -2472,7 +2473,8 @@ impl AppState {
         sql: &str,
         result: &QueryResult,
     ) -> Option<EditTarget> {
-        let table = editable_table(sql)?;
+        let kind = self.connections.iter().find(|c| c.id == conn)?.config.kind();
+        let table = editable_table(sql, kind)?;
         let schema = self.schemas.get(&conn)?;
         let pk = primary_key(schema, &table)?;
         let info = find_table(schema, &table);
@@ -2480,11 +2482,11 @@ impl AppState {
         // A named SELECT list maps each item to its source column, so an
         // alias like `name AS label` still writes `name`. A wildcard has no
         // item names, and the result columns already carry the table's.
-        let mut columns: Vec<Option<String>> = match parse_join(sql) {
+        let mut columns: Vec<Option<String>> = match parse_join(sql, kind) {
             Some(plan)
                 if plan.sources.len() == 1
                     && plan.selects.len() == names.len()
-                    && !wildcard_select(sql) =>
+                    && !wildcard_select(sql, kind) =>
             {
                 plan.selects.iter().map(|select| select.column.clone()).collect()
             }
@@ -2534,7 +2536,8 @@ impl AppState {
         sql: &str,
         result: &QueryResult,
     ) -> Option<EditTarget> {
-        let plan = parse_join(sql)?;
+        let kind = self.connections.iter().find(|c| c.id == conn)?.config.kind();
+        let plan = parse_join(sql, kind)?;
         if plan.selects.len() != result.columns().len() {
             return None;
         }
@@ -3294,19 +3297,19 @@ impl AppState {
             Some(t) => t.sql.clone(),
             None => return,
         };
-        let statements = effective_statements(&sql, RunScope::All, 0, None);
-        if statements.is_empty() {
-            return;
-        }
-        let (conn_id, handle) = match self.tabs.iter().find(|t| t.id == tab) {
+        let (conn_id, kind, handle) = match self.tabs.iter().find(|t| t.id == tab) {
             Some(t) => {
                 match t.conn.and_then(|id| self.connections.iter().find(|c| c.id == id)) {
-                    Some(c) => (c.id, c.handle()),
+                    Some(c) => (c.id, c.config.kind(), c.handle()),
                     None => return,
                 }
             }
             None => return,
         };
+        let statements = effective_statements(&sql, kind, RunScope::All, 0, None);
+        if statements.is_empty() {
+            return;
+        }
         self.send_batch(tab, conn_id, handle, statements, BatchPurpose::Refresh, None);
     }
 
@@ -3612,7 +3615,8 @@ impl AppState {
     /// None when the SQL is not a single-table SELECT.
     pub fn table_filter_select(&self, tab: TabId) -> Option<String> {
         let current = self.tabs.iter().find(|t| t.id == tab)?;
-        let table = editable_table(&current.sql)?;
+        let kind = self.connections.iter().find(|c| Some(c.id) == current.conn)?.config.kind();
+        let table = editable_table(&current.sql, kind)?;
         Some(filtered_table_select(
             &table,
             &current.filter_clauses,
@@ -3940,7 +3944,12 @@ impl AppState {
                 if col >= result.columns().len() || row >= result.row_count() {
                     return false;
                 }
-                let table_name = match editable_table(&current.sql) {
+                let Some(kind) =
+                    self.connections.iter().find(|c| c.id == conn).map(|c| c.config.kind())
+                else {
+                    return false;
+                };
+                let table_name = match editable_table(&current.sql, kind) {
                     Some(name) => name,
                     None => return false,
                 };
