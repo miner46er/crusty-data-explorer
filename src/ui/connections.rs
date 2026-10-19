@@ -16,7 +16,7 @@ use crate::db::{
 };
 use crate::ssh::{SshAuth, SshConfig};
 
-use super::{Palette, Theme};
+use super::{Palette, Theme, autofocus, modal_key, ModalKey};
 
 /// A connection's state as the card and the dot read it: one value that
 /// derives both the painted shape and the color, so a dot can never wear the
@@ -1503,11 +1503,13 @@ pub fn password_window(state: &mut AppState, ui: &mut egui::Ui) {
         state.cancel_password_prompt();
         return;
     };
+    let key = modal_key(ui, true);
     let mut submit = false;
     let mut cancel = false;
     egui::Window::new(format!("Password for {name}")).show(ui.ctx(), |ui| {
         ui.label(format!("Enter password for {name}"));
-        ui.add(egui::TextEdit::singleline(state.prompt_password_mut()).password(true));
+        let field = ui.add(egui::TextEdit::singleline(state.prompt_password_mut()).password(true));
+        autofocus(ui, "password", &field);
         ui.horizontal(|ui| {
             if ui.button("Connect").clicked() {
                 submit = true;
@@ -1517,9 +1519,9 @@ pub fn password_window(state: &mut AppState, ui: &mut egui::Ui) {
             }
         });
     });
-    if submit {
+    if submit || key == Some(ModalKey::Submit) {
         state.submit_password();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_password_prompt();
     }
 }
@@ -1532,6 +1534,7 @@ pub fn prod_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
         state.cancel_prod();
         return;
     };
+    let key = modal_key(ui, false);
     let mut confirm = false;
     let mut cancel = false;
     egui::Window::new("Connect to prod?").show(ui.ctx(), |ui| {
@@ -1547,7 +1550,7 @@ pub fn prod_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
     });
     if confirm {
         state.confirm_prod();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_prod();
     }
 }
@@ -1563,6 +1566,7 @@ pub fn terminate_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
         state.cancel_terminate();
         return;
     };
+    let key = modal_key(ui, false);
     let mut confirm = false;
     let mut cancel = false;
     egui::Window::new("Terminate session?").show(ui.ctx(), |ui| {
@@ -1577,7 +1581,7 @@ pub fn terminate_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
     });
     if confirm {
         state.confirm_terminate();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_terminate();
     }
 }
@@ -1591,6 +1595,7 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
     } else {
         "New connection"
     };
+    let key = modal_key(ui, false);
     let mut save = false;
     let mut close = false;
     egui::Window::new(title).show(ui.ctx(), |ui| {
@@ -1833,7 +1838,7 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
                 state.connect(id);
             }
         }
-    } else if close {
+    } else if close || key == Some(ModalKey::Cancel) {
         state.cancel_draft();
     }
 }

@@ -10564,11 +10564,11 @@ mod tests {
                 ..Default::default()
             };
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::query::editor(state, ui);
+                crate::ui::root(state, ui);
             });
             output.textures_delta.clear();
             let mut output = ctx.run_ui(input, |ui| {
-                crate::ui::query::editor(state, ui);
+                crate::ui::root(state, ui);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);
@@ -12024,11 +12024,11 @@ mod tests {
                 ..Default::default()
             };
             let mut output = ctx.run_ui(input.clone(), |ui| {
-                crate::ui::query::editor(state, ui);
+                crate::ui::root(state, ui);
             });
             output.textures_delta.clear();
             let mut output = ctx.run_ui(input, |ui| {
-                crate::ui::query::editor(state, ui);
+                crate::ui::root(state, ui);
             });
             output.textures_delta.clear();
             let text = rendered_text(&output);

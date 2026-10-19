@@ -11,7 +11,7 @@ use super::editor::{char_range, FindState};
 use crate::app::AppState;
 use crate::db::TabId;
 
-use super::{Palette, fit};
+use super::{Palette, autofocus, fit, modal_key, ModalKey};
 
 /// True while any modal owns the screen, so the editor's shortcuts stay dead.
 pub(crate) fn any_modal_open(state: &AppState) -> bool {
@@ -153,10 +153,6 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     }
     find_opened |= super::query_tools::toolbar(state, ui);
     ui.add_space(4.0);
-    save_window(state, ui);
-    write_confirm_window(state, ui);
-    edit_preview_window(state, ui);
-    params_window(state, ui);
     if let Some(id) = state.active() {
         let schema = state
             .tab(id)
@@ -403,17 +399,19 @@ fn find_bar(state: &AppState, ui: &mut egui::Ui, just_opened: bool) {
     store_find_bar(ui.ctx(), tab_id, bar);
 }
 
-fn save_window(state: &mut AppState, ui: &mut egui::Ui) {
+pub fn save_window(state: &mut AppState, ui: &mut egui::Ui) {
     if state.save_prompt().is_none() {
         return;
     }
+    let key = modal_key(ui, true);
     let mut confirm = false;
     let mut close = false;
     egui::Window::new("Save query").show(ui.ctx(), |ui| {
         let Some(prompt) = state.save_prompt_mut() else { return };
         ui.horizontal(|ui| {
             ui.label("Name:");
-            ui.text_edit_singleline(&mut prompt.name);
+            let name = ui.text_edit_singleline(&mut prompt.name);
+            autofocus(ui, "save-name", &name);
         });
         ui.horizontal(|ui| {
             ui.label("Folder:");
@@ -436,9 +434,9 @@ fn save_window(state: &mut AppState, ui: &mut egui::Ui) {
             }
         });
     });
-    if confirm {
+    if confirm || key == Some(ModalKey::Submit) {
         state.confirm_save_prompt();
-    } else if close {
+    } else if close || key == Some(ModalKey::Cancel) {
         state.close_save_prompt();
     }
 }
@@ -448,6 +446,7 @@ fn save_window(state: &mut AppState, ui: &mut egui::Ui) {
 /// exactly as prepared, Cancel drops it.
 pub fn write_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
     let Some(pending) = state.pending_write().cloned() else { return };
+    let key = modal_key(ui, false);
     let mut confirm = false;
     let mut cancel = false;
     egui::Window::new(format!("{} without WHERE?", pending.kind)).show(ui.ctx(), |ui| {
@@ -466,7 +465,7 @@ pub fn write_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
     });
     if confirm {
         state.confirm_write();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_write();
     }
 }
@@ -482,6 +481,7 @@ pub fn edit_preview_window(state: &mut AppState, ui: &mut egui::Ui) {
         state.cancel_pending_edits();
         return;
     }
+    let key = modal_key(ui, false);
     let mut confirm = false;
     let mut cancel = false;
     egui::Window::new("Apply staged edits?").show(ui.ctx(), |ui| {
@@ -506,7 +506,7 @@ pub fn edit_preview_window(state: &mut AppState, ui: &mut egui::Ui) {
     });
     if confirm {
         state.confirm_pending_edits();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_pending_edits();
     }
 }
@@ -518,14 +518,18 @@ pub fn params_window(state: &mut AppState, ui: &mut egui::Ui) {
     if state.pending_params().is_none() {
         return;
     }
+    let key = modal_key(ui, true);
     let mut run = false;
     let mut cancel = false;
     egui::Window::new("Query parameters").show(ui.ctx(), |ui| {
         let Some(pending) = state.pending_params_mut() else { return };
-        for param in &mut pending.params {
+        for (index, param) in pending.params.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(param.display());
-                ui.text_edit_singleline(&mut param.value);
+                let field = ui.text_edit_singleline(&mut param.value);
+                if index == 0 {
+                    autofocus(ui, "params-first", &field);
+                }
             });
         }
         ui.horizontal(|ui| {
@@ -537,9 +541,9 @@ pub fn params_window(state: &mut AppState, ui: &mut egui::Ui) {
             }
         });
     });
-    if run {
+    if run || key == Some(ModalKey::Submit) {
         state.confirm_params();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_params();
     }
 }

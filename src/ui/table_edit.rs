@@ -14,6 +14,8 @@ use eframe::egui;
 use crate::app::AppState;
 use crate::db::ConnectionId;
 
+use super::{ModalKey, modal_key};
+
 /// The status-bar entry's label, measured by the status bar before it draws:
 /// the entry and the measurement read one literal.
 pub(crate) const STATUS_LABEL: &str = "+ Table";
@@ -43,6 +45,7 @@ pub fn table_prod_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
         state.cancel_table_ddl();
         return;
     };
+    let key = modal_key(ui, false);
     let mut confirm = false;
     let mut cancel = false;
     egui::Window::new("Apply table DDL on prod?").show(ui.ctx(), |ui| {
@@ -67,7 +70,7 @@ pub fn table_prod_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
     });
     if confirm {
         state.confirm_table_ddl();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_table_ddl();
     }
 }
@@ -127,6 +130,7 @@ pub fn table_editor_window(state: &mut AppState, ui: &mut egui::Ui) {
         }
         None => return,
     };
+    let key = modal_key(ui, false);
     let mut close = false;
     let mut apply = false;
     let mut load_alter: Option<(String, String)> = None;
@@ -336,7 +340,7 @@ pub fn table_editor_window(state: &mut AppState, ui: &mut egui::Ui) {
         set_alter_input(ui.ctx(), "table", String::new());
     } else if back_to_new {
         state.open_table_create(conn);
-    } else if close {
+    } else if close || key == Some(ModalKey::Cancel) {
         state.close_table_editor();
     } else if apply {
         let tab = state

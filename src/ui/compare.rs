@@ -319,13 +319,14 @@ pub fn compare_window(state: &mut AppState, ui: &mut egui::Ui) {
     if !state.compare_window_open() {
         return;
     }
+    let key = super::modal_key(ui, false);
     let mut open = true;
     egui::Window::new("Table compare")
         .open(&mut open)
         .resizable(true)
         .default_width(520.0)
         .show(ui.ctx(), |ui| compare_body(state, ui));
-    if !open {
+    if !open || key == Some(super::ModalKey::Cancel) {
         state.close_compare();
     }
 }

@@ -23,6 +23,21 @@ pub mod table_edit;
 pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     // First, so the palette's keys win over the editor's completion popup.
     search::palette(state, ui);
+    // Every dialog draws before the panels, so a key it consumes never
+    // reaches the editor or the grid underneath in the same frame.
+    connections::prod_confirm_window(state, ui);
+    connections::terminate_confirm_window(state, ui);
+    connections::draft_window(state, ui);
+    query::save_window(state, ui);
+    connections::password_window(state, ui);
+    // The import window is drawn by the grid, so its Escape is claimed here.
+    import_escape(state, ui);
+    query::write_confirm_window(state, ui);
+    query::params_window(state, ui);
+    query::edit_preview_window(state, ui);
+    table_edit::table_prod_confirm_window(state, ui);
+    table_edit::table_editor_window(state, ui);
+    compare::compare_window(state, ui);
     egui::Panel::left("connections")
         .resizable(true)
         .default_size(240.0)
@@ -42,11 +57,62 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
             .show(ui, |ui| query::editor(state, ui));
     }
     egui::CentralPanel::default().show(ui, |ui| grid::results(state, ui));
-    compare::compare_window(state, ui);
-    connections::draft_window(state, ui);
-    connections::password_window(state, ui);
-    table_edit::table_editor_window(state, ui);
-    table_edit::table_prod_confirm_window(state, ui);
+}
+
+/// The import confirmation owns its own Escape: its window lives in the grid
+/// module, so the key is claimed before the panels read it.
+fn import_escape(state: &mut AppState, ui: &egui::Ui) {
+    if state.modal() != Some(crate::app::Modal::Import) {
+        return;
+    }
+    if modal_key(ui, false) == Some(ModalKey::Cancel) {
+        state.cancel_import();
+    }
+}
+
+/// A key a modal dialog answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModalKey {
+    Submit,
+    Cancel,
+}
+
+/// Consume plain Enter (only when `allow_submit`) and Escape for the dialog
+/// being drawn. Escape wins when both arrive in one frame. Exact modifiers,
+/// so Shift+Enter stays available to fields.
+pub(crate) fn modal_key(ui: &egui::Ui, allow_submit: bool) -> Option<ModalKey> {
+    if ui.input_mut(|i| consume_plain_key(i, egui::Key::Escape)) {
+        return Some(ModalKey::Cancel);
+    }
+    (allow_submit && ui.input_mut(|i| consume_plain_key(i, egui::Key::Enter)))
+        .then_some(ModalKey::Submit)
+}
+
+/// Consume one press of `key` with no modifiers at all. `consume_key` matches
+/// logically and would also eat Shift+Enter.
+fn consume_plain_key(input: &mut egui::InputState, key: egui::Key) -> bool {
+    let before = input.events.len();
+    input.events.retain(|event| match event {
+        egui::Event::Key { key: event_key, modifiers, pressed: true, .. } => {
+            !(*event_key == key && !modifiers.any())
+        }
+        _ => true,
+    });
+    input.events.len() != before
+}
+
+/// Focus `response` on the first frame its dialog draws after being opened,
+/// then leave focus alone: a pass gap of more than one means the dialog was
+/// closed and opened again.
+pub(crate) fn autofocus(ui: &egui::Ui, key: &'static str, response: &egui::Response) {
+    let id = egui::Id::new(("crusty_modal_autofocus", key));
+    let pass = ui.ctx().cumulative_pass_nr();
+    let first_frame =
+        ui.ctx().data_mut(|d| d.get_temp::<u64>(id)) != Some(pass.saturating_sub(1));
+    ui.ctx().data_mut(|d| d.insert_temp(id, pass));
+    if first_frame {
+        response.request_focus();
+    }
 }
 
 fn status_bar(state: &mut AppState, ui: &mut egui::Ui) {

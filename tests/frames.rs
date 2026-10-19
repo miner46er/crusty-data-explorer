@@ -22,7 +22,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::{By, NodeT, Queryable};
 
 use crusty_data_explorer::app::{AppState, ConnectionState, Environment, RunOutcome};
-use crusty_data_explorer::db::{ConnectionConfig, ConnectionId, TabId};
+use crusty_data_explorer::db::{ConnectionConfig, ConnectionId, PostgresSslMode, TabId};
 use crusty_data_explorer::ui;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -198,6 +198,28 @@ fn add_memory_database(state: &mut AppState) -> ConnectionId {
         draft.name = "local".to_owned();
         draft.env = Environment::Dev;
         draft.config = ConnectionConfig::Sqlite { read_only: false, path: ":memory:".into() };
+    }
+    state.save_draft();
+    state.connections().last().expect("the saved connection").id
+}
+
+/// A Postgres connection through the same draft transitions, left
+/// unconnected: the config is all the password prompt needs.
+fn add_postgres_draft(state: &mut AppState) -> ConnectionId {
+    state.open_draft(None);
+    {
+        let draft = state.draft_mut().expect("the open draft");
+        draft.name = "pg".to_owned();
+        draft.env = Environment::Dev;
+        draft.config = ConnectionConfig::Postgres {
+            host: "localhost".to_owned(),
+            port: 5432,
+            database: "appdb".to_owned(),
+            user: "owner".to_owned(),
+            ssl_mode: PostgresSslMode::Disable,
+            ssh: None,
+            read_only: false,
+        };
     }
     state.save_draft();
     state.connections().last().expect("the saved connection").id
@@ -1490,4 +1512,87 @@ fn autocommit_chip_frames() {
         channel_distance(light.fill, light.panel) < 16,
         "the light fill alone stays quiet against the panel: {light:?}"
     );
+}
+
+/// The params prompt: the first field takes focus, so typing lands there,
+/// and Enter runs the substituted batch.
+#[test]
+fn params_prompt_focuses_the_first_field_and_enter_runs() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("params-keys");
+    harness.state_mut().start_run(tab, "SELECT :a AS v", 0, None);
+    assert!(harness.state().pending_params().is_some(), "the prompt holds the run");
+    harness.run();
+
+    harness.event(egui::Event::Text("7".to_owned()));
+    harness.run();
+    assert_eq!(
+        harness.state().pending_params().map(|pending| pending.params[0].value.as_str()),
+        Some("7"),
+        "typing lands in the first parameter field"
+    );
+    capture(&mut harness, "params-prompt-dark");
+
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(harness.state().pending_params().is_none(), "Enter runs the batch");
+    step_until(&mut harness, "the substituted run", |state| {
+        !matches!(state.tab(tab).map(|t| t.outcome()), Some(RunOutcome::Running { .. }))
+    });
+    assert!(
+        matches!(harness.state().tab(tab).map(|t| t.outcome()), Some(RunOutcome::Ok { .. })),
+        "the substituted SELECT ran: {:?}",
+        harness.state().tab(tab).map(|t| t.outcome())
+    );
+}
+
+/// The write guard: Enter is not a confirm, Escape cancels and sends nothing.
+#[test]
+fn without_where_confirm_ignores_enter_and_cancels_on_escape() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("write-confirm-keys");
+    harness.state_mut().start_run(tab, "DELETE FROM users", 0, None);
+    assert!(harness.state().pending_write().is_some(), "the guard holds the delete");
+    harness.run();
+    capture(&mut harness, "write-confirm-dark");
+
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().pending_write().is_some(),
+        "a stray Enter never approves a DELETE without WHERE"
+    );
+
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(harness.state().pending_write().is_none(), "Escape cancels the guard");
+    assert!(
+        matches!(harness.state().tab(tab).map(|t| t.outcome()), Some(RunOutcome::Ok { .. })),
+        "nothing was sent on cancel"
+    );
+}
+
+/// The password prompt: its field takes focus on the first frame, so typing
+/// lands in the hidden field, and Escape cancels without connecting.
+#[test]
+fn password_prompt_focuses_the_field_and_escape_cancels() {
+    let _guard = env_lock();
+    let _scratch = Scratch::new("password-keys");
+    let mut harness = build();
+    let conn = add_postgres_draft(harness.state_mut());
+    harness.state_mut().open_password_prompt(conn);
+    assert_eq!(harness.state().password_prompt(), Some(conn), "the prompt arms");
+    harness.run();
+
+    harness.event(egui::Event::Text("hunter2".to_owned()));
+    harness.run();
+    assert_eq!(
+        harness.state().prompt_password(),
+        "hunter2",
+        "typing lands in the focused password field"
+    );
+
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(harness.state().password_prompt().is_none(), "Escape cancels the prompt");
 }
