@@ -2244,6 +2244,24 @@ impl AppState {
         self.start_batch(tab, sql, cursor, selection, true);
     }
 
+    /// Drop this tab's armed confirms. A new batch replaces the statement a
+    /// confirm was armed for, so approving afterwards could send text the
+    /// operator never saw.
+    fn clear_tab_confirms(&mut self, tab: TabId) {
+        if self.pending_write.as_ref().is_some_and(|pending| pending.tab == tab) {
+            self.pending_write = None;
+        }
+        if self.pending_params.as_ref().is_some_and(|pending| pending.tab == tab) {
+            self.pending_params = None;
+        }
+        if self.pending_edit_preview == Some(tab) {
+            self.pending_edit_preview = None;
+        }
+        if self.pending_table_confirm.as_ref().is_some_and(|pending| pending.tab == tab) {
+            self.pending_table_confirm = None;
+        }
+    }
+
     /// The shared body of run and explain. Resolves the tab's connection, its
     /// handle, and the effective statements. A batch with `:name` or `?`
     /// placeholders arms the value prompt and holds instead of sending; a
@@ -2260,6 +2278,7 @@ impl AppState {
         selection: Option<Range<usize>>,
         explain: bool,
     ) {
+        self.clear_tab_confirms(tab);
         let (conn_id, kind, handle, scope, read_only) =
             match self.tabs.iter().find(|t| t.id == tab) {
                 Some(t) => {
@@ -2379,6 +2398,7 @@ impl AppState {
         explain: bool,
         raw_history: Option<&[String]>,
     ) {
+        self.clear_tab_confirms(tab);
         let prepare = |statement: &String| {
             if explain { explain_sql(kind, statement) } else { statement.clone() }
         };

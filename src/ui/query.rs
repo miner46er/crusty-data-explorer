@@ -176,25 +176,42 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     find_opened |= super::query_tools::toolbar(state, ui);
     ui.add_space(4.0);
     if let Some(id) = state.active() {
+        // A dialog owns the keyboard: a stale editor caret would still take
+        // its text, Enter, and Tab, and the completion popup its Enter and
+        // Escape. Drop the caret and draw the well without an input.
+        if modal_open
+            && ui.ctx().memory(|memory| memory.focused())
+                == Some(super::complete::editor_id(id))
+        {
+            ui.ctx()
+                .memory_mut(|memory| memory.surrender_focus(super::complete::editor_id(id)));
+        }
         let schema = state
             .tab(id)
             .and_then(|tab| tab.conn)
             .and_then(|conn| state.schema(conn))
             .cloned();
-        find_bar(state, ui, find_opened);
+        ui.add_enabled_ui(!modal_open, |ui| find_bar(state, ui, find_opened));
         if let Some(sql) = state.tab_sql_mut(id) {
             egui::Frame::canvas(ui.style())
                 .inner_margin(egui::Margin::same(6))
                 .show(ui, |ui| {
-                    super::complete::editor_with_completion(id, schema.as_ref(), sql, ui);
+                    if modal_open {
+                        super::complete::editor_paused(id, sql, ui);
+                    } else {
+                        super::complete::editor_with_completion(id, schema.as_ref(), sql, ui);
+                    }
                 });
         }
-        // The completion popup gets first claim on Esc; close find only if free.
+        // The completion popup gets first claim on Esc; close find only if
+        // free, and hand the caret back to the editor either way.
         if !modal_open
             && find_bar_of(ui.ctx(), id).open
-            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            && ui.input_mut(|i| super::consume_plain_key(i, egui::Key::Escape))
         {
             close_find(ui.ctx(), id);
+            ui.ctx()
+                .memory_mut(|m| m.request_focus(super::complete::editor_id(id)));
         }
     } else if state.connections().is_empty() {
         let palette = Palette::of(ui.ctx().theme());
