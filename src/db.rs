@@ -220,6 +220,12 @@ impl Ids {
     }
 }
 
+impl Default for Ids {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The kind the user picks in the New Connection form. A chooser, not
 /// stored state: [`ConnectionConfig`] carries the kind, `kind()` derives it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -352,7 +358,7 @@ fn unqualified(sql: &str) -> Option<UnqualifiedWrite> {
     match keyword.as_str() {
         "UPDATE" => {
             let (table, _) = identifier_at(sql, end)?;
-            (!has_outer_where(sql)).then(|| UnqualifiedWrite { kind: "UPDATE", table })
+            (!has_outer_where(sql)).then_some(UnqualifiedWrite { kind: "UPDATE", table })
         }
         "DELETE" => delete_write(sql, end),
         "WITH" => {
@@ -763,20 +769,15 @@ impl DriverRegistry {
 /// Postgres TLS policy. Appended as `sslmode` on the connection string.
 /// `Disable` is the default and leaves the URL untouched, so existing
 /// profiles keep their old strings. Later additive options copy this shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PostgresSslMode {
+    #[default]
     Disable,
     Prefer,
     Require,
     VerifyCa,
     VerifyFull,
-}
-
-impl Default for PostgresSslMode {
-    fn default() -> Self {
-        Self::Disable
-    }
 }
 
 impl PostgresSslMode {
@@ -809,20 +810,15 @@ impl PostgresSslMode {
 
 /// MySQL TLS policy. `VerifyIdentity` is MySQL's counterpart of Postgres
 /// `verify-full`; the rest mirror the Postgres set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MysqlSslMode {
     Disabled,
+    #[default]
     Preferred,
     Required,
     VerifyCa,
     VerifyIdentity,
-}
-
-impl Default for MysqlSslMode {
-    fn default() -> Self {
-        Self::Preferred
-    }
 }
 
 impl MysqlSslMode {
@@ -1084,7 +1080,7 @@ impl QueryResult {
             }
         }
         let has_more = page.truncated;
-        for (own, next) in self.columns.iter_mut().zip(page.columns.into_iter()) {
+        for (own, next) in self.columns.iter_mut().zip(page.columns) {
             let (_, _, mut values) = next.into_parts();
             own.append_values(&mut values);
         }
@@ -1148,6 +1144,7 @@ impl SessionInfo {
     /// Checked constructor. Rejects an empty backend id; every other field
     /// keeps its text because engines report blanks and NULLs for idle or
     /// restricted backends.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         backend_id: String,
         user: String,
@@ -1246,6 +1243,7 @@ pub fn mysql_terminate_sql(id: u64) -> String {
 /// One Postgres introspection row as a [`SessionInfo`]. NULLs become empty
 /// text because restricted backends hide their user, database, or query.
 #[cfg(any(test, feature = "postgres"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pg_session_from_parts(
     pid: i32,
     user: Option<String>,
@@ -1752,6 +1750,7 @@ pub struct TableInfo {
 
 impl TableInfo {
     /// Checked constructor. Rejects empty names.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         kind: TableKind,
@@ -1823,6 +1822,7 @@ pub struct SchemaNode {
 }
 
 impl SchemaNode {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         tables: Vec<TableInfo>,
@@ -2198,18 +2198,18 @@ impl Session {
     ) -> Result<Session, DbError> {
         #[cfg(feature = "postgres")]
         {
-            return Ok(Session::Postgres(PgSession::connect(
+            Ok(Session::Postgres(PgSession::connect(
                 config,
                 password,
                 ssh_password,
-            )?));
+            )?))
         }
         #[cfg(not(feature = "postgres"))]
         {
             let _ = (config, password, ssh_password);
-            return Err(DbError::NotSupported(
+            Err(DbError::NotSupported(
                 "postgres needs the `postgres` feature".to_owned(),
-            ));
+            ))
         }
     }
 
@@ -2220,16 +2220,16 @@ impl Session {
     ) -> Result<Session, DbError> {
         #[cfg(feature = "mysql")]
         {
-            return Ok(Session::Mysql(MySession::connect(
+            Ok(Session::Mysql(MySession::connect(
                 config,
                 password,
                 ssh_password,
-            )?));
+            )?))
         }
         #[cfg(not(feature = "mysql"))]
         {
             let _ = (config, password, ssh_password);
-            return Err(DbError::Config("mysql feature not enabled".to_owned()));
+            Err(DbError::Config("mysql feature not enabled".to_owned()))
         }
     }
 
@@ -2868,13 +2868,12 @@ impl PgSession {
                 _ => false,
             };
             mode.tx_close();
-            if failed {
-                if let AutoMode::Pinned { mut conn, .. } =
+            if failed
+                && let AutoMode::Pinned { mut conn, .. } =
                     std::mem::replace(mode, AutoMode::Manual)
-                {
-                    conn.close_on_drop();
-                    let _ = rt.block_on(async { drop(conn) });
-                }
+            {
+                conn.close_on_drop();
+                rt.block_on(async { drop(conn) });
             }
         }
         Some(tick)
@@ -3017,7 +3016,7 @@ impl PgSession {
                     is_nullable == "YES",
                 ));
             }
-            let con_rows: Vec<(
+            type ConRow = (
                 String,
                 String,
                 String,
@@ -3026,7 +3025,8 @@ impl PgSession {
                 Option<String>,
                 Option<Vec<String>>,
                 String,
-            )> = self
+            );
+            let con_rows: Vec<ConRow> = self
                 .rt
                 .block_on(
                     sqlx::query(
@@ -3081,10 +3081,11 @@ impl PgSession {
                 String,
                 Vec<ConstraintInfo>,
             > = std::collections::HashMap::new();
-            let mut fk_grouped: std::collections::HashMap<
+            type FkGrouped = std::collections::HashMap<
                 String,
                 Vec<(String, Vec<String>, String, Vec<String>)>,
-            > = std::collections::HashMap::new();
+            >;
+            let mut fk_grouped: FkGrouped = std::collections::HashMap::new();
             for (conname, contype, table, cols, ref_table, ref_schema, ref_cols, def) in
                 &con_rows
             {
@@ -3111,25 +3112,25 @@ impl PgSession {
                 )
                 .map_err(|e| DbError::Query(e.to_string()))?;
                 constraints_by_table.entry(table.clone()).or_default().push(info);
-                if kind == ConstraintKind::Foreign {
-                    if let (Some(parent), Some(parent_schema)) = (ref_table, ref_schema) {
-                        let child_cols = cols.clone();
-                        let parent_cols = ref_cols.clone().unwrap_or_default();
-                        fk_grouped.entry(table.clone()).or_default().push((
-                            conname.clone(),
-                            child_cols.clone(),
-                            parent.clone(),
-                            parent_cols.clone(),
-                        ));
-                        all_edges.push(FkEdge {
-                            child_table: table.clone(),
-                            parent_schema: parent_schema.clone(),
-                            parent_table: parent.clone(),
-                            child_cols,
-                            parent_cols,
-                            name: conname.clone(),
-                        });
-                    }
+                if kind == ConstraintKind::Foreign
+                    && let (Some(parent), Some(parent_schema)) = (ref_table, ref_schema)
+                {
+                    let child_cols = cols.clone();
+                    let parent_cols = ref_cols.clone().unwrap_or_default();
+                    fk_grouped.entry(table.clone()).or_default().push((
+                        conname.clone(),
+                        child_cols.clone(),
+                        parent.clone(),
+                        parent_cols.clone(),
+                    ));
+                    all_edges.push(FkEdge {
+                        child_table: table.clone(),
+                        parent_schema: parent_schema.clone(),
+                        parent_table: parent.clone(),
+                        child_cols,
+                        parent_cols,
+                        name: conname.clone(),
+                    });
                 }
             }
             let mut fk_by_table: std::collections::HashMap<String, Vec<ForeignKeyInfo>> =
@@ -3190,28 +3191,23 @@ impl PgSession {
                     ))
                 })
                 .collect::<Result<Vec<_>, DbError>>()?;
-            let mut idx_grouped: std::collections::HashMap<
-                String,
-                Vec<(String, bool, Vec<String>)>,
-            > = std::collections::HashMap::new();
+            type IdxEntry = (String, bool, Vec<String>);
+            type IdxGrouped = std::collections::HashMap<String, Vec<IdxEntry>>;
+            type IdxCurrent = (String, String, bool, Vec<String>);
+            let mut idx_grouped: IdxGrouped = std::collections::HashMap::new();
             {
-                let mut current: Option<(String, String, bool, Vec<String>)> = None;
-                let flush = |current: &mut Option<(String, String, bool, Vec<String>)>,
-                             map: &mut std::collections::HashMap<
-                    String,
-                    Vec<(String, bool, Vec<String>)>,
-                >| {
-                    if let Some((table, name, unique, cols)) = current.take() {
-                        map.entry(table).or_default().push((name, unique, cols));
-                    }
-                };
+                let mut current: Option<IdxCurrent> = None;
+                let flush =
+                    |current: &mut Option<IdxCurrent>, map: &mut IdxGrouped| {
+                        if let Some((table, name, unique, cols)) = current.take() {
+                            map.entry(table).or_default().push((name, unique, cols));
+                        }
+                    };
                 for (table, index, unique, column) in index_rows {
                     match current.as_mut() {
                         Some(cur) if cur.0 == table && cur.1 == index => {
-                            if let Some(col) = column {
-                                if !col.trim().is_empty() {
-                                    cur.3.push(col);
-                                }
+                            if let Some(col) = column && !col.trim().is_empty() {
+                                cur.3.push(col);
                             }
                         }
                         _ => {
@@ -3900,13 +3896,12 @@ impl MySession {
                 _ => false,
             };
             mode.tx_close();
-            if failed {
-                if let AutoMode::Pinned { mut conn, .. } =
+            if failed
+                && let AutoMode::Pinned { mut conn, .. } =
                     std::mem::replace(mode, AutoMode::Manual)
-                {
-                    conn.close_on_drop();
-                    let _ = rt.block_on(async { drop(conn) });
-                }
+            {
+                conn.close_on_drop();
+                rt.block_on(async { drop(conn) });
             }
         }
         Some(tick)
@@ -4056,28 +4051,23 @@ impl MySession {
                     Ok((my_string(row, 0)?, my_string(row, 1)?, non_unique, column))
                 })
                 .collect::<Result<Vec<_>, DbError>>()?;
-            let mut idx_grouped: std::collections::HashMap<
-                String,
-                Vec<(String, bool, Vec<String>)>,
-            > = std::collections::HashMap::new();
+            type MysqlIdxEntry = (String, bool, Vec<String>);
+            type MysqlIdxGrouped = std::collections::HashMap<String, Vec<MysqlIdxEntry>>;
+            type MysqlIdxCurrent = (String, String, bool, Vec<String>);
+            let mut idx_grouped: MysqlIdxGrouped = std::collections::HashMap::new();
             {
-                let mut current: Option<(String, String, bool, Vec<String>)> = None;
-                let flush = |current: &mut Option<(String, String, bool, Vec<String>)>,
-                             map: &mut std::collections::HashMap<
-                    String,
-                    Vec<(String, bool, Vec<String>)>,
-                >| {
-                    if let Some((table, name, unique, cols)) = current.take() {
-                        map.entry(table).or_default().push((name, unique, cols));
-                    }
-                };
+                let mut current: Option<MysqlIdxCurrent> = None;
+                let flush =
+                    |current: &mut Option<MysqlIdxCurrent>, map: &mut MysqlIdxGrouped| {
+                        if let Some((table, name, unique, cols)) = current.take() {
+                            map.entry(table).or_default().push((name, unique, cols));
+                        }
+                    };
                 for (table, index, non_unique, column) in index_rows {
                     match current.as_mut() {
                         Some(cur) if cur.0 == table && cur.1 == index => {
-                            if let Some(col) = column {
-                                if !col.trim().is_empty() {
-                                    cur.3.push(col);
-                                }
+                            if let Some(col) = column && !col.trim().is_empty() {
+                                cur.3.push(col);
                             }
                         }
                         _ => {
@@ -5525,6 +5515,7 @@ pub fn spawn_session(
     DbHandle { cmds: cmds_tx }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     conn: ConnectionId,
     config: ConnectionConfig,
@@ -7185,7 +7176,6 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[test]
     #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
-
     fn pg_live_schema_lists_triggers_and_routines() {
         let _guard = LIVE_SCHEMA_LOCK.lock().expect("schema live lock");
         let config = ConnectionConfig::Postgres { read_only: false,

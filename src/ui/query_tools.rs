@@ -350,10 +350,11 @@ pub(crate) fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
             });
         }
     }
-    if !modal_open && scope != state.tab(tab_id).map(|t| t.run_scope()).unwrap_or_default() {
-        if let Some(tab) = state.tab_mut(tab_id) {
-            tab.set_run_scope(scope);
-        }
+    if !modal_open
+        && scope != state.tab(tab_id).map(|t| t.run_scope()).unwrap_or_default()
+        && let Some(tab) = state.tab_mut(tab_id)
+    {
+        tab.set_run_scope(scope);
     }
     if !modal_open {
         run_clicked |= ui.input_mut(|i| i.consume_shortcut(&run_shortcut()));

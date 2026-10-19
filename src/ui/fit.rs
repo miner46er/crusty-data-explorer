@@ -289,7 +289,7 @@ mod tests {
         frame(&ctx, [24.0, 200.0], |ui| {
             let mut drawn = 0;
             packed_row(ui, &[400.0], &["item"], |ui, _| {
-                ui.button("item");
+                let _ = ui.button("item");
                 drawn += 1;
             });
             assert_eq!(drawn, 1, "the item is drawn and clips, not dropped");

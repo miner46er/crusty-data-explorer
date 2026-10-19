@@ -447,6 +447,7 @@ fn count_affordance(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_table(
     state: &AppState,
     ui: &mut egui::Ui,

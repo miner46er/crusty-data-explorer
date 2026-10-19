@@ -60,10 +60,10 @@ impl SshConfig {
         if self.user.trim().is_empty() {
             return Err(DbError::Config("ssh user is empty".to_owned()));
         }
-        if let SshAuth::KeyFile { path, .. } = &self.auth {
-            if path.as_os_str().is_empty() {
-                return Err(DbError::Config("ssh key file is empty".to_owned()));
-            }
+        if let SshAuth::KeyFile { path, .. } = &self.auth
+            && path.as_os_str().is_empty()
+        {
+            return Err(DbError::Config("ssh key file is empty".to_owned()));
         }
         Ok(())
     }
