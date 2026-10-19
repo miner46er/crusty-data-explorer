@@ -16,6 +16,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::sql::{block_comment_end, line_comment_end, scan_dollar_quote, scan_quote};
 use crate::ssh::SshConfig;
 
 /// Cap on materialized rows per statement. The result reports truncation.
@@ -26,17 +27,83 @@ pub const STREAM_PAGE_SIZE: usize = 5_000;
 /// Cap on displayed characters per text cell in the grid.
 pub const CELL_CAP: usize = 256;
 
-/// One statement trimmed of trailing whitespace and semicolons, so a page
-/// or count wrapper never nests a second terminator inside the subselect.
-fn trim_statement(sql: &str) -> &str {
-    let mut inner = sql.trim();
-    while let Some(stripped) = inner.strip_suffix(';') {
-        inner = stripped.trim_end();
-        if inner.is_empty() {
-            break;
+/// One whole token the scanner steps over: its end offset and whether the
+/// text counts as code (`'...'`, `"..."`, `` `...` ``, `$$...$$`) or as a
+/// comment that does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Skipped {
+    Code { end: usize },
+    Comment { end: usize },
+}
+
+impl Skipped {
+    /// One past the token.
+    fn end(self) -> usize {
+        match self {
+            Skipped::Code { end } | Skipped::Comment { end } => end,
         }
     }
-    inner
+}
+
+/// The string, quoted identifier, comment, or dollar-quoted literal starting
+/// at `i`. None when `i` starts ordinary text, so callers decide what to do
+/// with the byte themselves.
+fn skipped_token(sql: &str, i: usize) -> Option<Skipped> {
+    let bytes = sql.as_bytes();
+    let token = match bytes.get(i) {
+        Some(&b'\'') | Some(&b'"') | Some(&b'`') => {
+            Skipped::Code { end: scan_quote(bytes, i, bytes[i]) }
+        }
+        Some(&b'$') => Skipped::Code { end: scan_dollar_quote(bytes, i)? },
+        Some(&b'-') if bytes.get(i + 1) == Some(&b'-') => {
+            Skipped::Comment { end: line_comment_end(bytes, i + 2) }
+        }
+        Some(&b'#') => Skipped::Comment { end: line_comment_end(bytes, i + 1) },
+        Some(&b'/') if bytes.get(i + 1) == Some(&b'*') => {
+            Skipped::Comment { end: block_comment_end(bytes, i + 2) }
+        }
+        _ => return None,
+    };
+    Some(token)
+}
+
+/// One statement with its leading and trailing comments dropped and its
+/// trailing terminators removed, so a page or count wrapper never nests a
+/// second terminator or swallows its own closing paren in a trailing line
+/// comment. Empty when no code token is left. A comment with code after it
+/// stays, since its newline keeps the wrapper's paren out of it.
+fn trim_statement(sql: &str) -> &str {
+    let bytes = sql.as_bytes();
+    let mut first: Option<usize> = None;
+    let mut last = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b';' {
+            i += 1;
+            continue;
+        }
+        if let Some(token) = skipped_token(sql, i) {
+            if let Skipped::Code { end } = token {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = end;
+            }
+            i = token.end();
+            continue;
+        }
+        let character = sql[i..].chars().next().expect("non-empty slice");
+        if character.is_whitespace() {
+            i += character.len_utf8();
+            continue;
+        }
+        if first.is_none() {
+            first = Some(i);
+        }
+        last = i + character.len_utf8();
+        i = last;
+    }
+    first.map_or("", |start| &sql[start..last])
 }
 
 /// One page of `sql` as a subselect. `LIMIT` plus `OFFSET` reads on SQLite,
@@ -54,9 +121,28 @@ pub fn count_sql(sql: &str) -> String {
 
 /// True when `sql` holds one statement with no inner terminator. Paging and
 /// streamed export wrap the whole text as a subselect, so a batch falls back
-/// to the visible grid instead.
+/// to the visible grid instead. A `;` inside a string, quoted identifier, or
+/// comment never counts.
 pub fn is_single_statement(sql: &str) -> bool {
-    !trim_statement(sql).contains(';')
+    !has_terminator(trim_statement(sql))
+}
+
+/// True when `sql` holds a `;` outside strings, quoted identifiers, comments,
+/// and dollar-quoted literals.
+fn has_terminator(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(token) = skipped_token(sql, i) {
+            i = token.end();
+            continue;
+        }
+        if bytes[i] == b';' {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Branded id so a tab id cannot stand in for a connection id.
@@ -5541,6 +5627,69 @@ mod tests {
         assert!(is_single_statement("SELECT * FROM users"));
         assert!(is_single_statement("SELECT 1;  "));
         assert!(!is_single_statement("SELECT 1; SELECT 2"));
+    }
+
+    #[test]
+    fn paged_sql_strips_trailing_comments_and_terminators() {
+        assert_eq!(
+            paged_sql("SELECT 1 -- trailing note", 10, 0),
+            "SELECT * FROM (SELECT 1) AS __cde_page LIMIT 10 OFFSET 0"
+        );
+        assert_eq!(
+            paged_sql("SELECT 1 # trailing note", 10, 0),
+            "SELECT * FROM (SELECT 1) AS __cde_page LIMIT 10 OFFSET 0"
+        );
+        assert_eq!(
+            paged_sql("SELECT 1 /* trailing */ ;", 10, 0),
+            "SELECT * FROM (SELECT 1) AS __cde_page LIMIT 10 OFFSET 0"
+        );
+        assert_eq!(
+            paged_sql("-- lead\nSELECT 1\n-- note", 10, 0),
+            "SELECT * FROM (SELECT 1) AS __cde_page LIMIT 10 OFFSET 0"
+        );
+        assert_eq!(
+            paged_sql("SELECT $$a;b$$", 10, 0),
+            "SELECT * FROM (SELECT $$a;b$$) AS __cde_page LIMIT 10 OFFSET 0"
+        );
+        // A comment with code after it stays: its newline keeps the wrapper's
+        // closing paren outside the comment.
+        assert_eq!(
+            paged_sql("SELECT 1 -- inline\n + 2", 10, 0),
+            "SELECT * FROM (SELECT 1 -- inline\n + 2) AS __cde_page LIMIT 10 OFFSET 0"
+        );
+    }
+
+    #[test]
+    fn count_sql_strips_trailing_comments_and_terminators() {
+        assert_eq!(
+            count_sql("SELECT 1 -- trailing note"),
+            "SELECT COUNT(*) FROM (SELECT 1) AS __cde_count"
+        );
+        assert_eq!(
+            count_sql("SELECT 1 # trailing note"),
+            "SELECT COUNT(*) FROM (SELECT 1) AS __cde_count"
+        );
+    }
+
+    #[test]
+    fn paged_and_count_sql_stay_valid_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let page = paged_sql("SELECT 1 -- trailing note", 10, 0);
+        assert_eq!(conn.query_row(&page, [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        let count = count_sql("SELECT 1 -- trailing note");
+        assert_eq!(conn.query_row(&count, [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn single_statement_ignores_quoted_and_commented_terminators() {
+        assert!(is_single_statement("SELECT ';'"));
+        assert!(is_single_statement("SELECT 1; -- note"));
+        assert!(is_single_statement("SELECT 1 # note"));
+        assert!(is_single_statement("SELECT $$a;b$$"));
+        assert!(is_single_statement("SELECT \"a;b\""));
+        assert!(!is_single_statement("SELECT 1; SELECT 2"));
+        assert!(!is_single_statement("SELECT 1; -- note\nSELECT 2"));
+        assert!(!is_single_statement("SELECT 1 # note\n; SELECT 2"));
     }
 
     fn two_rows(first: Vec<Value>, second: Vec<Value>) -> QueryResult {
