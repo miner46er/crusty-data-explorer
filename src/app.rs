@@ -8736,11 +8736,22 @@ mod tests {
                 state,
                 vec![key_event(eframe::egui::Key::Enter, eframe::egui::Modifiers::NONE)],
             );
-            assert!(!state.palette_open());
-            // The sidebar consumes the reveal on the same frame it draws, so
-            // a closed palette with no new tab is the trace the column row
-            // leaves: Enter activated it instead of opening a tab.
+            assert!(!state.palette_open(), "Enter closes the palette");
             assert_eq!(state.tabs().len(), 2, "the column row opened no tab");
+            // The sidebar consumes the reveal the same frame it draws, so the
+            // pending value is gone: the effect to read is the expanded entry.
+            assert!(
+                state.navigator_reveal().is_none(),
+                "the sidebar consumed the reveal"
+            );
+            // The forced-open animates in, so the expanded entry reads on the
+            // next frame.
+            let expanded = frame(state, vec![]);
+            let text = rendered_text(&expanded);
+            assert!(
+                text.iter().any(|t| t == "Columns (3)"),
+                "the reveal expanded main.items: {text:?}"
+            );
         });
     }
 
