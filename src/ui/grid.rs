@@ -125,10 +125,11 @@ impl Selection {
 
     /// One cursor move over `visible`, the view order: the active cell moves,
     /// edges clamp, and a plain step selects the row it lands on while a
-    /// Shift step extends the row range from the anchor. `cols` counts the
-    /// result columns the cursor may occupy, `page` the rows PageUp and
-    /// PageDown travel. A step with no cursor on a displayed row lands on the
-    /// first displayed row, column 0, and an empty view moves nothing.
+    /// Shift step onto another row extends the row range from the anchor.
+    /// `cols` counts the result columns the cursor may occupy, `page` the
+    /// rows PageUp and PageDown travel. A step with no cursor on a displayed
+    /// row lands on the first displayed row, column 0, and an empty view
+    /// moves nothing.
     fn step(&mut self, step: Step, extend: bool, visible: &[usize], cols: usize, page: usize) {
         if visible.is_empty() || cols == 0 {
             return;
@@ -160,8 +161,6 @@ impl Selection {
             self.anchor = Some(row);
             self.active = Some((row, col));
         } else if row != active_row {
-            // A row move with Shift extends from the anchor; a column move
-            // keeps the range and only moves the cursor.
             self.extend(row, col);
         } else {
             self.active = Some((row, col));
@@ -170,8 +169,7 @@ impl Selection {
 
     /// Tab and Shift+Tab: a column step inside the row, wrapping onto the
     /// next or previous row at the row's ends. The wrap takes two [`Step`]s,
-    /// since a single one can only move within a row. With no cursor on a
-    /// displayed row, either direction lands it the way any step does.
+    /// since a single one can only move within a row.
     fn tab_step(&mut self, back: bool, visible: &[usize], cols: usize, page: usize) {
         if visible.is_empty() || cols == 0 {
             return;
@@ -337,16 +335,11 @@ fn take_grid_scroll(ctx: &egui::Context, tab: TabId) -> Option<usize> {
     ctx.data_mut(|data| data.remove_temp::<usize>(grid_scroll_id(tab)))
 }
 
-/// The height of one table row, shared by the row builder, the page-step
-/// size, and the scroll-into-view math.
 const GRID_ROW_H: f32 = 20.0;
 
 /// The page a PageUp or PageDown moves when the viewport cannot be measured.
 const GRID_PAGE_FALLBACK: usize = 10;
 
-/// Rows one PageUp or PageDown moves: what the grid's viewport holds, at
-/// least one. A viewport that never resolves to a height falls back to
-/// [`GRID_PAGE_FALLBACK`].
 fn page_rows(available_height: f32) -> usize {
     if available_height.is_finite() && available_height > 0.0 {
         ((available_height / GRID_ROW_H).floor() as usize).max(1)
@@ -3308,10 +3301,7 @@ fn release_tab_focus(ui: &egui::Ui) {
 }
 
 /// Arrow, Home/End, Page, and Tab movement of the grid cursor, gated like
-/// [`grid_clipboard_keys`]: dead while any modal is open, while a cell editor
-/// is open, or while a text field holds focus. Tab is taken back from egui's
-/// focus traversal before the gate reads it, since that traversal runs before
-/// this handler. Returns the table row the view should scroll to.
+/// [`grid_clipboard_keys`]. Returns the table row the view should scroll to.
 fn grid_cursor_keys(
     tab: TabId,
     selection: &mut Selection,
@@ -3344,8 +3334,6 @@ fn grid_cursor_keys(
     // Alt stays with the resize keys `grid_edit_keys` takes first; a plain
     // pattern would match Alt+Arrow too once no column is active.
     if !alt {
-        // The Ctrl patterns go first: `consume_key` matches an event with
-        // extra Shift, so a plain pattern would swallow the Ctrl chord.
         take(egui::Modifiers::COMMAND, egui::Key::Home, Step::First);
         take(egui::Modifiers::COMMAND, egui::Key::End, Step::Last);
         take(egui::Modifiers::NONE, egui::Key::Home, Step::RowStart);
@@ -4129,7 +4117,6 @@ mod tests {
             assert_eq!(selection.active(), Some((3, 0)), "{step:?} starts at the top left");
             assert_eq!(selection.resolve(&visible), vec![3]);
         }
-        // A cursor whose row a filter dropped starts over the same way.
         let mut selection = Selection::default();
         selection.click(7, 1);
         selection.step(Step::Right, false, &visible, 2, 4);
@@ -4216,7 +4203,6 @@ mod tests {
         selection.step(Step::Up, true, &visible, 2, 2);
         assert_eq!(selection.resolve(&visible), vec![2, 3]);
         assert_eq!(selection.active(), Some((3, 0)));
-        // A column step keeps the range and only walks the cursor.
         selection.step(Step::Right, true, &visible, 2, 2);
         assert_eq!(selection.active(), Some((3, 1)));
         assert_eq!(selection.resolve(&visible), vec![2, 3]);
@@ -4255,7 +4241,6 @@ mod tests {
         assert_eq!(selection.active(), Some((1, 0)));
         selection.tab_step(true, &visible, 3, 2);
         assert_eq!(selection.active(), Some((0, 2)));
-        // The ends of the view hold instead of wrapping around.
         selection.click(2, 2);
         selection.tab_step(false, &visible, 3, 2);
         assert_eq!(selection.active(), Some((2, 0)));

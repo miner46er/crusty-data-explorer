@@ -1,9 +1,8 @@
 //! Keyboard behavior of the results grid over a rendered frame.
 //!
-//! Each test builds a real `AppState` on an in-memory SQLite database, draws
-//! it through `ui::root` with `egui_kittest`, and asserts what the operator
-//! could see: the text nodes of the row-detail pane, the cell editor, or the
-//! text a frame asked the clipboard to carry.
+//! Each test builds a real `AppState` on an in-memory SQLite database and
+//! draws it through `ui::root`, so the assertions read what the operator
+//! could see rather than a private flag.
 
 use std::ffi::OsString;
 use std::sync::{Mutex, MutexGuard};
@@ -231,8 +230,6 @@ fn open_detail(harness: &mut Harness<AppState>) {
     harness.run();
 }
 
-/// Arrow keys move the active cell over the rendered grid: the pane reports
-/// the row, and Enter opens the cell editor on the column the cursor reached.
 #[test]
 fn arrow_keys_move_the_active_cell() {
     let _lock = env_lock();
@@ -264,9 +261,9 @@ fn arrow_keys_move_the_active_cell() {
     );
 }
 
-/// Tab walks row and column, wrapping onto the next row, and does not leave
-/// the cursor behind: every later key here is gated like Ctrl+C, so a press
-/// that reached io focus instead would open no editor.
+/// The Enter presses below prove Tab left no widget focused: they run behind
+/// the same gate as Ctrl+C, so a Tab that moved egui's focus would open no
+/// editor.
 #[test]
 fn tab_walks_the_view_and_keeps_the_grid_alive() {
     let _lock = env_lock();
@@ -300,8 +297,6 @@ fn tab_walks_the_view_and_keeps_the_grid_alive() {
     press_key(&mut harness, egui::Key::Escape);
 }
 
-/// Escape cancels the grid's import confirmation, the way Escape cancels the
-/// cell editor.
 #[test]
 fn escape_cancels_the_import_confirmation() {
     let _lock = env_lock();
@@ -330,8 +325,6 @@ fn escape_cancels_the_import_confirmation() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Ctrl+Shift+C copies the one active cell, and Ctrl+C keeps copying the
-/// rows: the specific chord is consumed first, so one press never does both.
 #[test]
 fn shift_command_c_copies_the_active_cell() {
     let _lock = env_lock();
@@ -376,8 +369,6 @@ fn ctrl_end_scrolls_the_cursor_row_into_view() {
         harness.query_by_label("row-200").is_none(),
         "the last row starts below the viewport"
     );
-    // The first step from no cursor lands on the first row; the second
-    // Ctrl+End then jumps to the last.
     harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::End);
     harness.run();
     assert!(
