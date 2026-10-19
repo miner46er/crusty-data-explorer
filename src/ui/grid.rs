@@ -373,12 +373,17 @@ const GRID_ROW_H: f32 = 20.0;
 /// The page a PageUp or PageDown moves when the viewport cannot be measured.
 const GRID_PAGE_FALLBACK: usize = 10;
 
-fn page_rows(available_height: f32) -> usize {
-    if available_height.is_finite() && available_height > 0.0 {
-        ((available_height / GRID_ROW_H).floor() as usize).max(1)
-    } else {
-        GRID_PAGE_FALLBACK
+fn page_rows(available_height: f32, row_spacing: f32) -> usize {
+    let row = GRID_ROW_H + row_spacing;
+    if !available_height.is_finite() || available_height <= 0.0 || !row.is_finite() || row <= 0.0
+    {
+        return GRID_PAGE_FALLBACK;
     }
+    let body = available_height - (GRID_ROW_H + row_spacing);
+    if body <= 0.0 {
+        return 1;
+    }
+    ((body / row).floor() as usize).max(1)
 }
 
 /// The worker and connection pieces the grid needs past the tab borrow: a
@@ -2459,7 +2464,7 @@ fn results_grid(
     let mut pending_sort: Option<usize> = None;
     let shown = view.visible(ncols);
     let widths: Vec<Option<f32>> = shown.iter().map(|col| view.width(*col)).collect();
-    let page = page_rows(ui.available_height());
+    let page = page_rows(ui.available_height(), ui.spacing().item_spacing.y);
     let scroll_row = take_grid_scroll(ui.ctx(), tab.id);
     egui::ScrollArea::both().show(ui, |ui| {
         let mut table = TableBuilder::new(ui).striped(true);
@@ -4356,11 +4361,12 @@ mod tests {
 
     #[test]
     fn page_rows_measures_the_viewport_and_falls_back() {
-        assert_eq!(page_rows(400.0), 20);
-        assert_eq!(page_rows(19.0), 1);
-        assert_eq!(page_rows(0.0), GRID_PAGE_FALLBACK);
-        assert_eq!(page_rows(-20.0), GRID_PAGE_FALLBACK);
-        assert_eq!(page_rows(f32::INFINITY), GRID_PAGE_FALLBACK);
-        assert_eq!(page_rows(f32::NAN), GRID_PAGE_FALLBACK);
+        assert_eq!(page_rows(400.0, 0.0), 19, "the header takes one row");
+        assert_eq!(page_rows(400.0, 4.0), 15, "row spacing and the header are excluded");
+        assert_eq!(page_rows(19.0, 4.0), 1);
+        assert_eq!(page_rows(0.0, 4.0), GRID_PAGE_FALLBACK);
+        assert_eq!(page_rows(-20.0, 4.0), GRID_PAGE_FALLBACK);
+        assert_eq!(page_rows(f32::INFINITY, 4.0), GRID_PAGE_FALLBACK);
+        assert_eq!(page_rows(f32::NAN, 4.0), GRID_PAGE_FALLBACK);
     }
 }

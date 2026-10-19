@@ -446,9 +446,6 @@ fn find_bar(state: &AppState, ui: &mut egui::Ui, just_opened: bool) {
         } else if ui.input_mut(|i| super::consume_plain_key(i, egui::Key::Enter)) {
             step = Some(1);
         }
-        if ui.input_mut(|i| super::consume_plain_key(i, egui::Key::Escape)) {
-            close = true;
-        }
     }
     ui.horizontal(|ui| {
         ui.label("Find");
@@ -510,26 +507,28 @@ fn find_bar(state: &AppState, ui: &mut egui::Ui, just_opened: bool) {
     store_find_bar(ui.ctx(), tab_id, bar);
 }
 
-pub fn save_window(state: &mut AppState, ui: &mut egui::Ui) {
+pub fn save_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKey>) {
     if state.save_prompt().is_none() {
         return;
     }
-    let key = modal_key(ui, true);
     let mut confirm = false;
     let mut close = false;
+    let mut field_focused = false;
     egui::Window::new("Save query").show(ui.ctx(), |ui| {
         let Some(prompt) = state.save_prompt_mut() else { return };
         ui.horizontal(|ui| {
             ui.label("Name:");
             let name = ui.text_edit_singleline(&mut prompt.name);
+            field_focused |= name.has_focus();
             autofocus(ui, "save-name", &name);
         });
         ui.horizontal(|ui| {
             ui.label("Folder:");
-            ui.add(
+            let folder = ui.add(
                 egui::TextEdit::singleline(&mut prompt.folder)
                     .hint_text("no folder"),
             );
+            field_focused |= folder.has_focus();
         });
         ui.checkbox(&mut prompt.pinned, "Pinned")
             .on_hover_text("List this entry first inside its folder group");
@@ -545,7 +544,9 @@ pub fn save_window(state: &mut AppState, ui: &mut egui::Ui) {
             }
         });
     });
-    if confirm || key == Some(ModalKey::Submit) {
+    let free_focus = ui.ctx().memory(|memory| memory.focused().is_none());
+    let submit = key == Some(ModalKey::Submit) && (field_focused || free_focus);
+    if confirm || submit {
         state.confirm_save_prompt();
     } else if close || key == Some(ModalKey::Cancel) {
         state.close_save_prompt();
@@ -637,19 +638,20 @@ pub fn edit_preview_window(
 /// The value prompt for a run holding `:name` and `?` placeholders. Lists
 /// each parameter with a text field; Run substitutes the values and continues
 /// the prepared batch through the send path, Cancel sends nothing.
-pub fn params_window(state: &mut AppState, ui: &mut egui::Ui) {
+pub fn params_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKey>) {
     if state.pending_params().is_none() {
         return;
     }
-    let key = modal_key(ui, true);
     let mut run = false;
     let mut cancel = false;
+    let mut field_focused = false;
     egui::Window::new("Query parameters").show(ui.ctx(), |ui| {
         let Some(pending) = state.pending_params_mut() else { return };
         for (index, param) in pending.params.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(param.display());
                 let field = ui.text_edit_singleline(&mut param.value);
+                field_focused |= field.has_focus();
                 if index == 0 {
                     autofocus(ui, "params-first", &field);
                 }
@@ -664,7 +666,8 @@ pub fn params_window(state: &mut AppState, ui: &mut egui::Ui) {
             }
         });
     });
-    if run || key == Some(ModalKey::Submit) {
+    let free_focus = ui.ctx().memory(|memory| memory.focused().is_none());
+    if run || (key == Some(ModalKey::Submit) && (field_focused || free_focus)) {
         state.confirm_params();
     } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_params();

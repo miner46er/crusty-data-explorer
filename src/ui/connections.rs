@@ -1503,12 +1503,13 @@ pub fn password_window(
         state.cancel_password_prompt();
         return;
     };
-    let key = modal_key(ui, true);
     let mut submit = false;
     let mut cancel = false;
+    let mut field_focused = false;
     egui::Window::new(format!("Password for {name}")).show(ui.ctx(), |ui| {
         ui.label(format!("Enter password for {name}"));
         let field = ui.add(egui::TextEdit::singleline(state.prompt_password_mut()).password(true));
+        field_focused = field.has_focus();
         autofocus(ui, "password", &field);
         ui.horizontal(|ui| {
             if ui.button("Connect").clicked() {
@@ -1519,14 +1520,21 @@ pub fn password_window(
             }
         });
     });
-    if submit || key == Some(ModalKey::Submit) {
+    let free_focus = ui.ctx().memory(|memory| memory.focused().is_none());
+    let submit = submit
+        || (key == Some(ModalKey::Submit) && (field_focused || free_focus));
+    if submit {
         state.submit_password();
     } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_password_prompt();
     }
 }
 
-pub fn prod_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
+pub fn prod_confirm_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) {
     let Some(id) = state.pending_prod() else { return };
     let Some(name) =
         state.connections().iter().find(|c| c.id == id).map(|c| c.name.clone())
