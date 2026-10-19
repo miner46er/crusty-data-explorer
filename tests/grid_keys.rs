@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use eframe::egui;
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 
 use crusty_data_explorer::app::{AppState, ConnectionState, Environment, RunOutcome};
 use crusty_data_explorer::db::{ConnectionConfig, ConnectionId, TabId};
@@ -141,6 +142,24 @@ fn grid_setup(tag: &str) -> (Scratch, Harness<'static, AppState>, TabId) {
     (scratch, harness, tab)
 }
 
+/// One harness on a fresh scratch profile with a two-hundred-row table, so
+/// most of the view sits below the viewport and virtualization hides it.
+fn scrolling_setup(tag: &str) -> (Scratch, Harness<'static, AppState>, TabId) {
+    let scratch = Scratch::new(tag);
+    let mut harness = build();
+    let conn = add_memory_database(harness.state_mut());
+    connect_and_wait(&mut harness, conn);
+    let tab = harness.state_mut().new_tab(conn);
+    harness.state_mut().activate(tab);
+    run_sql(
+        &mut harness,
+        tab,
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200)\n\
+         SELECT i AS id, 'row-' || i AS note FROM n;",
+    );
+    (scratch, harness, tab)
+}
+
 /// The text a single frame asked the clipboard to carry, if any.
 fn copied_text(harness: &Harness<AppState>) -> Option<String> {
     harness
@@ -197,5 +216,117 @@ fn ctrl_c_is_dead_while_the_params_prompt_is_open() {
     assert!(
         press_for_copy(&mut harness, egui::Modifiers::COMMAND, egui::Key::C).is_none(),
         "Ctrl+C stays dead under the params prompt"
+    );
+}
+
+/// Press `key` alone and let the frames settle.
+fn press_key(harness: &mut Harness<AppState>, key: egui::Key) {
+    harness.key_press(key);
+    harness.run();
+}
+
+/// Open the row-detail pane, whose `Row N of M` text reports the cursor.
+fn open_detail(harness: &mut Harness<AppState>) {
+    harness.get_by_label("Detail").click();
+    harness.run();
+}
+
+/// Arrow keys move the active cell over the rendered grid: the pane reports
+/// the row, and Enter opens the cell editor on the column the cursor reached.
+#[test]
+fn arrow_keys_move_the_active_cell() {
+    let _lock = env_lock();
+    let (_scratch, mut harness, _tab) = grid_setup("arrows");
+    open_detail(&mut harness);
+    assert!(harness.query_by_label("Click a cell to inspect its row.").is_some());
+    press_key(&mut harness, egui::Key::ArrowDown);
+    assert!(
+        harness.query_by_label("Row 1 of 5").is_some(),
+        "the first displayed row takes the cursor"
+    );
+    press_key(&mut harness, egui::Key::ArrowDown);
+    assert!(harness.query_by_label("Row 2 of 5").is_some());
+    press_key(&mut harness, egui::Key::ArrowRight);
+    assert!(
+        harness.query_by_label("Row 2 of 5").is_some(),
+        "a column step stays on the row"
+    );
+    press_key(&mut harness, egui::Key::End);
+    press_key(&mut harness, egui::Key::Enter);
+    assert!(
+        harness.query_by_label("Currently: free").is_some(),
+        "the editor opens on the last column of the moved-to row"
+    );
+    press_key(&mut harness, egui::Key::Escape);
+    assert!(
+        harness.query_by_label("Currently: free").is_none(),
+        "Escape closes the cell editor"
+    );
+}
+
+/// Tab walks row and column, wrapping onto the next row, and does not leave
+/// the cursor behind: every later key here is gated like Ctrl+C, so a press
+/// that reached io focus instead would open no editor.
+#[test]
+fn tab_walks_the_view_and_keeps_the_grid_alive() {
+    let _lock = env_lock();
+    let (_scratch, mut harness, _tab) = grid_setup("tab");
+    open_detail(&mut harness);
+    press_key(&mut harness, egui::Key::Tab);
+    assert!(
+        harness.query_by_label("Row 1 of 5").is_some(),
+        "Tab lands on the first displayed row"
+    );
+    press_key(&mut harness, egui::Key::Tab);
+    press_key(&mut harness, egui::Key::Tab);
+    press_key(&mut harness, egui::Key::Tab);
+    assert!(
+        harness.query_by_label("Row 2 of 5").is_some(),
+        "Tab wraps off the last column onto the next row"
+    );
+    press_key(&mut harness, egui::Key::Enter);
+    assert!(
+        harness.query_by_label("Currently: 2").is_some(),
+        "the cursor walked the columns before it wrapped to the row's first one"
+    );
+    press_key(&mut harness, egui::Key::Escape);
+    harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Tab);
+    harness.run();
+    press_key(&mut harness, egui::Key::Enter);
+    assert!(
+        harness.query_by_label("Currently: pro").is_some(),
+        "Shift+Tab wraps back onto the previous row's last column"
+    );
+    press_key(&mut harness, egui::Key::Escape);
+}
+
+/// The cursor's row is scrolled into view: with 200 rows the last one is
+/// virtualized away until Ctrl+End moves the cursor onto it.
+#[test]
+fn ctrl_end_scrolls_the_cursor_row_into_view() {
+    let _lock = env_lock();
+    let (_scratch, mut harness, _tab) = scrolling_setup("scroll");
+    open_detail(&mut harness);
+    assert!(
+        harness.query_by_label("row-200").is_none(),
+        "the last row starts below the viewport"
+    );
+    // The first step from no cursor lands on the first row; the second
+    // Ctrl+End then jumps to the last.
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::End);
+    harness.run();
+    assert!(
+        harness.query_by_label("Row 1 of 200").is_some(),
+        "a step with no cursor lands on the first row"
+    );
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::End);
+    harness.run();
+    assert!(
+        harness.query_by_label("Row 200 of 200").is_some(),
+        "Ctrl+End puts the cursor on the last row"
+    );
+    assert!(
+        harness.query_by_label("row-200").is_some(),
+        "the cursor's row scrolled into view"
     );
 }

@@ -115,6 +115,101 @@ impl Selection {
         }
         visible.iter().copied().filter(|row| self.rows.contains(row)).collect()
     }
+
+    /// Where the cursor sits in the view order, when it sits on a displayed
+    /// row at all. A filter or sort can leave it off the view.
+    fn position(&self, visible: &[usize]) -> Option<usize> {
+        let (row, _) = self.active?;
+        visible.iter().position(|visible_row| *visible_row == row)
+    }
+
+    /// One cursor move over `visible`, the view order: the active cell moves,
+    /// edges clamp, and a plain step selects the row it lands on while a
+    /// Shift step extends the row range from the anchor. `cols` counts the
+    /// result columns the cursor may occupy, `page` the rows PageUp and
+    /// PageDown travel. A step with no cursor on a displayed row lands on the
+    /// first displayed row, column 0, and an empty view moves nothing.
+    fn step(&mut self, step: Step, extend: bool, visible: &[usize], cols: usize, page: usize) {
+        if visible.is_empty() || cols == 0 {
+            return;
+        }
+        let Some(position) = self.position(visible) else {
+            self.click(visible[0], 0);
+            return;
+        };
+        let last = visible.len() - 1;
+        let (active_row, active_col) = self.active.expect("a positioned cursor");
+        let mut position = position;
+        let mut col = active_col.min(cols - 1);
+        match step {
+            Step::Up => position = position.saturating_sub(1),
+            Step::Down => position = (position + 1).min(last),
+            Step::Left => col = col.saturating_sub(1),
+            Step::Right => col = (col + 1).min(cols - 1),
+            Step::PageUp => position = position.saturating_sub(page),
+            Step::PageDown => position = (position + page).min(last),
+            Step::RowStart => col = 0,
+            Step::RowEnd => col = cols - 1,
+            Step::First => position = 0,
+            Step::Last => position = last,
+        }
+        let row = visible[position];
+        if !extend {
+            self.rows.clear();
+            self.rows.insert(row);
+            self.anchor = Some(row);
+            self.active = Some((row, col));
+        } else if row != active_row {
+            // A row move with Shift extends from the anchor; a column move
+            // keeps the range and only moves the cursor.
+            self.extend(row, col);
+        } else {
+            self.active = Some((row, col));
+        }
+    }
+
+    /// Tab and Shift+Tab: a column step inside the row, wrapping onto the
+    /// next or previous row at the row's ends. The wrap takes two [`Step`]s,
+    /// since a single one can only move within a row. With no cursor on a
+    /// displayed row, either direction lands it the way any step does.
+    fn tab_step(&mut self, back: bool, visible: &[usize], cols: usize, page: usize) {
+        if visible.is_empty() || cols == 0 {
+            return;
+        }
+        let col = match self.position(visible) {
+            Some(_) => self.active.expect("a positioned cursor").1.min(cols - 1),
+            None => {
+                self.step(Step::Right, false, visible, cols, page);
+                return;
+            }
+        };
+        if !back && col + 1 < cols {
+            self.step(Step::Right, false, visible, cols, page);
+        } else if !back {
+            self.step(Step::RowStart, false, visible, cols, page);
+            self.step(Step::Down, false, visible, cols, page);
+        } else if col > 0 {
+            self.step(Step::Left, false, visible, cols, page);
+        } else {
+            self.step(Step::RowEnd, false, visible, cols, page);
+            self.step(Step::Up, false, visible, cols, page);
+        }
+    }
+}
+
+/// One keyboard cursor move over the grid's displayed rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Up,
+    Down,
+    Left,
+    Right,
+    PageUp,
+    PageDown,
+    RowStart,
+    RowEnd,
+    First,
+    Last,
 }
 
 fn selection_id(tab: TabId) -> egui::Id {
@@ -224,6 +319,39 @@ fn prune_grid_views(state: &AppState, ctx: &egui::Context) {
     }
     if known != live {
         ctx.data_mut(|data| data.insert_temp(id, live));
+    }
+}
+
+/// The table row index a keyboard step wants on screen. The key handler runs
+/// after the table has drawn for the frame and outside its scroll area, so
+/// the row is stored here and the next frame's scroll area consumes it.
+fn grid_scroll_id(tab: TabId) -> egui::Id {
+    egui::Id::new(("crusty_grid_scroll", tab))
+}
+
+fn request_grid_scroll(ctx: &egui::Context, tab: TabId, row: usize) {
+    ctx.data_mut(|data| data.insert_temp(grid_scroll_id(tab), row));
+}
+
+fn take_grid_scroll(ctx: &egui::Context, tab: TabId) -> Option<usize> {
+    ctx.data_mut(|data| data.remove_temp::<usize>(grid_scroll_id(tab)))
+}
+
+/// The height of one table row, shared by the row builder, the page-step
+/// size, and the scroll-into-view math.
+const GRID_ROW_H: f32 = 20.0;
+
+/// The page a PageUp or PageDown moves when the viewport cannot be measured.
+const GRID_PAGE_FALLBACK: usize = 10;
+
+/// Rows one PageUp or PageDown moves: what the grid's viewport holds, at
+/// least one. A viewport that never resolves to a height falls back to
+/// [`GRID_PAGE_FALLBACK`].
+fn page_rows(available_height: f32) -> usize {
+    if available_height.is_finite() && available_height > 0.0 {
+        ((available_height / GRID_ROW_H).floor() as usize).max(1)
+    } else {
+        GRID_PAGE_FALLBACK
     }
 }
 
@@ -2280,7 +2408,11 @@ fn results_grid(
     let mut pending_sort: Option<usize> = None;
     let shown = view.visible(ncols);
     let widths: Vec<Option<f32>> = shown.iter().map(|col| view.width(*col)).collect();
+    let page = page_rows(ui.available_height());
+    let scroll_row = take_grid_scroll(ui.ctx(), tab.id);
     egui::ScrollArea::both().show(ui, |ui| {
+        let table_top = ui.cursor().min.y;
+        let row_spacing = ui.spacing().item_spacing.y;
         let mut table = TableBuilder::new(ui).striped(true);
         for width in &widths {
             table = table.column(match width {
@@ -2289,7 +2421,7 @@ fn results_grid(
             });
         }
         table
-            .header(20.0, |mut header| {
+            .header(GRID_ROW_H, |mut header| {
                 for (i, (name, type_name)) in cols.iter().enumerate() {
                     if view.is_hidden(i) {
                         continue;
@@ -2341,7 +2473,7 @@ fn results_grid(
                 }
             })
             .body(|body| {
-                body.rows(20.0, visible.len() + added, |mut row| {
+                body.rows(GRID_ROW_H, visible.len() + added, |mut row| {
                     let index = row.index();
                     if let Some(added_index) = index.checked_sub(visible.len()) {
                         for c in 0..ncols {
@@ -2533,12 +2665,30 @@ fn results_grid(
                     }
                 });
             });
+        if let Some(row) = scroll_row {
+            // The table's own vertical scroll area cannot move this outer
+            // one, so the row a step landed on is brought into view here,
+            // the frame after the step stored it.
+            let top = table_top + (GRID_ROW_H + row_spacing) * (row as f32 + 1.0);
+            ui.scroll_to_rect(
+                egui::Rect::from_x_y_ranges(
+                    ui.clip_rect().x_range(),
+                    top..=top + GRID_ROW_H + row_spacing,
+                ),
+                None,
+            );
+        }
     });
     for (row, col, shift, ctrl) in gestures {
         selection.gesture(row, col, shift, ctrl);
     }
     let mut keyed = grid_edit_keys(tab, editable, &selection, &visible, &mut view, modal_open, ui);
     actions.append(&mut keyed);
+    if let Some(row) =
+        grid_cursor_keys(tab.id, &mut selection, &visible, ncols, page, modal_open, ui)
+    {
+        request_grid_scroll(ui.ctx(), tab.id, row);
+    }
     let mut clipboard = grid_clipboard_keys(tab, editable, &selection, &visible, modal_open, ui);
     actions.append(&mut clipboard);
     let mut editor_modal = cell_editor_window(tab, &cols, editable, active_result, ui);
@@ -3113,6 +3263,80 @@ fn grid_edit_keys(
         }
     }
     actions
+}
+
+/// Hand back the focus egui's Tab traversal gives the first focusable widget
+/// of the frame, which happens before this handler runs. Without it one Tab
+/// press would move the chrome's focus and the typing gate would then block
+/// every grid key.
+fn release_tab_focus(ui: &egui::Ui) {
+    let Some(focused) = ui.ctx().memory(|memory| memory.focused()) else { return };
+    if !ui.ctx().memory(|memory| memory.had_focus_last_frame(focused)) {
+        ui.ctx().memory_mut(|memory| memory.surrender_focus(focused));
+    }
+}
+
+/// Arrow, Home/End, Page, and Tab movement of the grid cursor, gated like
+/// [`grid_clipboard_keys`]: dead while any modal is open, while a cell editor
+/// is open, or while a text field holds focus. Tab is taken back from egui's
+/// focus traversal before the gate reads it, since that traversal runs before
+/// this handler. Returns the table row the view should scroll to.
+fn grid_cursor_keys(
+    tab: TabId,
+    selection: &mut Selection,
+    visible: &[usize],
+    cols: usize,
+    page: usize,
+    modal_open: bool,
+    ui: &egui::Ui,
+) -> Option<usize> {
+    if modal_open {
+        return None;
+    }
+    let (shift, alt) = ui.input(|input| (input.modifiers.shift, input.modifiers.alt));
+    let tab_pressed = ui.input(|input| input.key_pressed(egui::Key::Tab));
+    let can_move = !visible.is_empty() && cols > 0;
+    if tab_pressed && can_move {
+        release_tab_focus(ui);
+    }
+    let typing = edit_field_of(ui.ctx(), tab).is_some()
+        || ui.ctx().memory(|memory| memory.focused().is_some());
+    if typing {
+        return None;
+    }
+    let mut cursor: Option<Step> = None;
+    let mut take = |modifiers: egui::Modifiers, key: egui::Key, step: Step| {
+        if cursor.is_none() && ui.input_mut(|input| input.consume_key(modifiers, key)) {
+            cursor = Some(step);
+        }
+    };
+    // Alt stays with the resize keys `grid_edit_keys` takes first; a plain
+    // pattern would match Alt+Arrow too once no column is active.
+    if !alt {
+        // The Ctrl patterns go first: `consume_key` matches an event with
+        // extra Shift, so a plain pattern would swallow the Ctrl chord.
+        take(egui::Modifiers::COMMAND, egui::Key::Home, Step::First);
+        take(egui::Modifiers::COMMAND, egui::Key::End, Step::Last);
+        take(egui::Modifiers::NONE, egui::Key::Home, Step::RowStart);
+        take(egui::Modifiers::NONE, egui::Key::End, Step::RowEnd);
+        take(egui::Modifiers::NONE, egui::Key::PageUp, Step::PageUp);
+        take(egui::Modifiers::NONE, egui::Key::PageDown, Step::PageDown);
+        take(egui::Modifiers::NONE, egui::Key::ArrowUp, Step::Up);
+        take(egui::Modifiers::NONE, egui::Key::ArrowDown, Step::Down);
+        take(egui::Modifiers::NONE, egui::Key::ArrowLeft, Step::Left);
+        take(egui::Modifiers::NONE, egui::Key::ArrowRight, Step::Right);
+    }
+    if let Some(step) = cursor {
+        selection.step(step, shift, visible, cols, page);
+    } else if tab_pressed
+        && can_move
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+    {
+        selection.tab_step(shift, visible, cols, page);
+    } else {
+        return None;
+    }
+    selection.position(visible)
 }
 
 #[cfg(test)]
@@ -3836,5 +4060,166 @@ mod tests {
             assert_eq!(cell_label_color(true, &palette), Some(palette.selection_text));
             assert_eq!(cell_label_color(false, &palette), None);
         }
+    }
+
+    #[test]
+    fn a_step_with_no_cursor_lands_on_the_first_displayed_row() {
+        let visible = [3, 8];
+        for step in [Step::Up, Step::Down, Step::PageDown, Step::Last, Step::Right] {
+            let mut selection = Selection::default();
+            selection.step(step, false, &visible, 2, 4);
+            assert_eq!(selection.active(), Some((3, 0)), "{step:?} starts at the top left");
+            assert_eq!(selection.resolve(&visible), vec![3]);
+        }
+        // A cursor whose row a filter dropped starts over the same way.
+        let mut selection = Selection::default();
+        selection.click(7, 1);
+        selection.step(Step::Right, false, &visible, 2, 4);
+        assert_eq!(selection.active(), Some((3, 0)));
+    }
+
+    #[test]
+    fn steps_move_through_the_view_order_not_the_row_indices() {
+        let visible = [5, 1, 9];
+        let mut selection = Selection::default();
+        selection.step(Step::Down, false, &visible, 2, 1);
+        assert_eq!(selection.active(), Some((5, 0)));
+        selection.step(Step::Down, false, &visible, 2, 1);
+        assert_eq!(selection.active(), Some((1, 0)));
+        selection.step(Step::Up, false, &visible, 2, 1);
+        assert_eq!(selection.active(), Some((5, 0)));
+        assert_eq!(selection.resolve(&visible), vec![5]);
+    }
+
+    #[test]
+    fn steps_clamp_at_the_view_edges() {
+        let visible = [3, 8];
+        let mut selection = Selection::default();
+        selection.click(3, 0);
+        selection.step(Step::Up, false, &visible, 2, 5);
+        selection.step(Step::Left, false, &visible, 2, 5);
+        assert_eq!(selection.active(), Some((3, 0)));
+        selection.step(Step::Down, false, &visible, 2, 5);
+        selection.step(Step::Down, false, &visible, 2, 5);
+        selection.step(Step::Right, false, &visible, 2, 5);
+        selection.step(Step::Right, false, &visible, 2, 5);
+        assert_eq!(selection.active(), Some((8, 1)));
+        selection.step(Step::RowStart, false, &visible, 2, 5);
+        assert_eq!(selection.active(), Some((8, 0)));
+        selection.step(Step::RowEnd, false, &visible, 2, 5);
+        assert_eq!(selection.active(), Some((8, 1)));
+        selection.step(Step::First, false, &visible, 2, 5);
+        assert_eq!(selection.active(), Some((3, 1)));
+        selection.step(Step::Last, false, &visible, 2, 5);
+        assert_eq!(selection.active(), Some((8, 1)));
+        selection.step(Step::Right, false, &visible, 2, 5);
+        assert_eq!(selection.active(), Some((8, 1)), "the last column holds");
+    }
+
+    #[test]
+    fn a_step_that_cannot_move_leaves_no_cursor() {
+        let mut selection = Selection::default();
+        selection.step(Step::Down, false, &[], 3, 2);
+        assert_eq!(selection.active(), None);
+        selection.step(Step::Right, false, &[0, 1], 0, 2);
+        assert_eq!(selection.active(), None);
+        selection.tab_step(false, &[], 3, 2);
+        assert_eq!(selection.active(), None);
+        selection.tab_step(false, &[0], 0, 2);
+        assert_eq!(selection.active(), None);
+    }
+
+    #[test]
+    fn a_cursor_column_past_the_end_is_pulled_back_in() {
+        let visible = [0, 1];
+        let mut selection = Selection::default();
+        selection.click(0, 5);
+        selection.step(Step::RowEnd, false, &visible, 2, 1);
+        assert_eq!(selection.active(), Some((0, 1)));
+        selection.click(0, 5);
+        selection.step(Step::Left, false, &visible, 2, 1);
+        assert_eq!(selection.active(), Some((0, 0)), "the stale column clamps, then steps");
+    }
+
+    #[test]
+    fn a_shift_step_extends_the_row_range_from_the_anchor() {
+        let visible: Vec<usize> = (0..6).collect();
+        let mut selection = Selection::default();
+        selection.step(Step::Down, false, &visible, 2, 2);
+        selection.step(Step::Down, false, &visible, 2, 2);
+        selection.step(Step::Down, false, &visible, 2, 2);
+        assert_eq!(selection.active(), Some((2, 0)));
+        selection.step(Step::Down, true, &visible, 2, 2);
+        assert_eq!(selection.active(), Some((3, 0)));
+        assert_eq!(selection.resolve(&visible), vec![2, 3]);
+        selection.step(Step::Down, true, &visible, 2, 2);
+        assert_eq!(selection.resolve(&visible), vec![2, 3, 4]);
+        assert_eq!(selection.active(), Some((4, 0)));
+        selection.step(Step::Up, true, &visible, 2, 2);
+        assert_eq!(selection.resolve(&visible), vec![2, 3]);
+        assert_eq!(selection.active(), Some((3, 0)));
+        // A column step keeps the range and only walks the cursor.
+        selection.step(Step::Right, true, &visible, 2, 2);
+        assert_eq!(selection.active(), Some((3, 1)));
+        assert_eq!(selection.resolve(&visible), vec![2, 3]);
+        // A plain step collapses the range onto the row it lands on.
+        selection.step(Step::Left, false, &visible, 2, 2);
+        assert_eq!(selection.active(), Some((3, 0)));
+        assert_eq!(selection.resolve(&visible), vec![3]);
+    }
+
+    #[test]
+    fn page_steps_travel_the_viewport_worth_of_rows() {
+        let visible: Vec<usize> = (0..10).collect();
+        let mut selection = Selection::default();
+        selection.step(Step::PageDown, false, &visible, 1, 3);
+        assert_eq!(selection.active(), Some((0, 0)));
+        selection.step(Step::PageDown, false, &visible, 1, 3);
+        assert_eq!(selection.active(), Some((3, 0)));
+        selection.step(Step::PageDown, false, &visible, 1, 3);
+        assert_eq!(selection.active(), Some((6, 0)));
+        selection.step(Step::PageDown, false, &visible, 1, 3);
+        assert_eq!(selection.active(), Some((9, 0)));
+        selection.step(Step::PageUp, false, &visible, 1, 3);
+        assert_eq!(selection.active(), Some((6, 0)));
+    }
+
+    #[test]
+    fn tab_wraps_onto_the_next_or_previous_row() {
+        let visible: Vec<usize> = (0..3).collect();
+        let mut selection = Selection::default();
+        selection.tab_step(false, &visible, 3, 2);
+        assert_eq!(selection.active(), Some((0, 0)));
+        selection.tab_step(false, &visible, 3, 2);
+        selection.tab_step(false, &visible, 3, 2);
+        assert_eq!(selection.active(), Some((0, 2)));
+        selection.tab_step(false, &visible, 3, 2);
+        assert_eq!(selection.active(), Some((1, 0)));
+        selection.tab_step(true, &visible, 3, 2);
+        assert_eq!(selection.active(), Some((0, 2)));
+        // The ends of the view hold instead of wrapping around.
+        selection.click(2, 2);
+        selection.tab_step(false, &visible, 3, 2);
+        assert_eq!(selection.active(), Some((2, 0)));
+        selection.click(0, 0);
+        selection.tab_step(true, &visible, 3, 2);
+        assert_eq!(selection.active(), Some((0, 2)));
+    }
+
+    #[test]
+    fn tab_from_no_cursor_lands_like_any_step() {
+        let mut selection = Selection::default();
+        selection.tab_step(true, &[4, 9], 2, 2);
+        assert_eq!(selection.active(), Some((4, 0)));
+    }
+
+    #[test]
+    fn page_rows_measures_the_viewport_and_falls_back() {
+        assert_eq!(page_rows(400.0), 20);
+        assert_eq!(page_rows(19.0), 1);
+        assert_eq!(page_rows(0.0), GRID_PAGE_FALLBACK);
+        assert_eq!(page_rows(-20.0), GRID_PAGE_FALLBACK);
+        assert_eq!(page_rows(f32::INFINITY), GRID_PAGE_FALLBACK);
+        assert_eq!(page_rows(f32::NAN), GRID_PAGE_FALLBACK);
     }
 }
