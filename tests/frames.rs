@@ -701,14 +701,14 @@ fn narrow_window_chrome_stays_clear() {
 const TRUNCATED_SQL: &str = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c \
                               WHERE x < 10001) SELECT x FROM c;";
 
-/// The grid footer at the reported width, with a truncated result and an
-/// export notice on it: the paging controls keep their place, the counts and
-/// the tab's own state elide into what is left, and nothing in the row paints
-/// over a neighbor or past the window edge.
-#[test]
-fn truncated_footer_band_stays_clear() {
-    let _guard = env_lock();
-    let (_scratch, mut harness) = three_tabs_at(NARROW_WINDOW, "footer");
+/// The truncated-result footer fixture of fix round 2 at one size: three tabs,
+/// the active tab's result truncated at the row cap, and a successful export
+/// notice set directly on the tab, so no export runs.
+fn truncated_footer_at(
+    size: [u32; 2],
+    tag: &str,
+) -> (Scratch, Harness<'static, AppState>, TabId) {
+    let (scratch, mut harness) = three_tabs_at(size, tag);
     let tab = harness.state().active().expect("the active tab");
     run_sql(&mut harness, tab, TRUNCATED_SQL);
     assert!(
@@ -719,13 +719,23 @@ fn truncated_footer_band_stays_clear() {
             .is_some_and(|result| result.is_truncated()),
         "the recursive query fills the row cap"
     );
-    // Set on the tab, so no export runs for the notice.
     harness
         .state_mut()
         .tab_mut(tab)
         .expect("the active tab")
         .set_export_notice("Copied 10000 rows as TSV".to_owned(), false);
     harness.run();
+    (scratch, harness, tab)
+}
+
+/// The grid footer at the reported width, with a truncated result and an
+/// export notice on it: the paging controls keep their place, the counts and
+/// the tab's own state elide into what is left, and nothing in the row paints
+/// over a neighbor or past the window edge.
+#[test]
+fn truncated_footer_band_stays_clear() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = truncated_footer_at(NARROW_WINDOW, "footer");
     capture_at(&mut harness, "footer-truncated-dark", NARROW_WINDOW);
 
     let band = band_of(&harness, "Count total", NARROW_WINDOW);
@@ -768,6 +778,26 @@ fn truncated_footer_band_stays_clear() {
         drawn.iter().any(|label| label == "Copied 10000 rows as TSV"),
         "the notice keeps its whole label at the row's right edge: {drawn:?}"
     );
+}
+
+/// The same fixture a little wider, inside the band the reviewer named
+/// (660-710): the paging controls still fit, and the row's leftover is real.
+/// Every text elides into that leftover; elision must give each text only
+/// what it reserved, or the four of them paint over each other and past the
+/// window edge.
+#[test]
+fn truncated_footer_mid_width_stays_clear() {
+    const MID_WINDOW: [u32; 2] = [700, 640];
+    let _guard = env_lock();
+    let (_scratch, mut harness, _tab) = truncated_footer_at(MID_WINDOW, "footer-mid");
+    capture_at(&mut harness, "footer-mid-width-dark", MID_WINDOW);
+
+    let band = band_of(&harness, "Count total", MID_WINDOW);
+    let mut drawn: Vec<String> =
+        band_nodes(&harness, band).into_iter().map(|(label, _)| label).collect();
+    drawn.sort();
+    println!("mid footer band labels: {drawn:?}");
+    assert_band_clear(&harness, band, MID_WINDOW);
 }
 
 /// The editor row at about 670px of row width and the results row at about
