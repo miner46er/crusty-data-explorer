@@ -300,6 +300,36 @@ fn tab_walks_the_view_and_keeps_the_grid_alive() {
     press_key(&mut harness, egui::Key::Escape);
 }
 
+/// Escape cancels the grid's import confirmation, the way Escape cancels the
+/// cell editor.
+#[test]
+fn escape_cancels_the_import_confirmation() {
+    let _lock = env_lock();
+    let (_scratch, mut harness, tab) = grid_setup("escape");
+    let conn = harness.state().tab(tab).and_then(|tab| tab.conn).expect("the tab's connection");
+    step_until(&mut harness, "the schema", |state| state.schema(conn).is_some());
+    let path = std::env::temp_dir()
+        .join(format!("cde-grid-keys-import-{}.csv", std::process::id()));
+    std::fs::write(&path, "id,email,plan\n9,nine@example.com,pro\n").unwrap();
+    harness.state_mut().begin_import(tab, &path);
+    harness.run();
+    assert!(
+        harness.state().import_draft().is_some(),
+        "the import file waits for confirmation"
+    );
+    press_key(&mut harness, egui::Key::Escape);
+    assert!(
+        harness.state().import_draft().is_none(),
+        "Escape cancels the pending import"
+    );
+    assert_eq!(
+        harness.state().tab(tab).map(|tab| tab.staged_count()),
+        Some(0),
+        "a cancelled import stages nothing"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Ctrl+Shift+C copies the one active cell, and Ctrl+C keeps copying the
 /// rows: the specific chord is consumed first, so one press never does both.
 #[test]

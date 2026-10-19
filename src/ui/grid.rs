@@ -1256,6 +1256,9 @@ pub fn import_window(state: &mut AppState, ui: &mut egui::Ui) {
                 cancel = true;
             }
         });
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            cancel = true;
+        }
     });
     if confirm {
         state.commit_import();
