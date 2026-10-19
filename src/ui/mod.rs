@@ -28,7 +28,7 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     // just opened cannot block the chrome behind it until the next frame.
     // Draw that one frame's panels disabled: they register no focus and take
     // no clicks, which closes the gap.
-    let newly_opened = note_open_modals(ui.ctx(), &open_modals);
+    let (newly_opened, restore_focus) = note_open_modals(ui.ctx(), &open_modals);
     // A press that landed on the opening frame armed a click against the
     // previous frame's chrome. Keep the panels disabled until that press is
     // released, so its release cannot turn into a click behind the dialog.
@@ -106,21 +106,56 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     if state.modals_back_to_front() != open_modals || cell_editor_now != previous_cell {
         ui.ctx().request_repaint();
     }
+    // The modal layer from the frame just gone still blocks the widget we
+    // want, so hand focus back after every widget has drawn. The layer clears
+    // at the end of this pass and the repaint draws the widget focused.
+    let handing_back = !restore_focus.is_empty();
+    for focused in restore_focus {
+        ui.ctx().memory_mut(|memory| memory.request_focus(focused));
+    }
+    if handing_back {
+        ui.ctx().request_repaint();
+    }
 }
 
 fn cell_editor_id() -> egui::Id {
     egui::Id::new("crusty_cell_editor_was_open")
 }
 
-/// Whether the open dialog set gained one since last frame, and remember this
-/// frame's set for the next comparison.
-fn note_open_modals(ctx: &egui::Context, open: &[crate::app::Modal]) -> bool {
+/// Whether the open dialog set gained one since last frame. Remember this
+/// frame's set for the next comparison, what held focus before each newly
+/// opened dialog (so closing it can hand focus back), and restore that focus
+/// for every dialog that closed. A stacked dialog records the field under it,
+/// so closing the top one refocuses the dialog beneath.
+fn note_open_modals(
+    ctx: &egui::Context,
+    open: &[crate::app::Modal],
+) -> (bool, Vec<egui::Id>) {
     let id = egui::Id::new("crusty_open_modals");
     let previous: Vec<crate::app::Modal> =
         ctx.data_mut(|data| data.get_temp(id)).unwrap_or_default();
     let opened = open.iter().any(|modal| !previous.contains(modal));
+    for modal in open.iter().filter(|modal| !previous.contains(modal)) {
+        let key = modal_return_id(*modal);
+        let focused = ctx.memory(|memory| memory.focused());
+        ctx.data_mut(|data| data.insert_temp(key, focused));
+    }
+    let mut restore = Vec::new();
+    for modal in previous.iter().filter(|modal| !open.contains(modal)) {
+        let key = modal_return_id(*modal);
+        let focused = ctx
+            .data_mut(|data| data.remove_temp::<Option<egui::Id>>(key))
+            .flatten();
+        if let Some(focused) = focused {
+            restore.push(focused);
+        }
+    }
     ctx.data_mut(|data| data.insert_temp(id, open.to_vec()));
-    opened
+    (opened, restore)
+}
+
+fn modal_return_id(modal: crate::app::Modal) -> egui::Id {
+    egui::Id::new(("crusty_modal_return_focus", modal))
 }
 
 /// One invisible full-screen click shield under each dialog's window. egui's

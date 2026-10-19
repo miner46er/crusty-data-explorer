@@ -2023,6 +2023,62 @@ fn the_first_frame_of_a_dialog_keeps_focus_inside_it() {
 }
 
 #[test]
+fn escape_returns_focus_to_the_editor_after_a_confirm() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("dialog-focus-return");
+    let sql = "DELETE FROM users";
+    *harness.state_mut().tab_sql_mut(tab).expect("the tab sql") = sql.to_owned();
+    harness.ctx.memory_mut(|memory| memory.request_focus(editor_id(tab)));
+    harness.run();
+    assert_eq!(
+        harness.ctx.memory(|memory| memory.focused()),
+        Some(editor_id(tab)),
+        "the editor starts focused"
+    );
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
+    harness.run();
+    assert!(harness.state().pending_write().is_some(), "the write guard holds the delete");
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(harness.state().pending_write().is_none(), "Escape cancels the guard");
+    assert_eq!(
+        harness.ctx.memory(|memory| memory.focused()),
+        Some(editor_id(tab)),
+        "closing the guard hands focus back to the SQL editor"
+    );
+    harness.event(egui::Event::Text("x".to_owned()));
+    harness.run();
+    assert_ne!(
+        harness.state().tab(tab).expect("the tab").sql,
+        sql,
+        "typing after the guard lands in the SQL"
+    );
+}
+
+#[test]
+fn escape_returns_focus_to_the_dialog_under_the_top_one() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("dialog-focus-stack");
+    harness.state_mut().open_save_prompt();
+    harness.run();
+    assert!(harness.state().save_prompt().is_some(), "the save prompt is open");
+    harness.state_mut().start_run(tab, "SELECT :a AS v", 0, None);
+    harness.run();
+    assert!(harness.state().pending_params().is_some(), "the params prompt sits on top");
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(harness.state().pending_params().is_none(), "Escape closes the top prompt");
+    assert!(harness.state().save_prompt().is_some(), "the save prompt stays open");
+    harness.event(egui::Event::Text("kept".to_owned()));
+    harness.run();
+    assert_eq!(
+        harness.state().save_prompt().map(|prompt| prompt.name.as_str()),
+        Some("kept"),
+        "the save prompt's field has the keyboard back"
+    );
+}
+
+#[test]
 fn destructive_confirms_never_approve_from_the_keyboard() {
     let _guard = env_lock();
     let (_scratch, mut harness, tab) = demo_setup("confirm-approval");
