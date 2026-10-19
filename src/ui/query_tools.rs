@@ -164,6 +164,13 @@ impl ToolClicks {
     }
 }
 
+/// The run control's label. The row measures it in [`fits_one_row`] and
+/// draws it in [`toolbar`], so both sides read this.
+const RUN_LABEL: &str = "▶ Run";
+
+/// The explain control's label, measured and drawn like [`RUN_LABEL`].
+const EXPLAIN_LABEL: &str = "Explain";
+
 /// The narrowest a hint may be elided to before it is dropped: the hint is
 /// the softest text on the row, so it goes first.
 const HINT_MIN: f32 = 24.0;
@@ -180,8 +187,8 @@ fn fits_one_row(
 ) -> bool {
     let gap = ui.spacing().item_spacing.x;
     let leading = fit::combo_w(ui, scope_label)
-        + fit::button_w(ui, "▶ Run")
-        + fit::button_w(ui, "Explain");
+        + fit::button_w(ui, RUN_LABEL)
+        + fit::button_w(ui, EXPLAIN_LABEL);
     let tools_w: f32 = tool_state
         .tools(false)
         .iter()
@@ -252,12 +259,12 @@ pub(crate) fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
                     });
                 run_clicked = ui
                     .add(
-                        egui::Button::new(egui::RichText::new("▶ Run").strong())
+                        egui::Button::new(egui::RichText::new(RUN_LABEL).strong())
                             .fill(Palette::of(ui.ctx().theme()).success),
                     )
                     .clicked();
                 explain_clicked = ui
-                    .button("Explain")
+                    .button(EXPLAIN_LABEL)
                     .on_hover_text("Query execution plan")
                     .clicked();
             }

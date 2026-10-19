@@ -34,6 +34,10 @@ use super::{Palette, fit};
 const FIELD_W: f32 = 180.0;
 const FIELD_MIN: f32 = 64.0;
 
+/// The filter's clear label. The results toolbar measures it before it draws
+/// it, so both sides read this.
+const CLEAR_LABEL: &str = "Clear";
+
 /// Identity of the result a [`Selection`] was made on. A new run, a result
 /// switch, or a shape change carries a new id and clears the selection.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1751,7 +1755,7 @@ fn results_grid(
         "Filters".to_owned()
     };
     let clear_shown = !tab.filter().is_empty();
-    let clear_w = fit::button_w(ui, "Clear");
+    let clear_w = fit::button_w(ui, CLEAR_LABEL);
     let filters_w = fit::button_w(ui, &filters_label);
     let left_fixed = filters_w + if clear_shown { clear_w + gap } else { 0.0 };
     let tab_id = tab.id;
@@ -2071,7 +2075,7 @@ fn results_grid(
         if field.changed() {
             filter_after = Some(text);
         }
-        if clear_shown && ui.button("Clear").clicked() {
+        if clear_shown && ui.button(CLEAR_LABEL).clicked() {
             filter_after = Some(String::new());
         }
         if ui
@@ -2629,7 +2633,7 @@ fn structured_filter_body(
             {
                 actions.push(EditAction::ApplyTableFilter);
             }
-            if ui.button("Clear").clicked() {
+            if ui.button(CLEAR_LABEL).clicked() {
                 actions.push(EditAction::ClearTableFilter);
             }
             if !single {
