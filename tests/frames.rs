@@ -744,10 +744,10 @@ fn truncated_footer_at(
     (scratch, harness, tab)
 }
 
-/// The grid footer at the reported width, with a truncated result and an
-/// export notice on it: the paging controls keep their place, the counts and
-/// the tab's own state elide into what is left, and nothing in the row paints
-/// over a neighbor or past the window edge.
+/// The grid footer at the reported width, with a truncated result, one hidden
+/// column, and an export notice on it: the truncation flag keeps its place,
+/// every control is inline or behind the row's one `…`, and nothing in the
+/// row paints over a neighbor or past the window edge.
 #[test]
 fn truncated_footer_band_stays_clear() {
     let _guard = env_lock();
