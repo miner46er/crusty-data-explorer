@@ -572,9 +572,12 @@ pub fn write_confirm_window(
             if ui.button("Confirm").clicked() {
                 confirm = true;
             }
-            if ui.button("Cancel").clicked() {
+            let cancel_button = ui.button("Cancel");
+            autofocus(ui, "write-cancel", &cancel_button);
+            if cancel_button.clicked() {
                 cancel = true;
             }
+            park_focus(ui);
         });
     });
     if confirm {
@@ -616,9 +619,12 @@ pub fn edit_preview_window(
             if ui.button("Confirm").clicked() {
                 confirm = true;
             }
-            if ui.button("Cancel").clicked() {
+            let cancel_button = ui.button("Cancel");
+            autofocus(ui, "edit-preview-cancel", &cancel_button);
+            if cancel_button.clicked() {
                 cancel = true;
             }
+            park_focus(ui);
         });
     });
     if confirm {

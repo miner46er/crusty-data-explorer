@@ -66,9 +66,12 @@ pub fn table_prod_confirm_window(
             if ui.button("Apply").clicked() {
                 confirm = true;
             }
-            if ui.button("Cancel").clicked() {
+            let cancel_button = ui.button("Cancel");
+            autofocus(ui, "table-ddl-cancel", &cancel_button);
+            if cancel_button.clicked() {
                 cancel = true;
             }
+            park_focus(ui);
         });
     });
     if confirm {

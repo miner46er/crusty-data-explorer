@@ -1542,9 +1542,12 @@ pub fn prod_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
             if ui.button("Connect").clicked() {
                 confirm = true;
             }
-            if ui.button("Cancel").clicked() {
+            let cancel_button = ui.button("Cancel");
+            autofocus(ui, "prod-cancel", &cancel_button);
+            if cancel_button.clicked() {
                 cancel = true;
             }
+            park_focus(ui);
         });
     });
     if confirm {
@@ -1577,9 +1580,12 @@ pub fn terminate_confirm_window(
         if ui.button("Terminate").clicked() {
             confirm = true;
         }
-        if ui.button("Cancel").clicked() {
+        let cancel_button = ui.button("Cancel");
+        autofocus(ui, "terminate-cancel", &cancel_button);
+        if cancel_button.clicked() {
             cancel = true;
         }
+        park_focus(ui);
     });
     if confirm {
         state.confirm_terminate();

@@ -1255,17 +1255,17 @@ pub fn import_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalK
             if ui.button("Import").clicked() {
                 confirm = true;
             }
-            if ui.button("Cancel").clicked() {
+            let cancel_button = ui.button("Cancel");
+            autofocus(ui, "import-cancel", &cancel_button);
+            if cancel_button.clicked() {
                 cancel = true;
             }
+            park_focus(ui);
         });
-        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            cancel = true;
-        }
     });
     if confirm {
         state.commit_import();
-    } else if cancel {
+    } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_import();
     }
 }
