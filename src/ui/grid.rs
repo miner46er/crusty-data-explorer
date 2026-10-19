@@ -2444,9 +2444,10 @@ fn results_grid(
     let page = page_rows(ui.available_height());
     let scroll_row = take_grid_scroll(ui.ctx(), tab.id);
     egui::ScrollArea::both().show(ui, |ui| {
-        let table_top = ui.cursor().min.y;
-        let row_spacing = ui.spacing().item_spacing.y;
         let mut table = TableBuilder::new(ui).striped(true);
+        if let Some(row) = scroll_row {
+            table = table.scroll_to_row(row, Some(egui::Align::Center));
+        }
         for width in &widths {
             table = table.column(match width {
                 Some(width) => Column::initial(*width).resizable(true),
@@ -2698,19 +2699,6 @@ fn results_grid(
                     }
                 });
             });
-        if let Some(row) = scroll_row {
-            // The table's own vertical scroll area cannot move this outer
-            // one, so the row a step landed on is brought into view here,
-            // the frame after the step stored it.
-            let top = table_top + (GRID_ROW_H + row_spacing) * (row as f32 + 1.0);
-            ui.scroll_to_rect(
-                egui::Rect::from_x_y_ranges(
-                    ui.clip_rect().x_range(),
-                    top..=top + GRID_ROW_H + row_spacing,
-                ),
-                None,
-            );
-        }
     });
     let clicked_cell = !gestures.is_empty();
     for (row, col, shift, ctrl) in gestures {
