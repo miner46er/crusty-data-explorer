@@ -573,15 +573,19 @@ fn light_visuals() -> egui::Visuals {
 }
 
 fn dark_style() -> egui::Style {
-    let mut style = egui::Style::default();
-    style.visuals = dark_visuals();
+    let mut style = egui::Style {
+        visuals: dark_visuals(),
+        ..Default::default()
+    };
     apply_shared(&mut style);
     style
 }
 
 fn light_style() -> egui::Style {
-    let mut style = egui::Style::default();
-    style.visuals = light_visuals();
+    let mut style = egui::Style {
+        visuals: light_visuals(),
+        ..Default::default()
+    };
     apply_shared(&mut style);
     style
 }

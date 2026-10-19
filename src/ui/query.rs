@@ -52,18 +52,16 @@ pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
             state.activate_nth(n);
         }
     }
-    if !modal_open {
-        if new_tab_shortcut_pressed {
-            if let Some(conn) = state.default_connection() {
-                let id = state.new_tab(conn);
-                state.activate(id);
-            }
-        }
-        if close_tab_shortcut_pressed {
-            if let Some(active) = state.active() {
-                state.close_tab(active);
-            }
-        }
+    if !modal_open && new_tab_shortcut_pressed
+        && let Some(conn) = state.default_connection()
+    {
+        let id = state.new_tab(conn);
+        state.activate(id);
+    }
+    if !modal_open && close_tab_shortcut_pressed
+        && let Some(active) = state.active()
+    {
+        state.close_tab(active);
     }
     let mut active = state.active();
     let mut activate: Option<TabId> = None;
@@ -144,10 +142,10 @@ pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
             new_tab = true;
         }
     });
-    if active != state.active() {
-        if let Some(id) = active {
-            state.activate(id);
-        }
+    if active != state.active()
+        && let Some(id) = active
+    {
+        state.activate(id);
     }
     if let Some(id) = activate {
         state.activate(id);
@@ -155,11 +153,11 @@ pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
     for id in close {
         state.close_tab(id);
     }
-    if new_tab {
-        if let Some(conn) = state.default_connection() {
-            let id = state.new_tab(conn);
-            state.activate(id);
-        }
+    if new_tab
+        && let Some(conn) = state.default_connection()
+    {
+        let id = state.new_tab(conn);
+        state.activate(id);
     }
 }
 
@@ -170,10 +168,10 @@ pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     let modal_open = super::modal_open(state, ui.ctx());
     let find_shortcut_pressed = ui.input_mut(|i| i.consume_shortcut(&find_shortcut()));
     let mut find_opened = false;
-    if !modal_open && find_shortcut_pressed {
-        if let Some(id) = state.active() {
-            find_opened = toggle_find(ui.ctx(), id);
-        }
+    if !modal_open && find_shortcut_pressed
+        && let Some(id) = state.active()
+    {
+        find_opened = toggle_find(ui.ctx(), id);
     }
     find_opened |= super::query_tools::toolbar(state, ui);
     ui.add_space(4.0);

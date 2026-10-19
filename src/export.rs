@@ -333,7 +333,9 @@ fn md_raw(value: Option<&Value>) -> String {
 }
 
 fn escape_md_cell(raw: &str) -> String {
-    raw.replace("\r\n", "<br>").replace('\r', "<br>").replace('\n', "<br>").replace('|', "\\|")
+    raw.replace("\r\n", "<br>")
+        .replace(['\r', '\n'], "<br>")
+        .replace('|', "\\|")
 }
 
 pub fn to_markdown(result: &QueryResult, rows: &[usize]) -> String {
@@ -616,6 +618,7 @@ fn stream_xlsx_to_file(
 
 /// Stream one [`crate::db::Session`] query to `path` in pages. `table`
 /// names the INSERT target and is ignored otherwise.
+#[allow(clippy::too_many_arguments)]
 pub fn stream_session_to_file(
     session: &mut crate::db::Session,
     sql: &str,

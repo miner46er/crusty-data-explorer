@@ -1779,10 +1779,10 @@ pub fn draft_window(
                 ui.horizontal(|ui| {
                     ui.label("Port:");
                     let mut text = port.to_string();
-                    if ui.text_edit_singleline(&mut text).changed() {
-                        if let Ok(p) = text.parse() {
-                            *port = p;
-                        }
+                    if ui.text_edit_singleline(&mut text).changed()
+                        && let Ok(p) = text.parse()
+                    {
+                        *port = p;
                     }
                 });
                 ui.horizontal(|ui| {
@@ -1813,10 +1813,10 @@ pub fn draft_window(
                 ui.horizontal(|ui| {
                     ui.label("Port:");
                     let mut text = port.to_string();
-                    if ui.text_edit_singleline(&mut text).changed() {
-                        if let Ok(p) = text.parse() {
-                            *port = p;
-                        }
+                    if ui.text_edit_singleline(&mut text).changed()
+                        && let Ok(p) = text.parse()
+                    {
+                        *port = p;
                     }
                 });
                 ui.horizontal(|ui| {
@@ -1861,10 +1861,11 @@ pub fn draft_window(
     if save {
         let is_new = state.draft().is_some_and(|d| d.editing.is_none());
         state.save_draft();
-        if state.draft().is_none() && is_new {
-            if let Some(id) = state.connections().last().map(|c| c.id) {
-                state.connect(id);
-            }
+        if state.draft().is_none()
+            && is_new
+            && let Some(id) = state.connections().last().map(|c| c.id)
+        {
+            state.connect(id);
         }
     } else if !dismissed_popup && (close || key == Some(ModalKey::Cancel)) {
         state.cancel_draft();
@@ -1887,10 +1888,10 @@ fn ssh_section(ui: &mut egui::Ui, ssh: &mut Option<SshConfig>, secret: &mut Stri
     ui.horizontal(|ui| {
         ui.label("SSH port:");
         let mut text = ssh.port.to_string();
-        if ui.text_edit_singleline(&mut text).changed() {
-            if let Ok(port) = text.parse() {
-                ssh.port = port;
-            }
+        if ui.text_edit_singleline(&mut text).changed()
+            && let Ok(port) = text.parse()
+        {
+            ssh.port = port;
         }
     });
     ui.horizontal(|ui| {

@@ -706,6 +706,7 @@ fn start_stream_export(
 /// Open a background session and stream `sql` to `path` in pages. Records
 /// the count for progress when one is available and the engine handle so
 /// Cancel stops the in-flight page as well as the loop.
+#[allow(clippy::too_many_arguments)]
 fn run_stream_export(
     config: &ConnectionConfig,
     password: &str,
@@ -722,15 +723,15 @@ fn run_stream_export(
         .map_err(|e| e.to_string())?;
     if let Ok(handle) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         session.cancel_handle()
-    })) {
-        if let Ok(mut guard) = state.lock() {
-            guard.cancel_handle = Some(handle);
-        }
+    }))
+        && let Ok(mut guard) = state.lock()
+    {
+        guard.cancel_handle = Some(handle);
     }
-    if let Ok(total) = session.count_for(sql) {
-        if let Ok(mut guard) = state.lock() {
-            guard.total = Some(total);
-        }
+    if let Ok(total) = session.count_for(sql)
+        && let Ok(mut guard) = state.lock()
+    {
+        guard.total = Some(total);
     }
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         return Err("cancelled".to_owned());
@@ -807,22 +808,22 @@ pub fn visible_rows(
             })
         })
         .collect();
-    if let Some(col) = sort_col {
-        if col < ncols {
-            rows.sort_by(|&a, &b| {
-                let va = result.cell(a, col);
-                let vb = result.cell(b, col);
-                let ord = cmp_values(va, vb);
-                let ord = match sort_dir {
-                    SortDir::Asc => ord,
-                    SortDir::Desc => match (va, vb) {
-                        (Some(Value::Null) | None, _) | (_, Some(Value::Null) | None) => ord,
-                        _ => ord.reverse(),
-                    },
-                };
-                ord.then_with(|| a.cmp(&b))
-            });
-        }
+    if let Some(col) = sort_col
+        && col < ncols
+    {
+        rows.sort_by(|&a, &b| {
+            let va = result.cell(a, col);
+            let vb = result.cell(b, col);
+            let ord = cmp_values(va, vb);
+            let ord = match sort_dir {
+                SortDir::Asc => ord,
+                SortDir::Desc => match (va, vb) {
+                    (Some(Value::Null) | None, _) | (_, Some(Value::Null) | None) => ord,
+                    _ => ord.reverse(),
+                },
+            };
+            ord.then_with(|| a.cmp(&b))
+        });
     }
     rows
 }
@@ -857,7 +858,7 @@ fn cmp_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
 
 /// One CSV field: quotes guard commas, quotes, and line breaks.
 fn csv_escape(raw: &str) -> String {
-    if raw.contains(|c| matches!(c, ',' | '"' | '\n' | '\r')) {
+    if raw.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", raw.replace('"', "\"\""))
     } else {
         raw.to_owned()
@@ -940,10 +941,10 @@ fn tsv_to_csv(text: &str) -> String {
 /// [`tsv_to_csv`] first, so quotes around tab and newline cells survive,
 /// then everything parses through [`parse_csv`].
 fn parse_paste(text: &str) -> Option<ParsedCsv> {
-    if text.contains('\t') {
-        if let Some(parsed) = parse_csv(&tsv_to_csv(text)) {
-            return Some(parsed);
-        }
+    if text.contains('\t')
+        && let Some(parsed) = parse_csv(&tsv_to_csv(text))
+    {
+        return Some(parsed);
     }
     parse_csv(text)
 }

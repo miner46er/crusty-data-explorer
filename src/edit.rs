@@ -188,8 +188,6 @@ fn parse_select_list(tokens: &[Token]) -> Option<Vec<JoinSelect>> {
         if boundary {
             if index > start {
                 items.push(parse_select_item(&rest[start..index]));
-            } else if index == rest.len() && items.is_empty() {
-                return None;
             } else {
                 return None;
             }
@@ -315,14 +313,10 @@ fn parse_sources(tokens: &[Token]) -> Option<Vec<JoinSource>> {
                 if is_union_at(tokens, pos) {
                     return None;
                 }
-                match consume_join(tokens, pos) {
-                    Some(after_join) => {
-                        let (source, next) = parse_table_ref(tokens, after_join)?;
-                        sources.push(source);
-                        pos = next;
-                    }
-                    None => return None,
-                }
+                let after_join = consume_join(tokens, pos)?;
+                let (source, next) = parse_table_ref(tokens, after_join)?;
+                sources.push(source);
+                pos = next;
             }
             Some(_) => return None,
         }

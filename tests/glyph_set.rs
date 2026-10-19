@@ -152,10 +152,8 @@ fn literal_glyphs(text: &str) -> Vec<(usize, char)> {
                     }
                 }
                 '"' => scan = Scan::Code,
-                c if !c.is_ascii() => {
-                    if !skip_item {
-                        found.push((line, c));
-                    }
+                c if !c.is_ascii() && !skip_item => {
+                    found.push((line, c));
                 }
                 _ => {}
             },

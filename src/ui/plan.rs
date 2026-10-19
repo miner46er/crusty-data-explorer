@@ -179,10 +179,10 @@ fn json_node(plan: &JsonValue) -> Option<PlanNode> {
         .or_else(|| plan.get("Actual Rows").and_then(JsonValue::as_f64).map(|rows| rows as u64));
     let mut details = Vec::new();
     for key in ["Join Type", "Index Name", "Hash Cond", "Merge Cond", "Filter", "Sort Key"] {
-        if let Some(text) = plan.get(key).and_then(JsonValue::as_str) {
-            if !text.is_empty() {
-                details.push(format!("{key}: {text}"));
-            }
+        if let Some(text) = plan.get(key).and_then(JsonValue::as_str)
+            && !text.is_empty()
+        {
+            details.push(format!("{key}: {text}"));
         }
     }
     let mut children = Vec::new();
@@ -512,7 +512,7 @@ fn cost_bar(share: f64, total: f64, heavy: bool, ui: &mut egui::Ui) {
         return;
     }
     let fraction = (share / total).clamp(0.0, 1.0) as f32;
-    let width = ui.available_width().min(280.0).max(60.0);
+    let width = ui.available_width().clamp(60.0, 280.0);
     let (response, painter) = ui.allocate_painter(egui::vec2(width, 6.0), egui::Sense::hover());
     painter.rect_filled(response.rect, 3.0, ui.visuals().faint_bg_color);
     let mut bar = response.rect;

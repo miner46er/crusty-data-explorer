@@ -865,7 +865,7 @@ pub fn saved_folder_tree(saved: &[SavedQuery]) -> FolderNode<&SavedQuery> {
 /// (stable, so each pin class keeps the stored newest-first order).
 fn sort_saved_tree(node: &mut FolderNode<&SavedQuery>) {
     node.children.sort_by(|a, b| a.name.cmp(&b.name));
-    node.entries.sort_by(|a, b| b.pinned.cmp(&a.pinned));
+    node.entries.sort_by_key(|a| std::cmp::Reverse(a.pinned));
     for child in &mut node.children {
         sort_saved_tree(child);
     }
@@ -920,7 +920,7 @@ pub fn saved_groups(saved: &[SavedQuery]) -> Vec<SavedGroup<'_>> {
     }
     for group in &mut groups {
         // Stable, so each pin class keeps the stored newest-first order.
-        group.entries.sort_by(|a, b| b.pinned.cmp(&a.pinned));
+        group.entries.sort_by_key(|a| std::cmp::Reverse(a.pinned));
     }
     groups.retain(|group| !group.entries.is_empty());
     groups
@@ -1165,8 +1165,8 @@ fn search_candidates(state: &AppState) -> Vec<SearchCandidate> {
             extra: query.folder.clone(),
         });
     }
-    if let Some(conn) = state.default_connection() {
-        if let Some(schema) = state.schema(conn) {
+    if let Some(conn) = state.default_connection()
+        && let Some(schema) = state.schema(conn) {
             for database in schema.databases() {
                 for node in database.schemas() {
                     for table in node.tables().iter().chain(node.views()) {
@@ -1194,7 +1194,6 @@ fn search_candidates(state: &AppState) -> Vec<SearchCandidate> {
                     }
                 }
             }
-        }
     }
     candidates
 }
@@ -2114,10 +2113,9 @@ impl AppState {
     }
     /// Connection of the active tab, else the first live one, else None.
     pub fn default_connection(&self) -> Option<ConnectionId> {
-        if let Some(active) = self.active {
-            if let Some(tab) = self.tab(active) {
+        if let Some(active) = self.active
+            && let Some(tab) = self.tab(active) {
                 return tab.conn;
-            }
         }
         self.connections
             .iter()
@@ -2389,6 +2387,7 @@ impl AppState {
     /// through the run or explain form, then the read-only guard, the write
     /// confirm, and the send. `raw_history` carries the raw placeholder text
     /// when the batch was substituted, so history keeps `:name` and `?`.
+    #[allow(clippy::too_many_arguments)]
     fn continue_batch(
         &mut self,
         tab: TabId,
@@ -2412,10 +2411,10 @@ impl AppState {
                 })
                 .collect()
         });
-        if read_only {
-            if let Some(kind) =
+        if read_only
+            && let Some(kind) =
                 prepared.iter().find_map(|statement| crate::db::write_statement_kind(statement))
-            {
+        {
                 self.set_outcome(
                     tab,
                     RunOutcome::Err(
@@ -2426,7 +2425,6 @@ impl AppState {
                     ),
                 );
                 return;
-            }
         }
         if let Some(found) =
             prepared.iter().find_map(|statement| crate::db::unqualified_write(statement))
@@ -2565,11 +2563,10 @@ impl AppState {
                                 statements: history.unwrap_or(statements),
                             },
                         );
-                        if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn_id) {
-                            if let ConnectionState::Connected { session } = &c.state {
+                        if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn_id)
+                            && let ConnectionState::Connected { session } = &c.state {
                                 let session = session.clone();
                                 c.state = ConnectionState::QueryRunning { session, run, tab };
-                            }
                         }
                     }
                     Err(error) => self.set_outcome(tab, RunOutcome::Err(error.to_string())),
@@ -2610,16 +2607,14 @@ impl AppState {
                 t.pending_table = None;
             }
         }
-        if let Some(conn_id) = conn_id {
-            if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn_id) {
-                if let ConnectionState::QueryRunning { session, run: current, .. } = &c.state {
-                    if *current == run {
+        if let Some(conn_id) = conn_id
+            && let Some(c) = self.connections.iter_mut().find(|c| c.id == conn_id)
+            && let ConnectionState::QueryRunning { session, run: current, .. } = &c.state
+            && *current == run
+        {
                         let session = session.clone();
                         session.cancel.cancel();
                         c.state = ConnectionState::Connected { session };
-                    }
-                }
-            }
         }
     }
 
@@ -3900,9 +3895,7 @@ impl AppState {
         schema: &str,
         table: &str,
     ) -> Option<TabId> {
-        if self.connections.iter().find(|c| c.id == conn).is_none() {
-            return None;
-        }
+        self.connections.iter().find(|c| c.id == conn)?;
         let kind = TabKind::Table { schema: schema.to_owned(), table: table.to_owned() };
         if let Some(existing) = self
             .tabs
@@ -4055,16 +4048,15 @@ impl AppState {
             &self.compare.right.schema.clone(),
             &self.compare.right.table.clone(),
         );
-        if read_only {
-            if let Some(kind) =
+        if read_only
+            && let Some(kind) =
                 [left_sql.clone(), right_sql.clone()]
                     .iter()
                     .find_map(|statement| crate::db::write_statement_kind(statement))
-            {
-                self.compare.error =
-                    Some(format!("read-only connection refused {kind}"));
-                return;
-            }
+        {
+            self.compare.error =
+                Some(format!("read-only connection refused {kind}"));
+            return;
         }
         self.clear_compare_results();
         let Some(handle) = handle else {
@@ -4282,13 +4274,8 @@ impl AppState {
             return None;
         }
         let folder = normalize_folder_path(folder);
-        let (conn, sql) = match self.active.and_then(|id| self.tab(id)) {
-            Some(tab) => match tab.conn {
-                Some(conn) => (conn, tab.sql.clone()),
-                None => return None,
-            },
-            None => return None,
-        };
+        let tab = self.active.and_then(|id| self.tab(id))?;
+        let (conn, sql) = (tab.conn?, tab.sql.clone());
         if let Some(existing) = self
             .saved
             .iter_mut()
@@ -4941,10 +4928,10 @@ impl AppState {
                 }
             }
             DbEvent::ConnectFailed { conn, error } => {
-                if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn) {
-                    if matches!(c.state, ConnectionState::Connecting { .. }) {
-                        c.state = ConnectionState::Error { message: error.to_string() };
-                    }
+                if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn)
+                    && matches!(c.state, ConnectionState::Connecting { .. })
+                {
+                    c.state = ConnectionState::Error { message: error.to_string() };
                 }
                 self.schema_loading.remove(&conn);
             }
@@ -5019,19 +5006,16 @@ impl AppState {
                     .find(|t| matches!(&t.outcome, RunOutcome::Running { run: r, .. } if *r == run))
                     .and_then(|t| t.conn);
                 self.finish_run(run, RunOutcome::Err(message.clone()));
-                if fatal {
-                    if let Some(id) = conn_id {
-                        if let Some(c) = self.connections.iter_mut().find(|c| c.id == id) {
-                            if matches!(
-                                c.state,
-                                ConnectionState::Connected { .. }
-                                    | ConnectionState::QueryRunning { .. }
-                            ) {
-                                c.state = ConnectionState::Error { message };
-                                c.transaction = Transaction::Closed;
-                            }
-                        }
-                    }
+                if fatal
+                    && let Some(id) = conn_id
+                    && let Some(c) = self.connections.iter_mut().find(|c| c.id == id)
+                    && matches!(
+                        c.state,
+                        ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
+                    )
+                {
+                    c.state = ConnectionState::Error { message };
+                    c.transaction = Transaction::Closed;
                 }
             }
             DbEvent::AutocommitSet { conn, on, tx_open, error } => {
@@ -5056,13 +5040,13 @@ impl AppState {
                 }
             }
             DbEvent::TxState { conn, open } => {
-                if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn) {
-                    if matches!(
+                if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn)
+                    && matches!(
                         c.state,
                         ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
-                    ) {
-                        c.transaction = if open { Transaction::Open } else { Transaction::Closed };
-                    }
+                    )
+                {
+                    c.transaction = if open { Transaction::Open } else { Transaction::Closed };
                 }
             }
             DbEvent::TxIdleWarning { conn } => {
@@ -5077,13 +5061,13 @@ impl AppState {
                 );
             }
             DbEvent::TxIdleRollback { conn } => {
-                if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn) {
-                    if matches!(
+                if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn)
+                    && matches!(
                         c.state,
                         ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
-                    ) {
-                        c.transaction = Transaction::Closed;
-                    }
+                    )
+                {
+                    c.transaction = Transaction::Closed;
                 }
                 self.notice_connection(
                     conn,
@@ -5101,15 +5085,14 @@ impl AppState {
                         RunOutcome::Ok { results, .. } => results.get_mut(active),
                         _ => t.results.get_mut(active),
                     };
-                    if let Some(current) = target {
-                        if current.row_count() as u64 == offset {
-                            if let Err(error) = current.append_page(result) {
-                                t.set_export_notice(
-                                    format!("Page failed: {error}"),
-                                    true,
-                                );
-                            }
-                        }
+                    if let Some(current) = target
+                        && current.row_count() as u64 == offset
+                        && let Err(error) = current.append_page(result)
+                    {
+                        t.set_export_notice(
+                            format!("Page failed: {error}"),
+                            true,
+                        );
                     }
                 }
             }
@@ -5259,25 +5242,23 @@ impl AppState {
             .tabs
             .iter()
             .any(|t| t.conn == Some(conn) && matches!(t.outcome, RunOutcome::Running { .. }));
-        if !still_running {
-            if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn) {
-                if let ConnectionState::QueryRunning { session, .. } = &c.state {
-                    let session = session.clone();
-                    c.state = ConnectionState::Connected { session };
-                }
-            }
+        if !still_running
+            && let Some(c) = self.connections.iter_mut().find(|c| c.id == conn)
+            && let ConnectionState::QueryRunning { session, .. } = &c.state
+        {
+            let session = session.clone();
+            c.state = ConnectionState::Connected { session };
         }
-        if let Some(action) = transaction {
-            if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn) {
-                // A landing that arrives after a disconnect must not reopen
-                // the flag, so only a live connection moves it.
-                if matches!(
-                    c.state,
-                    ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
-                ) {
-                    c.transaction = action.on_ok();
-                }
-            }
+        // A landing that arrives after a disconnect must not reopen
+        // the flag, so only a live connection moves it.
+        if let Some(action) = transaction
+            && let Some(c) = self.connections.iter_mut().find(|c| c.id == conn)
+            && matches!(
+                c.state,
+                ConnectionState::Connected { .. } | ConnectionState::QueryRunning { .. }
+            )
+        {
+            c.transaction = action.on_ok();
         }
         if refresh {
             self.start_refresh(tab_id);
@@ -6541,11 +6522,11 @@ mod tests {
             value: "30".to_owned(),
         };
         assert_eq!(
-            filter_where(&[clause.clone()], "name <> 'x'"),
+            filter_where(std::slice::from_ref(&clause), "name <> 'x'"),
             Some("\"age\" > 30 AND (name <> 'x')".to_owned())
         );
         assert_eq!(
-            filter_where(&[clause.clone()], ""),
+            filter_where(std::slice::from_ref(&clause), ""),
             Some("\"age\" > 30".to_owned())
         );
         assert_eq!(
@@ -11885,7 +11866,7 @@ mod tests {
                 .join(format!("cde-sql-import-replace-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let fresh = write_sql_file(&dir, "daily.sql", "SELECT 1");
-            assert!(state.import_sql_files(&[fresh.clone()], None).is_none());
+            assert!(state.import_sql_files(std::slice::from_ref(&fresh), None).is_none());
 
             let conn = add_sqlite_connection(state, "mem");
             let tab = state.new_tab(conn);

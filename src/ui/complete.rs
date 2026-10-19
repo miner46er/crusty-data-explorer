@@ -235,18 +235,18 @@ fn alias_map(sql: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let mut i = 0;
     while i < words.len() {
-        if words[i].eq_ignore_ascii_case("from") || words[i].eq_ignore_ascii_case("join") {
-            if let Some(table) = words.get(i + 1) {
-                let table = table.to_lowercase();
-                let mut alias = words.get(i + 2).copied();
-                if alias.is_some_and(|a| a.eq_ignore_ascii_case("as")) {
-                    alias = words.get(i + 3).copied();
-                }
-                if let Some(alias) = alias {
-                    let low = alias.to_lowercase();
-                    if !CLAUSE_WORDS.contains(&low.as_str()) {
-                        map.insert(low, table);
-                    }
+        if (words[i].eq_ignore_ascii_case("from") || words[i].eq_ignore_ascii_case("join"))
+            && let Some(table) = words.get(i + 1)
+        {
+            let table = table.to_lowercase();
+            let mut alias = words.get(i + 2).copied();
+            if alias.is_some_and(|a| a.eq_ignore_ascii_case("as")) {
+                alias = words.get(i + 3).copied();
+            }
+            if let Some(alias) = alias {
+                let low = alias.to_lowercase();
+                if !CLAUSE_WORDS.contains(&low.as_str()) {
+                    map.insert(low, table);
                 }
             }
         }
@@ -287,8 +287,7 @@ fn is_select_star(sql: &str, star: usize) -> bool {
     }
     let last = before
         .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|w| !w.is_empty())
-        .next_back()
+        .rfind(|w| !w.is_empty())
         .unwrap_or("");
     last.eq_ignore_ascii_case("select")
         || last.eq_ignore_ascii_case("distinct")
@@ -364,10 +363,10 @@ pub fn suggest_with_toggles(
 ) -> Vec<Completion> {
     let cursor = clamp_cursor(sql, cursor);
     let prefix = &sql[..cursor];
-    if toggles.columns {
-        if let Some(expansion) = star_expansion(schema, sql, cursor) {
-            return vec![expansion];
-        }
+    if toggles.columns
+        && let Some(expansion) = star_expansion(schema, sql, cursor)
+    {
+        return vec![expansion];
     }
     if let Some((qual, partial)) = dot_qualifier(prefix) {
         if !toggles.columns {
@@ -443,14 +442,14 @@ pub fn apply_completion(
     completion: &Completion,
 ) -> (String, usize) {
     let cursor = clamp_cursor(sql, cursor);
-    if completion.kind == CompleteKind::Star {
-        if let Some(star) = star_at(sql, cursor) {
-            let mut next = String::with_capacity(sql.len() + completion.insert.len());
-            next.push_str(&sql[..star]);
-            next.push_str(&completion.insert);
-            next.push_str(&sql[star + 1..]);
-            return (next, star + completion.insert.len());
-        }
+    if completion.kind == CompleteKind::Star
+        && let Some(star) = star_at(sql, cursor)
+    {
+        let mut next = String::with_capacity(sql.len() + completion.insert.len());
+        next.push_str(&sql[..star]);
+        next.push_str(&completion.insert);
+        next.push_str(&sql[star + 1..]);
+        return (next, star + completion.insert.len());
     }
     let prefix = &sql[..cursor];
     let suffix = &sql[cursor..];
