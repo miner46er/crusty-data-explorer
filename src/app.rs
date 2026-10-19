@@ -1745,6 +1745,41 @@ pub struct PendingTerminate {
     pub backend: String,
 }
 
+/// The modal dialog that owns the screen, frontmost first. One variant per
+/// dialog an `AppState` field can show, so `any_modal_open` and every
+/// per-dialog key handler read the same one answer. The palette is drawn
+/// first and checked last: it never coexists with another dialog. Not
+/// persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Modal {
+    /// The prod connect confirmation over `pending_prod`.
+    ProdConnect,
+    /// The prod session terminate confirmation over `pending_terminate`.
+    Terminate,
+    /// The new/edit connection form over `draft`.
+    Draft,
+    /// The save-query prompt over `save_prompt`.
+    SavePrompt,
+    /// The password prompt over `password_prompt`.
+    PasswordPrompt,
+    /// The import confirmation over `imports`.
+    Import,
+    /// The UPDATE/DELETE without WHERE confirmation over `pending_write`.
+    WriteConfirm,
+    /// The placeholder value prompt over `pending_params`.
+    Params,
+    /// The staged-edit SQL preview over `pending_edit_preview`.
+    EditPreview,
+    /// The prod table DDL confirmation over `pending_table_confirm`.
+    TableDdl,
+    /// The visual table creator over `table_editor`.
+    TableEditor,
+    /// The table compare window over `compare_open`.
+    Compare,
+    /// The Ctrl+K command palette over `search`.
+    Palette,
+}
+
 /// A run held for its parameter values: the tab and connection it would run
 /// on, whether it is an explain run, the raw scoped statements with their
 /// placeholders, and the collected parameters with the typed values. Confirm
@@ -1873,6 +1908,52 @@ impl AppState {
         };
         state.restore_tabs();
         state
+    }
+
+    /// The modal that owns the screen right now, frontmost first. None is
+    /// free keyboard. Every "is a modal open" gate and per-dialog key handler
+    /// reads this one answer.
+    pub fn modal(&self) -> Option<Modal> {
+        if self.pending_prod.is_some() {
+            return Some(Modal::ProdConnect);
+        }
+        if self.pending_terminate.is_some() {
+            return Some(Modal::Terminate);
+        }
+        if self.draft.is_some() {
+            return Some(Modal::Draft);
+        }
+        if self.save_prompt.is_some() {
+            return Some(Modal::SavePrompt);
+        }
+        if self.password_prompt.is_some() {
+            return Some(Modal::PasswordPrompt);
+        }
+        if self.imports.is_some() {
+            return Some(Modal::Import);
+        }
+        if self.pending_write.is_some() {
+            return Some(Modal::WriteConfirm);
+        }
+        if self.pending_params.is_some() {
+            return Some(Modal::Params);
+        }
+        if self.pending_edit_preview.is_some() {
+            return Some(Modal::EditPreview);
+        }
+        if self.pending_table_confirm.is_some() {
+            return Some(Modal::TableDdl);
+        }
+        if self.table_editor.is_some() {
+            return Some(Modal::TableEditor);
+        }
+        if self.compare_open {
+            return Some(Modal::Compare);
+        }
+        if self.search.is_some() {
+            return Some(Modal::Palette);
+        }
+        None
     }
 
     /// The current app theme, flipped from the status bar.
@@ -10323,6 +10404,92 @@ mod tests {
                 }
                 other => panic!("expected QueryBatch, got {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn modal_names_each_dialog_while_its_state_is_set() {
+        with_isolated_state("modal-identity", |state| {
+            assert_eq!(state.modal(), None, "a fresh state is free keyboard");
+
+            state.open_draft(None);
+            assert_eq!(state.modal(), Some(Modal::Draft));
+            state.cancel_draft();
+
+            state.open_save_prompt();
+            assert_eq!(state.modal(), Some(Modal::SavePrompt));
+            state.close_save_prompt();
+
+            let (tab, conn, _commands) = editable_tab(state);
+            state.activate(tab);
+
+            let csv = std::env::temp_dir().join(format!(
+                "cde-modal-import-{}.csv",
+                std::process::id()
+            ));
+            std::fs::write(&csv, "tenant,id,name\nacme,1,Ada\n").unwrap();
+            state.begin_import(tab, &csv);
+            assert_eq!(state.modal(), Some(Modal::Import));
+            state.cancel_import();
+            let _ = std::fs::remove_file(&csv);
+
+            state.start_run(tab, "DELETE FROM items", 0, None);
+            assert_eq!(state.modal(), Some(Modal::WriteConfirm));
+            state.cancel_write();
+
+            state.start_run(tab, "SELECT item_name FROM items WHERE item_name = :name", 0, None);
+            assert_eq!(state.modal(), Some(Modal::Params));
+            state.cancel_params();
+
+            state.stage_edit(tab, 0, 2, "Ada".to_owned());
+            state.apply_edits(tab);
+            assert_eq!(state.modal(), Some(Modal::EditPreview));
+            state.cancel_pending_edits();
+
+            state.open_table_create(conn);
+            assert_eq!(state.modal(), Some(Modal::TableEditor));
+            state.close_table_editor();
+
+            state.open_compare();
+            assert_eq!(state.modal(), Some(Modal::Compare));
+            state.close_compare();
+
+            state.open_palette();
+            assert_eq!(state.modal(), Some(Modal::Palette));
+            state.close_palette();
+
+            let prod = add_sqlite_connection_env(state, "prod-modal", Environment::Prod);
+            state.connect(prod);
+            assert_eq!(state.modal(), Some(Modal::ProdConnect));
+            state.cancel_prod();
+
+            state.request_terminate(prod, "4242");
+            assert_eq!(state.modal(), Some(Modal::Terminate));
+            state.cancel_terminate();
+
+            let prod_tab = state.new_tab(prod);
+            state.open_table_create(prod);
+            {
+                let editor = state.table_editor_mut().expect("editor open");
+                editor.form.table = "audit".to_owned();
+                editor.form.columns = vec![crate::ui::ddl::TableColumnDraft {
+                    name: "id".to_owned(),
+                    data_type: "INTEGER".to_owned(),
+                    nullable: false,
+                    default: String::new(),
+                    pk: true,
+                }];
+            }
+            state.apply_table_ddl(prod_tab);
+            assert_eq!(state.modal(), Some(Modal::TableDdl), "the confirm outranks its editor");
+            state.cancel_table_ddl();
+            state.close_table_editor();
+
+            let prompting = add_postgres_connection_env(state, "pg-modal", "", Environment::Dev);
+            state.open_password_prompt(prompting);
+            assert_eq!(state.modal(), Some(Modal::PasswordPrompt));
+            assert_eq!(state.connections().len(), 3, "the prompt spawns nothing");
+            state.cancel_password_prompt();
         });
     }
 

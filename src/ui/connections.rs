@@ -477,21 +477,6 @@ pub(crate) fn restore_version_then_open(state: &mut AppState, id: u64, index: us
     }
 }
 
-/// Whether a modal owns the keyboard, mirroring the editor's gate, so the
-/// version Restore and Preview buttons stay disabled under one.
-fn sidebar_modal_open(state: &AppState) -> bool {
-    state.draft().is_some()
-        || state.save_prompt().is_some()
-        || state.password_prompt().is_some()
-        || state.import_draft().is_some()
-        || state.pending_write().is_some()
-        || state.pending_params().is_some()
-        || state.pending_edit_preview().is_some()
-        || state.table_editor().is_some()
-        || state.pending_table_ddl().is_some()
-        || state.palette_open()
-}
-
 /// One saved-query row: pin mark, open button, connection name, delete, plus
 /// a collapsible version list. The list renders `versions` newest first with
 /// one Restore button (restore into the entry, then open it) and one Preview
@@ -901,7 +886,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
 
                 // The saved rows and the action loop both gate on a modal, so
                 // the flag lives outside the section gate.
-                let modal_open = sidebar_modal_open(state);
+                let modal_open = super::query::any_modal_open(state);
                 match state.sidebar_view() {
                     SidebarView::Schema => {
                         if !no_connections {

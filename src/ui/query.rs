@@ -15,16 +15,7 @@ use super::{Palette, fit};
 
 /// True while any modal owns the screen, so the editor's shortcuts stay dead.
 pub(crate) fn any_modal_open(state: &AppState) -> bool {
-    state.draft().is_some()
-        || state.save_prompt().is_some()
-        || state.password_prompt().is_some()
-        || state.import_draft().is_some()
-        || state.pending_write().is_some()
-        || state.pending_params().is_some()
-        || state.pending_edit_preview().is_some()
-        || state.table_editor().is_some()
-        || state.pending_table_ddl().is_some()
-        || state.palette_open()
+    state.modal().is_some()
 }
 
 /// The tab strip, drawn by `root` for every tab whatever its kind. The new

@@ -36,12 +36,7 @@ fn row_text(state: &AppState, result: &SearchResult) -> (String, String) {
 /// Pump the palette from `root`: the Ctrl+K toggle everywhere, then the
 /// window, its keys, and its rows while it is open.
 pub fn palette(state: &mut AppState, ui: &mut egui::Ui) {
-    let other_modal_open = state.draft().is_some()
-        || state.save_prompt().is_some()
-        || state.password_prompt().is_some()
-        || state.import_draft().is_some()
-        || state.pending_write().is_some()
-        || state.pending_params().is_some();
+    let other_modal_open = !matches!(state.modal(), None | Some(crate::app::Modal::Palette));
     let toggled = ui.input_mut(|i| i.consume_shortcut(&search_shortcut()));
     if toggled {
         if state.palette_open() {
