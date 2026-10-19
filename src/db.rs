@@ -2144,9 +2144,15 @@ impl Session {
         ssh_password: Option<&str>,
     ) -> Result<Session, DbError> {
         match config {
-            ConnectionConfig::Sqlite { path, .. } => rusqlite::Connection::open(path)
-                .map(Session::Sqlite)
-                .map_err(|e| DbError::Open(e.to_string())),
+            ConnectionConfig::Sqlite { path, read_only } => {
+                let conn = rusqlite::Connection::open(path)
+                    .map_err(|e| DbError::Open(e.to_string()))?;
+                if *read_only {
+                    conn.execute_batch("PRAGMA query_only = ON")
+                        .map_err(|e| DbError::Open(e.to_string()))?;
+                }
+                Ok(Session::Sqlite(conn))
+            }
             ConnectionConfig::Postgres { .. } => {
                 Self::open_postgres(config, password, ssh_password)
             }
@@ -2620,7 +2626,7 @@ impl PgSession {
             user,
             ssl_mode,
             ssh,
-            ..
+            read_only,
         } = config
         else {
             return Err(DbError::Config("not a postgres connection".to_owned()));
@@ -2647,6 +2653,12 @@ impl PgSession {
                     .connect(&connection_string),
             )
             .map_err(|e| DbError::Open(e.to_string()))?;
+        if *read_only {
+            rt.block_on(
+                sqlx::query("SET default_transaction_read_only = on").execute(&pool),
+            )
+            .map_err(|e| DbError::Open(e.to_string()))?;
+        }
         let server_version = rt
             .block_on(async {
                 let row = sqlx::query("SELECT version()")
@@ -3644,7 +3656,8 @@ impl MySession {
         password: Option<&str>,
         ssh_password: Option<&str>,
     ) -> Result<Self, DbError> {
-        let ConnectionConfig::Mysql { host, port, database, user, ssl_mode, ssh, .. } = config
+        let ConnectionConfig::Mysql { host, port, database, user, ssl_mode, ssh, read_only } =
+            config
         else {
             return Err(DbError::Config("not a mysql connection".to_owned()));
         };
@@ -3669,6 +3682,12 @@ impl MySession {
                     .connect(&connection_string),
             )
             .map_err(|e| DbError::Open(e.to_string()))?;
+        if *read_only {
+            rt.block_on(
+                sqlx::query("SET SESSION TRANSACTION READ ONLY").execute(&pool),
+            )
+            .map_err(|e| DbError::Open(e.to_string()))?;
+        }
         let server_version = rt
             .block_on(async {
                 let row = sqlx::query("SELECT VERSION()")
@@ -8486,6 +8505,76 @@ mod tests {
         assert!(json.contains("\"read_only\":true"), "{json}");
         let roundtrip: ConnectionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip, flagged);
+    }
+
+    #[test]
+    fn sqlite_read_only_session_refuses_writes() {
+        let read_only = ConnectionConfig::Sqlite {
+            path: PathBuf::from(":memory:"),
+            read_only: true,
+        };
+        let mut session = Session::open(&read_only, None, None).unwrap();
+        assert_eq!(session.query("SELECT 1 AS n").unwrap().row_count(), 1);
+        let refused = session.query("CREATE TABLE t (a INTEGER)").unwrap_err();
+        assert!(refused.to_string().contains("readonly"), "{refused}");
+
+        let writable = ConnectionConfig::Sqlite {
+            path: PathBuf::from(":memory:"),
+            read_only: false,
+        };
+        let mut session = Session::open(&writable, None, None).unwrap();
+        session.query("CREATE TABLE t (a INTEGER)").expect("a writable session creates");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "needs a live Postgres; set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD"]
+    fn pg_live_read_only_session_refuses_writes() {
+        let config = ConnectionConfig::Postgres {
+            read_only: true,
+            host: std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_owned()),
+            port: std::env::var("PGPORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            database: std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_owned()),
+            user: std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_owned()),
+            ssl_mode: PostgresSslMode::Disable,
+            ssh: None,
+        };
+        let password = std::env::var("PGPASSWORD").ok();
+        let mut session = Session::open(&config, password.as_deref(), None).expect("open");
+        assert_eq!(session.query("SELECT 1").expect("a read passes").row_count(), 1);
+        let refused = session
+            .query("CREATE TABLE cde_read_only_probe (a integer)")
+            .expect_err("a read-only session refuses a write");
+        assert!(refused.to_string().contains("read-only"), "{refused}");
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    #[ignore = "needs a live MySQL; set MYSQLHOST/MYSQLPORT/MYSQLDATABASE/MYSQLUSER/MYSQLPASSWORD"]
+    fn mysql_live_read_only_session_refuses_writes() {
+        let config = ConnectionConfig::Mysql {
+            read_only: true,
+            host: std::env::var("MYSQLHOST").unwrap_or_else(|_| "localhost".to_owned()),
+            port: std::env::var("MYSQLPORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(3306),
+            database: std::env::var("MYSQLDATABASE").unwrap_or_else(|_| "cde_test".to_owned()),
+            user: std::env::var("MYSQLUSER").unwrap_or_else(|_| "root".to_owned()),
+            ssl_mode: MysqlSslMode::default(),
+            ssh: None,
+        };
+        let password = std::env::var("MYSQLPASSWORD").ok();
+        let mut session = Session::open(&config, password.as_deref(), None).expect("open");
+        assert_eq!(session.query("SELECT 1").expect("a read passes").row_count(), 1);
+        let refused = session
+            .query("CREATE TABLE cde_read_only_probe (a integer)")
+            .expect_err("a read-only session refuses a write");
+        let text = refused.to_string().to_ascii_lowercase();
+        assert!(text.contains("read only") || text.contains("read-only"), "{refused}");
     }
 
     #[test]
