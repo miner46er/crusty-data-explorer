@@ -676,6 +676,12 @@ fn narrow_window_chrome_stays_clear() {
     harness.get_by_label("Chart").click();
     harness.run_steps(6);
     assert!(harness.query_by_label("Kind").is_some(), "the chart pane opened from the tail");
+    assert!(
+        !harness
+            .query_all_by_label("Chart")
+            .any(|node| results_band.intersects(node.rect())),
+        "a tail tick closes the menu it fired from"
+    );
 
     let window = window_rect(NARROW_WINDOW);
     let label = harness
