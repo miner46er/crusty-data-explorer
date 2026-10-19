@@ -2328,7 +2328,7 @@ fn every_destructive_confirm_starts_on_cancel_and_tab_enter_never_approves() {
 }
 
 #[test]
-fn escape_in_the_find_bar_returns_focus_after_it_moved_away() {
+fn escape_away_from_the_find_field_leaves_the_find_bar_open() {
     let _guard = env_lock();
     let (_scratch, mut harness, tab) = demo_setup("find-escape-focus");
     harness.ctx.memory_mut(|memory| memory.request_focus(editor_id(tab)));
@@ -2343,17 +2343,19 @@ fn escape_in_the_find_bar_returns_focus_after_it_moved_away() {
         harness.ctx.memory(|memory| memory.focused()) != Some(editor_id(tab)),
         "Tab moved the keyboard off the editor"
     );
+    let moved = harness.ctx.memory(|memory| memory.focused());
     harness.key_press(egui::Key::Escape);
     harness.run();
-    assert!(
-        harness.query_by_label("0/2").is_none() && harness.query_by_label("1/2").is_none(),
-        "Escape closes the find bar"
-    );
     assert_eq!(
-        harness.ctx.memory(|memory| memory.focused()),
-        Some(editor_id(tab)),
-        "closing the find bar hands the caret back to the editor"
+        harness.query_all_by_label("Find").count(),
+        2,
+        "Escape away from the find field leaves the find bar open"
     );
+    assert!(
+        harness.ctx.memory(|memory| memory.focused()).is_none(),
+        "egui clears the button focus and the bar claims nothing back"
+    );
+    assert!(moved.is_some(), "the probe started from a focused button");
 }
 
 #[test]
