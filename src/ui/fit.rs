@@ -77,7 +77,11 @@ pub(crate) struct Budget {
 
 impl Budget {
     pub(crate) fn new(ui: &egui::Ui) -> Self {
-        Self { available: ui.available_width(), used: 0.0 }
+        // egui grows a ui's max_rect to fit a widget that overflows it, so a
+        // row that ran past the panel would hand the next row a phantom
+        // width. A row can only use what the panel shows.
+        let visible = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+        Self { available: visible.width().max(0.0), used: 0.0 }
     }
 
     /// Reserve `w` plus the row's item spacing; false when it does not fit.
