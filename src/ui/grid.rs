@@ -3080,6 +3080,22 @@ pub fn copy_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::C)
 }
 
+/// Ctrl+Shift+C copies the active cell as plain text; Ctrl+C alone copies the
+/// selected rows as TSV.
+pub fn copy_cell_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::C)
+}
+
+/// One cell as plain text for the clipboard: the whole value, blobs as size
+/// tags, and NULL empty, the way a TSV field renders one without the escapes
+/// a single cell does not need.
+fn cell_text(cell: Option<&Value>) -> String {
+    match cell {
+        None | Some(Value::Null) => String::new(),
+        Some(value) => value.display(usize::MAX).into_owned(),
+    }
+}
+
 /// Ctrl+V pastes through the same mapping as the Paste rows button.
 pub fn paste_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::V)
@@ -3146,19 +3162,31 @@ fn grid_clipboard_keys(
     }
     let typing = edit_field_of(ui.ctx(), tab.id).is_some()
         || ui.ctx().memory(|memory| memory.focused().is_some());
-    if !modal_open
-        && !typing
-        && ui.input_mut(|i| i.consume_shortcut(&copy_shortcut()))
-    {
-        let rows = selection.resolve(visible);
-        let headers = tsv_headers_of(ui.ctx(), tab.id);
-        let text = tab
-            .active_query_result()
-            .map(|result| to_tsv(result, &rows, headers))
-            .unwrap_or_default();
-        let nrows = rows.len();
-        ui.ctx().copy_text(text);
-        tab.set_export_notice(format!("Copied {nrows} rows as TSV"), false);
+    if !modal_open && !typing {
+        // The Shift chord goes first: `consume_shortcut` matches an event
+        // with extra Shift, so the plain pattern would swallow it and copy
+        // the selected rows instead of the one cell.
+        if ui.input_mut(|i| i.consume_shortcut(&copy_cell_shortcut())) {
+            match selection.active().and_then(|(row, col)| {
+                tab.active_query_result().and_then(|result| result.cell(row, col))
+            }) {
+                Some(cell) => {
+                    ui.ctx().copy_text(cell_text(Some(cell)));
+                    tab.set_export_notice("Copied 1 cell".to_owned(), false);
+                }
+                None => tab.set_export_notice("Click a cell to copy it".to_owned(), true),
+            }
+        } else if ui.input_mut(|i| i.consume_shortcut(&copy_shortcut())) {
+            let rows = selection.resolve(visible);
+            let headers = tsv_headers_of(ui.ctx(), tab.id);
+            let text = tab
+                .active_query_result()
+                .map(|result| to_tsv(result, &rows, headers))
+                .unwrap_or_default();
+            let nrows = rows.len();
+            ui.ctx().copy_text(text);
+            tab.set_export_notice(format!("Copied {nrows} rows as TSV"), false);
+        }
     }
     actions
 }
@@ -3798,6 +3826,33 @@ mod tests {
         let shortcut = copy_shortcut();
         assert_eq!(shortcut.modifiers, egui::Modifiers::COMMAND);
         assert_eq!(shortcut.logical_key, egui::Key::C);
+    }
+
+    #[test]
+    fn copy_cell_shortcut_is_command_shift_c() {
+        let shortcut = copy_cell_shortcut();
+        assert_eq!(shortcut.modifiers, egui::Modifiers::COMMAND | egui::Modifiers::SHIFT);
+        assert_eq!(shortcut.logical_key, egui::Key::C);
+    }
+
+    #[test]
+    fn a_copied_cell_is_plain_text_with_null_empty() {
+        assert_eq!(cell_text(None), String::new());
+        assert_eq!(cell_text(Some(&Value::Null)), String::new());
+        assert_eq!(cell_text(Some(&Value::Integer(7))), "7");
+        assert_eq!(cell_text(Some(&Value::Real(2.5))), "2.5");
+        assert_eq!(
+            cell_text(Some(&Value::Text("a\tb".to_owned()))),
+            "a\tb",
+            "a single cell keeps the tab a TSV field would flatten"
+        );
+        assert_eq!(cell_text(Some(&Value::Blob(vec![0x01, 0x02]))), "[BLOB 2 B]");
+    }
+
+    #[test]
+    fn a_copied_cell_keeps_text_past_the_display_cap() {
+        let long = "x".repeat(CELL_CAP + 50);
+        assert_eq!(cell_text(Some(&Value::Text(long.clone()))), long);
     }
 
     #[test]

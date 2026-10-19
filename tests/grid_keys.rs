@@ -130,7 +130,7 @@ fn grid_setup(tag: &str) -> (Scratch, Harness<'static, AppState>, TabId) {
          INSERT INTO users (email, plan) VALUES\n\
          ('ada@example.com', 'pro'),\n\
          ('grace@example.com', 'free'),\n\
-         ('alan@example.com', 'team'),\n\
+         ('alan@example.com', NULL),\n\
          ('edsger@example.com', 'pro'),\n\
          ('barbara@example.com', 'free');",
     );
@@ -298,6 +298,41 @@ fn tab_walks_the_view_and_keeps_the_grid_alive() {
         "Shift+Tab wraps back onto the previous row's last column"
     );
     press_key(&mut harness, egui::Key::Escape);
+}
+
+/// Ctrl+Shift+C copies the one active cell, and Ctrl+C keeps copying the
+/// rows: the specific chord is consumed first, so one press never does both.
+#[test]
+fn shift_command_c_copies_the_active_cell() {
+    let _lock = env_lock();
+    let (_scratch, mut harness, _tab) = grid_setup("copy-cell");
+    press_key(&mut harness, egui::Key::ArrowDown);
+    let copied = press_for_copy(
+        &mut harness,
+        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        egui::Key::C,
+    );
+    assert_eq!(copied.as_deref(), Some("1"), "the cursor's cell copies as plain text");
+    assert!(harness.query_by_label("Copied 1 cell").is_some());
+    press_key(&mut harness, egui::Key::ArrowRight);
+    press_key(&mut harness, egui::Key::ArrowRight);
+    press_key(&mut harness, egui::Key::ArrowDown);
+    press_key(&mut harness, egui::Key::ArrowDown);
+    let copied = press_for_copy(
+        &mut harness,
+        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        egui::Key::C,
+    );
+    assert_eq!(
+        copied.as_deref(),
+        Some(""),
+        "a NULL cell copies as an empty string"
+    );
+    assert_eq!(
+        press_for_copy(&mut harness, egui::Modifiers::COMMAND, egui::Key::C).as_deref(),
+        Some("id\temail\tplan\n3\talan@example.com\t\n"),
+        "plain Ctrl+C still copies the cursor's row as TSV"
+    );
 }
 
 /// The cursor's row is scrolled into view: with 200 rows the last one is
