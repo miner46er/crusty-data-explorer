@@ -2181,18 +2181,7 @@ impl AppState {
 
     pub fn close_tab(&mut self, tab: TabId) {
         self.tabs.retain(|t| t.id != tab);
-        if self.pending_write.as_ref().is_some_and(|pending| pending.tab == tab) {
-            self.pending_write = None;
-        }
-        if self.pending_params.as_ref().is_some_and(|pending| pending.tab == tab) {
-            self.pending_params = None;
-        }
-        if self.pending_edit_preview == Some(tab) {
-            self.pending_edit_preview = None;
-        }
-        if self.pending_table_confirm.as_ref().is_some_and(|pending| pending.tab == tab) {
-            self.pending_table_confirm = None;
-        }
+        self.clear_tab_confirms(tab);
         self.repair_active();
     }
 
