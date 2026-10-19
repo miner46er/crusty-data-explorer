@@ -2650,4 +2650,26 @@ fn enter_on_the_save_cancel_button_cancels_without_saving() {
         "cancelling the prompt saves nothing"
     );
 }
-
+/// No completion popup over a dialog: Ctrl+Space under the write guard opens
+/// nothing, so the guard keeps Enter and Escape. This pins why the editor
+/// draws paused while a dialog owns the keyboard.
+#[test]
+fn no_completion_popup_opens_under_a_dialog() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("dialog-no-popup");
+    harness.state_mut().start_run(tab, "DELETE FROM users", 0, None);
+    harness.run();
+    assert!(harness.state().pending_write().is_some(), "the guard holds the delete");
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Space);
+    harness.run();
+    assert!(
+        harness.query_by_label("sql completion").is_none(),
+        "Ctrl+Space under the guard opens no popup"
+    );
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(
+        harness.state().pending_write().is_none(),
+        "Escape still cancels the guard itself"
+    );
+}

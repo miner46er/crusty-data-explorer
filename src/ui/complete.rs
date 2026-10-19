@@ -549,9 +549,6 @@ pub fn complete_menu(ui: &mut egui::Ui) {
     });
 }
 
-/// SQL editor with autocomplete. Ctrl+Space opens the popup, Enter applies
-/// the selected row, Esc closes it. The Complete menu switches each
-/// completion source independently.
 /// The editor while a dialog owns the keyboard: the same buffer and id, shown
 /// disabled, with no completion popup reading Enter or Escape. The id keeps
 /// the caret in `TextEditState`, so the position returns when the dialog
@@ -567,6 +564,9 @@ pub fn editor_paused(tab: TabId, sql: &mut String, ui: &mut egui::Ui) {
     );
 }
 
+/// SQL editor with autocomplete. Ctrl+Space opens the popup, Enter applies
+/// the selected row, Esc closes it. The Complete menu switches each
+/// completion source independently.
 pub fn editor_with_completion(
     tab: TabId,
     schema: Option<&SchemaInfo>,
