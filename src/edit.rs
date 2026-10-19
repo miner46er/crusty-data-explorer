@@ -5,13 +5,13 @@
 //! Pure text, no engine calls. `app.rs` decides when an edit may be staged
 //! and sends the statements this module builds.
 
-/// Some(table name) only for a single-table SELECT: a plain or double-quoted
-/// identifier after FROM, optionally one more of either kind joined by a
-/// single unquoted dot, with WHERE, GROUP, ORDER, HAVING, LIMIT, or OFFSET
-/// allowed to follow it. Joins, unions, comma sources, parenthesized FROM
-/// clauses, aliases, deeper qualifiers, and anything but a SELECT are not
-/// editable. The name joins its parts with a dot; a part containing a dot or
-/// quote keeps its quotes.
+/// Some(table name) only for a single-table SELECT: a plain, double-quoted,
+/// or backtick-quoted identifier after FROM, optionally one more of either
+/// kind joined by a single unquoted dot, with WHERE, GROUP, ORDER, HAVING,
+/// LIMIT, or OFFSET allowed to follow it. Joins, unions, comma sources,
+/// parenthesized FROM clauses, aliases, deeper qualifiers, and anything but
+/// a SELECT are not editable. The name joins its parts with a dot; a part
+/// containing a dot or quote keeps its quotes.
 pub fn editable_table(sql: &str) -> Option<String> {
     let tokens = lex(sql);
     if !matches!(tokens.first(), Some(Token::Word(w)) if w.eq_ignore_ascii_case("select")) {
@@ -46,7 +46,8 @@ pub fn editable_table(sql: &str) -> Option<String> {
     }
 }
 
-/// One plain or double-quoted identifier at `index`, with the index after it.
+/// One plain, double-quoted, or backtick-quoted identifier at `index`, with
+/// the index after it.
 fn identifier_at(tokens: &[Token], index: usize) -> Option<(String, usize)> {
     match tokens.get(index) {
         Some(Token::Word(name)) | Some(Token::Quoted(name)) => Some((name.clone(), index + 1)),
@@ -125,6 +126,26 @@ pub fn parse_join(sql: &str) -> Option<JoinPlan> {
         return None;
     }
     Some(JoinPlan { sources, selects })
+}
+
+/// True when the SELECT list is exactly `*` or `table.*`, the forms whose
+/// result columns read positionally from the one source table. A function or
+/// arithmetic item is not a wildcard even though its parsed column is None.
+pub fn wildcard_select(sql: &str) -> bool {
+    let tokens = lex(sql);
+    let Some(from) = top_level_from(&tokens) else { return false };
+    let mut list = &tokens[1..from];
+    if matches!(
+        list.first(),
+        Some(Token::Word(w)) if w.eq_ignore_ascii_case("distinct") || w.eq_ignore_ascii_case("all")
+    ) {
+        list = &list[1..];
+    }
+    matches!(
+        list,
+        [Token::Punct('*')]
+            | [Token::Word(_) | Token::Quoted(_), Token::Punct('.'), Token::Punct('*')]
+    )
 }
 
 /// Index of the top-level FROM, so a subquery's FROM never reads as the
@@ -405,10 +426,11 @@ fn is_union_at(tokens: &[Token], pos: usize) -> bool {
 enum Token {
     /// An unquoted word: identifier or keyword.
     Word(String),
-    /// A double-quoted identifier, doubled quotes unescaped, so it never
-    /// reads as a keyword.
+    /// A double- or backtick-quoted identifier, doubled quotes unescaped, so
+    /// it never reads as a keyword.
     Quoted(String),
-    /// A single-quoted string literal; its contents never matter here.
+    /// A single-quoted string literal, a Postgres dollar-quoted string, or
+    /// anything else whose contents never matter here.
     Str,
     /// Any other single character: punctuation and operators.
     Punct(char),
@@ -436,13 +458,14 @@ fn lex(sql: &str) -> Vec<Token> {
                 i += 1;
             }
             tokens.push(Token::Str);
-        } else if c == '"' {
+        } else if c == '"' || c == '`' {
+            let quote = c;
             let mut text = String::new();
             i += 1;
             while i < chars.len() {
-                if chars[i] == '"' {
-                    if chars.get(i + 1) == Some(&'"') {
-                        text.push('"');
+                if chars[i] == quote {
+                    if chars.get(i + 1) == Some(&quote) {
+                        text.push(quote);
                         i += 2;
                         continue;
                     }
@@ -458,6 +481,11 @@ fn lex(sql: &str) -> Vec<Token> {
             while i < chars.len() && chars[i] != '\n' {
                 i += 1;
             }
+        } else if c == '#' {
+            i += 1;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
         } else if c == '/' && chars.get(i + 1) == Some(&'*') {
             i += 2;
             while i < chars.len() {
@@ -467,6 +495,9 @@ fn lex(sql: &str) -> Vec<Token> {
                 }
                 i += 1;
             }
+        } else if let Some(end) = dollar_quote_end(&chars, i) {
+            i = end;
+            tokens.push(Token::Str);
         } else if c.is_alphanumeric() || c == '_' || c == '$' {
             let start = i;
             while i < chars.len()
@@ -481,6 +512,43 @@ fn lex(sql: &str) -> Vec<Token> {
         }
     }
     tokens
+}
+
+/// Index after the Postgres dollar-quoted string starting at `index`: `$$`
+/// or `$tag$` where a nonempty tag starts with an ASCII letter or `_` and
+/// continues with ASCII letters, digits, or `_`. None when no quote opens
+/// there, so `$1` stays a word. An unterminated quote runs to the end.
+fn dollar_quote_end(chars: &[char], index: usize) -> Option<usize> {
+    if chars.get(index) != Some(&'$') {
+        return None;
+    }
+    let mut tag_end = index + 1;
+    while tag_end < chars.len()
+        && (chars[tag_end].is_ascii_alphanumeric() || chars[tag_end] == '_')
+    {
+        tag_end += 1;
+    }
+    if chars.get(tag_end) != Some(&'$') {
+        return None;
+    }
+    let tag = &chars[index + 1..tag_end];
+    if let Some(first) = tag.first()
+        && !(first.is_ascii_alphabetic() || *first == '_')
+    {
+        return None;
+    }
+    let mut close = Vec::with_capacity(tag.len() + 2);
+    close.push('$');
+    close.extend_from_slice(tag);
+    close.push('$');
+    let mut cursor = tag_end + 1;
+    while cursor + close.len() <= chars.len() {
+        if chars[cursor..cursor + close.len()] == close[..] {
+            return Some(cursor + close.len());
+        }
+        cursor += 1;
+    }
+    Some(chars.len())
 }
 
 /// Staged text meaning the SQL `DEFAULT` keyword. A control-wrapped marker
@@ -586,26 +654,30 @@ pub fn qualified_parts(table: &str) -> Vec<String> {
     split_unquoted(table).into_iter().map(|part| unquote(&part)).collect()
 }
 
-/// Split on dots outside double quotes, keeping each part's quotes.
+/// Split on dots outside double or backtick quotes, keeping each part's
+/// quotes.
 fn split_unquoted(table: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
-    let mut in_quotes = false;
+    let mut quote: Option<char> = None;
     let mut chars = table.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '"' {
-            current.push(c);
-            if !in_quotes {
-                in_quotes = true;
-            } else if chars.next_if_eq(&'"').is_some() {
-                current.push('"');
-            } else {
-                in_quotes = false;
+        match quote {
+            Some(q) if c == q => {
+                current.push(c);
+                if chars.next_if_eq(&q).is_some() {
+                    current.push(q);
+                } else {
+                    quote = None;
+                }
             }
-        } else if c == '.' && !in_quotes {
-            parts.push(std::mem::take(&mut current));
-        } else {
-            current.push(c);
+            Some(_) => current.push(c),
+            None if c == '"' || c == '`' => {
+                current.push(c);
+                quote = Some(c);
+            }
+            None if c == '.' => parts.push(std::mem::take(&mut current)),
+            None => current.push(c),
         }
     }
     parts.push(current);
@@ -615,11 +687,13 @@ fn split_unquoted(table: &str) -> Vec<String> {
 /// One part's content: a fully quoted part loses its quotes and undoubles
 /// its inner quotes; a bare part is kept as is.
 fn unquote(part: &str) -> String {
-    if part.len() >= 2 && part.starts_with('"') && part.ends_with('"') {
-        part[1..part.len() - 1].replace("\"\"", "\"")
-    } else {
-        part.to_owned()
+    for quote in ['"', '`'] {
+        if part.len() >= 2 && part.starts_with(quote) && part.ends_with(quote) {
+            let doubled = format!("{quote}{quote}");
+            return part[1..part.len() - 1].replace(&doubled, &quote.to_string());
+        }
     }
+    part.to_owned()
 }
 
 fn predicate(pk: &[(String, String)]) -> String {
@@ -741,6 +815,55 @@ mod tests {
         assert_eq!(table_of("SELECT * FROM \"a\".\"b\".\"c\""), None);
         assert_eq!(table_of("SELECT * FROM main."), None);
         assert_eq!(table_of("SELECT * FROM main.users u"), None);
+    }
+
+    #[test]
+    fn a_backtick_identifier_is_accepted_and_unescaped() {
+        assert_eq!(table_of("SELECT * FROM `users`"), Some("users".to_owned()));
+        assert_eq!(
+            table_of("select `id` from `main`.`Users` where `id` = 1"),
+            Some("main.Users".to_owned())
+        );
+        assert_eq!(table_of("SELECT * FROM `odd``name`"), Some("odd`name".to_owned()));
+        // A backtick identifier is not the FROM keyword.
+        assert_eq!(table_of("SELECT `from` FROM users").as_deref(), Some("users"));
+    }
+
+    #[test]
+    fn hash_comments_and_dollar_quotes_lex_as_skipped_text() {
+        assert_eq!(
+            table_of("SELECT * FROM users # note with from join\nWHERE id = 1"),
+            Some("users".to_owned())
+        );
+        assert_eq!(
+            table_of("SELECT * FROM users WHERE note = $tag$from join 'where'$tag$"),
+            Some("users".to_owned())
+        );
+        assert_eq!(
+            table_of("SELECT * FROM users WHERE note = $$from join$$ LIMIT 5"),
+            Some("users".to_owned())
+        );
+        assert_eq!(
+            join_of("SELECT u.id FROM users u JOIN orders o ON o.note = $$join from$$"),
+            Some(JoinPlan {
+                sources: vec![
+                    JoinSource { table: "users".to_owned(), alias: Some("u".to_owned()) },
+                    JoinSource { table: "orders".to_owned(), alias: Some("o".to_owned()) },
+                ],
+                selects: vec![JoinSelect {
+                    qualifier: Some("u".to_owned()),
+                    column: Some("id".to_owned())
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn wildcard_selects_read_positionally() {
+        assert!(wildcard_select("SELECT * FROM users"));
+        assert!(wildcard_select("SELECT DISTINCT t.* FROM users t"));
+        assert!(!wildcard_select("SELECT count(*) FROM users"));
+        assert!(!wildcard_select("SELECT u.id, u.* FROM users u"));
     }
 
     #[test]
@@ -941,6 +1064,26 @@ mod tests {
                 selects: vec![
                     JoinSelect { qualifier: Some("a".to_owned()), column: Some("id".to_owned()) },
                     JoinSelect { qualifier: Some("b".to_owned()), column: Some("total".to_owned()) },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn backtick_sources_and_columns_parse_as_join_items() {
+        assert_eq!(
+            join_of(
+                "SELECT `u`.`id`, `o`.`total` FROM `users` `u` JOIN `orders` `o` \
+                 ON `o`.`user_id` = `u`.`id`"
+            ),
+            Some(JoinPlan {
+                sources: vec![
+                    JoinSource { table: "users".to_owned(), alias: Some("u".to_owned()) },
+                    JoinSource { table: "orders".to_owned(), alias: Some("o".to_owned()) },
+                ],
+                selects: vec![
+                    JoinSelect { qualifier: Some("u".to_owned()), column: Some("id".to_owned()) },
+                    JoinSelect { qualifier: Some("o".to_owned()), column: Some("total".to_owned()) },
                 ],
             })
         );
