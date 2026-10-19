@@ -315,11 +315,14 @@ fn key_label(
 /// columns, the Compare button, and the cached diff with its counts. Closed by
 /// default, so the grid keeps its full height until asked. Reads state and
 /// sends through transitions only.
-pub fn compare_window(state: &mut AppState, ui: &mut egui::Ui) {
+pub fn compare_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<super::ModalKey>,
+) {
     if !state.compare_window_open() {
         return;
     }
-    let key = super::modal_key(ui, false);
     let mut open = true;
     egui::Window::new("Table compare")
         .open(&mut open)

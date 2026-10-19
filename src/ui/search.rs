@@ -33,35 +33,42 @@ fn row_text(state: &AppState, result: &SearchResult) -> (String, String) {
     }
 }
 
-/// Pump the palette from `root`: the Ctrl+K toggle everywhere, then the
-/// window, its keys, and its rows while it is open.
-pub fn palette(state: &mut AppState, ui: &mut egui::Ui) {
-    let other_modal_open = !matches!(state.modal(), None | Some(crate::app::Modal::Palette));
-    let toggled = ui.input_mut(|i| i.consume_shortcut(&search_shortcut()));
-    if toggled {
-        if state.palette_open() {
-            state.close_palette();
-        } else if !other_modal_open {
-            state.open_palette();
-        }
+/// Pump the Ctrl+K toggle from `root`: the palette opens anywhere no other
+/// dialog owns the keyboard, and an open palette closes on a second press.
+pub fn palette_toggle(state: &mut AppState, ui: &mut egui::Ui) {
+    let other_modal_open = super::modal_open(state, ui.ctx())
+        && !matches!(state.modal(), Some(crate::app::Modal::Palette));
+    let pressed = ui.input_mut(|i| i.consume_shortcut(&search_shortcut()));
+    if pressed && !other_modal_open {
+        state.toggle_palette();
     }
+}
+
+/// The open palette's window and keys. `owns` is false when a newer dialog
+/// covers it: it still draws, but no key reaches it. The arrows, Enter, and
+/// Escape are claimed before the filter box sees them.
+pub fn palette_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    owns: bool,
+    key: Option<super::ModalKey>,
+) {
     if !state.palette_open() {
         return;
     }
-    let just_opened = toggled;
-    // The arrows, Enter, and Escape are claimed before the filter box sees
-    // them, so they never move its caret.
-    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
-        state.move_palette_selection(1);
-    }
-    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
-        state.move_palette_selection(-1);
-    }
-    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
-        state.activate_palette_selection();
-    }
-    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-        state.close_palette();
+    if owns {
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+            state.move_palette_selection(1);
+        }
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+            state.move_palette_selection(-1);
+        }
+        if key == Some(super::ModalKey::Submit) {
+            state.activate_palette_selection();
+        }
+        if key == Some(super::ModalKey::Cancel) {
+            state.close_palette();
+        }
     }
     if !state.palette_open() {
         return;
@@ -80,7 +87,7 @@ pub fn palette(state: &mut AppState, ui: &mut egui::Ui) {
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
         .show(ui.ctx(), |ui| {
             let Some(palette) = state.palette_mut() else { return };
-            let focus = just_opened || ui.memory(|memory| memory.focused().is_none());
+            let focus = owns && ui.memory(|memory| memory.focused().is_none());
             let response = ui.add(
                 egui::TextEdit::singleline(&mut palette.query)
                     .hint_text("Search connections, saved queries, tables, and columns")

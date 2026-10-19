@@ -11,17 +11,12 @@ use super::editor::{char_range, FindState};
 use crate::app::AppState;
 use crate::db::TabId;
 
-use super::{Palette, autofocus, fit, modal_key, ModalKey};
-
-/// True while any modal owns the screen, so the editor's shortcuts stay dead.
-pub(crate) fn any_modal_open(state: &AppState) -> bool {
-    state.modal().is_some()
-}
+use super::{Palette, autofocus, fit, park_focus, ModalKey};
 
 /// The tab strip, drawn by `root` for every tab whatever its kind. The new
 /// and close shortcuts live here so they work on a table tab too.
 pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
-    let modal_open = any_modal_open(state);
+    let modal_open = super::modal_open(state, ui.ctx());
     let (new_tab_shortcut_pressed, close_tab_shortcut_pressed) = ui.input_mut(|i| {
         (
             i.consume_shortcut(&new_tab_shortcut()),
@@ -170,7 +165,7 @@ pub fn tab_bar(state: &mut AppState, ui: &mut egui::Ui) {
 /// `root` for `Query` tabs only.
 pub fn editor(state: &mut AppState, ui: &mut egui::Ui) {
     prune_find(state, ui.ctx());
-    let modal_open = any_modal_open(state);
+    let modal_open = super::modal_open(state, ui.ctx());
     let find_shortcut_pressed = ui.input_mut(|i| i.consume_shortcut(&find_shortcut()));
     let mut find_opened = false;
     if !modal_open && find_shortcut_pressed {
@@ -230,7 +225,7 @@ pub fn table_header(state: &mut AppState, ui: &mut egui::Ui) {
     }) else {
         return;
     };
-    let modal_open = any_modal_open(state);
+    let modal_open = super::modal_open(state, ui.ctx());
     let mut edit = false;
     let mut refresh = ui.input_mut(|i| i.consume_shortcut(&run_shortcut()));
     // A table tab has no editor to search, so find lands in the row filter.
@@ -543,9 +538,12 @@ pub fn save_window(state: &mut AppState, ui: &mut egui::Ui) {
 /// The write guard modal for an UPDATE or DELETE without WHERE. Names the
 /// statement kind and the affected table; Confirm sends the held batch
 /// exactly as prepared, Cancel drops it.
-pub fn write_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
+pub fn write_confirm_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) {
     let Some(pending) = state.pending_write().cloned() else { return };
-    let key = modal_key(ui, false);
     let mut confirm = false;
     let mut cancel = false;
     egui::Window::new(format!("{} without WHERE?", pending.kind)).show(ui.ctx(), |ui| {
@@ -572,7 +570,11 @@ pub fn write_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
 /// The staged-edit SQL preview. Lists the exact UPDATE, DELETE, and INSERT
 /// statements the apply path would send, in send order; Confirm sends them
 /// through the unchanged apply path, Cancel keeps the staged edits.
-pub fn edit_preview_window(state: &mut AppState, ui: &mut egui::Ui) {
+pub fn edit_preview_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) {
     let Some(tab) = state.pending_edit_preview() else { return };
     let table = state.edit_target(tab).map(|target| target.table).unwrap_or_default();
     let statements = state.preview_edit_statements(tab).unwrap_or_default();
@@ -580,7 +582,6 @@ pub fn edit_preview_window(state: &mut AppState, ui: &mut egui::Ui) {
         state.cancel_pending_edits();
         return;
     }
-    let key = modal_key(ui, false);
     let mut confirm = false;
     let mut cancel = false;
     egui::Window::new("Apply staged edits?").show(ui.ctx(), |ui| {

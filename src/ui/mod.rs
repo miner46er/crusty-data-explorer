@@ -21,23 +21,23 @@ pub mod search;
 pub mod table_edit;
 
 pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
-    // First, so the palette's keys win over the editor's completion popup.
-    search::palette(state, ui);
-    // Every dialog draws before the panels, so a key it consumes never
-    // reaches the editor or the grid underneath in the same frame.
-    connections::prod_confirm_window(state, ui);
-    connections::terminate_confirm_window(state, ui);
-    connections::draft_window(state, ui);
-    query::save_window(state, ui);
-    connections::password_window(state, ui);
-    // The import window is drawn by the grid, so its Escape is claimed here.
-    import_escape(state, ui);
-    query::write_confirm_window(state, ui);
-    query::params_window(state, ui);
-    query::edit_preview_window(state, ui);
-    table_edit::table_prod_confirm_window(state, ui);
-    table_edit::table_editor_window(state, ui);
-    compare::compare_window(state, ui);
+    // The palette's Ctrl+K stays live everywhere; an open dialog refuses it.
+    search::palette_toggle(state, ui);
+    let modal = state.modal();
+    let key = modal.and_then(|modal| modal_key(ui, modal.submits_on_enter()));
+    // The cell editor lives in egui temp data, so it has no `Modal` variant;
+    // it owns the keyboard only when no dialog backs it.
+    let cell_editor_key = if modal.is_none() && grid::cell_editor_open(state, ui.ctx()) {
+        modal_key(ui, false)
+    } else {
+        None
+    };
+    // Back to front, so the newest dialog draws last, on top, and the one
+    // `state.modal()` names is the one whose key was read.
+    for open in state.modals_back_to_front() {
+        let owns = Some(open) == modal;
+        draw_modal(state, ui, open, owns, owns.then_some(key).flatten());
+    }
     egui::Panel::left("connections")
         .resizable(true)
         .default_size(240.0)
@@ -56,23 +56,55 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
             .default_size(210.0)
             .show(ui, |ui| query::editor(state, ui));
     }
-    egui::CentralPanel::default().show(ui, |ui| grid::results(state, ui));
+    egui::CentralPanel::default().show(ui, |ui| grid::results(state, ui, cell_editor_key));
 }
 
-/// The import confirmation owns its own Escape: its window lives in the grid
-/// module, so the key is claimed before the panels read it.
-fn import_escape(state: &mut AppState, ui: &egui::Ui) {
-    if state.modal() != Some(crate::app::Modal::Import) {
-        return;
-    }
-    if modal_key(ui, false) == Some(ModalKey::Cancel) {
-        state.cancel_import();
+/// Route one frame's dialog key to the window that owns it.
+fn draw_modal(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    modal: crate::app::Modal,
+    owns: bool,
+    key: Option<ModalKey>,
+) {
+    use crate::app::Modal;
+    match modal {
+        Modal::ProdConnect => connections::prod_confirm_window(state, ui, key),
+        Modal::Terminate => connections::terminate_confirm_window(state, ui, key),
+        Modal::Draft => connections::draft_window(state, ui, key),
+        Modal::SavePrompt => query::save_window(state, ui, key),
+        Modal::PasswordPrompt => connections::password_window(state, ui, key),
+        Modal::Import => grid::import_window(state, ui, key),
+        Modal::WriteConfirm => query::write_confirm_window(state, ui, key),
+        Modal::Params => query::params_window(state, ui, key),
+        Modal::EditPreview => query::edit_preview_window(state, ui, key),
+        Modal::TableDdl => table_edit::table_prod_confirm_window(state, ui, key),
+        Modal::TableEditor => table_edit::table_editor_window(state, ui, key),
+        Modal::Compare => compare::compare_window(state, ui, key),
+        Modal::Palette => search::palette_window(state, ui, owns, key),
     }
 }
 
-/// A key a modal dialog answers.
+/// Whether any dialog owns the keyboard, including the grid's cell editor,
+/// which carries a UI-only text buffer and therefore stays in egui temp data.
+pub(crate) fn modal_open(state: &AppState, ctx: &egui::Context) -> bool {
+    state.modal().is_some() || grid::cell_editor_open(state, ctx)
+}
+
+/// Register a focusable, non-interactive parking spot after a destructive
+/// dialog's buttons. Tab from Cancel lands here, where Enter and Space do
+/// nothing, instead of wrapping onto the approve button.
+pub(crate) fn park_focus(ui: &mut egui::Ui) {
+    let _ = ui.allocate_exact_size(
+        egui::Vec2::ZERO,
+        egui::Sense::focusable_noninteractive(),
+    );
+}
+
+/// A key a modal dialog answers. Public because the routed key crosses the
+/// UI module's window signatures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ModalKey {
+pub enum ModalKey {
     Submit,
     Cancel,
 }

@@ -16,7 +16,7 @@ use crate::db::{
 };
 use crate::ssh::{SshAuth, SshConfig};
 
-use super::{Palette, Theme, autofocus, modal_key, ModalKey};
+use super::{Palette, Theme, autofocus, park_focus, ModalKey};
 
 /// A connection's state as the card and the dot read it: one value that
 /// derives both the painted shape and the color, so a dot can never wear the
@@ -882,7 +882,7 @@ pub fn sidebar(state: &mut AppState, ui: &mut egui::Ui) {
 
                 // The saved rows and the action loop both gate on a modal, so
                 // the flag lives outside the section gate.
-                let modal_open = super::query::any_modal_open(state);
+                let modal_open = super::modal_open(state, ui.ctx());
                 match state.sidebar_view() {
                     SidebarView::Schema => {
                         if !no_connections {
@@ -1491,7 +1491,11 @@ fn json_flag(object: &serde_json::Map<String, serde_json::Value>, keys: &[&str])
     keys.iter().any(|key| object.get(*key).is_some_and(|v| v.as_bool().unwrap_or(false)))
 }
 
-pub fn password_window(state: &mut AppState, ui: &mut egui::Ui) {
+pub fn password_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) {
     let Some(id) = state.password_prompt() else { return };
     let Some(name) =
         state.connections().iter().find(|c| c.id == id).map(|c| c.name.clone())
@@ -1530,7 +1534,6 @@ pub fn prod_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
         state.cancel_prod();
         return;
     };
-    let key = modal_key(ui, false);
     let mut confirm = false;
     let mut cancel = false;
     egui::Window::new("Connect to prod?").show(ui.ctx(), |ui| {
@@ -1554,7 +1557,11 @@ pub fn prod_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
 /// The prod-gated terminate confirmation: names the backend and the
 /// connection, with the production warning the connect confirm carries.
 /// Non-prod terminates never arm this modal; they send on click.
-pub fn terminate_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
+pub fn terminate_confirm_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) {
     let Some(pending) = state.pending_terminate().cloned() else { return };
     let Some(name) =
         state.connections().iter().find(|c| c.id == pending.conn).map(|c| c.name.clone())
@@ -1562,7 +1569,6 @@ pub fn terminate_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
         state.cancel_terminate();
         return;
     };
-    let key = modal_key(ui, false);
     let mut confirm = false;
     let mut cancel = false;
     egui::Window::new("Terminate session?").show(ui.ctx(), |ui| {
@@ -1582,7 +1588,7 @@ pub fn terminate_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
     }
 }
 
-pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui) {
+pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKey>) {
     if state.draft().is_none() {
         return;
     }

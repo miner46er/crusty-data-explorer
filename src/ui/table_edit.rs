@@ -14,7 +14,7 @@ use eframe::egui;
 use crate::app::AppState;
 use crate::db::ConnectionId;
 
-use super::{ModalKey, modal_key};
+use super::{ModalKey, autofocus, park_focus};
 
 /// The status-bar entry's label, measured by the status bar before it draws:
 /// the entry and the measurement read one literal.
@@ -37,7 +37,11 @@ pub fn status_entry(state: &mut AppState, ui: &mut egui::Ui) {
 
 /// The prod-gated table DDL confirmation: names the connection and lists the
 /// exact held statements. Non-prod applies never arm this modal.
-pub fn table_prod_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
+pub fn table_prod_confirm_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) {
     let Some(pending) = state.pending_table_ddl().cloned() else { return };
     let Some(name) =
         state.connections().iter().find(|c| c.id == pending.conn).map(|c| c.name.clone())
@@ -45,7 +49,6 @@ pub fn table_prod_confirm_window(state: &mut AppState, ui: &mut egui::Ui) {
         state.cancel_table_ddl();
         return;
     };
-    let key = modal_key(ui, false);
     let mut confirm = false;
     let mut cancel = false;
     egui::Window::new("Apply table DDL on prod?").show(ui.ctx(), |ui| {
@@ -102,7 +105,11 @@ fn schema_has_table(state: &AppState, conn: ConnectionId, schema: &str, table: &
 
 /// The editor window: form rows, validation errors, SQL preview with Copy,
 /// and Apply through the batch path. Nothing sends without Apply.
-pub fn table_editor_window(state: &mut AppState, ui: &mut egui::Ui) {
+pub fn table_editor_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) {
     let (conn, conn_name, backend, read_only, prod, is_alter, editing_title) = match state
         .table_editor()
     {

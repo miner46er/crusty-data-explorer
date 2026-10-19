@@ -27,7 +27,7 @@ use crate::export::{
 use crate::edit::{STAGED_DEFAULT, editable_table};
 use crate::import::{ParsedCsv, parse_csv, parse_jsonl, parse_xlsx};
 
-use super::{Palette, fit};
+use super::{ModalKey, Palette, autofocus, fit, park_focus};
 
 /// The row filter's desired width, and the narrowest it shrinks to before
 /// the results toolbar wraps to a second row.
@@ -954,12 +954,14 @@ fn column_names(tab: &Tab) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
-    import_window(state, ui);
+pub fn results(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    cell_editor_key: Option<ModalKey>,
+) {
     prune_selection(state, ui.ctx());
     prune_grid_views(state, ui.ctx());
-    let modal_open = super::query::any_modal_open(state)
-        || state.active().is_some_and(|id| cell_editor_of(ui.ctx(), id).is_some());
+    let modal_open = super::modal_open(state, ui.ctx());
     let Some(tab_id) = state.active() else {
         ui.label("No query tab.");
         return;
@@ -1019,7 +1021,15 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
             }
         });
     let Some(tab) = state.tab_mut(tab_id) else { return };
-    let actions = results_grid(tab, target.as_ref(), &filter_history, modal_open, grid_conn, ui);
+    let actions = results_grid(
+        tab,
+        target.as_ref(),
+        &filter_history,
+        modal_open,
+        grid_conn,
+        cell_editor_key,
+        ui,
+    );
     apply_edit_actions(state, tab_id, actions);
 }
 
@@ -1207,7 +1217,7 @@ fn stage_rows_into(
 /// The confirmation modal for a pending import: every mapped header beside
 /// the table column it writes, the skipped headers, the truncation count,
 /// and the Import and Cancel buttons.
-pub fn import_window(state: &mut AppState, ui: &mut egui::Ui) {
+pub fn import_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKey>) {
     let Some(draft) = state.import_draft() else { return };
     let title = format!("Import into {}", draft.table);
     let mut confirm = false;
@@ -1327,6 +1337,13 @@ fn cell_editor_of(ctx: &egui::Context, tab: TabId) -> Option<CellEditor> {
     ctx.data(|d| d.get_temp(cell_editor_id(tab)))
 }
 
+/// Whether the active tab's cell editor owns the keyboard. The editor itself
+/// stays in egui temp data because it carries a UI text buffer; this is the
+/// piece the shared [`super::modal_open`] gate reads.
+pub(crate) fn cell_editor_open(state: &AppState, ctx: &egui::Context) -> bool {
+    state.active().is_some_and(|tab| cell_editor_of(ctx, tab).is_some())
+}
+
 fn store_cell_editor(ctx: &egui::Context, tab: TabId, editor: Option<CellEditor>) {
     ctx.data_mut(|d| match editor {
         Some(editor) => {
@@ -1436,6 +1453,7 @@ fn cell_editor_window(
     cols: &[(String, String)],
     editable: bool,
     active_result: usize,
+    key: Option<ModalKey>,
     ui: &mut egui::Ui,
 ) -> Vec<EditAction> {
     let mut actions = Vec::new();
@@ -1507,7 +1525,7 @@ fn cell_editor_window(
                 cancel = true;
             }
         });
-        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        if key == Some(ModalKey::Cancel) {
             cancel = true;
         }
         store_cell_editor(ui.ctx(), tab.id, Some(editor.clone()));
@@ -1779,6 +1797,7 @@ fn results_grid(
     filter_history: &[SavedFilter],
     modal_open: bool,
     grid_conn: Option<GridConn>,
+    cell_editor_key: Option<ModalKey>,
     ui: &mut egui::Ui,
 ) -> Vec<EditAction> {
     let mut actions = Vec::new();
@@ -2687,7 +2706,8 @@ fn results_grid(
     }
     let mut clipboard = grid_clipboard_keys(tab, editable, &selection, &visible, modal_open, ui);
     actions.append(&mut clipboard);
-    let mut editor_modal = cell_editor_window(tab, &cols, editable, active_result, ui);
+    let mut editor_modal =
+        cell_editor_window(tab, &cols, editable, active_result, cell_editor_key, ui);
     actions.append(&mut editor_modal);
     store_selection(ui.ctx(), tab.id, &selection);
     store_grid_view(ui.ctx(), tab.id, &view);

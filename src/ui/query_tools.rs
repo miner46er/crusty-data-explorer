@@ -216,6 +216,7 @@ fn fits_one_row(
 
 pub(crate) fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
     let Some(tab_id) = state.active() else { return false };
+    let modal_open = super::modal_open(state, ui.ctx());
     let find_shown = find_open(ui.ctx(), tab_id);
     let (mut run_clicked, mut explain_clicked, mut cancel_clicked) = (false, false, false);
     let mut clicks = ToolClicks::default();
@@ -326,7 +327,9 @@ pub(crate) fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
             tab.set_run_scope(scope);
         }
     }
-    run_clicked |= ui.input_mut(|i| i.consume_shortcut(&run_shortcut()));
+    if !modal_open {
+        run_clicked |= ui.input_mut(|i| i.consume_shortcut(&run_shortcut()));
+    }
     if cancel_clicked {
         state.cancel_run(tab_id);
     }
@@ -336,24 +339,25 @@ pub(crate) fn toolbar(state: &mut AppState, ui: &mut egui::Ui) -> bool {
     if let Some(on) = clicks.autocommit {
         state.set_autocommit(tab_id, on);
     }
-    if clicks.save {
+    if clicks.save && !modal_open {
         state.open_save_prompt();
     }
     if clicks.format
+        && !modal_open
         && let Some(sql) = state.tab_sql_mut(tab_id)
     {
         *sql = format_sql(sql);
     }
     let mut find_opened = false;
-    if clicks.find {
+    if clicks.find && !modal_open {
         find_opened = toggle_find(ui.ctx(), tab_id);
     }
-    if run_clicked {
+    if run_clicked && !modal_open {
         let sql = state.tab(tab_id).map(|t| t.sql.clone()).unwrap_or_default();
         let (cursor, selection) = super::complete::editor_offsets(ui.ctx(), tab_id, &sql);
         state.start_run(tab_id, &sql, cursor, selection);
     }
-    if explain_clicked {
+    if explain_clicked && !modal_open {
         let sql = state.tab(tab_id).map(|t| t.sql.clone()).unwrap_or_default();
         let (cursor, selection) = super::complete::editor_offsets(ui.ctx(), tab_id, &sql);
         state.start_explain(tab_id, &sql, cursor, selection);

@@ -1746,10 +1746,8 @@ pub struct PendingTerminate {
 }
 
 /// The modal dialog that owns the screen, frontmost first. One variant per
-/// dialog an `AppState` field can show, so `any_modal_open` and every
-/// per-dialog key handler read the same one answer. The palette is drawn
-/// first and checked last: it never coexists with another dialog. Not
-/// persisted.
+/// dialog an `AppState` field can show, so every key gate and the root
+/// dispatcher read the same one answer. Not persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Modal {
     /// The prod connect confirmation over `pending_prod`.
@@ -1778,6 +1776,40 @@ pub enum Modal {
     Compare,
     /// The Ctrl+K command palette over `search`.
     Palette,
+}
+
+impl Modal {
+    /// Every dialog an `AppState` field can show, in the order ties fall back
+    /// to when two were never marked.
+    pub const ALL: [Modal; 13] = [
+        Modal::ProdConnect,
+        Modal::Terminate,
+        Modal::Draft,
+        Modal::SavePrompt,
+        Modal::PasswordPrompt,
+        Modal::Import,
+        Modal::WriteConfirm,
+        Modal::Params,
+        Modal::EditPreview,
+        Modal::TableDdl,
+        Modal::TableEditor,
+        Modal::Compare,
+        Modal::Palette,
+    ];
+
+    /// This dialog's slot in [`Modal::ALL`].
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Whether plain Enter means submit. Only the prompts with a text field
+    /// and the palette, whose Enter opens the selected row.
+    pub fn submits_on_enter(self) -> bool {
+        matches!(
+            self,
+            Modal::SavePrompt | Modal::PasswordPrompt | Modal::Params | Modal::Palette
+        )
+    }
 }
 
 /// A run held for its parameter values: the tab and connection it would run
@@ -1852,6 +1884,10 @@ pub struct AppState {
     /// The idle schedule for open manual transactions, threaded to each
     /// worker at spawn. Tests swap in a short schedule.
     tx_idle: TxIdle,
+    /// The sequence number each dialog got when it last opened, indexed by
+    /// [`Modal::index`]. The newest open dialog owns the keyboard.
+    modal_marks: [u64; Modal::ALL.len()],
+    modal_seq: u64,
 }
 
 impl AppState {
@@ -1905,55 +1941,68 @@ impl AppState {
             compare: CompareState::default(),
             theme: settings.theme,
             tx_idle: TxIdle::default(),
+            modal_marks: [0; Modal::ALL.len()],
+            modal_seq: 0,
         };
         state.restore_tabs();
         state
     }
 
-    /// The modal that owns the screen right now, frontmost first. None is
-    /// free keyboard. Every "is a modal open" gate and per-dialog key handler
-    /// reads this one answer.
+    /// The modal that owns the screen right now. Every "is a modal open" gate
+    /// and per-dialog key handler reads this one answer.
+    ///
+    /// The newest dialog wins: opening one over another stacks it on top,
+    /// gives it the keyboard, and draws it last, so what the operator sees is
+    /// what Escape and Enter reach. Ties, which only a transition that forgot
+    /// to mark a dialog can create, fall back to [`Modal::ALL`] order.
     pub fn modal(&self) -> Option<Modal> {
-        if self.pending_prod.is_some() {
-            return Some(Modal::ProdConnect);
+        Modal::ALL
+            .iter()
+            .copied()
+            .filter(|modal| self.modal_is_open(*modal))
+            .max_by_key(|modal| self.modal_marks[modal.index()])
+    }
+
+    /// Every open dialog, back to front. `root` draws it in this order, so the
+    /// last one is the topmost window and the one [`AppState::modal`] names.
+    pub fn modals_back_to_front(&self) -> Vec<Modal> {
+        let mut open: Vec<Modal> = Modal::ALL
+            .iter()
+            .copied()
+            .filter(|modal| self.modal_is_open(*modal))
+            .collect();
+        open.sort_by_key(|modal| self.modal_marks[modal.index()]);
+        open
+    }
+
+    /// Whether one dialog's backing state is set.
+    fn modal_is_open(&self, modal: Modal) -> bool {
+        match modal {
+            Modal::ProdConnect => self.pending_prod.is_some(),
+            Modal::Terminate => self.pending_terminate.is_some(),
+            Modal::Draft => self.draft.is_some(),
+            Modal::SavePrompt => self.save_prompt.is_some(),
+            Modal::PasswordPrompt => self.password_prompt.is_some(),
+            Modal::Import => self.imports.is_some(),
+            Modal::WriteConfirm => self.pending_write.is_some(),
+            Modal::Params => self.pending_params.is_some(),
+            Modal::EditPreview => self.pending_edit_preview.is_some(),
+            Modal::TableDdl => self.pending_table_confirm.is_some(),
+            Modal::TableEditor => self.table_editor.is_some(),
+            Modal::Compare => self.compare_open,
+            Modal::Palette => self.search.is_some(),
         }
-        if self.pending_terminate.is_some() {
-            return Some(Modal::Terminate);
+    }
+
+    /// Record that a dialog just opened and drop the text focus behind it, so
+    /// a key typed for the dialog cannot edit the editor underneath. The
+    /// dialog's first draw requests its own focus.
+    fn note_modal(&mut self, modal: Modal) {
+        self.modal_seq = self.modal_seq.wrapping_add(1);
+        self.modal_marks[modal.index()] = self.modal_seq;
+        if let Some(focused) = self.ui_ctx.memory(|memory| memory.focused()) {
+            self.ui_ctx.memory_mut(|memory| memory.surrender_focus(focused));
         }
-        if self.draft.is_some() {
-            return Some(Modal::Draft);
-        }
-        if self.save_prompt.is_some() {
-            return Some(Modal::SavePrompt);
-        }
-        if self.password_prompt.is_some() {
-            return Some(Modal::PasswordPrompt);
-        }
-        if self.imports.is_some() {
-            return Some(Modal::Import);
-        }
-        if self.pending_write.is_some() {
-            return Some(Modal::WriteConfirm);
-        }
-        if self.pending_params.is_some() {
-            return Some(Modal::Params);
-        }
-        if self.pending_edit_preview.is_some() {
-            return Some(Modal::EditPreview);
-        }
-        if self.pending_table_confirm.is_some() {
-            return Some(Modal::TableDdl);
-        }
-        if self.table_editor.is_some() {
-            return Some(Modal::TableEditor);
-        }
-        if self.compare_open {
-            return Some(Modal::Compare);
-        }
-        if self.search.is_some() {
-            return Some(Modal::Palette);
-        }
-        None
     }
 
     /// The current app theme, flipped from the status bar.
@@ -2247,6 +2296,7 @@ impl AppState {
                     statements,
                     params,
                 });
+                self.note_modal(Modal::Params);
                 return;
             }
             Ok(_) => {}
@@ -2366,6 +2416,7 @@ impl AppState {
                 kind: found.kind.to_owned(),
                 table: found.table,
             });
+            self.note_modal(Modal::WriteConfirm);
             return;
         }
         self.send_batch(tab, conn, handle, prepared, BatchPurpose::Run, history);
@@ -2905,6 +2956,7 @@ impl AppState {
             return;
         }
         self.pending_edit_preview = Some(tab);
+        self.note_modal(Modal::EditPreview);
     }
 
     /// Send the previewed batch exactly as the apply path would: an UPDATE
@@ -2962,6 +3014,7 @@ impl AppState {
             form: crate::ui::ddl::TableForm::blank(),
         });
         self.pending_table_confirm = None;
+        self.note_modal(Modal::TableEditor);
     }
 
     /// Open the alter-table form prefilled from the loaded schema. No-op
@@ -2985,6 +3038,7 @@ impl AppState {
         let form = crate::ui::ddl::TableForm::from_table(schema, &info);
         self.table_editor = Some(TableEditorState { conn, original: Some(info), form });
         self.pending_table_confirm = None;
+        self.note_modal(Modal::TableEditor);
     }
 
     /// Close the table editor without sending anything. A held prod
@@ -3079,6 +3133,7 @@ impl AppState {
         if prod {
             self.pending_table_confirm =
                 Some(PendingTableDdl { conn: conn_id, tab, statements });
+            self.note_modal(Modal::TableDdl);
             return;
         }
         self.send_batch(tab, conn_id, handle, statements, BatchPurpose::TableDdl, None);
@@ -3184,6 +3239,7 @@ impl AppState {
             table: target.table,
             source,
         });
+        self.note_modal(Modal::Import);
         if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
             t.clear_export_notice();
         }
@@ -3428,6 +3484,7 @@ impl AppState {
     pub fn connect(&mut self, id: ConnectionId) {
         if self.prod_needs_confirm(id) {
             self.pending_prod = Some(id);
+            self.note_modal(Modal::ProdConnect);
             return;
         }
         self.connect_now(id);
@@ -3535,6 +3592,7 @@ impl AppState {
     pub fn open_password_prompt(&mut self, id: ConnectionId) {
         if self.prod_needs_confirm(id) {
             self.pending_prod = Some(id);
+            self.note_modal(Modal::ProdConnect);
             return;
         }
         self.prompt_or_connect(id);
@@ -3548,6 +3606,7 @@ impl AppState {
         };
         if should_prompt {
             self.password_prompt = Some(id);
+            self.note_modal(Modal::PasswordPrompt);
             self.prompt_password.clear();
         } else {
             self.connect_now(id);
@@ -3679,6 +3738,7 @@ impl AppState {
         if prod {
             self.pending_terminate =
                 Some(PendingTerminate { conn, backend: backend.to_owned() });
+            self.note_modal(Modal::Terminate);
             return;
         }
         self.send_terminate(conn, backend.to_owned(), handle);
@@ -3860,6 +3920,7 @@ impl AppState {
     /// Open the Table compare window.
     pub fn open_compare(&mut self) {
         self.compare_open = true;
+        self.note_modal(Modal::Compare);
     }
 
     /// Close the Table compare window without clearing its picks or diff.
@@ -4500,6 +4561,7 @@ impl AppState {
             selected: 0,
             results: Vec::new(),
         });
+        self.note_modal(Modal::Palette);
     }
 
     pub fn close_palette(&mut self) {
@@ -4644,6 +4706,7 @@ impl AppState {
                 error: None,
             },
         });
+        self.note_modal(Modal::SavePrompt);
     }
 
     pub fn close_save_prompt(&mut self) {
@@ -4727,6 +4790,7 @@ impl AppState {
             folder,
             error: None,
         });
+        self.note_modal(Modal::Draft);
     }
 
     pub fn cancel_draft(&mut self) {
