@@ -52,9 +52,9 @@ pub fn palette_window(
     ui: &mut egui::Ui,
     owns: bool,
     key: Option<super::ModalKey>,
-) {
+) -> Option<egui::LayerId> {
     if !state.palette_open() {
-        return;
+        return None;
     }
     if owns {
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
@@ -71,7 +71,7 @@ pub fn palette_window(
         }
     }
     if !state.palette_open() {
-        return;
+        return None;
     }
 
     let rows: Vec<(String, String)> = state
@@ -114,9 +114,6 @@ pub fn palette_window(
                 }
             });
         });
-    if owns && let Some(window) = &window {
-        ui.ctx().memory_mut(|memory| memory.set_modal_layer(window.response.layer_id));
-    }
     if query_changed {
         let query = state.palette().map(|palette| palette.query.clone()).unwrap_or_default();
         state.set_palette_query(&query);
@@ -127,6 +124,7 @@ pub fn palette_window(
         }
         state.activate_palette_selection();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ use eframe::egui;
 use crate::app::AppState;
 use crate::db::ConnectionId;
 
-use super::{ModalKey, approve_button, autofocus, own_modal_layer};
+use super::{ModalKey, approve_button, autofocus};
 
 /// The status-bar entry's label, measured by the status bar before it draws:
 /// the entry and the measurement read one literal.
@@ -41,13 +41,13 @@ pub fn table_prod_confirm_window(
     state: &mut AppState,
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
-) {
-    let Some(pending) = state.pending_table_ddl().cloned() else { return };
+) -> Option<egui::LayerId> {
+    let Some(pending) = state.pending_table_ddl().cloned() else { return None };
     let Some(name) =
         state.connections().iter().find(|c| c.id == pending.conn).map(|c| c.name.clone())
     else {
         state.cancel_table_ddl();
-        return;
+        return None;
     };
     let mut confirm = false;
     let mut cancel = false;
@@ -73,19 +73,12 @@ pub fn table_prod_confirm_window(
             }
         });
     });
-    if let Some(window) = &window {
-        own_modal_layer(
-            state,
-            ui.ctx(),
-            crate::app::Modal::TableDdl,
-            window.response.layer_id,
-        );
-    }
     if confirm {
         state.confirm_table_ddl();
     } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_table_ddl();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 fn alter_input_id(which: &str) -> egui::Id {
@@ -119,7 +112,7 @@ pub fn table_editor_window(
     state: &mut AppState,
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
-) {
+) -> Option<egui::LayerId> {
     let (conn, conn_name, backend, read_only, prod, is_alter, editing_title) = match state
         .table_editor()
     {
@@ -145,7 +138,7 @@ pub fn table_editor_window(
             };
             (editor.conn, name, backend, read_only, prod, is_alter, title)
         }
-        None => return,
+        None => return None,
     };
     let dismissed_popup =
         key == Some(ModalKey::Cancel) && egui::Popup::is_any_open(ui.ctx());
@@ -355,14 +348,6 @@ pub fn table_editor_window(
             }
         });
     });
-    if let Some(window) = &window {
-        own_modal_layer(
-            state,
-            ui.ctx(),
-            crate::app::Modal::TableEditor,
-            window.response.layer_id,
-        );
-    }
     if let Some((schema, table)) = load_alter {
         state.open_table_alter(conn, &schema, &table);
         set_alter_input(ui.ctx(), "schema", String::new());
@@ -384,6 +369,7 @@ pub fn table_editor_window(
             state.close_table_editor();
         }
     }
+    window.map(|window| window.response.layer_id)
 }
 
 #[cfg(test)]

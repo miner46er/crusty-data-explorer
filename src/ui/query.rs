@@ -12,7 +12,7 @@ use crate::app::AppState;
 use crate::db::TabId;
 
 use super::{
-    ModalKey, Palette, approve_button, autofocus, fit, note_dialog_field, own_modal_layer,
+    ModalKey, Palette, approve_button, autofocus, fit, note_dialog_field,
 };
 
 /// The tab strip, drawn by `root` for every tab whatever its kind. The new
@@ -509,9 +509,13 @@ fn find_bar(state: &AppState, ui: &mut egui::Ui, just_opened: bool) {
     store_find_bar(ui.ctx(), tab_id, bar);
 }
 
-pub fn save_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKey>) {
+pub fn save_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) -> Option<egui::LayerId> {
     if state.save_prompt().is_none() {
-        return;
+        return None;
     }
     let mut confirm = false;
     let mut close = false;
@@ -548,9 +552,6 @@ pub fn save_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKey
             }
         });
     });
-    if let Some(window) = &window {
-        own_modal_layer(state, ui.ctx(), crate::app::Modal::SavePrompt, window.response.layer_id);
-    }
     let free_focus = ui.ctx().memory(|memory| memory.focused().is_none());
     let submit = key == Some(ModalKey::Submit) && (field_focused || free_focus);
     if confirm || submit {
@@ -558,6 +559,7 @@ pub fn save_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKey
     } else if close || key == Some(ModalKey::Cancel) {
         state.close_save_prompt();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 /// The write guard modal for an UPDATE or DELETE without WHERE. Names the
@@ -567,8 +569,8 @@ pub fn write_confirm_window(
     state: &mut AppState,
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
-) {
-    let Some(pending) = state.pending_write().cloned() else { return };
+) -> Option<egui::LayerId> {
+    let Some(pending) = state.pending_write().cloned() else { return None };
     let mut confirm = false;
     let mut cancel = false;
     let window = egui::Window::new(format!("{} without WHERE?", pending.kind)).show(ui.ctx(), |ui| {
@@ -587,14 +589,12 @@ pub fn write_confirm_window(
             }
         });
     });
-    if let Some(window) = &window {
-        own_modal_layer(state, ui.ctx(), crate::app::Modal::WriteConfirm, window.response.layer_id);
-    }
     if confirm {
         state.confirm_write();
     } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_write();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 /// The staged-edit SQL preview. Lists the exact UPDATE, DELETE, and INSERT
@@ -604,13 +604,13 @@ pub fn edit_preview_window(
     state: &mut AppState,
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
-) {
-    let Some(tab) = state.pending_edit_preview() else { return };
+) -> Option<egui::LayerId> {
+    let Some(tab) = state.pending_edit_preview() else { return None };
     let table = state.edit_target(tab).map(|target| target.table).unwrap_or_default();
     let statements = state.preview_edit_statements(tab).unwrap_or_default();
     if statements.is_empty() {
         state.cancel_pending_edits();
-        return;
+        return None;
     }
     let mut confirm = false;
     let mut cancel = false;
@@ -636,27 +636,24 @@ pub fn edit_preview_window(
             }
         });
     });
-    if let Some(window) = &window {
-        own_modal_layer(
-            state,
-            ui.ctx(),
-            crate::app::Modal::EditPreview,
-            window.response.layer_id,
-        );
-    }
     if confirm {
         state.confirm_pending_edits();
     } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_pending_edits();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 /// The value prompt for a run holding `:name` and `?` placeholders. Lists
 /// each parameter with a text field; Run substitutes the values and continues
 /// the prepared batch through the send path, Cancel sends nothing.
-pub fn params_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKey>) {
+pub fn params_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) -> Option<egui::LayerId> {
     if state.pending_params().is_none() {
-        return;
+        return None;
     }
     let mut run = false;
     let mut cancel = false;
@@ -683,15 +680,13 @@ pub fn params_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalK
             }
         });
     });
-    if let Some(window) = &window {
-        own_modal_layer(state, ui.ctx(), crate::app::Modal::Params, window.response.layer_id);
-    }
     let free_focus = ui.ctx().memory(|memory| memory.focused().is_none());
     if run || (key == Some(ModalKey::Submit) && (field_focused || free_focus)) {
         state.confirm_params();
     } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_params();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 #[cfg(test)]

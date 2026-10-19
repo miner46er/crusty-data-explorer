@@ -212,21 +212,10 @@ fn modal_shield(ctx: &egui::Context, modal: crate::app::Modal) {
         });
 }
 
-/// Limit focus and interaction to the window that owns the keyboard.
-/// `egui` applies the layer from the next frame on, so the frame a dialog
-/// opens is handled by [`root`] drawing the panels disabled.
-pub(crate) fn own_modal_layer(
-    state: &AppState,
-    ctx: &egui::Context,
-    modal: crate::app::Modal,
-    layer_id: egui::LayerId,
-) {
-    if state.modal() == Some(modal) {
-        ctx.memory_mut(|memory| memory.set_modal_layer(layer_id));
-    }
-}
-
-/// Route one frame's dialog key to the window that owns it.
+/// Route one frame's dialog key to the window that owns it, and limit focus
+/// and interaction to that window. `egui` applies the layer from the next
+/// frame on, so the frame a dialog opens is handled by [`root`] drawing the
+/// panels disabled.
 fn draw_modal(
     state: &mut AppState,
     ui: &mut egui::Ui,
@@ -235,7 +224,7 @@ fn draw_modal(
     key: Option<ModalKey>,
 ) {
     use crate::app::Modal;
-    match modal {
+    let layer = match modal {
         Modal::ProdConnect => connections::prod_confirm_window(state, ui, key),
         Modal::Terminate => connections::terminate_confirm_window(state, ui, key),
         Modal::Draft => connections::draft_window(state, ui, key),
@@ -249,6 +238,11 @@ fn draw_modal(
         Modal::TableEditor => table_edit::table_editor_window(state, ui, key),
         Modal::Compare => compare::compare_window(state, ui, key),
         Modal::Palette => search::palette_window(state, ui, owns, key),
+    };
+    if owns {
+        if let Some(layer) = layer {
+            ui.ctx().memory_mut(|memory| memory.set_modal_layer(layer));
+        }
     }
 }
 

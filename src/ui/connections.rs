@@ -17,7 +17,7 @@ use crate::db::{
 use crate::ssh::{SshAuth, SshConfig};
 
 use super::{
-    ModalKey, Palette, Theme, approve_button, autofocus, note_dialog_field, own_modal_layer,
+    ModalKey, Palette, Theme, approve_button, autofocus, note_dialog_field,
 };
 
 /// A connection's state as the card and the dot read it: one value that
@@ -1497,13 +1497,13 @@ pub fn password_window(
     state: &mut AppState,
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
-) {
-    let Some(id) = state.password_prompt() else { return };
+) -> Option<egui::LayerId> {
+    let Some(id) = state.password_prompt() else { return None };
     let Some(name) =
         state.connections().iter().find(|c| c.id == id).map(|c| c.name.clone())
     else {
         state.cancel_password_prompt();
-        return;
+        return None;
     };
     let mut submit = false;
     let mut cancel = false;
@@ -1523,14 +1523,6 @@ pub fn password_window(
             }
         });
     });
-    if let Some(window) = &window {
-        own_modal_layer(
-            state,
-            ui.ctx(),
-            crate::app::Modal::PasswordPrompt,
-            window.response.layer_id,
-        );
-    }
     let free_focus = ui.ctx().memory(|memory| memory.focused().is_none());
     let submit = submit
         || (key == Some(ModalKey::Submit) && (field_focused || free_focus));
@@ -1539,19 +1531,20 @@ pub fn password_window(
     } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_password_prompt();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 pub fn prod_confirm_window(
     state: &mut AppState,
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
-) {
-    let Some(id) = state.pending_prod() else { return };
+) -> Option<egui::LayerId> {
+    let Some(id) = state.pending_prod() else { return None };
     let Some(name) =
         state.connections().iter().find(|c| c.id == id).map(|c| c.name.clone())
     else {
         state.cancel_prod();
-        return;
+        return None;
     };
     let mut confirm = false;
     let mut cancel = false;
@@ -1568,19 +1561,12 @@ pub fn prod_confirm_window(
             }
         });
     });
-    if let Some(window) = &window {
-        own_modal_layer(
-            state,
-            ui.ctx(),
-            crate::app::Modal::ProdConnect,
-            window.response.layer_id,
-        );
-    }
     if confirm {
         state.confirm_prod();
     } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_prod();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 /// The prod-gated terminate confirmation: names the backend and the
@@ -1590,13 +1576,13 @@ pub fn terminate_confirm_window(
     state: &mut AppState,
     ui: &mut egui::Ui,
     key: Option<ModalKey>,
-) {
-    let Some(pending) = state.pending_terminate().cloned() else { return };
+) -> Option<egui::LayerId> {
+    let Some(pending) = state.pending_terminate().cloned() else { return None };
     let Some(name) =
         state.connections().iter().find(|c| c.id == pending.conn).map(|c| c.name.clone())
     else {
         state.cancel_terminate();
-        return;
+        return None;
     };
     let mut confirm = false;
     let mut cancel = false;
@@ -1612,24 +1598,21 @@ pub fn terminate_confirm_window(
             cancel = true;
         }
     });
-    if let Some(window) = &window {
-        own_modal_layer(
-            state,
-            ui.ctx(),
-            crate::app::Modal::Terminate,
-            window.response.layer_id,
-        );
-    }
     if confirm {
         state.confirm_terminate();
     } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_terminate();
     }
+    window.map(|window| window.response.layer_id)
 }
 
-pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKey>) {
+pub fn draft_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) -> Option<egui::LayerId> {
     if state.draft().is_none() {
-        return;
+        return None;
     }
     let title = if state.draft().is_some_and(|d| d.editing.is_some()) {
         "Edit connection"
@@ -1877,9 +1860,6 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKe
             }
         });
     });
-    if let Some(window) = &window {
-        own_modal_layer(state, ui.ctx(), crate::app::Modal::Draft, window.response.layer_id);
-    }
     if save {
         let is_new = state.draft().is_some_and(|d| d.editing.is_none());
         state.save_draft();
@@ -1891,6 +1871,7 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKe
     } else if !dismissed_popup && (close || key == Some(ModalKey::Cancel)) {
         state.cancel_draft();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 /// The SSH tunnel fields, rendered for Postgres and MySQL drafts only. The

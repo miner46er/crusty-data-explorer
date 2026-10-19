@@ -319,9 +319,9 @@ pub fn compare_window(
     state: &mut AppState,
     ui: &mut egui::Ui,
     key: Option<super::ModalKey>,
-) {
+) -> Option<egui::LayerId> {
     if !state.compare_window_open() {
-        return;
+        return None;
     }
     let mut open = true;
     let window = egui::Window::new("Table compare")
@@ -329,17 +329,10 @@ pub fn compare_window(
         .resizable(true)
         .default_width(520.0)
         .show(ui.ctx(), |ui| compare_body(state, ui));
-    if let Some(window) = &window {
-        super::own_modal_layer(
-            state,
-            ui.ctx(),
-            crate::app::Modal::Compare,
-            window.response.layer_id,
-        );
-    }
     if !open || key == Some(super::ModalKey::Cancel) {
         state.close_compare();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 fn compare_body(state: &mut AppState, ui: &mut egui::Ui) {

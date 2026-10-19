@@ -27,7 +27,7 @@ use crate::export::{
 use crate::edit::{STAGED_DEFAULT, editable_table};
 use crate::import::{ParsedCsv, parse_csv, parse_jsonl, parse_xlsx};
 
-use super::{ModalKey, Palette, autofocus, fit, own_modal_layer};
+use super::{ModalKey, Palette, autofocus, fit};
 
 /// The row filter's desired width, and the narrowest it shrinks to before
 /// the results toolbar wraps to a second row.
@@ -1254,8 +1254,12 @@ fn stage_rows_into(
 /// The confirmation modal for a pending import: every mapped header beside
 /// the table column it writes, the skipped headers, the truncation count,
 /// and the Import and Cancel buttons.
-pub fn import_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKey>) {
-    let Some(draft) = state.import_draft() else { return };
+pub fn import_window(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    key: Option<ModalKey>,
+) -> Option<egui::LayerId> {
+    let Some(draft) = state.import_draft() else { return None };
     let title = format!("Import into {}", draft.table);
     let mut confirm = false;
     let mut cancel = false;
@@ -1299,14 +1303,12 @@ pub fn import_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalK
             }
         });
     });
-    if let Some(window) = &window {
-        own_modal_layer(state, ui.ctx(), crate::app::Modal::Import, window.response.layer_id);
-    }
     if confirm {
         state.commit_import();
     } else if cancel || key == Some(ModalKey::Cancel) {
         state.cancel_import();
     }
+    window.map(|window| window.response.layer_id)
 }
 
 /// The in-place cell editor, kept in the egui context data keyed by tab, the
