@@ -11,7 +11,7 @@ use super::editor::{char_range, FindState};
 use crate::app::AppState;
 use crate::db::TabId;
 
-use super::{Palette, autofocus, fit, park_focus, ModalKey};
+use super::{ModalKey, Palette, autofocus, fit, own_modal_layer};
 
 /// The tab strip, drawn by `root` for every tab whatever its kind. The new
 /// and close shortcuts live here so they work on a table tab too.
@@ -514,7 +514,7 @@ pub fn save_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKey
     let mut confirm = false;
     let mut close = false;
     let mut field_focused = false;
-    egui::Window::new("Save query").show(ui.ctx(), |ui| {
+    let window = egui::Window::new("Save query").show(ui.ctx(), |ui| {
         let Some(prompt) = state.save_prompt_mut() else { return };
         ui.horizontal(|ui| {
             ui.label("Name:");
@@ -544,6 +544,9 @@ pub fn save_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKey
             }
         });
     });
+    if let Some(window) = &window {
+        own_modal_layer(state, ui.ctx(), crate::app::Modal::SavePrompt, window.response.layer_id);
+    }
     let free_focus = ui.ctx().memory(|memory| memory.focused().is_none());
     let submit = key == Some(ModalKey::Submit) && (field_focused || free_focus);
     if confirm || submit {
@@ -564,7 +567,7 @@ pub fn write_confirm_window(
     let Some(pending) = state.pending_write().cloned() else { return };
     let mut confirm = false;
     let mut cancel = false;
-    egui::Window::new(format!("{} without WHERE?", pending.kind)).show(ui.ctx(), |ui| {
+    let window = egui::Window::new(format!("{} without WHERE?", pending.kind)).show(ui.ctx(), |ui| {
         ui.label(format!(
             "{} on {} has no WHERE clause and affects every row.",
             pending.kind, pending.table
@@ -578,9 +581,11 @@ pub fn write_confirm_window(
             if cancel_button.clicked() {
                 cancel = true;
             }
-            park_focus(ui);
         });
     });
+    if let Some(window) = &window {
+        own_modal_layer(state, ui.ctx(), crate::app::Modal::WriteConfirm, window.response.layer_id);
+    }
     if confirm {
         state.confirm_write();
     } else if cancel || key == Some(ModalKey::Cancel) {
@@ -605,7 +610,7 @@ pub fn edit_preview_window(
     }
     let mut confirm = false;
     let mut cancel = false;
-    egui::Window::new("Apply staged edits?").show(ui.ctx(), |ui| {
+    let window = egui::Window::new("Apply staged edits?").show(ui.ctx(), |ui| {
         ui.label(format!(
             "{} statement{} on {table}. Confirm sends them, Cancel keeps the staged edits.",
             statements.len(),
@@ -625,9 +630,16 @@ pub fn edit_preview_window(
             if cancel_button.clicked() {
                 cancel = true;
             }
-            park_focus(ui);
         });
     });
+    if let Some(window) = &window {
+        own_modal_layer(
+            state,
+            ui.ctx(),
+            crate::app::Modal::EditPreview,
+            window.response.layer_id,
+        );
+    }
     if confirm {
         state.confirm_pending_edits();
     } else if cancel || key == Some(ModalKey::Cancel) {
@@ -645,7 +657,7 @@ pub fn params_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalK
     let mut run = false;
     let mut cancel = false;
     let mut field_focused = false;
-    egui::Window::new("Query parameters").show(ui.ctx(), |ui| {
+    let window = egui::Window::new("Query parameters").show(ui.ctx(), |ui| {
         let Some(pending) = state.pending_params_mut() else { return };
         for (index, param) in pending.params.iter_mut().enumerate() {
             ui.horizontal(|ui| {
@@ -666,6 +678,9 @@ pub fn params_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalK
             }
         });
     });
+    if let Some(window) = &window {
+        own_modal_layer(state, ui.ctx(), crate::app::Modal::Params, window.response.layer_id);
+    }
     let free_focus = ui.ctx().memory(|memory| memory.focused().is_none());
     if run || (key == Some(ModalKey::Submit) && (field_focused || free_focus)) {
         state.confirm_params();

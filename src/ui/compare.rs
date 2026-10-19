@@ -324,11 +324,19 @@ pub fn compare_window(
         return;
     }
     let mut open = true;
-    egui::Window::new("Table compare")
+    let window = egui::Window::new("Table compare")
         .open(&mut open)
         .resizable(true)
         .default_width(520.0)
         .show(ui.ctx(), |ui| compare_body(state, ui));
+    if let Some(window) = &window {
+        super::own_modal_layer(
+            state,
+            ui.ctx(),
+            crate::app::Modal::Compare,
+            window.response.layer_id,
+        );
+    }
     if !open || key == Some(super::ModalKey::Cancel) {
         state.close_compare();
     }

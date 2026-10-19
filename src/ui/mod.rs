@@ -23,40 +23,134 @@ pub mod table_edit;
 pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     // The palette's Ctrl+K stays live everywhere; an open dialog refuses it.
     search::palette_toggle(state, ui);
-    let modal = state.modal();
+    let open_modals = state.modals_back_to_front();
+    // egui reads the modal layer from the previous frame, so a dialog that
+    // just opened cannot block the chrome behind it until the next frame.
+    // Draw that one frame's panels disabled: they register no focus and take
+    // no clicks, which closes the gap.
+    let newly_opened = note_open_modals(ui.ctx(), &open_modals);
+    // A press that landed on the opening frame armed a click against the
+    // previous frame's chrome. Keep the panels disabled until that press is
+    // released, so its release cannot turn into a click behind the dialog.
+    let hold_id = egui::Id::new("crusty_modal_click_hold");
+    let holding_click: bool =
+        ui.ctx().data_mut(|data| data.get_temp(hold_id).unwrap_or(false));
+    let pointer_down = ui.input(|input| input.pointer.any_down());
+    let block_panels = newly_opened || holding_click;
+    ui.ctx().data_mut(|data| data.insert_temp(hold_id, block_panels && pointer_down));
+    let modal = open_modals.last().copied();
     let key = modal.and_then(|modal| modal_key(ui, modal.submits_on_enter()));
     // The cell editor lives in egui temp data, so it has no `Modal` variant;
     // it owns the keyboard only when no dialog backs it.
-    let cell_editor_key = if modal.is_none() && grid::cell_editor_open(state, ui.ctx()) {
+    let cell_editor_open = grid::cell_editor_open(state, ui.ctx());
+    let cell_editor_key = if modal.is_none() && cell_editor_open {
         modal_key(ui, false)
     } else {
         None
     };
     // Back to front, so the newest dialog draws last, on top, and the one
     // `state.modal()` names is the one whose key was read.
-    for open in state.modals_back_to_front() {
-        let owns = Some(open) == modal;
-        draw_modal(state, ui, open, owns, owns.then_some(key).flatten());
+    for open in &open_modals {
+        let owns = Some(*open) == modal;
+        modal_shield(ui.ctx(), *open);
+        draw_modal(state, ui, *open, owns, owns.then_some(key).flatten());
     }
+    let panel = |ui: &mut egui::Ui| {
+        if block_panels {
+            ui.disable();
+        }
+    };
     egui::Panel::left("connections")
         .resizable(true)
         .default_size(240.0)
-        .show(ui, |ui| connections::sidebar(state, ui));
-    egui::Panel::bottom("status").show(ui, |ui| status_bar(state, ui));
-    egui::Panel::top("tabs").show(ui, |ui| query::tab_bar(state, ui));
+        .show(ui, |ui| {
+            panel(ui);
+            connections::sidebar(state, ui);
+        });
+    egui::Panel::bottom("status").show(ui, |ui| {
+        panel(ui);
+        status_bar(state, ui);
+    });
+    egui::Panel::top("tabs").show(ui, |ui| {
+        panel(ui);
+        query::tab_bar(state, ui);
+    });
     let table_tab = state
         .active()
         .and_then(|id| state.tab(id))
         .is_some_and(|tab| matches!(tab.kind, crate::app::TabKind::Table { .. }));
     if table_tab {
-        egui::Panel::top("table").show(ui, |ui| query::table_header(state, ui));
+        egui::Panel::top("table").show(ui, |ui| {
+            panel(ui);
+            query::table_header(state, ui);
+        });
     } else {
         egui::Panel::top("editor")
             .resizable(true)
             .default_size(210.0)
-            .show(ui, |ui| query::editor(state, ui));
+            .show(ui, |ui| {
+                panel(ui);
+                query::editor(state, ui);
+            });
     }
-    egui::CentralPanel::default().show(ui, |ui| grid::results(state, ui, cell_editor_key));
+    egui::CentralPanel::default().show(ui, |ui| {
+        panel(ui);
+        grid::results(state, ui, cell_editor_key);
+    });
+    // A dialog that opened or closed mid-frame needs one more frame for the
+    // modal layer, focus handoff, or first-field focus to land.
+    let cell_editor_now = grid::cell_editor_open(state, ui.ctx());
+    let previous_cell: bool =
+        ui.ctx().data_mut(|data| data.get_temp(cell_editor_id()).unwrap_or(false));
+    ui.ctx().data_mut(|data| data.insert_temp(cell_editor_id(), cell_editor_now));
+    if state.modals_back_to_front() != open_modals || cell_editor_now != previous_cell {
+        ui.ctx().request_repaint();
+    }
+}
+
+fn cell_editor_id() -> egui::Id {
+    egui::Id::new("crusty_cell_editor_was_open")
+}
+
+/// Whether the open dialog set gained one since last frame, and remember this
+/// frame's set for the next comparison.
+fn note_open_modals(ctx: &egui::Context, open: &[crate::app::Modal]) -> bool {
+    let id = egui::Id::new("crusty_open_modals");
+    let previous: Vec<crate::app::Modal> =
+        ctx.data_mut(|data| data.get_temp(id)).unwrap_or_default();
+    let opened = open.iter().any(|modal| !previous.contains(modal));
+    ctx.data_mut(|data| data.insert_temp(id, open.to_vec()));
+    opened
+}
+
+/// One invisible full-screen click shield under each dialog's window. egui's
+/// modal layer limits focus and hover, but its hit-test still finds widgets
+/// in layers behind the window, so a click outside the window's rect would
+/// reach the sidebar or grid. The shield is a `Middle` layer created just
+/// before its dialog, so it sits above the chrome and under that window (and,
+/// for a newer dialog, above the dialogs it stacks on).
+fn modal_shield(ctx: &egui::Context, modal: crate::app::Modal) {
+    egui::Area::new(egui::Id::new(("crusty_modal_shield", modal)))
+        .order(egui::Order::Middle)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let rect = ui.ctx().content_rect();
+            ui.allocate_exact_size(rect.size(), egui::Sense::CLICK | egui::Sense::DRAG);
+        });
+}
+
+/// Limit focus and interaction to the window that owns the keyboard.
+/// `egui` applies the layer from the next frame on, so the frame a dialog
+/// opens is handled by [`root`] drawing the panels disabled.
+pub(crate) fn own_modal_layer(
+    state: &AppState,
+    ctx: &egui::Context,
+    modal: crate::app::Modal,
+    layer_id: egui::LayerId,
+) {
+    if state.modal() == Some(modal) {
+        ctx.memory_mut(|memory| memory.set_modal_layer(layer_id));
+    }
 }
 
 /// Route one frame's dialog key to the window that owns it.
@@ -89,16 +183,6 @@ fn draw_modal(
 /// which carries a UI-only text buffer and therefore stays in egui temp data.
 pub(crate) fn modal_open(state: &AppState, ctx: &egui::Context) -> bool {
     state.modal().is_some() || grid::cell_editor_open(state, ctx)
-}
-
-/// Register a focusable, non-interactive parking spot after a destructive
-/// dialog's buttons. Tab from Cancel lands here, where Enter and Space do
-/// nothing, instead of wrapping onto the approve button.
-pub(crate) fn park_focus(ui: &mut egui::Ui) {
-    let _ = ui.allocate_exact_size(
-        egui::Vec2::ZERO,
-        egui::Sense::focusable_noninteractive(),
-    );
 }
 
 /// A key a modal dialog answers. Public because the routed key crosses the

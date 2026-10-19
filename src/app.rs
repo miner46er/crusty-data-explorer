@@ -1748,7 +1748,7 @@ pub struct PendingTerminate {
 /// The modal dialog that owns the screen, frontmost first. One variant per
 /// dialog an `AppState` field can show, so every key gate and the root
 /// dispatcher read the same one answer. Not persisted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Modal {
     /// The prod connect confirmation over `pending_prod`.
     ProdConnect,
@@ -1994,15 +1994,11 @@ impl AppState {
         }
     }
 
-    /// Record that a dialog just opened and drop the text focus behind it, so
-    /// a key typed for the dialog cannot edit the editor underneath. The
-    /// dialog's first draw requests its own focus.
+    /// Record that a dialog just opened, so it draws above the dialogs already
+    /// open and owns the keyboard.
     fn note_modal(&mut self, modal: Modal) {
         self.modal_seq = self.modal_seq.wrapping_add(1);
         self.modal_marks[modal.index()] = self.modal_seq;
-        if let Some(focused) = self.ui_ctx.memory(|memory| memory.focused()) {
-            self.ui_ctx.memory_mut(|memory| memory.surrender_focus(focused));
-        }
     }
 
     /// The current app theme, flipped from the status bar.

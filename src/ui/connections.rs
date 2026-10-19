@@ -16,7 +16,7 @@ use crate::db::{
 };
 use crate::ssh::{SshAuth, SshConfig};
 
-use super::{Palette, Theme, autofocus, park_focus, ModalKey};
+use super::{ModalKey, Palette, Theme, autofocus, own_modal_layer};
 
 /// A connection's state as the card and the dot read it: one value that
 /// derives both the painted shape and the color, so a dot can never wear the
@@ -1506,7 +1506,7 @@ pub fn password_window(
     let mut submit = false;
     let mut cancel = false;
     let mut field_focused = false;
-    egui::Window::new(format!("Password for {name}")).show(ui.ctx(), |ui| {
+    let window = egui::Window::new(format!("Password for {name}")).show(ui.ctx(), |ui| {
         ui.label(format!("Enter password for {name}"));
         let field = ui.add(egui::TextEdit::singleline(state.prompt_password_mut()).password(true));
         field_focused = field.has_focus();
@@ -1520,6 +1520,14 @@ pub fn password_window(
             }
         });
     });
+    if let Some(window) = &window {
+        own_modal_layer(
+            state,
+            ui.ctx(),
+            crate::app::Modal::PasswordPrompt,
+            window.response.layer_id,
+        );
+    }
     let free_focus = ui.ctx().memory(|memory| memory.focused().is_none());
     let submit = submit
         || (key == Some(ModalKey::Submit) && (field_focused || free_focus));
@@ -1544,7 +1552,7 @@ pub fn prod_confirm_window(
     };
     let mut confirm = false;
     let mut cancel = false;
-    egui::Window::new("Connect to prod?").show(ui.ctx(), |ui| {
+    let window = egui::Window::new("Connect to prod?").show(ui.ctx(), |ui| {
         ui.label(format!("Connect to {name}?"));
         ui.horizontal(|ui| {
             if ui.button("Connect").clicked() {
@@ -1555,9 +1563,16 @@ pub fn prod_confirm_window(
             if cancel_button.clicked() {
                 cancel = true;
             }
-            park_focus(ui);
         });
     });
+    if let Some(window) = &window {
+        own_modal_layer(
+            state,
+            ui.ctx(),
+            crate::app::Modal::ProdConnect,
+            window.response.layer_id,
+        );
+    }
     if confirm {
         state.confirm_prod();
     } else if cancel || key == Some(ModalKey::Cancel) {
@@ -1582,7 +1597,7 @@ pub fn terminate_confirm_window(
     };
     let mut confirm = false;
     let mut cancel = false;
-    egui::Window::new("Terminate session?").show(ui.ctx(), |ui| {
+    let window = egui::Window::new("Terminate session?").show(ui.ctx(), |ui| {
         ui.label(format!("Terminate backend {} on {name}?", pending.backend));
         ui.label("The backend's running query stops and its connection drops.");
         if ui.button("Terminate").clicked() {
@@ -1593,8 +1608,15 @@ pub fn terminate_confirm_window(
         if cancel_button.clicked() {
             cancel = true;
         }
-        park_focus(ui);
     });
+    if let Some(window) = &window {
+        own_modal_layer(
+            state,
+            ui.ctx(),
+            crate::app::Modal::Terminate,
+            window.response.layer_id,
+        );
+    }
     if confirm {
         state.confirm_terminate();
     } else if cancel || key == Some(ModalKey::Cancel) {
@@ -1620,7 +1642,7 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKe
     }
     let mut save = false;
     let mut close = false;
-    egui::Window::new(title).show(ui.ctx(), |ui| {
+    let window = egui::Window::new(title).show(ui.ctx(), |ui| {
         let registry = state.registry();
         let Some(draft) = state.draft_mut() else { return };
         let draft_scope = draft.editing.map(|id| id.raw());
@@ -1852,6 +1874,9 @@ pub fn draft_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalKe
             }
         });
     });
+    if let Some(window) = &window {
+        own_modal_layer(state, ui.ctx(), crate::app::Modal::Draft, window.response.layer_id);
+    }
     if save {
         let is_new = state.draft().is_some_and(|d| d.editing.is_none());
         state.save_draft();

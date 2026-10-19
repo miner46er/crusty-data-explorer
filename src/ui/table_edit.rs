@@ -14,7 +14,7 @@ use eframe::egui;
 use crate::app::AppState;
 use crate::db::ConnectionId;
 
-use super::{ModalKey, autofocus, park_focus};
+use super::{ModalKey, autofocus, own_modal_layer};
 
 /// The status-bar entry's label, measured by the status bar before it draws:
 /// the entry and the measurement read one literal.
@@ -51,7 +51,7 @@ pub fn table_prod_confirm_window(
     };
     let mut confirm = false;
     let mut cancel = false;
-    egui::Window::new("Apply table DDL on prod?").show(ui.ctx(), |ui| {
+    let window = egui::Window::new("Apply table DDL on prod?").show(ui.ctx(), |ui| {
         ui.label(format!(
             "{} statement{} on {name}. Prod applies need one more click.",
             pending.statements.len(),
@@ -71,9 +71,16 @@ pub fn table_prod_confirm_window(
             if cancel_button.clicked() {
                 cancel = true;
             }
-            park_focus(ui);
         });
     });
+    if let Some(window) = &window {
+        own_modal_layer(
+            state,
+            ui.ctx(),
+            crate::app::Modal::TableDdl,
+            window.response.layer_id,
+        );
+    }
     if confirm {
         state.confirm_table_ddl();
     } else if cancel || key == Some(ModalKey::Cancel) {
@@ -149,7 +156,7 @@ pub fn table_editor_window(
     let mut apply = false;
     let mut load_alter: Option<(String, String)> = None;
     let mut back_to_new = false;
-    egui::Window::new(editing_title).show(ui.ctx(), |ui| {
+    let window = egui::Window::new(editing_title).show(ui.ctx(), |ui| {
         ui.label(egui::RichText::new(format!("{conn_name} · {backend}")).small().weak());
         if is_alter {
             ui.horizontal(|ui| {
@@ -348,6 +355,14 @@ pub fn table_editor_window(
             }
         });
     });
+    if let Some(window) = &window {
+        own_modal_layer(
+            state,
+            ui.ctx(),
+            crate::app::Modal::TableEditor,
+            window.response.layer_id,
+        );
+    }
     if let Some((schema, table)) = load_alter {
         state.open_table_alter(conn, &schema, &table);
         set_alter_input(ui.ctx(), "schema", String::new());

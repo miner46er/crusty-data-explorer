@@ -27,7 +27,7 @@ use crate::export::{
 use crate::edit::{STAGED_DEFAULT, editable_table};
 use crate::import::{ParsedCsv, parse_csv, parse_jsonl, parse_xlsx};
 
-use super::{ModalKey, Palette, autofocus, fit, park_focus};
+use super::{ModalKey, Palette, autofocus, fit, own_modal_layer};
 
 /// The row filter's desired width, and the narrowest it shrinks to before
 /// the results toolbar wraps to a second row.
@@ -1259,7 +1259,7 @@ pub fn import_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalK
     let title = format!("Import into {}", draft.table);
     let mut confirm = false;
     let mut cancel = false;
-    egui::Window::new(title).show(ui.ctx(), |ui| {
+    let window = egui::Window::new(title).show(ui.ctx(), |ui| {
         let Some(draft) = state.import_draft() else { return };
         ui.label(format!("{} rows", draft.rows.len()));
         egui::Grid::new("import_columns").striped(true).show(ui, |ui| {
@@ -1297,9 +1297,11 @@ pub fn import_window(state: &mut AppState, ui: &mut egui::Ui, key: Option<ModalK
             if cancel_button.clicked() {
                 cancel = true;
             }
-            park_focus(ui);
         });
     });
+    if let Some(window) = &window {
+        own_modal_layer(state, ui.ctx(), crate::app::Modal::Import, window.response.layer_id);
+    }
     if confirm {
         state.commit_import();
     } else if cancel || key == Some(ModalKey::Cancel) {
@@ -1506,7 +1508,7 @@ fn cell_editor_window(
     let mut set_null = false;
     let mut set_default = false;
     let mut cancel = false;
-    egui::Window::new(title).collapsible(false).resizable(true).show(ui.ctx(), |ui| {
+    let window = egui::Window::new(title).collapsible(false).resizable(true).show(ui.ctx(), |ui| {
         ui.label(egui::RichText::new(format!("{name} · {type_name}")).small().weak());
         ui.label(egui::RichText::new(status).small().weak());
         if editor.is_blob {
@@ -1524,6 +1526,10 @@ fn cell_editor_window(
         );
         if editor.fresh {
             response.request_focus();
+            // The window's modal layer only applies next frame. Drop this
+            // frame's Tab direction so the fresh field is not stepped over
+            // before the layer takes hold.
+            ui.ctx().memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
             editor.fresh = false;
         }
         if editor_size_ok(&editor.text) {
@@ -1567,6 +1573,9 @@ fn cell_editor_window(
         }
         store_cell_editor(ui.ctx(), tab.id, Some(editor.clone()));
     });
+    if let Some(window) = &window {
+        ui.ctx().memory_mut(|memory| memory.set_modal_layer(window.response.layer_id));
+    }
     let (row, col) = (editor.row, editor.col);
     if save {
         actions.push(EditAction::Stage { row, col, text: editor.text.clone() });

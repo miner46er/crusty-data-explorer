@@ -1730,6 +1730,207 @@ fn add_prod_sqlite(state: &mut AppState) -> ConnectionId {
     state.connections().last().expect("the saved connection").id
 }
 
+/// One of the five dialogs an approval click can arm.
+#[derive(Clone, Copy)]
+enum Destructive {
+    Write,
+    Edits,
+    ProdConnect,
+    Terminate,
+    Ddl,
+}
+
+impl Destructive {
+    const ALL: [Self; 5] = [
+        Self::Write,
+        Self::Edits,
+        Self::ProdConnect,
+        Self::Terminate,
+        Self::Ddl,
+    ];
+
+    fn approve_label(self) -> &'static str {
+        match self {
+            Self::Write | Self::Edits => "Confirm",
+            Self::ProdConnect => "Connect",
+            Self::Terminate => "Terminate",
+            Self::Ddl => "Apply",
+        }
+    }
+
+    fn shown(self, state: &AppState) -> bool {
+        match self {
+            Self::Write => state.pending_write().is_some(),
+            Self::Edits => state.pending_edit_preview().is_some(),
+            Self::ProdConnect => state.pending_prod().is_some(),
+            Self::Terminate => state.pending_terminate().is_some(),
+            Self::Ddl => state.pending_table_ddl().is_some(),
+        }
+    }
+}
+
+/// Arm one confirmation through its real transition and let the frame settle.
+fn arm_destructive(
+    harness: &mut Harness<AppState>,
+    tab: TabId,
+    prod: ConnectionId,
+    case: Destructive,
+) {
+    match case {
+        Destructive::Write => {
+            harness.state_mut().start_run(tab, "DELETE FROM users", 0, None);
+        }
+        Destructive::Edits => {
+            let conn =
+                harness.state().tab(tab).and_then(|tab| tab.conn).expect("the tab connection");
+            step_until(harness, "the schema", |state| state.schema(conn).is_some());
+            harness
+                .state_mut()
+                .stage_edit(tab, 0, 1, "changed@example.com".to_owned());
+            harness.state_mut().apply_edits(tab);
+        }
+        Destructive::ProdConnect => harness.state_mut().connect(prod),
+        Destructive::Terminate => harness.state_mut().request_terminate(prod, "4242"),
+        Destructive::Ddl => {
+            harness.state_mut().open_table_create(prod);
+            {
+                let editor = harness.state_mut().table_editor_mut().expect("the table editor");
+                editor.form.table = "audit".to_owned();
+                editor.form.columns[0].name = "id".to_owned();
+                editor.form.columns[0].data_type = "INTEGER".to_owned();
+            }
+            let prod_tab = harness.state_mut().new_tab(prod);
+            harness.state_mut().apply_table_ddl(prod_tab);
+        }
+    }
+    harness.run();
+    assert!(case.shown(harness.state()), "{} arms", approve_label(case));
+}
+
+fn approve_label(case: Destructive) -> &'static str {
+    case.approve_label()
+}
+
+/// The label of the one accesskit node that holds keyboard focus.
+fn focused_label(harness: &Harness<AppState>) -> Option<String> {
+    harness
+        .query_all(By::new())
+        .find(|node| node.is_focused())
+        .map(|node| node_text(&node))
+        .filter(|text| !text.is_empty())
+}
+
+/// Focus may sit nowhere or on a widget in the modal window, never on the
+/// chrome behind it.
+fn focus_stays_in_dialog(harness: &Harness<AppState>) -> bool {
+    let Some(focused) = harness.ctx.memory(|memory| memory.focused()) else {
+        return true;
+    };
+    let layer = harness.ctx.read_response(focused).map(|response| response.layer_id);
+    layer.is_some() && layer == harness.ctx.memory(|memory| memory.top_modal_layer())
+}
+
+#[test]
+fn a_destructive_confirm_owns_tab_focus() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("dialog-containment");
+    let prod = add_prod_sqlite(harness.state_mut());
+    for case in Destructive::ALL {
+        arm_destructive(&mut harness, tab, prod, case);
+        for _ in 0..5 {
+            harness.key_press(egui::Key::Tab);
+            harness.run();
+            assert!(
+                focus_stays_in_dialog(&harness),
+                "{}: Tab left the dialog, focus {:?}",
+                approve_label(case),
+                focused_label(&harness)
+            );
+        }
+        for _ in 0..5 {
+            harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Tab);
+            harness.run();
+            assert!(
+                focus_stays_in_dialog(&harness),
+                "{}: Shift+Tab left the dialog, focus {:?}",
+                approve_label(case),
+                focused_label(&harness)
+            );
+        }
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(!case.shown(harness.state()), "{}: Escape closes the dialog", approve_label(case));
+    }
+}
+
+#[test]
+fn a_click_behind_a_dialog_does_nothing() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("dialog-click");
+    let prod = add_prod_sqlite(harness.state_mut());
+    arm_destructive(&mut harness, tab, prod, Destructive::Write);
+    harness.get_by_label("+ New connection").click();
+    harness.run();
+    assert_eq!(
+        harness.state().modal(),
+        Some(Modal::WriteConfirm),
+        "the click behind the write guard changed nothing"
+    );
+    assert!(harness.state().draft().is_none(), "the click opened no draft");
+}
+
+/// A click already queued for the sidebar on the frame a dialog first draws
+/// must not reach it: egui applies the modal layer only from the next frame.
+#[test]
+fn the_first_frame_of_a_dialog_blocks_clicks_behind_it() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("dialog-first-frame");
+    let button = harness.get_by_label("+ New connection").rect().center();
+    harness.state_mut().start_run(tab, "DELETE FROM users", 0, None);
+    for pressed in [true, false] {
+        harness.event(egui::Event::PointerButton {
+            pos: button,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    harness.step();
+    assert!(
+        harness.state().pending_write().is_some(),
+        "the write guard is open on its first frame"
+    );
+    assert!(
+        harness.state().draft().is_none(),
+        "a click queued for the sidebar on the first frame opened no draft"
+    );
+}
+
+/// The dialog draws before the chrome, so its first frame already owns the
+/// keyboard even though egui has not applied the modal layer yet.
+#[test]
+fn the_first_frame_of_a_dialog_keeps_focus_inside_it() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("dialog-first-frame-focus");
+    harness.state_mut().start_run(tab, "DELETE FROM users", 0, None);
+    harness.event(egui::Event::Key {
+        key: egui::Key::Tab,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.step();
+    assert!(
+        harness.state().pending_write().is_some(),
+        "the write guard is open on its first frame"
+    );
+    assert!(
+        harness.get_by_label("Cancel").is_focused(),
+        "the first frame starts on the dialog's Cancel"
+    );
+}
+
 #[test]
 fn every_destructive_confirm_starts_on_cancel_and_tab_enter_never_approves() {
     let _guard = env_lock();
@@ -1872,9 +2073,9 @@ fn a_newer_dialog_takes_escape_from_the_palette() {
     harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
     harness.run();
     assert!(harness.state().palette_open(), "Ctrl+K opens the palette");
-    harness.get_by_label("+ New connection").click();
+    harness.state_mut().open_draft(None);
     harness.run();
-    assert!(harness.state().draft().is_some(), "the click opens the draft over the palette");
+    assert!(harness.state().draft().is_some(), "the draft opens over the palette");
     assert_eq!(
         harness.state().modal(),
         Some(Modal::Draft),

@@ -80,22 +80,21 @@ pub fn palette_window(
         .unwrap_or_default();
     let mut clicked: Option<usize> = None;
     let mut query_changed = false;
-    egui::Window::new("Search")
+    let window = egui::Window::new("Search")
         .collapsible(false)
         .resizable(false)
         .default_width(460.0)
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
         .show(ui.ctx(), |ui| {
             let Some(palette) = state.palette_mut() else { return };
-            let focus = owns && ui.memory(|memory| memory.focused().is_none());
             let response = ui.add(
                 egui::TextEdit::singleline(&mut palette.query)
                     .hint_text("Search connections, saved queries, tables, and columns")
                     .desired_width(f32::INFINITY),
             );
             query_changed = response.changed();
-            if focus {
-                response.request_focus();
+            if owns {
+                super::autofocus(ui, "palette-query", &response);
             }
             egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                 for (index, (name, detail)) in rows.iter().enumerate() {
@@ -114,6 +113,9 @@ pub fn palette_window(
                 }
             });
         });
+    if owns && let Some(window) = &window {
+        ui.ctx().memory_mut(|memory| memory.set_modal_layer(window.response.layer_id));
+    }
     if query_changed {
         let query = state.palette().map(|palette| palette.query.clone()).unwrap_or_default();
         state.set_palette_query(&query);
