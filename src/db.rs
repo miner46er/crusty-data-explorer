@@ -31,7 +31,7 @@ pub const CELL_CAP: usize = 256;
 /// One whole token the scanner steps over: its end offset and whether the
 /// text counts as code (`'...'`, `"..."`, `` `...` ``, `$$...$$`) or as a
 /// comment that does not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum Skipped {
     Code { end: usize },
     Comment { end: usize },
@@ -363,7 +363,8 @@ fn delete_write(sql: &str, after_delete: usize) -> Option<UnqualifiedWrite> {
     };
     if word.eq_ignore_ascii_case("from") {
         let (table, _) = identifier_at(sql, after_word)?;
-        return (!has_outer_where(sql)).then(|| UnqualifiedWrite { kind: "DELETE", table });
+        return (!has_outer_where(sql))
+            .then_some(UnqualifiedWrite { kind: "DELETE", table });
     }
     let (table, after_target) = identifier_at(sql, pos)?;
     if !targets_from(sql, after_target) || has_outer_where(sql) {
@@ -391,10 +392,10 @@ fn targets_from(sql: &str, start: usize) -> bool {
 /// `WITH [RECURSIVE] <name> [(<columns>)] AS [[NOT] MATERIALIZED] (...)`.
 fn with_clause(sql: &str, after_with: usize) -> Option<(Vec<Range<usize>>, usize)> {
     let mut pos = skip_ignorable(sql, after_with);
-    if let Some((word, next)) = word_at(sql, pos) {
-        if word.eq_ignore_ascii_case("recursive") {
-            pos = skip_ignorable(sql, next);
-        }
+    if let Some((word, next)) = word_at(sql, pos)
+        && word.eq_ignore_ascii_case("recursive")
+    {
+        pos = skip_ignorable(sql, next);
     }
     let mut bodies = Vec::new();
     loop {
