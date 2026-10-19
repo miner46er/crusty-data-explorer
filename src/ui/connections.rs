@@ -110,8 +110,7 @@ fn state_dot(
             // The right half of the disc, sampled along the arc so the fill
             // meets the ring instead of cutting a chord through it.
             let steps = 20;
-            let mut points = Vec::with_capacity(steps + 2);
-            points.push(center + egui::vec2(0.0, -ring_radius));
+            let mut points = Vec::with_capacity(steps + 1);
             for step in 0..=steps {
                 let angle = -std::f32::consts::FRAC_PI_2
                     + std::f32::consts::PI * step as f32 / steps as f32;
