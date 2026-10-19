@@ -837,12 +837,7 @@ pub fn results(state: &mut AppState, ui: &mut egui::Ui) {
     import_window(state, ui);
     prune_selection(state, ui.ctx());
     prune_grid_views(state, ui.ctx());
-    let modal_open = state.draft().is_some()
-        || state.save_prompt().is_some()
-        || state.password_prompt().is_some()
-        || state.import_draft().is_some()
-        || state.pending_write().is_some()
-        || state.palette_open()
+    let modal_open = super::query::any_modal_open(state)
         || state.active().is_some_and(|id| cell_editor_of(ui.ctx(), id).is_some());
     let Some(tab_id) = state.active() else {
         ui.label("No query tab.");
