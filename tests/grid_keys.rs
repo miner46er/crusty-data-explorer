@@ -445,13 +445,15 @@ fn arrow_steps_inside_the_view_leave_the_scroll_alone() {
 }
 
 /// The cursor's row is scrolled into view: with 200 rows the last one is
-/// virtualized away until Ctrl+End moves the cursor onto it. The detail pane
+/// virtualized away until Ctrl+End moves the cursor onto it. The cursor is
+/// placed first, so one press proves it reaches the last row. The detail pane
 /// stays closed, so the row label can only appear through the grid's own
 /// vertical scroll.
 #[test]
 fn ctrl_end_scrolls_the_cursor_row_into_view() {
     let _lock = env_lock();
     let (_scratch, mut harness, _tab) = scrolling_setup("scroll");
+    press_key(&mut harness, egui::Key::ArrowDown);
     assert_eq!(
         harness.query_all_by_label("row-200").count(),
         0,
@@ -459,12 +461,10 @@ fn ctrl_end_scrolls_the_cursor_row_into_view() {
     );
     harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::End);
     harness.run();
-    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::End);
-    harness.run();
     assert_eq!(
         harness.query_all_by_label("row-200").count(),
         1,
-        "the cursor's row scrolled into view"
+        "one Ctrl+End press scrolled the cursor's row into view"
     );
 }
 
