@@ -1385,6 +1385,13 @@ pub(crate) fn cell_editor_open(state: &AppState, ctx: &egui::Context) -> bool {
     state.active().is_some_and(|tab| cell_editor_of(ctx, tab).is_some())
 }
 
+/// Whether the cell editor may claim the modal layer this frame. `root` sets
+/// it before the panels draw; the editor window reads it after, so a dialog
+/// that owns the keyboard keeps its layer.
+pub(crate) fn cell_editor_owns_id() -> egui::Id {
+    egui::Id::new("crusty_cell_editor_owns")
+}
+
 fn store_cell_editor(ctx: &egui::Context, tab: TabId, editor: Option<CellEditor>) {
     ctx.data_mut(|d| match editor {
         Some(editor) => {
@@ -1576,7 +1583,11 @@ fn cell_editor_window(
         store_cell_editor(ui.ctx(), tab.id, Some(editor.clone()));
     });
     if let Some(window) = &window {
-        ui.ctx().memory_mut(|memory| memory.set_modal_layer(window.response.layer_id));
+        let owns: bool =
+            ui.ctx().data_mut(|data| data.get_temp(cell_editor_owns_id()).unwrap_or(false));
+        if owns {
+            ui.ctx().memory_mut(|memory| memory.set_modal_layer(window.response.layer_id));
+        }
     }
     let (row, col) = (editor.row, editor.col);
     if save {

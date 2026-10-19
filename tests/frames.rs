@@ -2022,6 +2022,47 @@ fn the_first_frame_of_a_dialog_keeps_focus_inside_it() {
     );
 }
 
+/// The cell editor owns the keyboard like a dialog: a click on the chrome
+/// behind it opens nothing, and Tab cycles inside the editor.
+#[test]
+fn a_click_behind_the_cell_editor_opens_nothing_and_tab_stays_inside() {
+    let _guard = env_lock();
+    let (_scratch, mut harness, tab) = demo_setup("cell-editor-containment");
+    let conn = harness.state().tab(tab).and_then(|tab| tab.conn).expect("a connection");
+    step_until(&mut harness, "the schema", |state| state.schema(conn).is_some());
+    harness.key_press(egui::Key::ArrowDown);
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.query_by_label("Set NULL").is_some(),
+        "Enter on the grid opens the cell editor"
+    );
+    harness.get_by_label("+ New connection").click();
+    harness.run();
+    assert!(
+        harness.state().draft().is_none(),
+        "a click behind the cell editor opens no draft"
+    );
+    for _ in 0..5 {
+        harness.key_press(egui::Key::Tab);
+        harness.run();
+        assert!(
+            harness.query_by_label("Set NULL").is_some(),
+            "Tab keeps the cell editor open"
+        );
+        assert!(
+            harness.state().draft().is_none(),
+            "Tab opens no draft behind the cell editor"
+        );
+        assert!(
+            focus_stays_in_dialog(&harness),
+            "Tab stays inside the cell editor, focus {:?}",
+            focused_label(&harness)
+        );
+    }
+}
+
 #[test]
 fn escape_returns_focus_to_the_editor_after_a_confirm() {
     let _guard = env_lock();

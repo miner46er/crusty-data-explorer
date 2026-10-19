@@ -24,6 +24,12 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     // The palette's Ctrl+K stays live everywhere; an open dialog refuses it.
     search::palette_toggle(state, ui);
     let open_modals = state.modals_back_to_front();
+    // The cell editor owns the keyboard like a dialog when no dialog backs
+    // it, so it gets the same shield, first-frame disable, and owner-only
+    // layer, keyed on the same flag.
+    let cell_editor_open = grid::cell_editor_open(state, ui.ctx());
+    let cell_editor_prev: bool =
+        ui.ctx().data_mut(|data| data.get_temp(cell_editor_id()).unwrap_or(false));
     // egui reads the modal layer from the previous frame, so a dialog that
     // just opened cannot block the chrome behind it until the next frame.
     // Draw that one frame's panels disabled: they register no focus and take
@@ -36,7 +42,8 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     let holding_click: bool =
         ui.ctx().data_mut(|data| data.get_temp(hold_id).unwrap_or(false));
     let pointer_down = ui.input(|input| input.pointer.any_down());
-    let block_panels = newly_opened || holding_click;
+    let block_panels =
+        newly_opened || (cell_editor_open && !cell_editor_prev) || holding_click;
     ui.ctx().data_mut(|data| data.insert_temp(hold_id, block_panels && pointer_down));
     let modal = open_modals.last().copied();
     let key = modal.and_then(|modal| {
@@ -50,12 +57,17 @@ pub fn root(state: &mut AppState, ui: &mut egui::Ui) {
     });
     // The cell editor lives in egui temp data, so it has no `Modal` variant;
     // it owns the keyboard only when no dialog backs it.
-    let cell_editor_open = grid::cell_editor_open(state, ui.ctx());
     let cell_editor_key = if modal.is_none() && cell_editor_open {
         modal_key(ui, false)
     } else {
         None
     };
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(grid::cell_editor_owns_id(), modal.is_none() && cell_editor_open);
+    });
+    if cell_editor_open && modal.is_none() {
+        cell_editor_shield(ui.ctx());
+    }
     // Back to front, so the newest dialog draws last, on top, and the one
     // `state.modal()` names is the one whose key was read.
     for open in &open_modals {
@@ -196,14 +208,24 @@ fn dialog_field_focused(ctx: &egui::Context, modal: crate::app::Modal) -> bool {
     fields.contains(&focused)
 }
 
-/// One invisible full-screen click shield under each dialog's window. egui's
+/// One invisible full-screen click shield under a dialog's window. egui's
 /// modal layer limits focus and hover, but its hit-test still finds widgets
 /// in layers behind the window, so a click outside the window's rect would
 /// reach the sidebar or grid. The shield is a `Middle` layer created just
 /// before its dialog, so it sits above the chrome and under that window (and,
 /// for a newer dialog, above the dialogs it stacks on).
 fn modal_shield(ctx: &egui::Context, modal: crate::app::Modal) {
-    egui::Area::new(egui::Id::new(("crusty_modal_shield", modal)))
+    click_shield(ctx, egui::Id::new(("crusty_modal_shield", modal)));
+}
+
+/// The same shield under the cell editor, which owns the keyboard like a
+/// dialog when no dialog backs it.
+fn cell_editor_shield(ctx: &egui::Context) {
+    click_shield(ctx, egui::Id::new("crusty_cell_editor_shield"));
+}
+
+fn click_shield(ctx: &egui::Context, id: egui::Id) {
+    egui::Area::new(id)
         .order(egui::Order::Middle)
         .fixed_pos(egui::Pos2::ZERO)
         .show(ctx, |ui| {
