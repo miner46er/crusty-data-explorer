@@ -107,9 +107,16 @@ struct ToolClicks {
     find: bool,
 }
 
+/// A tail toggle ends like the tail's other items: the menu it was opened
+/// from closes. Inline, the toggle has no menu to close.
+fn close_in_menu(ui: &egui::Ui) {
+    if egui::menu::is_in_menu(ui) {
+        ui.close();
+    }
+}
+
 impl ToolClicks {
-    fn draw(&mut self, ui: &mut egui::Ui, tool: Tool, state: &ToolState) {
-        match tool {
+    fn draw(&mut self, ui: &mut egui::Ui, tool: Tool, state: &ToolState) {        match tool {
             Tool::Save => self.save |= ui.button(tool.label()).clicked(),
             Tool::Commit | Tool::Rollback => {
                 let action = if tool == Tool::Commit {
@@ -140,6 +147,7 @@ impl ToolClicks {
                         autocommit_control(ui, state.slot, state.autocommit, state.sqlite);
                     if toggle.clicked() {
                         self.autocommit = Some(!state.autocommit);
+                        close_in_menu(ui);
                     }
                 });
             }
@@ -147,18 +155,23 @@ impl ToolClicks {
                 let toggle = autocommit_control(ui, state.slot, state.autocommit, state.sqlite);
                 if toggle.clicked() {
                     self.autocommit = Some(!state.autocommit);
+                    close_in_menu(ui);
                 }
             }
             Tool::Complete => super::complete::complete_menu(ui),
             Tool::Format => self.format |= ui.button(tool.label()).clicked(),
             Tool::Find => {
-                self.find |= ui
+                if ui
                     .selectable_label(state.find_open, tool.label())
                     .on_hover_text(format!(
                         "Find ({})",
                         ui.ctx().format_shortcut(&find_shortcut())
                     ))
-                    .clicked();
+                    .clicked()
+                {
+                    self.find = true;
+                    close_in_menu(ui);
+                }
             }
         }
     }
@@ -189,10 +202,14 @@ fn fits_one_row(
     let leading = fit::combo_w(ui, scope_label)
         + fit::button_w(ui, RUN_LABEL)
         + fit::button_w(ui, EXPLAIN_LABEL);
-    let tools_w: f32 = tool_state
+    // A run in flight widens the autocommit chip; measure the idle slot, or
+    // starting a run would re-flow the row.
+    let idle_slot = tool_state.slot.without_running(tool_state.sqlite);
+    let idle = ToolState { slot: &idle_slot, ..*tool_state };
+    let tools_w: f32 = idle
         .tools(false)
         .iter()
-        .map(|tool| tool.width(ui, tool_state) + gap)
+        .map(|tool| tool.width(ui, &idle) + gap)
         .sum();
     ui.available_width() >= leading + 3.0 * gap + tools_w
 }
@@ -359,6 +376,17 @@ pub(crate) enum AutocommitSlot {
 }
 
 impl AutocommitSlot {
+    /// The slot a row measures with: a run in flight does not change the
+    /// width of the autocommit control, so a width decision must not see
+    /// `Running`.
+    pub(crate) fn without_running(self, sqlite: bool) -> Self {
+        match self {
+            Self::Running if sqlite => Self::Sqlite,
+            Self::Running => Self::Toggle,
+            other => other,
+        }
+    }
+
     /// Which slot `tab`'s connection is in.
     pub(crate) fn of(state: &AppState, tab: TabId) -> Self {
         let conn = state
@@ -474,6 +502,47 @@ mod tests {
         };
         assert!(!fits(364.0), "the idle toolbar takes two rows at 364");
         assert!(fits(1200.0), "the idle toolbar fits one row at 1200");
+    }
+
+    /// A run in flight swaps the autocommit chip for a wider label. The row's
+    /// decision measures the idle slot, so a run starting or finishing cannot
+    /// move the tools to another row.
+    #[test]
+    fn a_run_in_flight_does_not_move_the_editor_row() {
+        let same = |width: f32| {
+            let ctx = egui::Context::default();
+            crate::ui::install(&ctx);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 200.0),
+                )),
+                ..Default::default()
+            };
+            let mut answer = None;
+            let mut output = ctx.run_ui(input, |ui| {
+                let idle_slot = AutocommitSlot::Toggle;
+                let idle = ToolState {
+                    slot: &idle_slot,
+                    autocommit: false,
+                    sqlite: false,
+                    transaction_open: false,
+                    transaction_ready: true,
+                    find_open: false,
+                };
+                let running_slot = AutocommitSlot::Running;
+                let running = ToolState { slot: &running_slot, ..idle };
+                let idle_row = fits_one_row(ui, &idle, RunScope::All.label());
+                let running_row = fits_one_row(ui, &running, RunScope::All.label());
+                answer = Some((idle_row, running_row));
+            });
+            output.textures_delta.clear();
+            answer.expect("the frame ran the check")
+        };
+        for width in [364.0, 520.0, 640.0, 1200.0] {
+            let (idle, running) = same(width);
+            assert_eq!(idle, running, "the row decision matches at {width}");
+        }
     }
 
     #[test]
