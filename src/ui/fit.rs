@@ -112,9 +112,10 @@ impl Budget {
 
 /// One packed row: items in order while they fit, the contiguous tail
 /// behind one `…` menu whose hover text names what went in. `labels[i]`
-/// names item `i`, and `draw` draws the item's control. A row too narrow for
-/// the overflow button itself draws no menu: there is nothing to attach it
-/// to.
+/// names item `i`, and `draw` draws the item's control. Below the floor,
+/// where even the `…` cannot fit, the row draws every item to clip at the
+/// panel edge: there is no menu to attach a tail to, and a dropped control
+/// is unreachable.
 pub(crate) fn packed_row(
     ui: &mut egui::Ui,
     widths: &[f32],
@@ -123,10 +124,10 @@ pub(crate) fn packed_row(
 ) {
     debug_assert_eq!(widths.len(), labels.len(), "one label per packed item");
     let spill = spill(ui, widths);
-    for index in 0..spill {
-        draw(ui, index);
-    }
     if spill < widths.len() && overflow_fits(ui) {
+        for index in 0..spill {
+            draw(ui, index);
+        }
         let tail = labels[spill..].join(", ");
         ui.menu_button(OVERFLOW_LABEL, |ui| {
             for index in spill..widths.len() {
@@ -135,6 +136,10 @@ pub(crate) fn packed_row(
         })
         .response
         .on_hover_text(format!("More: {tail}"));
+    } else {
+        for index in 0..widths.len() {
+            draw(ui, index);
+        }
     }
 }
 
@@ -159,8 +164,8 @@ pub(crate) fn spill(ui: &egui::Ui, widths: &[f32]) -> usize {
             return inline;
         }
     }
-    // No inline prefix fits, not even one item behind the overflow button:
-    // keep every item behind it.
+    // Even the overflow button alone does not fit: the row is below its
+    // floor, and it draws its items to clip at the panel edge instead.
     0
 }
 
@@ -268,6 +273,22 @@ mod tests {
             // The overflow button fits; the item does not, so it goes behind
             // the button alone.
             assert_eq!(spill(ui, &[400.0]), 0);
+        });
+    }
+
+    /// Below the floor, where even the `…` cannot fit, the row still draws
+    /// its items: they clip at the panel edge, and a control that vanishes
+    /// is unreachable.
+    #[test]
+    fn packed_row_draws_items_when_even_the_overflow_cannot_fit() {
+        let ctx = context();
+        frame(&ctx, [24.0, 200.0], |ui| {
+            let mut drawn = 0;
+            packed_row(ui, &[400.0], &["item"], |ui, _| {
+                ui.button("item");
+                drawn += 1;
+            });
+            assert_eq!(drawn, 1, "the item is drawn and clips, not dropped");
         });
     }
 
