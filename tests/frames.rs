@@ -771,7 +771,7 @@ fn truncated_footer_band_stays_clear() {
     drawn.sort();
     println!("plain footer band labels: {drawn:?}");
     assert!(
-        drawn.iter().any(|label| label.starts_with("1 of") && label.ends_with('…')),
+        drawn.iter().any(|label| label.starts_with('1') && label.ends_with('…')),
         "the counts elide into their share: {drawn:?}"
     );
     assert!(

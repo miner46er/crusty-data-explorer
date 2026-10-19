@@ -96,12 +96,15 @@ impl Budget {
     }
 
     /// The widest form of `text` the row can still hold, reserved in the same
-    /// step. Empty when the row cannot hold even the ellipsis, so the caller
-    /// draws nothing then.
+    /// step. Elision leaves room for the item spacing the reservation adds,
+    /// and the cut is returned only when that reservation landed; otherwise
+    /// the row draws nothing. The other texts on the row still see the whole
+    /// leftover, so no two of them share it.
     pub(crate) fn elide(&mut self, ui: &egui::Ui, text: &str, style: egui::TextStyle) -> String {
-        let cut = elide(ui, text, style.clone(), self.leftover());
-        if !cut.is_empty() {
-            self.take(ui, text_w(ui, &cut, style));
+        let room = self.leftover() - ui.spacing().item_spacing.x;
+        let cut = elide(ui, text, style.clone(), room);
+        if cut.is_empty() || !self.take(ui, text_w(ui, &cut, style)) {
+            return String::new();
         }
         cut
     }
@@ -210,6 +213,29 @@ mod tests {
         frame(&ctx, [320.0, 200.0], |ui| {
             assert_eq!(elide(ui, "anything", egui::TextStyle::Body, 1.0), "");
             assert_eq!(elide(ui, "", egui::TextStyle::Body, 0.0), "");
+        });
+    }
+
+    /// The honest elision rule: the text `Budget::elide` returns fits the
+    /// room the budget had before the call, spacing included, so the row
+    /// could reserve it. A cut that only fits the leftover is not returned:
+    /// the next elide on the same budget still sees a real share.
+    #[test]
+    fn budget_elide_returns_only_text_it_reserved() {
+        let ctx = context();
+        frame(&ctx, [320.0, 200.0], |ui| {
+            let gap = ui.spacing().item_spacing.x;
+            for taken in [0.0, 100.0, 200.0, 250.0, 300.0] {
+                let mut budget = Budget::new(ui);
+                let _ = budget.take(ui, taken);
+                let room = budget.leftover();
+                let cut = budget.elide(ui, "a very long label indeed", egui::TextStyle::Body);
+                let width = text_w(ui, &cut, egui::TextStyle::Body);
+                assert!(
+                    width + gap <= room + 0.001,
+                    "a {taken}px reservation left {room}px but the cut is {width}px"
+                );
+            }
         });
     }
 
